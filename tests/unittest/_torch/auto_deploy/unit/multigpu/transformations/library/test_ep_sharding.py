@@ -17,6 +17,7 @@ from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
     FP8EPShardingInfo,
     NVFP4EPShardingInfo,
 )
+from tensorrt_llm.functional import AllReduceStrategy
 
 
 def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
@@ -93,6 +94,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                         target_node=node.name,
                         rank=rank,
                         world_size=world_size,
+                        allreduce_strategy=AllReduceStrategy.AUTO,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
@@ -101,6 +103,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                         target_node=node.name,
                         rank=rank,
                         world_size=world_size,
+                        allreduce_strategy=AllReduceStrategy.AUTO,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
@@ -109,6 +112,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                         target_node=node.name,
                         rank=rank,
                         world_size=world_size,
+                        allreduce_strategy=AllReduceStrategy.AUTO,
                     )
                 )
 

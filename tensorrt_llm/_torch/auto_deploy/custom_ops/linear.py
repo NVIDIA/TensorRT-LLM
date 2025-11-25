@@ -34,16 +34,16 @@ def simple_fake(input, weight, bias):
     "auto_deploy::trtllm_dist_fused_linear_all_reduce", mutates_args=(), device_types="cuda"
 )
 def fused_linear_all_reduce(
-    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], strategy: str
 ) -> torch.Tensor:
-    """Fused linear followed by all_reduce on the output."""
+    """Fused linear followed by all_reduce on the output. Strategy is MANDATORY."""
     output = torch.ops.aten.linear(input, weight, bias)
     if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM)
+        return trtllm_dist.trtllm_allreduce(output, op=dist.ReduceOp.SUM, strategy=strategy)
     dist.all_reduce(output, op=dist.ReduceOp.SUM)
     return output
 
 
 @fused_linear_all_reduce.register_fake
-def fused_linear_all_reduce_fake(input, weight, bias):
+def fused_linear_all_reduce_fake(input, weight, bias, strategy):
     return torch.ops.aten.linear(input, weight, bias)

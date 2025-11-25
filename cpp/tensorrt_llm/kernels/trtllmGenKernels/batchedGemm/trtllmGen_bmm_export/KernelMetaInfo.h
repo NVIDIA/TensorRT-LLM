@@ -28,7 +28,7 @@ namespace kernels
 {
 // clang-format off
 
-#define TLLM_GEN_COMMIT "67ea8687"
+#define TLLM_GEN_COMMIT "3b034f4a"
 #define TLLM_GEN_EXPORT_VERSION "7.0.4.0.4.0"
 
 static constexpr size_t tllmGenBatchedGemmListLen = 449;
@@ -940,7 +940,7 @@ extern unsigned int Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x
 
 static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 #ifndef EXCLUDE_SM_100
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 211624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "cdfe58a75f8248fe24066e36687a3819e51ed62d7ef56fc757fa754063d166a1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 211624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "e6722031e78d92fa890e9a41b1863fb9880c1a222d83dc44b2dc2f8c5342eada", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -1038,7 +1038,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 211624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "20f165cb44faf746fd20170884e9ab9475f31b065aab80afdcfd54552682db5d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 211624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x128_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "2b5dc6fa73dc8d2ec773b062a0bef1c49f8f61557480e50dc2906d27fa2267b7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -1136,7 +1136,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196640, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "1558977820f0abc66bf60b32ccfef96bc9ddc71f81b04679387d1ce28515bc85", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196640, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "d9cf88e210d27fa2328673dfe86aa9ed88157e1130b7dba459b3fc18d15180e5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1234,7 +1234,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196480, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "36859cc785b9c97d876d632d504f9b3b5ad89674cded56571f32c2da2f5dc03a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196480, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "19e287aa2f1b7ccd25b27a3b6f2ce3d1ecece123a9d259c21bebf749aeb74f90", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1332,7 +1332,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196640, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "7a114dfb1117c50b2cbf0ccb1f4c15321f0ec9fd60be9c6eed3b3ef6d2201285", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196640, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "868852d81116aa8040d4acf10b3e38c7b2b946a2495994c84030a405e47ca2ce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1430,7 +1430,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196480, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "89efbc29f2f2e9eef2bea4573e8e077f7cd83cc9d1c02c5dc9c74a4ebd693769", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 196480, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "fc6375a809a2db573fd4512359a679a1ca49e30cec7606767fddd9b7ffc0c665", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1528,7 +1528,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "184abf29dfab04ff96d85ed3b212b809dbd7413473e68dd2b7b5b1d97b7ca03e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "71dbd225cae4e85b2ed7cc916fe0a62302d8c6f5fb1917a6ea985f924a2d5a6f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -1626,7 +1626,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206344, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "19e48bcbe02f6f1526b934bf4456c69b95cee401209b9c424c38c36bc50015a5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206344, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "0849d8c868d71451f478921bffa60fda825895f6184a4019e90cddd0a99bbd0e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -1724,7 +1724,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "492db88b9f4ed7f39b35885fdb075ac163f269969bd61c987664296968e11286", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "4e34bdc186575e7c13ff243f34c6345f142c3d8506ce8c11348dcd1cbc0bfb2a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -1822,7 +1822,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206344, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "71ef5676d83522358e2386ff42d44657296e288623e1cdb6bae34c9187bb9b09", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206344, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "ea4adefbca0a2124b7fdb165c0a0150b47da2a8eedfc2e0216fc73a2bafe753f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -1920,7 +1920,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x256x256_s5_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x256x256_s5_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 219720, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x256x256_s5_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "17eafabdc60a776066692cdd1f80f045fbadba86cd2bafff390207db6793b755", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x256x256_s5_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x256x256_s5_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 219720, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x256x256_s5_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "3240c5b9919e61d2c467d263c48667b4193f5fab9e68964b8d99fa437c8b0c3f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2018,7 +2018,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221216, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "e3461e14bb6a5671bd6a2d50c9e1dc66c484775e561ed70c62b06952b3bc252c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221216, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c128516a3a71293efda628fb24678a281ae0a01f044a428568eacf875f2c43a9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2116,7 +2116,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221056, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c0a7d158ddce04bd238575eadf009ea1f85bc18eee64b07008b2e502c935c8bb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221056, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c1009c8407c622a00e70cf12e35a85b10dacbc0342da33ceb00c27679279e36e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2214,7 +2214,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221216, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "011faab8f1e170ed9f59ec54d67bcc906ffb3fd6b62cce740ee101bc919cc3cb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221216, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "7aa6113346d5d089d3f20100ec4099de24b55c3d3e28280e4660b3d1dde8019b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2312,7 +2312,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221056, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f5658b8c78a49d57b63971d1f5f83ec1fd9cf978fe16c2cb70df58e886b30ca4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 221056, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "6bbde19e544bbb4bb8d497a3fae1276ab8a4460aa2850b3e489abf665757d56a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2410,7 +2410,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222888, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "dd2b3887b1aa9968523505741696544322c0421fcb3fb345b59b3814245a43f7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222888, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a2c0d10f8afb9231aab045f43d90c9e264863186b2effaede5f035f81665c88f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2508,7 +2508,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222728, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f145a7346f00e01f90a6108e042f29f7cc0cd5559fe5d5c665f55b69fe685d4d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222728, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "4a35d88e24de0982d32c1d9eef197da2aebab80e40952a120a4de539243edb5a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2606,7 +2606,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222888, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "6a85842fea7a3366cddc047c6608ac618a43c7478c1c8811128c60f268f84e61", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222888, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a7548e788c8314dbce34e9f7e727421e0779cc1dea0f6d321af4f0b90b749818", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2704,7 +2704,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222728, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "23cc1f6c392606076bede6698fcd3afff74a07d114563b6308ca0b11e4627917", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222728, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "45d4fb2e3e6cab3678c4ee30da30e31e9a3ca86608492df3f48c3b32b37cc4f9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2802,7 +2802,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 210504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "d8d58192e5b2f335f4b8c5601f14f0e7fd4e685fa9395882f63ca55d4d00fa39", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 210504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "8904ff529a6b85609d0bb898555d16e90a58f9f4ad9113f45cb85e0ed190d6e7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2900,7 +2900,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 210504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "7ebd75a27c0ab5cb7ef8500a0930324266c19370cb9feeb8196ef4777f82160e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 210504, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "21272d1fea630bd343c76b43b9ef251adff0d2bafaaa4bc13d3cdf474e332651", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -2998,7 +2998,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184352, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "2cfd27b448554dac59bc25862e1b51449256767ee2c7bde6402a5c8f4f662f04", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184352, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "ce194eb093421fabab86f1c03be906af2ea5ab105e9f21265337fc7d8f76f0b2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3096,7 +3096,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "cc7a188335649eb6e86eddff397bcad40b5254a833151720fb6506c4f5d50a99", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "841d96eda616c2cc49899f85422bc8baef25aea66a423c85bd7676b502f2ca3f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3194,7 +3194,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184352, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "81a3caf549f4c14a4b1220ccd9c822607036f62b4f825c8ffec5a5b6767e1142", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184352, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a22d1ae3a56a520f8ef479c1cdacefeb20516cda799fc39938b8086ed8cca529", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3292,7 +3292,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "861e97fecde6328688ddee3437295d3e752cb3063ab7ec1489fa8e2a204ebc13", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a809d5f97b0a2519ce289880a5a273575a8772aa5a9fb6b2e6074b51662fa676", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3390,7 +3390,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "f53237fb0d930bc8a931d8dbc131406748789b0cdc622ac5155b40be0f2603de", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "22a0fed793c1d64742f19fc4efc0b172ccde31e92ce8cead327745c82c31e388", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3488,7 +3488,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203424, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "85c893c4cb15e8122df0fd5040afdfad4207a9ae0d03762b9020e0590bd9da17", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203424, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "d41c45bd7dc1570bc2cf13e4d7e1a934333d3a129803a43be16381409ed073d6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3586,7 +3586,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203264, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "fddc3a2cd261c7fcf104754c96400a6a4eeaddf3d3444acaffb1e4bdf63e1287", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203264, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "06c3356c4a630fd9fce8202aa197568496b7f13ca7c6419a5d6f6adca188ed69", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3684,7 +3684,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 209560, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "845be78d2accdfb5be8460b727fe8054b72b8e1022f0a0def69e6f2f816713cf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 209560, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "ddc47fbde477051a8158008b55f97d5dfa9778801b9398bf09f7264475ff79bd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3782,7 +3782,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 213656, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "cc0ea758fcbbb852d975975762a8f0f52bd2eb2ead96e2f0b4562ea3665bf730", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 213656, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "68e1dea7b3aae9dd0329ebfb8fbf0b12770f57e0cec67625e334b508c07ee403", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3880,7 +3880,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217752, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "3eb9ff77c3b94a4c5b37dc7547e24678fcfa83535674aa18b69cf8bc399106b8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217752, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedPx3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "373f6be837fb471536bd637b647b844096bf6d46c900867cbe4af9e3e1cf9271", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3978,7 +3978,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "b0cdbb51273287fe2188c34a2d2120facf1318ee71be2b8a8efa19b862c267ef", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "19efea89d59b88ef399118ea1f1bf319ac4c828daab80d2041bc705209ca395b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4076,7 +4076,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203424, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f13e51f47d2d4c90cc4b27d9d4f6e3ebc8e5819744468a1eb8f6b4efc371cb3a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203424, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "80844fec54b54fae2a8c8a2e581a32714149b4b96fd24c699509e6464c02a5fd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4174,7 +4174,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203264, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a4ab8ff99670998b3f031894ae6e33e9fdfe073696e51910f61b4b669360222e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203264, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "2e7049a231ce4a71c1a0bcc7993b0c1466e1bf50fda9675d51f0f0da68ee29b9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4272,7 +4272,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "16de48b542ccfbbc4b48208ca18dfe6f4c2aeb6c541017d66cd2ee03d259acb9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "0f30b74fd617852fb744de5ab9732fd93bdf8fae8b7030f7c84d04732f59e3eb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4370,7 +4370,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "04c35aa53302687bc259192c36ba4e4198f8d74261fe938adf7497afbed44aa8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "1c260c31a4391e5e9b775d76fb232c4285bdd8b7bdae83a45de5bb759c15bedb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4468,7 +4468,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "8631fbcacf11681044ad513816c61e9d847bbbb99ea53715c05eb8a4af09f0ac", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "1ed872ba9b2d0eea1368adf34e08cd9b48a9917886a87dcba26bed0e3db82a53", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4566,7 +4566,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "90508f014d4a350e2006294dfc2fe80d520784a76cb2beab9b7637f766503747", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "2fe4a74b3b6d522ac244c4a5a268f8c49ec64b5f9c9996dd677071644c0721b2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4664,7 +4664,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "3bede4d8faae6a31ea49a97a490ca4f3bf1b1a69a8ff737dc9e2ddb946e417ba", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "aaa330d3eddc3b5a63163b5bf378f7536b9f2d634528c640de47331d382fe86f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4762,7 +4762,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "8fc4e8a3c73a2d86bb08d99714c81ab7abb63080d1a7e8aa451a0f72acb60aa6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116224, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "dc508c7a500d0d6afaba5dabf8150fb3b3e5a9c736bf78d89b8019d9c962c701", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4860,7 +4860,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "e93103e7d307fc0528ab0261d86a57cdf63a3b397d6769b2d51c0ea7d4b3e574", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "b8edb95aae312390c02b0efbd589cb9138feeea5d196a5a8a9eca8074974b0d8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4958,7 +4958,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "7109f99755fa9407f8f448353f9f9d1f8b916f1b5d3bb40e34eaeb35d7f67471", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 116064, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "f90f31be6c8a1480f20e79b6adebbdbebaa61e2613dfea9b6871bcaf755b7912", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5056,7 +5056,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "2047a240a9eca90d045bc64d57804bf5e3b7d466f556d323966e917f7a8cb540", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "fbda7597d3ae4961a8cc9ddfae8b8ea4be3054dc5727a2731b320fc3d368c7da", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5154,7 +5154,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "5251e3918f5b2af5816ad8552a6963166e005ed0138cf96f8582f0fa952af36a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "669499f5eca1d205173db0af6e3e8afa22a6c40e7aaf3f62b556a2641908b576", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5252,7 +5252,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "f9b1f2d1395ceedaae9dc907592973e406b7a6e70206e93a1d20a7aa22e85605", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "c5774d5264c0f8b38020fd7dff2b889fc8a41fa6096fd283ae06a56e4e56784d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5350,7 +5350,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "e0e67a9088b346c9081e2683e7cc617088531da401afdfe810e1bddb6a0681df", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "770fafb13283db0b2f39ddbce65c9d96acd247aa651a307ed00f8e47b3939495", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5448,7 +5448,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "ed5ac8d75ce619c2d1935a42ca258be5c50c3f45dcfab3d1970deeff5c2ebcd0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "cc3bd28cbab951911a21ad01dbf3c2cc4f7254b0d3f7349980064a9769d666e3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5546,7 +5546,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "9d276068405ed43db4561eedaef7563bbefff70b86f6f7cedf869b0576695e4b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140800, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "4d59f035bc2c7a9ffd35a4bd0d5c9360ab06c8e13142709408443232f33e96f0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5644,7 +5644,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "791c0f8229db9665bff46a388ad22fa9497e2c967d9fdd6cdc30a40419343399", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "a24f5b38681a96c84d40fea6881787071f37ac051dd1a1fcd5ee8642bae392a7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5742,7 +5742,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "7f702831321c2f1d2720ab7e4af645e70040cf08fe10df554b54a4dd6eef3294", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 140640, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "b195f4e914c92bcebc2d7e5e546acb76296956bc6dc57fc4c5012da3d399238f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5840,7 +5840,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "f767a324998a4561af8ead17f484697392360de9a74e55f1664573c86fbd5485", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "df53172fd57540314efa0ded84d42a97789df304c721d476e47b41f4c169cffd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5938,7 +5938,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "7676f08ec67783cec0a5e448d5abe86b5483cd0cf83c0742f418e97517f13b8c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "09af0e1076646f00bd8963ee054fab9a3350a04015d26e3642f372668904fb1d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6036,7 +6036,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "8e98af5b49fc22bf5c9f175c04ba8918cc3413362e31a6afabb2a517d7ad7f4d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "360556baa5575dac5881f5cce8ff59127ee82adb27fe0e5ffc2efb18ee794cfc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6134,7 +6134,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "c8794578703bda9a764032107f6b3d47b49ac3349b2eb4bd463d84563b0e588d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "11dbfc1e55c524f5049a62e82133502a3fca3e9fcdd5201cd1c6522358bd72c9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6232,7 +6232,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "e377e883ebced8095f2f64c3daba2fed64094909ce39b13cc09e8b872686f275", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "24b222fe6b2db0163b8c3b6fccea43cd68970d7702b86f759fdc62dec8d79997", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6330,7 +6330,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "d13c8f8a0026e9f4652f012cc0dce80d2ba84a98a84c02600fbbc15949514978", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 157120, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "92f18302dc078ba48672a2420bb97f9b19018aa2236029c41271b924eed5713a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6428,7 +6428,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "fa743d0f913e8b0be44e64b617ab56f709b3d3116c88d87d27ccf56e7a0ccca8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "a1af9cab4a063f86e916b7c7748a41fd77f3505626cab247876fb5949418a1db", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6526,7 +6526,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "46570fca9e5364b77223303c59ef553d0fac38f60f536f9e288674b05131e9d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 156960, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "052248a3c1b7c3210b160d38d4f2d5f8ab2e1759072b40034568bb0acb3a2a4a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6624,7 +6624,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "d992995c9c5f99201cb7910d974cda4febfd1e50d6601846672e5b561be00825", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "3b4b5b08820c80d5c54234761f5c2785f46049eef894612dbfcfd913d0b101c2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6722,7 +6722,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "68188cb6e11d089844b24e5d197c9c622fceb7f4fbd695607e45c83bda6cd0a6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "0719a004e58ae3d3bd316603225473118112b4abbe022bb02ff3b1b41b62b9ca", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6820,7 +6820,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "6c7a2c886fc0d9995a43a763f6b135b96bfb02e929e9a79cc1b7d282d4d4cc79", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "a2f68564ab39f8e6fbb322cb4655e5dc484190f7751f7b4b78db75ae85151866", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6918,7 +6918,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "d508d513f3db23b85fae632a0015081122fb655d3f8b79b2915de3d4748e44af", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "8c8eaf30c5317c45c2d5814646f205f692e9d4f9f5cf780bb9516873cf06a2d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7016,7 +7016,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "cb68166a118ab18bf1cbfea16b460f65b0db7beb6591f37177b98258197adb91", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "51707327651615983523ddc375ef2fa5468df865ea9b8ec4de37ad30a295c35e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7114,7 +7114,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "a361429a7491a3a9072cbbbf63185120348078f03e0b0a2c5d4a0fb3303363d2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103936, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "599ead7b8cce7126b91af8f06736bd4bde63600f9a0259978311adf3135d9177", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7212,7 +7212,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "25c67930814442ef2e1a26532b2455f4dc04dc836c7c742955a4c834b395f7f2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "f89508797a2273fbd39ab38de0fcf8225a473c0c94f3ccfc7449240a07b77937", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7310,7 +7310,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "0806ff351bb3cba65c5d8ed8b89261fd8aa63bac14c9d8b4868cf23db390049a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 103776, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "e5e54c8091766cc8c0fab82eac717a1d23cf9d8a13bd3af4ab0d1f6ff208bedd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7408,7 +7408,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "1e427d00586b8bfff67a45917d7c1a2bd510af56bce8d0570d0ddf0286c7a68e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "fec57bd36b2a5157b1ccac6c3d0c7e6f8e36911fd5e03a8993578e2bfd3685e6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7506,7 +7506,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "c86997ac5d746a805eab4f86cad18a36c9c9a74d5ac66b02037ebb722ba0a6c2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "dd2ef374a7bf707228e3897d16452de648f3dcce6bd362ed340859f7224b4332", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7604,7 +7604,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "0979df9925cfee6e41e6e98e45909430d6a9c10e2528c30bb9154dac8dbf8500", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "c0909bda59d74d31a4a49c22863252ddbbaa342c8d481d118e0e0661727fb607", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7702,7 +7702,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "057e7b001f230286333921ab0ba78f73f82b89ece74d71b55572aea01e70c107", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "df2d146b74d128c7b03720e5872ec04594f22515619c807958c4ad060431edaa", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7800,7 +7800,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "4564d88a10e7b1166266b2307f4dc0dcb36ac95930d9500e4c7cc72b7c2f086b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 512, "49356c1e9e6774ce9fb89464f0f9cfe98fec1d0f393c33512966bd9e103cf2fe", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7898,7 +7898,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "93bbd6964c23e3a264cb148ed9d70212b30b39b786bdcaf7158c165cf88d88d4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123264, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 512, "832cd734d93b9d6694039326007debfe0c938f30cd0b323a5d5c52c0182dd92a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7996,7 +7996,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "5b1a489406858c9c54a831bc96eee66e4f3cae117059b49b1fd02e9e97ab5114", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100a", 384, "5d23555df3db7701061154d818a18f3103aea0f25e002870b7bf54850302591b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8094,7 +8094,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "71c247c3ec45225b87bae10f6e799b15f854064ef237b6bcf0523f10e2947d6c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin, Bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a_cubin_len, 123104, "bmm_Bfloat16_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm103a", 384, "009990b9d04a2300b90edb520b3e190db880d361d134015f291cb86fbaed9224", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8192,7 +8192,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206896, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "58b8fdd5a6743576ea9d54c6781504a00a6c36c0d6f37482a39e60c4fa9890f3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206896, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "97656f97c5c7a69fca4c27676ecb15196a4ad906bf2cc5df0d759587a5bafa37", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8290,7 +8290,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206688, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "44f6a1e0dd7a41c7244d82767fd53eb0986782c2dac5a2feadaa162e445ad5b8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206688, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "02ec7321cc8df08ef7aa723734ee55682f704fbbfdd4137fba93277bc84203c3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8388,7 +8388,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 185768, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "85a3f4fb0a8f545e7fa2e2ed2f797b5ef8fa2b0058d06ac341f46bb3395062b4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 185768, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "2b55ea9cac791f81e0f189232adcbf831f5f7528367c1406cb951244da1deec5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -8486,7 +8486,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206896, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "fd8cd9c777cfac43c3d67cd280ac273c5286d501a2145f8bf4803f7046abc149", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206896, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "aacf18dc4c68b07549c665a79b7ebd8d9986235d3a3ee3d5b8509432d2ee5f58", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8584,7 +8584,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206688, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "f7541590025a47394e5f0522205b41e0b4de469bf6a9a6bf0072350a73838edb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 206688, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "4b38c6dac010c08e1dd4171789cf8b97bf427869b3158d1f84ff476b3a86bd77", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8682,7 +8682,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 185768, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "f29d4f75781e05a76b51ad651f311f8ddcf02d367038bc0bd2d8bcf7c8131e6f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 185768, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "8c51e8b499eea55e093f78596eeb505d6e7fbaa5afa5cc544aba67fa9afb5c1a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -8780,7 +8780,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 121184, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "827638b6095ca49a6e9a08f970b7c0ccd77277e6cacaa985db7b1c944bef2041", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 121184, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "b5f8e5212ff199c5678cba2ac78812c87556201bee335b2fb1ffebd6c774fb9d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8878,7 +8878,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 120976, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "92f87d7f4eaec8fb958835b7ccf0b232ccc2379b08ee6ecd2b3be75f8a84b6c7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 120976, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "d0b88f37053b4e90c79d6627adf1ad5e9e7e7c03b40a215802bb0810bcc7b06c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8976,7 +8976,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 121184, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "d27aa123a5587c523723dbb2f3b35e8769fa1060697f1eb0514a47a01a364161", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 121184, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "5977b584645940a665353f259413ee567fc4032ef6e21bc15af6f305f2f2cc0a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9074,7 +9074,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 120976, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "4430942a73e06b3c2d6b8584e634d54987dc57735f914a3566b4194c42d1da31", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 120976, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "ae48bb7547915080482abb8c271e7d74dd717163df8227d5b333c0ec579878b0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9172,7 +9172,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229760, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "884cf217e939b52b5f7cc0524abdd9cc65672c6ec1230f9a9d86f8ed5f021c6e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229760, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "e2dc1327377b7145ff73faa661a46b7462d29f82b4a0e0c8e498cf1838675bce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9270,7 +9270,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "f6850d85cc5d282145e41b17036c23c0bba1a73098a4ec630c1738445c8028c8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "006b703351f1e16300acf156a2df7d7ec9a639b6b497fbb46e97c01ec10de2c8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9368,7 +9368,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229760, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "17dcbe40544df01bde7d0f42474e444657952522f1222c98b01bc5511455cb98", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229760, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "887a91a9be0e6d8884e33a169234e3658026f1f8538f5cbbced448cd126ef162", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9466,7 +9466,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "a39c733f0aff9fd4c440c7b10a3cfdabbb4a1d43ebbb3f74ff421c64293c2178", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "23da5a4de0ca85a82a085537e9ca951fdeff7a755f9d05e0890c1ea4513ba678", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9564,7 +9564,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215464, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "a6aff1f81ea00c934d2ec4f131f2eccda4b60e09f97701f32a6e81ab41af3621", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215464, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "c794274db148784a11d9355b9b5cdba7cf29a2916ed4b24ea97a6b6988f5b1a1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -9662,7 +9662,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215464, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "95bdcdd681fbb8961414ac0163ecb6a70f43dd3acc7a593237d4ab3a46c48711", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215464, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "0958179296781f597e60d4656464ea50a59428de172cdcac4eb8c69c72e64ab3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -9760,7 +9760,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220552, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "1e694400ac07f0870c6844f9cb3d02cd229f2ff739776435c10910af2ccf52b2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220552, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "0db6dc774bc88b49f3252f5bf5e0293156d46f9333e146f458882941abd136f5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -9858,7 +9858,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220552, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "542800c5fb5650e36ad6f30fcace9b5773d5128814363f6b668de2dad80c4e76", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220552, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x32_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_eW8_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6f96d58634c6cb52a5e79e0c605b2468a9d8e996a6c1d09bfe8c3d800f26f1b1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -9956,7 +9956,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137568, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "2c21bb5df5fb9702fef4d047d75f29be9cff3a03bc3fcb11f395e6c5ca6dbf50", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137568, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "0968a820c2b2a547db0e4a4a250c25d4af9290f4d2f4c66ec27f23979dfb018f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10054,7 +10054,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137360, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "a41479cffe0fa5a06e88eefbe7f331aa6c2b7e329261d8c09eae9de722916ea7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137360, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "03cb4d21edb2fc1d47266d95a2be6078b5429f40b714df39c0a2950b293b2dbd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10152,7 +10152,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137568, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "52676996b11e277aac3837b0c9a6fde6a124c3778a648896e1fe8b031f4eca55", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137568, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a64ec053362e3200989569b36594bd588270a81b486de6bbfaf450145fba9e74", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10250,7 +10250,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137360, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "bb4f1519bb1f114dc23827d3c7bdbb1e0a714fd5ad827311e74446b395b99d7a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 137360, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "65ab48f2d990bb2f91779728648536956a1d8e68a1c7356e7bcab0532ae312ab", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10348,7 +10348,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "f6a95d568e7cc6d3cdd2d990ca3d7caa85286ba6d7ce7c165de571afaae57969", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "bb06989bc3aae4ffb5e36563019693a410ee7b772330968d0c232073ea0350b1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10446,7 +10446,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "c4a4310d3c81ecf1c0b26935f3f7c9ad0105369bc09f8b430957126354d61955", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "fdacd9ee7e1ce50c9b9143772f08f1f73e2efd0b799e478c2a22e416150ac3c7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10544,7 +10544,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "e2a886b0ffbdae8579d7f6ee926ec21a2d82e2f0fe125abad05d3c918e82bf1e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "a76baaedbfcf1dfcb9aaa5524bbc442ec00a2fd9567aebb9ae208ddc25c52fe7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10642,7 +10642,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "86d1f1f0d9ee2ee4e4be6d4b6586b1ca95cc3ab89baa4d472bf986594fb83ba0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 217280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "b72898e676fb3ce2bf6efc50ffc0af050b4e3561bd36c060cc3141ff87053167", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10740,7 +10740,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172128, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "d67eda7608dc48cacf73e2f0e22a5f0b91fdf5b37612b81f03aa444e87a38be0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172128, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "4fbfd02b6a88e6bd180ae0d3e15551b6d6fe7ea9072b83ef0a6a93e9dc61dca0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10838,7 +10838,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171920, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6bb77cfb6801556a2b255395921679ed9a640a79d7c29df678c453b08dd35ff8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171920, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "512585e1550ca2200100b1c789f4b23f24b27e666004caf4f90280f71d43edb5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10936,7 +10936,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184776, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "dc569a28e838620f08282343870322b12fbf0ddaf044160d14f3bb043b8a96d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184776, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "7cb4d1a0af70155bdb97a8c58e74f59b480c72d11b2b51d689c58f96c2e9b220", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -11034,7 +11034,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172128, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c2fd6da1a5d94384f3e197d939a6667479f0bf3fc141062f0112c519ec985ebe", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172128, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "72b297680b735a182be85d6ef786de08bef8af0b855d5691ec21e0f8fa9ab693", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11132,7 +11132,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171920, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "4f1fa8de51d26d12e72d1312adfc3f5054e5ac2af3ab6fa06f16f16d9aa38f0a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171920, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "3cb912bfd369e98085480d8be92a1fd7e5fd44184e0158371cbb1d64e78989bf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11230,7 +11230,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184776, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "2ece890995fb57fd3c39ea5d0d8018dd1e293daf4d069e40ac8879314dab167a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 184776, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s8_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "563c1b6b6e9795cf539a2b60172f9ec17caeb2f610adb17c9ce0d69c67928b29", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -11328,7 +11328,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "1db2321f564ccb1c44ad7c23243474f4fbd1e866fc747ffdb44ccd6f20b93296", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "ddd57496d782bcafbeba1b39ab978671efbe4a92c15d36c696cf69db61f11f1f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11426,7 +11426,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 148160, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "dbe8eb0c7b6eb470dfe5b8bd17eb1deac6ad1f95ebe8de11f6a8ef457e28676c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 148160, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "b6411392db0833dc227aba7629b4c67b48bd6962dde5e1e1b696de026528292a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11524,7 +11524,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 147952, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6433e01e790d75f9cf60c87d60bd1fe2ad0166f0fdc8e2377cddbaed26c4c885", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 147952, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "c92f778c1436026017d19733173257954bdae0a1257a900e33d2d98adae5049f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11622,7 +11622,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "7528bd8f3b244cd1f6f3c2d69dc200db8353841841c4fa1544259491572ab535", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "3fc3c264c5ff7b324e5410944c87acb796ba93ef60ea22b6e5fffebbf9a22069", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11720,7 +11720,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 148160, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "afe6bac1fb990d1c1eec6bd188a66248aacba193c92fd863c573dc77fd4402b9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 148160, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "3acd1c3a48e0e139a84ac8d09ffbcdd8bc362563426839ec65b33f478328f747", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11818,7 +11818,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 147952, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "2775514a221224ef173aa7e1bc9753575d8f039c9e9acf53c53fa82fe445de88", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 147952, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "9dce6419f83c97951f6608117ace2a3050ea1b67be479bb135f330d4ccccbaff", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11916,7 +11916,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215424, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "fab2715a5434a97919101205d9a0b39b27f819b8d65689a582b0c0dae6aea3c2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215424, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "9fd9652ba2e3fd3cef09d558ebb4ebc02cff889d0063d5196438b5b2e0bceb97", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12014,7 +12014,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215264, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "84e7a85b19d695ff980f06278b9467db9b27d91aa8de509a78e4bba7bc2cde67", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215264, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "23c7d87ad0f2035a58905a90c11ce64590cc988f61464bfc58cf987ec67cfadb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12112,7 +12112,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215424, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "1eb61a8766b4877e9c8604470eb8a25ae99dac18c324c519ebd46a082a9a782c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215424, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "3092e5f719f0f200cb3c9ca24a994b4e044828cc9ffdd4b68963b703eb5f4a6d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12210,7 +12210,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215264, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "e3f15a4126c21e050d5d84845a0e24e87516c13c64b834e6cb38fd7d301b693e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 215264, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_dynBatch_sm100f", 256, "31e86b7e74a316c28f67b384d96a97d085b927e2e5b1d0b85449b7e8df4e0623", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12308,7 +12308,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "325970c7494b91aacfd546596119d83169d5d9c6af0a6cb2741ee8c176713153", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "ace78cf0ab07b0d772864b0f655162b7ae6c4ac4874657331ec894add11b7845", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12406,7 +12406,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "0bb6454bc3fd89133096c2ae5c1491001b234f5fa8fa895ca8d26cc29cef8cc1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "5980cb8fcffea6823af5b2b8d001afb897bca7eec947f11bcd68de73b60bba91", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12504,7 +12504,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "365f3df961f0e0bb5e3215abd314e433806d76b006e69c453ef5d9622c44d2ea", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "298babe66992104ad7abad7c0f73d6178e2001b04e8c366bf15180641fa0b1eb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12602,7 +12602,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73056, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "b11b2ef610d91af923b0580eca3a93179bfed1ecd208da02a4eeaef7fb5a815e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73056, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "3f763eebfa39a6f71dd2e7cf1d87285c00eff9db33de5ef1464561b6daf7ea02", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12700,7 +12700,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "fb8804ba291bf7a05ae2ffe04712a51665f1cf8ed08aa5fd9414f7aed26af3ee", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "071b0e2541a3a1f492958f3cc6a68859bef02abc51c8a8004681f1d302016cac", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12798,7 +12798,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73056, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e1526910ce336cf6ca68c627df4e294df97502cd7d37af409a5e66416790472b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 73056, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x128u2_s5_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "129b49c8aee1cad940b733755a2f7e1c445c31ce673afa3a3163b409cfb2640f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12896,7 +12896,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "f737fff78eed1fe1bf1a439fe86a3ce00dc8c8c7d49faf80d73538c2c5bcb622", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "c01cb91d52fd4b65a8cbb3516b8c13d5067f3c3ab12f006dbc0fe1813e810a05", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12994,7 +12994,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "046f191b74cb22ebc8f69878fbdadcad252852fc458cfdc216f6c44491d590bb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a7a3c889296f1befaadb02fed31fe76483776b67f9ef0a6925dba733e1948d9f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13092,7 +13092,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "9950c320464131ee48b2ec6af089855ec7ca61fddfd4a1f012f564450ed95f7d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "27310ddfe9cacdfa915504a5c1e8c5534a63c102c3cd132b066596e23ea2d662", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13190,7 +13190,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "9caca7c74ac1abefad04e80213cb9c1e378e075da5e898d47e1c738eadd279a5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "ccf9743c34faa89ce63fa952f53785615745325197fbd97dd20a9541f9c53139", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13288,7 +13288,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "391fcdbe252996c50371b0e838ed8ebb774458f2038dd1fa5b9d7efdcd7ab1bd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "ea83e58f3d431d2442c3d4714e6141d4b47eecac4a8135eadbe2910dbeb122bb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13386,7 +13386,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c8103da7205b109cf6e4f772069db32530a752b36e147e8c5e526ea5fab32d51", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85376, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "1fbe26c3a7925b1bf7ef33eedc41607c22b2b784698f6baab764c9192b36ddca", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13484,7 +13484,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "c4d0e40a2a845626fd6034002095137a21d9baf0421236128d0f4e528f3856c0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "f0f87b11777af787544f104c51aedce014298d75c137475f7efd90ad0b5ac805", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13582,7 +13582,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "154e9027cdf67d5258ccd3e8f6f5293d23b3e45cf0f792e037a08b71dde83619", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 85216, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x16x256u2_s3_et128x16_m128x16x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "afb94cdee5b47ab1ee34d7088468caa67129915941837f0118ec154c3879e312", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13680,7 +13680,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97792, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "42b880f130337bad091a9a583bfef50dd9cc12aee4bb699546363e701eaecaae", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97792, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "46c6283c6912509bd53b868ac79a78f6052fff0a5da507149d81e31631536e40", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13778,7 +13778,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97632, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "d7edb67be6fc850dd3080b64501ee617949c2a8ef32b3fc4e992e4da9b0f8e14", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97632, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "1cad80c643785cb3eae517936df128787b80423d32ba9458803c13bd512bdc72", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13876,7 +13876,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97792, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "21a73c01111e458d56439517f13ab3edc458ea2fe4343e258f30852c1f82fd49", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97792, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "b3ca776e09f503e322e6c11fd3842eafde5d6a912be1e4ec744eee21d67e8218", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13974,7 +13974,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97632, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "a4ec5dfdf997d13881c9e567db78dc00fd37a6b44422048fff06cb0be0abfa85", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 97632, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x128u2_s5_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "fdc60e64e388be2f40a708e94f9b58e19708855677b35e320f2efecfc31f6c38", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14072,7 +14072,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "acf26ef3ccedf1053d729b553a396b2fef0755ddae54965663cb4debd2fd78f6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "9e558bcf50f0292e88ba856da7ba42d2ff042bcf0200784362d78bc0429daf50", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14170,7 +14170,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "8ccc1a99775aa3dfc21bb4881eb2b19ed4b994ab8d14927b51cedf913f4e866a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "b2b86fc79aab63ca24ccf575df761a5f8b64b9f22f9312d07ffd8c474700a0b4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14268,7 +14268,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "620a787f656d5c21f2a774f6e0fec8d52998a4f4eb25108cb503ac4404bb74f2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "8a6869aa2342289b79ab8bf9023c1e2ca35f2ffa0eb85ce0c70703ff43367824", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14366,7 +14366,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "cb317c73195f9066c215588add9daf8ac3481adf2c4e1882fa8925d5d2c9f6ea", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "e4405ae3c2ef6eeb4e57153e4499e0c05314c9ee3cb550ed12c54b0b7b310e2d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14464,7 +14464,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "f608da6f9d577a38407dde01cfae8eb19568dae2ba654e3b1eaeab0e4d59be60", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "4ebd051baece27f8ebeb7b6264cd3811c802b3a28d9a01aeee50ba8bf00bb597", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14562,7 +14562,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c62156a0106f1d772b3497f459e04044d566f324ba16a9121e38e88bebcf3a7c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 114048, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "cc7e0a4b8a1aea1513c42775e45af0cce6744399ddf98c2ff043f824d5d3ad18", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14660,7 +14660,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "7bbda475541e27dad424179a44bf499ab1f68e01b01788812c2ae19578e4afdf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "5c335042eea86fb9e0fc10d6df70c4cbb949cb239f18d3ba4d31013f25078c7f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14758,7 +14758,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "b6aceb64522e7943a3153fa1f716ad1baf335da32c8875dfc87f56967ee90f48", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 113888, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x32x256u2_s3_et128x32_m128x32x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "d021fe7feade0cf2265cf9adbb91f3fa06025b573d96b8bafd91169937a338e9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14856,7 +14856,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147968, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e74362baef10c9efd58cd7977b449a2dfe4800a83eaec1eddf6ecbfd74d84f47", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147968, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e64a93f56f92be59e08c3c2da8173843dd08fa93606c524929991eb36b268a0a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14954,7 +14954,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147808, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "2b042269a40b2d8ef81502ffa29236e3d7e1ebb782a430f781b55085bf56fd18", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147808, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "8b686e308fd7f1b82b05494440d6c717ebdb290474e8aaeb2216c94958adc4f0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15052,7 +15052,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147968, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "dbd1392864104a1fc418aef3218c513d7457fdb2d1c8861e3726117a8e13e579", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147968, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "89d00b465794d2ad8f7104c85cdb57c1a723ac05366bd7395bc0e2186e9285fc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15150,7 +15150,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147808, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "fde9602eaf4ab45ffcadb86e2a659a004efd5350672436e264ac24550a181c1f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 147808, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x128u2_s5_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "01c7189f828d77f544cc3c5d6edfb81b2fe2ab67b680af0cb4938a5a42f732dc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15248,7 +15248,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "d76136a5794ab0ddcf9bfff728882ee354b8c843534df2f04d4eb7d60fe1cba6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "20b13988849f8011ae01da45d132c4b04bdb5361cd8989304d5c1596b6987d0e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15346,7 +15346,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "6fc3171d2eeeedc9baa25bb1b23fa31725aba50436a78a307d6de25761934602", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "36b0102c48829de09fea412ef5d033564fcb91ae1b08314bf0a998b9e7fc8109", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15444,7 +15444,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "c8682ca423d05e4f7a540515e40daad7b57fd7f5571b5371fcd69c3472631ac1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "056f8d2062ead7fc1700e1b3503c8d59158a34b9f61b55826918fb08934138dd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15542,7 +15542,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "39c2677b5e56b516e42dcfb63dd41409c5357d811f54515883966ef3baa78ec9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "dfa56dee7c91d828f9c3ee73ae91bebf3bd2bbbe539cea975354ca3bf670d971", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15640,7 +15640,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "944f344f95384e55b8f1ee2428c08d0f9c47551d1357ddc3d77266ae7f960d5b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "2944e23de70a297f3bfc2caddce4e972ad4064115db736264ce1a1036697da06", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15738,7 +15738,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c378e172a49766a039f18708e335043fc6eb8ef70bd2cf38c8b3c6aed6f96f3b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172416, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "e3fb562a177422f3e09755e51468ae38ee1f8b14eaa428836826fcb1e2201a07", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15836,7 +15836,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "7b4469ee8527d1408b3a4db0de7938ce41f2bb226b6c9afb36c46913ee9e15e3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "63e409969ea15d261ec61a52ecb8e9957444c48918de02b1a807b5dd0763d23a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15934,7 +15934,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "ffa914d315134f7438ff786dfc19c50802562aa0ec3497be466b2af5b535ec02", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 172256, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x64x256u2_s3_et128x64_m128x64x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "c39c5c3c110fb950f0fee7b9569b67051b807c02ffdcbb691e200cda302a735e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16032,7 +16032,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60928, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "aceaf083a75d617fc6daf9ce3397efb286e302ee0ca3e01c67b17fed14b20bb2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60928, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "374751f34024d851c5d8af6a8bb2baebd348ed1b69e7c33516a545e40e279cae", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16130,7 +16130,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60768, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "23b0fe8d2a9ba5cddc67d7fce84b72e1f843a5c6d66564ea2ffcce022202475a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60768, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e141ca133e1809cb9f22573d1a7e29ff6bbd013ca2bbc0229c6655433c833653", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16228,7 +16228,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60928, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "67e888bcc456c7d8b403aad269a795af9f1a573f98736df03625a24ab3b8b767", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60928, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "0e63bca5fe8f2e48208dfb9b2cd2d87f1b3f30383f675b5fbcb50f0acb577b39", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16326,7 +16326,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60768, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "5a3e16bba83d7eca4facc624fc062fbe76f99e1d46f6b52a5e7154cbae2d7683", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 60768, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x128u2_s5_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "5d02e52b3baeea47ff04aa02afe765b87c2aecce7bb0fc5805ca529ec10ef28d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16424,7 +16424,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e40fc014eab4379711085c17bbc236ae7cba1b681ed0196a6f8e3f0c9c976f48", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "82897e85169287c957bed4c9218b2c991dada12955c094de6a1e0fc192a6377d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16522,7 +16522,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "46288c09771ec7042fdc63344f177c438949ee11914d08eff5da9ce994e44653", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f2a67d1a113595a208c5677aacd97ff8d0a475bc34fd2d1249dc74aad8839e01", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16620,7 +16620,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "2167e734c4da63ddfce0de0c362e8fac73d5f557da5d177d1082da40d9f7fcea", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "baf648e589fb58883e17cbdbcc2845a5b5904c3f34398fdfac25ddcbbcdfd444", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16718,7 +16718,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "cff3b78a4b4270752272c6d4d69ef8456c3370d178ee6d32068e5f5f7c08498c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "53a13975e798a61f94ff177157f3ee147faba235a8fa4ecb66ef205341c8c45c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16816,7 +16816,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "8ce9273b9fbf61cf3e84a2a2f24c4d015bd71d9213baf2e3d4aa1bd9cdedcd32", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "587a9e546ffef4bd7b2f1460830fe4250a3a8c58a3a344ae9c4c281dea7e5ae5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16914,7 +16914,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "9528ca499a42e575362768a32c441bdc8f5c020ead6f7d48b76dbf542b3c92a6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 71040, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "2bb5c4fee39284fe3634e32106520d903de4e540319fa42c55b0f8e0dfd2d689", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17012,7 +17012,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "cfd48ee86531b77faf96d6d573832131829576adcccae0f6a5dd58d03bcf34d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "1fa973d8e3288527980c3a6ee508e50e286ea4528b39e610681b4a3139d47353", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17110,7 +17110,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "fd17f7a1223ff62d2f62c450969178ed7b8466e076eeba63a7cc6531b57dbd49", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 70880, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_Fp32_t128x8x256u2_s3_et128x8_m128x8x16_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "344f95c54a3a4c878db87d96889f97666d1f1844723a54fea463a99cae7ebab3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17208,7 +17208,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "d92f7f7459929cf44ab9b8aee65de75602c2a637dfcc2a2a8afda4121887d904", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "355443a2121d692ffa9ba113c8935dd91f81470c6aba993901c66ece0f904453", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17306,7 +17306,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199008, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6a056d643300b66b12186824cde6d7112eadf021a72544c13291738675439784", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199008, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6700040212410110092f792277b74f6e84bc85623c431701a806371749f9b8a0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17404,7 +17404,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "4e7470c140dc23230aed4822cfad2eb28899b0241ea28c942c3976fbe91462ec", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "9cba3bf07406cf0d8dfe85540253657215c3ebf69d3cce0c361acd12055a74c1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17502,7 +17502,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199008, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6dc45735e2784280bd3f55703bfc46c9470955f8d81fb7f5ebe60e0c21c00685", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199008, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "46d4d50bb70ef96846490161955ce39a51bc3c6270a9bb5db5247b7992d34674", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17600,7 +17600,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223744, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "bba8486ab5b1a767bc4a114ff81fcefeb365d854879ad7259e841baaf4212ce8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223744, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "c34cf9d9ab3c9ec0fa41c7f9c078db5f3e0e2747f734b72823f1bbc2d9d7d518", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17698,7 +17698,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223584, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "7473edcf6071b8408a1c0d56fac69b8ae219a61b9da8675c7077ec11a71120de", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223584, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "1ae0310be153b41054f89cb323f3750cc05e3651cebd8f84b8bfd1b93c540538", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17796,7 +17796,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223744, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "a59a1c312199dcf966010f97d80267ff245ba44d580e37db1205f69c024f4b45", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223744, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "a3a67808fe4fe98ecc89a5aef0b5bf68bd7ff5459cd19dd7748aebd48ffe58d8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17894,7 +17894,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223584, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "42c412387850404d48a7a1e77045c0caf408cc700f79d1257fe600e646859db1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 223584, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "2f3a6ad2d7dde7a3dd662afa86887791ee8e94abb82de36d3f526727ba060220", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17992,7 +17992,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222656, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "1177063657573c404e7b65e0f7a51822d4cd4f9618653bdb128a8441386ccea4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222656, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "18c015d15aea4ef83eed9a2eec3c011dfa1bc079761de9673811ebfb6a1ef43c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18090,7 +18090,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222496, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "ab980fdf95520d6b8ae516c41dd62f5000031e1976609beeb95e67df1102100b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222496, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "a19700b5984f3935dc5131ae47073bc31b8ecee99e627a1a55612aa740f46c57", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18188,7 +18188,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222656, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "cd22109093763aeb492da671b3ad04a4acb8e488fe61d6b41fa64e6343b7c572", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222656, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "468ed999604ef02408b93ceeda393ce36a9df4bbab331b802d32674d97a6d9ae", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18286,7 +18286,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222496, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "4a2c21ed51b0ddb98bea1aa98d5edeb25abd6deea97dc0642a7cb0d28a79916e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222496, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "c88b2cb7698001b10e3d1ff051752c04e0cee45f17c26bea43df60ad838e033a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18384,7 +18384,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186880, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "48f84a73a9596700218ea5ebcded39c14c8175775c9fa99e038853cf340957ab", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186880, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "81a5312f73db0ff9bbd20142cea91c5547d530c05b714957d1932e932e9a25a4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18482,7 +18482,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186720, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "f5fdfa4fa64b5df78d832ec5c2cd5fa4a052c3ef0ccb670e99be9f9fd8c52c8f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186720, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "f6fb3d4514ed1ef73448c3ebe07b0d8d1a1d3e6d9796898b4da8f4743d899eb6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18580,7 +18580,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186880, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "598f6cf427abbb334d45bad051001fd11f87cf518451027294fc08bb85e069fc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186880, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "e73e09e3e9ffbeeda9b68afcccf723740386ec4c7e39d605197e418ca33ee33b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18678,7 +18678,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186720, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "f4822b617e06300b7b81dfa3c036ca2bcc35ebdac241a72578c28a08c09e0ac7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 186720, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "defd6e51aef435315971d2e9f5f9ff103491ddee5dd9ebd13668cefd37b358d7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18776,7 +18776,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222592, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "665b2b0c76d02048aad9b2a633c8c986b5af860aa1063efee1a9890e9897bf41", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222592, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "0a307c25ee69a353f0de9ce4082fe7899e48071529b4bfe15a214d38cebdae7a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18874,7 +18874,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222432, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "2a7898a71f6b79e5363719128a6fd22a8ffc5ed92e22bfe86fe26e1f08bc43ad", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222432, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "a6df272510f21a610350025e8ac4cf7cd8aa689dd562a00ee0a0bcde2ba457b7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18972,7 +18972,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222592, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "6c3ab400392271d232b3d9f6d122046cf847ea47a1cf1afbd184f69694686adc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222592, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "c693adbba3056e8f631bce4958e5028a36eeb2cda70e81c438607a97575b24e1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19070,7 +19070,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222432, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "d0293829f574800ae928590a532109894897392e0d132dc715a1ed1c6c0329f8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222432, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "27291268867f49ab7fa4b321b309010150e9a215aa7fb2e5d19a4714306f5a5b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19168,7 +19168,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203512, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "236111d83720af723b5cb9505c8ddb4656dc82d2e78941685fec035a23214df0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203512, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "70d5a861126c535d7f065b5208cde1818314b6685d496abbb2920f95be7b420c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -19266,7 +19266,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203512, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "21b276f4b36ae9b8c4962cbd2b67ccab979a67259075f01cf4fe8284abfca1be", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 203512, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "1b0b8cea50c9d247179926bec89edc421cad6fd6e182387093b0a20872589c32", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -19364,7 +19364,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 227848, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "5f4fe368cf0c4edef92a70897d4aa8e9c915313c2aa83793a7d8547cd5eeb1b7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 227848, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "2e2f15d86c76fbc19ce9d183d00bbbf1e8810fd66d699f2639ef62357e9df878", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -19462,7 +19462,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 227848, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "b4437a43ebe54c849c57fb4cc7963fb625b818b5c3b4eaee83975c149054286d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 227848, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "06b71bd1e17e7125ab9e8d02528191815908785a470bbdafe38a5f7b3a672b36", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -19560,7 +19560,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199328, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "421b14b2bd95b29b341708c1c3be30a783c746480fa67c8a80422f4d14dbc4cb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199328, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f121e1abbcbf29beb97763dbdf274357e08d0f0312ebcbae286d273aaab13e6e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19658,7 +19658,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "b1e60e23947d512deb85d73077c996e1a8b654572c31a580668f4f279a3644e5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "e55fa7fd32e19f27214df857e45b84c31cc946363b0d8c4db0183f9e4ea1f8a3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19756,7 +19756,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 225032, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "374c408d367e36924b5c8771c7208f47ffc5eee738c371e980e0a3c3f6c9a362", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 225032, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "ac59c1400f90af1b7c693076e7097ff1f1bf7640645aeb41f1894b17fed2df0d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -19854,7 +19854,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224872, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a13747983e19c0faf38a95cb00cd49375994d4a38ffde4413cc9c4ff5a2ef061", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224872, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "69fe9498c4433c8661701cbff160d9c8fb08337aed0475f41117b4a55584b096", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -19952,7 +19952,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199328, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "b2898a812a80b69c42a9983c04a730dd10c62bf01154b0ef8fe9853d3440dd78", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199328, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "9ba3f5b384b793f608d313bdf7726539b850049b3fe539caebb83b6a0aab2e08", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20050,7 +20050,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a26742d108cc3b3d6fced20eb330f2b91b208ca6b5c6c680ee621f575df6a35b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 199168, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "7bafb0670cf200d3c475a3bd3c930c0c23020d2557143dc13a6981c64bb98f27", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20148,7 +20148,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 225032, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f57059374c505a8a4651e90178ab6bbf2c1ab013da5e932df0e67e9235721109", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 225032, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "fbad9788a99719b390952c345d778dbef093f749a615a23b0d5b0538ab66156b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -20246,7 +20246,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224872, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "0d6c5950df47e23dc9b744f96b85d910ac4ea23f1a5eda78e7c3c9f0a949ca67", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224872, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "6f169c8e4619ccc9f67d97d7e5f1f865503c004f37d15f03b916392443672c2d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -20344,7 +20344,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x256x128_s5_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x256x128_s5_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 197192, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x256x128_s5_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "582475a099bfb5cfcc2a18373d8e53f5dcf7500c60cc1f2b40099588db5fd4a7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x256x128_s5_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x256x128_s5_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 197192, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x256x128_s5_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tmaOpt_clmp_dynBatch_sm100f", 384, "a78557e4644249ae20435bca7c0524c3498c3678f6f2ce5bb0d6303c488e9a88", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -20442,7 +20442,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224928, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "42909d6120faa39407ecda009d9e49c548976d577004b49bc4e0cd65f62f4cd6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224928, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "80f196a3864155e5925d85ba43528a56e8fb66bdcadfd054d0d6b025ec95f75f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20540,7 +20540,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224768, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a40462e08226ba922f57bb3d3131864debc4b199b9b5952e9c4011ebaee58554", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224768, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "7dee093a2cc27b201d9f34209bc2ce1ffa18cb637eef73f0807bcf8a0684673a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20638,7 +20638,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204456, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "aa61ff8f5c05094a2e0789b2f58df7e4a98cd75332821ecae5d5c78e2fc8b317", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204456, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "31dbf7a55574b70ae4dd64fc428934c75fcd8b4d460b8860d1511fabc3258865", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -20736,7 +20736,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204296, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f91dd6306152917ed22d5c8cd804bd4983f2b05f27dbd15607a7be91fab058d3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204296, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "5bf6a57f7573ec297672e353728f36d39b6338aa8165896fc69654ad572d78cc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -20834,7 +20834,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224928, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "2b8284d0a7883b81cd2881b01da7266fa0acb1cbd944e0f832753673e4887978", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224928, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "984fb47bc73b83898375b3b0f39dcdde4761388596e39d9f5b7ad28a58cd0727", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20932,7 +20932,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224768, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "e374e045506bccfb67dc1565a1fb3ee97b54a3e81c901af306ebb2e0d04538c5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 224768, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "39bcb5b5d9eb2337a166cc69e4d6431798bbdb848423bb117ec4b75903f01a87", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21030,7 +21030,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204456, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "40b10f7c6335de6c9b6d24553f56843c3f1e9fa1af716409b5b99bdf7dab8d84", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204456, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a1f6eaa0561e8e779a06a3ed59cb8620a07fce995137e2cdb7688b114b374028", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -21128,7 +21128,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204296, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "722919168a6b701e773fbd98cade060bce1cf5d4641900ff2c4011f04b2c08c8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 204296, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "9608ede4cc5139ef03363182a2df6ec8a652bd4512f85f6a4f12841ad6a65235", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -21226,7 +21226,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171880, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "82e7ef1bd43132ff386d480d9571749d9d721551a702113bfac19963f5ab2c92", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171880, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "736b4ad4c8ebc5fabd8590ec4fb9cec56d72392ef6fcd075549b461f6fd00504", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -21324,7 +21324,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171880, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c8c8e9272f8fe514f48b7507783d7b49ecbdcb76ebd16ef4c17338b8b01adf4f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 171880, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a52f687bc4e193c5a2c4e72df1a3b2b264879861e5877a88e678c28c0d3fa73a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -21422,7 +21422,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 192072, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "80c081f381caed983602b2911860e6958e0d80e9d909a9173cde3694d27db605", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 192072, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a6dc00a7ef6669491130e1ed85b687d73e2b98352f63a4ea7eeb2afe9671e614", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -21520,7 +21520,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 192072, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "dccfe5768a832cb985e68e3895b78dec45c68224f903dffd354a9436d377278d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 192072, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "80f71d4462c33df65d99ed6c027a2901a9ee4867e551f78e924bfc081750a9f0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -21618,7 +21618,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222976, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "6ce44b17f5f684e2fa99d0db79f544fccc0f68cf503f1cb54514c9ddba71138a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222976, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "05dd237bbf4907140af915ce7fa04317fedf32f1780970dc426f32a1c791e2b0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21716,7 +21716,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222816, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "4289a7a520197e3de26ae466d29fc5975b75d7c7f286ea3ae238c17c5305be0a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222816, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a89a8f7e0622a5eed84ea7c7d949f4f34f291d762f19be0880ab8c89a8fc4536", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21814,7 +21814,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229128, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "00fb857206e5e1ed5d308c7df55721935804ed28dc46bb20196b9df814c1d69a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229128, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "a695b38aba02e312609dc0c6892f89adff7a4da33d45927b5c4f581f8c782105", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21912,7 +21912,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220776, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "009753aeb5093e39abe4c3f15d72dd9afd120580e5b29c4a3bc269839e0e07da", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220776, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "c8800c1cfb93330efe34972159b554bfb403b7c71a1ed399852336fa23c8fd43", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22010,7 +22010,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222976, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "08083957d00678a3057f1af6a6a405c050e96625d522c6c4923ec2a0e0322209", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222976, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "fe69ff1189a4cbf419823df06b6a86cfe2db65beecc1aabc58fa174e4075f5c3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22108,7 +22108,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222816, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "40b4f9ec90ddf3d5c757de8f5f991e1abf7432caec8adb5504ff69491a6216d1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222816, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "1599f89531854d7a5317c3c348911db9aa991f2bafd90062c4cf35c261426a06", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22206,7 +22206,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229128, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "1e572ad42e033081c9e24e4d7d3f1cb3a6ebd23c7e399f85ba60be669d3b276e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 229128, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "ff2405f3b5b46f9819e79eaab357207b04efb3cc54363223b9ad925ae2be8a6b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22304,7 +22304,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220776, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "f541d3d801f74fe9af54dcf348eefcc38b8c0f313882982e93d02aec2ce9b557", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220776, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "93022df232e343de94a1a288161a8ab62c14d4e0bee0f12d6d6d2ae6c2e576e2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22402,7 +22402,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222688, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "26ec898c4ff1bea841518c5f5c4563a08d08931837194a91cf227c4538690d2f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222688, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "6f7ad0fd9db221c1344dbb1666c4fc507613566aebe9361b5bf03aa1e266969c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22500,7 +22500,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222528, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "96d4a1d4137b3bc7f922cb39fdab6cf1fc2a5005f3bce95974aa086e19b32039", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222528, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "49b50098a2f8af0699dbd0fc984ad4783f5015a050f5d9fe6b0bc7e9f2844b34", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22598,7 +22598,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 228840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "cd182a8d0ebc05d19804e2e0f5a35bc558e09a03cc0178d021b5348e9aba5652", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 228840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "90daa8e633d98454df1b15a775cad342393e83676f1bb077f8d926311573611e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22696,7 +22696,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220488, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "d79f1c8237aa5b5c1f5dc0621628c946bb54c46628e0284989ec87ca95a72dfb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220488, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "0b65a1422aa4b7d4fd37140d4c2fb32cd648df2beb65bab9ba02eed14fd3f60a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22794,7 +22794,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222688, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "05f3c299dcd5623587d35721578210de3b197406ad049acf835e6b32fb1962a9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222688, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "3f012d9990f72f117c2feb378e654c3762f2494820a982cf56b72ecb605f0016", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22892,7 +22892,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222528, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "423393989192b3a71e4312ef4b579f34cc78f3510b82b8455b4477483234ddd6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 222528, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "5841c140ef2ac7aada518a12a4cfb5da53181a404cc0aaf1ab2ce12cf1683448", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22990,7 +22990,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 228840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "9b547d92faa6b08db505c38fb82791cf09b3c4d36ae93047d2f6280abf25ee9b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 228840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "b17364efa8e3b292647fa3e0161fac908b36c311348b7d7a717c1dab43662dec", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23088,7 +23088,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220488, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "494ddf7c428d4e994773a24ad1256cc4bae69b94e4abdcc1d804e54e97bfc5bb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f_cubin_len, 220488, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_dynBatch_sm100f", 512, "1fa825d90da5e2404221528c3f16069f0db2e2ed33e343d913a775c706c9b4dd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23186,7 +23186,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "7140f4ee72f5f577cd58019e4714eddd6714ebb396370029b166bf3bdbcc76e3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "b514130737a69f6ce244b71f911048b846c5afd30f2b4e1a35e6899de45d8e64", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -23284,7 +23284,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "fb2ed715046ca018ed2b71a84c81a70b99c49078c117d647098627ede5d44fb8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "565d4bec91e21246e706e7b4b24c179ae686c39d2504a5aaa785e118bf7b9907", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -23382,7 +23382,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "0845c49333f3dcc436860fc66a1f5f0a4a049aa1de961f8ac7ec4f373ac4ee9c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "628f73373c822db870dd34f273edd9348c24c6deba20a85ac1dc7d7827773a31", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -23480,7 +23480,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "caf13a0bee2ebd16d0fc907875e2cc714d44457de7eba141c40aa8f0002e7f48", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 180904, "bmm_E2m1_E2m1E2m1_Fp32_t128x128x256u2_s6_et128x32_m256x128x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "86a61b7cc55f60dc919b67348d4235a7fbc2cb24d0b57b456b01b974924a1a34", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -23578,7 +23578,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "ec5649372050a574ae80bd369f9fd68995d891cdd9e39eb569d71b09e1eadf53", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "e95cb5eab80534dcfcb174e99363f3adf39b42f4f6c35a9349c8887f51f4364d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23676,7 +23676,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "fdc45aa41c3b8e5e54b57b8e24829982c12dff44d59dc87325c1a9fbeea7c985", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "e19cf895b27f6853e329daed77655f6129806105403446282740132fd328bd7b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23774,7 +23774,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "10a34bebab4ebe5397bcbcfb72be049e2a3c170f89ce82769f00d889c6454cf8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "03c1c8d8a1a0f9c9b2683d3b6856cb503636c89a73321e7e7a1b9bcac9f250b9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23872,7 +23872,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "195b59e34b5398d445600d61cc37ada12e9dd87fe771df79558f18563d423732", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "af66ed699e7a50150869f942e0c8bcb5362a26703f1b10cf3681233254ee331d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23970,7 +23970,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "61922f52f5d67c92f707cfcde4e6222dddcb7458a71b4e3ce165201ce52e654e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "9a513cad3d0ad9ffe5b757b891c49fd0833ace56474233ef582d15f2ed3da248", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -24068,7 +24068,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "bb7b15b58ebc313006340f317bdb76d2b4ab48e0b1601ed862c72490fe57d32c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193568, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "82ef683b2e07c16adb589afa9ceac36f72d2a48608b3f1cfc6d4f607cc78aaea", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -24166,7 +24166,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "1ecc19d6e4ec01406a0e75ff775acedc9eba5306221e2f9491db3b6bc0ed3b59", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "220bc7172a923cf2e4151feffcd315a19c9bd134b75f0319f74d3a182a1f739e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -24264,7 +24264,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "17e1daf5ca9de4ac8dacbfa83be4e65d725011bf788c8a92f53cd8cb57679792", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 193408, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x256u2_s9_et128x16_m128x16x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "fbc5de7d738ba4a5b63caf1210605c9604e6719a471a51b32e6fb15b06bbc2d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -24362,7 +24362,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 195144, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "1bfa93859a717f4b954cd81471576eadf4d96156c12738ddd17fe2a3e76b9615", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 195144, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "ce0d0ff3fc5bb6bda3cea4030961a2b48b533613b7514021692be4f1373aef2e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -24460,7 +24460,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203336, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "e4da67690af1b1b90f8b87b3439df4280bfe344b1f71446fdb0d902d37b510d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203336, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s4_et128x16_m128x16x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "d6a7f208e751306ba3b1d3c8474f9683d10e8f453402a3df59bcf6b60ad1bc4c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -24558,7 +24558,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "7e7ae6d8ecacd93c843391ad53cf4ab9de3e828ae2bd2fc0ab2105a9b5283596", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "52bdb7b4b539744f7fb7fa127fefc43ac47b8346d1078f2a968f324bd25ac531", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -24656,7 +24656,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "45866fd32dc0956082a3cdf6c49e98aae2fb35ea35f8815687161795ddb4f28a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "fe516972fed487c4cc2eac3c9dc8e22c717398ea08d9e3c18e139124e5501333", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -24754,7 +24754,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "4140db75f48184943416b3372108e137fd1053dd5fee80425b40056063a8977b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "e5bdb73cc25cf91368aeee422b9a7e11480863f7c9ab2f0b7b406327f31ccb16", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -24852,7 +24852,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "8ab45a9b52301bcb3842e56c71c10740e1306d7027ada8f3a8d45fe077353cfe", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "bf7946d13d4022501906bb20e4ae35764f8b9cc5d7de22c26875e92a6903b874", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -24950,7 +24950,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "70341f4f2da7159997d1ec55133e7b45061d36de6f94006f322316c40ef8be0a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "2f36e5638183098015d557565ecdcf422bb6012507184966253a1b7447542e44", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -25048,7 +25048,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "2b4baaf55a2f48c42b8cdb109e458f3da60da557b07634f6e43af1e074de1edb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203432, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "4f0688003e9ed42086af5387978c2790e229301cfa779458f93fd4b50928951f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -25146,7 +25146,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "4f59e412b8a05e0746c4e14784a418af02fe502eb840ef02688489317452cc35", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "fff9baa30bed2d64333ba62177e405be7f6aa99ac2d88b15bbb2ed694350c0e5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -25244,7 +25244,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "f79760008ec519596a484419ce7a3e864ac3089242e518b01741c1213fb1b9ee", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 203272, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_s5_et128x16_m256x16x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "e075d782b84a522aed1b3b873fd81112981f30a06f795dbcb6b1f15ebdaba1c4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -25342,7 +25342,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_geGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_geGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 172536, "bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_geGlu_lbW8_lsfbW4_dynBatch_sm100f", 768, "1e2c6ef55d49f20defbf33125ae3c583b68ae27fc061c5aee6e884e3742cd890", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_geGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_geGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 172536, "bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_geGlu_lbW8_lsfbW4_dynBatch_sm100f", 768, "6ac60e6bd81563778ba7092b240ca08b9b89d0f160fe5732529290f6e8620c93", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -25440,7 +25440,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(3)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 172536, "bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 768, "a1554cd54bc69d4217c41047197e61c6404a30b91218995c78023a90b9ed297a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 172536, "bmm_E2m1_E2m1E2m1_Fp32_t128x256x256_s4_et128x64_m256x256x64_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_eW8_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 768, "176e9ba2e406c02683cb56f7d68f3867c9ec8cf715b2cde29fbc1316ab896ebd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -25538,7 +25538,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(3)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "8c84438779a9a77f3a89ee0e576d5c35ae442884eb76abecdb9ab1812b86ec70", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "eefbdabbe74324aac7655bd4ab1e79aee01dca2579bf96c62e1a262bab0c9926", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -25636,7 +25636,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "919c0e2399f405d75d1896eb21b20e62ac40854c79617a8014bc38b93738b71c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "501fea2fb400076ee07490269170d89a6b50bcf48c26cc2789a9cc25abe2f416", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -25734,7 +25734,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "01bb9caab8d0c4ff965c10d376847c5aa1ba991fc20adb07e4455c4a5eaabec7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "053710f86da6620904777060d1641f2c3b0199f653ac0df9c1f22cd3afe127e7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -25832,7 +25832,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "2a7fdfa35fd71cf8021740ef64b5f82576ca9006a0bc5e71fa11cd4d17c2de29", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "fa239691a9f0b851a72b3e318c1c30e9f9fc55fc40132ddeaa0a1ea04b2033f4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -25930,7 +25930,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "64c0bf1849d4482cc23c0b528c78213f82681cb37e0b1e671c3e3d8ac6b71236", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "3161b300a7c475b00e5268e2384ac18d88302ef5812883d9608dba83e6143cf4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -26028,7 +26028,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "e0923315ca4199dbbe53679123323bfb9ab5fea61dc3651f4b295cb41abea4e6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 215072, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "b3a7c277131acfd666be1ca619ccda5296d1b56be0d71d8dc2753a810e6432f1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -26126,7 +26126,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "70a9a833b323c37f29afdb946b1fe3b2f2816ae26320a7374201a68394de6f2d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "7a42d4b64d30ed3c1a5f2c548a68551e05a2f190a68bd750a5ed11cb54f5b533", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -26224,7 +26224,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "3ee15abd039b1cfe786cad7086eca22170eefde3294c0d32b701b332aaf2d04d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214912, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x256u2_s9_et128x32_m128x32x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "8d007ed4875a2aa963265724d5df3afbb38251b49773cc720b1264af27926b89", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -26322,7 +26322,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s3_et128x32_m128x32x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s3_et128x32_m128x32x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 175592, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s3_et128x32_m128x32x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "47e6250d4f7e530e15dfeb030338e5816b434e18ccb2ec3a945c12647f70fdce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s3_et128x32_m128x32x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s3_et128x32_m128x32x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 175592, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s3_et128x32_m128x32x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "23be40d1a888e26d2aa4b809c3bd577083d9afae662c68ec90a158f218c6ba72", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -26420,7 +26420,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "c0a4745d83a17a5bb24aeb4626e97b8be045ab43af0c6dbab2363dd9a2e1fefe", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "7342d03360798f1a93d009b82249987714ce0c41a3a990242a646a6dd16360a6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -26518,7 +26518,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "30f7eab6bb628718d90ce2ae3d5a608126d17c94944e3ff8870869605bcfe4db", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "b2e746473c4fd0d405548bec3d6d519cfd8eba8ddf4f284eaa7b5a633dfa7553", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -26616,7 +26616,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "0a9e3b28ceacb556479a9d73bac15509be740108c73cd94a437973f4e300fbb0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "1056f78eb3fcc264d2e4c6ac9636544a746dcfa9a9cfef78d38d039954a58634", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -26714,7 +26714,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 768, "66cf838b7e262a54e18a1d744e4752dc26f6fa04c4a8fa911ff1a7ab9291db83", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 768, "6e385ccd2a730a078c52e4445e889a7534194b38122df4d2d878d93f91f71c65", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -26812,7 +26812,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "0e1a0b2bbf3257b7ff62ba25c369b47e19a14be7f8a18bf93b346e3056d9c15a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "dcb0a1d7ce7b8ba55c8f83ca96b89f2e01aed0ff096187d7db609ace958cb2ec", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -26910,7 +26910,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "8913b6a3cd371dcde49da8e8eb3e95159ce1e4a5f9a9ed9c3b54a274a7595639", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216744, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "e2a29a020bdaefa3eadb2063f1486657ac0a985852b5ef46a2de7986f6457fd8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27008,7 +27008,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "f97b73ff345f9777ccdee1302945dede87e4fbcb2b0047b2dbaf316ecdc7259e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 768, "b42bb7f33a0f964c96ba7292ceb9b92cb7fd9732e3ae13e4847cd4cca751e334", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27106,7 +27106,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 768, "e57b054defe3e383656967b1775119ca6cf735b5c8874f7a870bbb230cb8bf20", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 216584, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_s5_et128x32_m256x32x64_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 768, "0c23fa7d6e3794d03a8c5086f1f550f6d5a192dfc428951ea4277e6b355fc607", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27204,7 +27204,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "cbcab50b4709ed54657e72eae21c587e3c67c6c830fcd4d5b7b516ef018c461d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "9e98df59fd353b05842cca9ad378fe5f2831a207d7ef37bf81c3d17ec1293105", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27302,7 +27302,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "525026cfd893ca7392c129ba451014b39560b4e25ebba657eb0d6d5cb0a51a65", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "1659b5a9df68e42788620f6e3a0e24084c87a47af86c0685130d597177074006", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27400,7 +27400,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "f825ae7e2e4ce4a361248fcfb8860ef665e70ac017cb07a9bcdfa1e17d3063e3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "e68e0652a7632ca05352d6da8bb8cd54e0e271ae61fed962a397f3503c8602a7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27498,7 +27498,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "9493226632d7c54771b240e0e467f7aba5e5259589188ad45b8ad7341f9c8a66", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 151304, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_s6_et128x64_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "1a0ad45c61248040df2c9ff30af4b3a42f617046ba9dd403140efef926bf3dd0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27596,7 +27596,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "523b41096c9560796f5137866031c2cb56268dfefbd372d5db85d15b362264b1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "54ef1722d0bbdf88f2389447bcf13b13a2107c55e6824ff1c40d78c300ebda86", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27694,7 +27694,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "16ee6d8de4de787f7969cb98d713d88ffb90e21299675cf122cda88495b8aada", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "14d4c46d1710a75e9337c104cf63b008716a70785a1af0f9678d7cdc61b321e5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27792,7 +27792,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "3b9e551ed3c1b591fd390ad50c4aa7012bb4422af35252129fe16e343fcd27f7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 896, "da45991bf3a23e3388fd84812a5c34c9e8658ef48a1fb5165bf35bfd7d49be17", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27890,7 +27890,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "7f05e1d60efbf275871596b01382454dda38ecf3a4df5a205b1ea3977f2c4435", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196168, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x512u2_s4_et128x32_m256x64x64_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 896, "a84414d643013f4e879c57fc91ef0952e23ab692e77f702e956dc5224acc8358", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -27988,7 +27988,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "52564facd4b04a55ed584e3f66a1f61c21252534b4eef74c16e02078b39bcd1f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "0c3e7b581df76635633831eb0b85ea94e43fc22083e22dd8441efa4ec4a4c411", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28086,7 +28086,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "add7813b5f363d7fec5fa084b65c8c9c92525cad7bbd471cf724ef276f971020", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "26fa38b5e6bcd1179811cd894192956a7f1dceddfc559a32800e6a0f5b591bda", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28184,7 +28184,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "33e3926062492806783150874fcafdeb31e921c9c86353995ab2387272c9f609", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "c577f2a97805f72c22b85a43260af6d5eba172198ff988c143c9ef37ec9724fb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28282,7 +28282,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "5f521870b4d4b81e2b054e0fef658edc14f965d86e44851ee38ec16511440c92", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e22879490e65b449cc6a03ddd7b4db0a3e7bb59a13ae1c5325b302eb2aaecc1a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28380,7 +28380,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "412d9922f31b7e0ffed4f49d52d5da67b3acad2f9da834a4adc182d1397d14d9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "80798aa53d76f060dea150966d16da995fe89ef02866d1bd9f8c01b275999931", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28478,7 +28478,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "a7443f29c750ba8b6b76b69f245930ef5524b2a93362da63f678fe9e13ae3af9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183328, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "df2976401bc9b3ebfe1ca116be0f2a9d351b82f21941aba5a7fb3bda34ab9d88", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28576,7 +28576,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "e5f6f473f65131d9a3bef03a8d5b92c9a6c08de4d7a9acb02466dd05ff63482c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "c8de1d41b98a62461cefda26bf66397da7420c8d1c9111709aa53e5645bc9836", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28674,7 +28674,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "606ebe8be358ffae9d28ad615bc3ead431ec1a4770ffe983de3d0c23296a8ec1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 183168, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x256u2_s9_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "65b03fe9034f50e5a18a4cab39e616d81ad1fec9c0b9d55a12e55bbb4a721a2f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28772,7 +28772,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 162208, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "6d9d677feb422d034b57f19f5727970d241ec1a9372130fec0f3f928ddfe4c37", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 162208, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "d00e2a1807b1e30ea3725139daa55278e98958a1b0773d33349286a82642a90b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28870,7 +28870,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "e6cb4338748212890977fa9b934a5973aba74b0018b6925c10205ad3be500648", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "a0a6feeaf1f3510e7119942387cee93ea5ea1d9e202b1bf159c8140cf6a93421", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -28968,7 +28968,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "993dd243d4f714d566f4fbc4007cc1a61534d5c7fefc1d8148653f2d33b72c9e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "a12b8b5f736f2dd3d77b524dcf72e257567a4fb0538caa2ed0ae6c9922b64b0e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29066,7 +29066,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "f80afd3a510f108dee5994b4d5c04f3ce51855fc130966aa63cf033cc3c0a988", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "c2a79eeb8a29a7a71ec4743a4f70d793d68b029d9a9f6d7b7dbea2f6a003423e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29164,7 +29164,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "80228873a64b88155fe5f378917d320982fccfe676c2d473065f1f6c43c2654f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "2e4dd79a7cea90b3951092522a8305037c3ba8a9bb2841b0771069bfc3836431", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29262,7 +29262,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 209576, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "a29f68efcf145f3891f4264b3caa309c2bc87380b932e1730842ceee7e297a5b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 209576, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "1554c4f71009ee6d6e50819f3ca40e7f7293a7154371268c2130cbb1b189fcab", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29360,7 +29360,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 213672, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "02a07e6238c7816de97026cba9dd83ddc41f22e810b46def229c1696a5ea8860", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 213672, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x3_16dp256b_rM_splitK3_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "b549c361727fd31aff5812467a285d8e85bb8d9a6146115c5b0aa05f3ab0b012", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29458,7 +29458,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 217768, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "3acf458014f933dc6abf427f68635607feaab18dfa48db282da4951fb4a3f8ce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 217768, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_s5_et128x8_m128x8x64_cga1x1x4_16dp256b_rM_splitK4_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "7b88136a008beb184cbf393c8aaabb35bd1362f29ed75f8f1a96c775072dccda", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29556,7 +29556,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 162208, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "2bd99b7bc110f7efec009e78c015883fa36ddc9c1eeb6d81ff843f84931a70b6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 162208, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "842dee6e49053bdc14f7545d97d0f0179ea35a1ebfce61a045dd16e4361c33da", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29654,7 +29654,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "cffeab8ffb2bd95e7a322be293901c2c919af9933c985a4d222dfdeb5c9211b7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 640, "afbc7e1aa7e0c57b365d421073117d31560182296af081399ed2cd92e1df6805", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29752,7 +29752,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "6ceedab8a703ebf698d30a2172d6c1ea31b97ab08e5d6f100c0fc533b6d29fa7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202400, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "33f7eb6e1954ed9fae50ca8b45e4d718c035b94474b5cd014c871b83d0a9d8c4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29850,7 +29850,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "1139bd831ef4633ac8f79453d81ff790d1fd0cd3dd06bdd9b94b5384a296fa70", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_geGlu_dynBatch_sm100f", 512, "4b013265e6d23c6d4dcd353a7857c504203fd190481a2e98e1af8ad3da143a08", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -29948,7 +29948,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "8357d6bd18299001152279a2399d8fe287031937acf7e81bcd131d928b14cdfa", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 202240, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_s5_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "23b1698bb6d8c2c7994fc562b0722d768c61402fe2577adf75a17838fce17c94", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30046,7 +30046,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "a331010617044a6ebfc365b0435b9ddd7156c9e708fc2e79bdeb52c8776a1a35", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "30e416a3e053ce884682d5e2d8c284a306c42e1a75fc06689cd2d452b291cb49", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30144,7 +30144,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "ea5d34435fa741d36d14d973e2883f618d291c1fcf1c42c6025199779530392f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "3efa88bb8d32636099ab977537703ccf2f76941c9b65f8053b010e1f7d2e1d99", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30242,7 +30242,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "9a7e0cd328cc88f52c3abcefec92df326ab4c6fe46dbb5d754c9002f5988b330", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "2ab728e7009cac624a785b2e20f55e057cfbb5a5ea91e9753f5afbfe0bc073c5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30340,7 +30340,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "544eb0b8c7c4953b29be1e0ceb0db283a90b8ed13a16e2a79bdea76d74b27d7b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "d2e320bbfe8a9ba001d2d2862a4f4dfda2869a2837045d60668242e58d242e5b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30438,7 +30438,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "25164dfaaa83863c530e9e66586d3d3559cf1fbc0e21887b77dae83d90d31cce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "8ed1e139a0f1c08fcc647c6be51f4f42b75bc1706ce53618d203d328964ded31", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30536,7 +30536,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "65831cbc14b940ce017d1abc16dcf6e7f9d51a2f86cfd295e57ca06328e02f69", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114176, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "6f976a64bf0ccfc4eabf04d31900b4c50eeae118cb05410358857fbf26ae33b0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30634,7 +30634,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "363c83298e4ceac8f3f0888d42ddd0116487f87b87f2dc7db0311e6697c08cd1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "955e11d4f4d5966f8c71c465ed5c85279e4389ce53f768d0d65e5c58bb273496", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30732,7 +30732,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "314a660e08ed8bc4097abd377903791a027ded2286410d092af0e6c1e4bf1fcd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 114016, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "1ba420c2fb369b9af71cb42ec5c0b14fbe3968f16a80a7d9ad1ae8e874e6517f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30830,7 +30830,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "2fd8d8ee198c850499965f72dcc415a5c76b29797911ac38b7d130252deb753d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "04cafec61204433b425a86b42c522ab55837bde7a83436fb1e2921a1bb00bc2c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -30928,7 +30928,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "6a2d4249176f37de5de1bc0fd3544c25e95eda80162b833344105014d6e0b86c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "9b69cd38f303999ecb02a2b943970d9a0c31db5dea9f1f316c4bd169b8d344ed", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31026,7 +31026,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "89fdcf14dddbdfff40371a67aaf80c6cb99d15b16bc40084a1071b112c78a6a9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "63092d900c5932272732adb2160918afb5a6fe4aa1d4c3992661364d220d0be3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31124,7 +31124,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "050aa30f245fb4dc265204757ebed505509f73921c158dde86501b1e3057cbbd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "5c1d1c8c85b8098e5fb259783a89f1791dce24b25182ef9ce063683b13b8fa1b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31222,7 +31222,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "9978dd3f0e2e755fc402fabdcd7392ebefb7a64188fac961f025f2a4bd670d10", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "58b51d66f41b4a46b80f3ae0b9e20d59573e9531ab08bd45fb88245fb932d24e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31320,7 +31320,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "1f81bd612fd6ba074a7d8ee8033d8c96cb9aaf03840c6907d9959f0f8909f100", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136704, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "3a00e3a3add959e0d506bed7fb934a79e3f3f381dd52f3c85d706d7822dfe985", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31418,7 +31418,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "5c017ac8f7ce8225878aa0e8a59f6b9f2ccab387b66a8944319b49a57d42c27c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "3acc67427c60665a4d5fb7448108229824d5c838b14711c6a273ec34a3705dbf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31516,7 +31516,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "e17ca38c3282da0b4d1b5fec71d1723504be28ad1000a4be4a20f54ac4181a82", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 136544, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "3d97d80c1e52ce2416152025a7b07be0cd55cb86862b713d55545938befba401", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31614,7 +31614,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "9323dc8f1e11ca5e058f84006ae3132471d410ee2e2b025e193cab1892dde3d2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "998eac5a7bed88e7f514b13253f279f709f811e4f7f976ebe10b71fae3cbb26d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31712,7 +31712,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "700c2a38b025db8b2d035b5db4942a231070fbe890f7cda30137cc2f08d0a87a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "ffaa7fe066a2d5794cd4be7cfac8f9a273cdc5ffad3b1c6484660df24b78dc8c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31810,7 +31810,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "0586be72620fae84199cb1fde1d87e57c21bcda8afb94377a6272705411517d3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "f6aabf16916657ae5764e4a22a848f739ae05d9f20ccb03a418a64bd825bf54c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -31908,7 +31908,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "3fe94f2ccee4b004f7d0963efd9a38d339d97fb03275c024de903bc12990c19f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "c85029ded7602e4aa3bb7e9046f94fe975c00a770cb7b29b4e52ddb845892b8e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32006,7 +32006,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "8f4d584087b1d5183e5271d351b36cbb40989331261c51d87b8bd71d71c2bb66", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "548b99c50b73ddd06dae95c4a88702745a65a390a8125a5ab66867c96da3c015", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32104,7 +32104,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "dbd3833c61aa96918206da725b8620dd60ee833665a67518a120922a79a8cd5d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148928, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "9b75aa04debadcb8a63baf4747ae19a16e313b4d850fb16130460458fb592dac", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32202,7 +32202,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "65ddca96454a3615d6a2e1c8d4a14d46d1fce40f9d9e9e873ef38750360f5a9a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "dcff599aa1c0ddac97449d297fa6bd2851952917a9738d60027250151fd5d354", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32300,7 +32300,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "823ff8aa0b439e4b5de28fa615bf89d212b5cd8d288ca3bf3d2910fdabe88ff5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 148768, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "925386955ee33e66e51c7029189d8e7cf2cf5ade89d61b137ecc0a5a02f889ea", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32398,7 +32398,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "3a1efd834d26aeb01abf991f9e766e6cf3b90edc871f2f8cd1b2973e30258abc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "c8b40660d97f90ea3c2ececb2aea6e2f3d38e9202f693532f7dc04e9b52c8f62", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32496,7 +32496,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "309ac198d147691d36f8ea73819d6daccbc9c453c4739d38981b4ab9a8e7b962", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "a6864394dbae86bc29a4628a8102c29a266117d8c699eb42bfb495e097a1b779", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32594,7 +32594,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "7359b20a03616d4d97ac364b43245bb399018cf88bb7e4141fcce5c7f40efe1c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "0fccdd0090cf4acad0e0f0fff0e316662309775bcb78c0534a3c355b3d570d39", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32692,7 +32692,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "fa1ea2d686383f11e10807bb4837f9beed0bce77c1e001bf1b5c6ca1d5412800", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "e0559cf69328ae45fedc5690c59296f7d8901532eaa75b33e804b4401d7ef21d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32790,7 +32790,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "716c802e899e0b49e137bc6c21018d66a0d62b757d5205975e053a952be6cbf1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "6c2e597810fad189ee667e77fb875938ca61c0b5cd0246a98c063b19babcc077", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32888,7 +32888,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "78c28f0f55dd4d2c5f849867a353ae57216ee91eaae8e6117ba8ef3fe32d75d1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102912, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "57e2246339ec42e162d9fb2efbbe27162c82586d9b99715435f00bac9ae7216f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -32986,7 +32986,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "189f2efe196d9784bc46b6b29e28d8f3160a9aff1656aa7dd10b567b344a2c69", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "fa7fda5424f527ad78123f27db6bde1d6cb8114a2287b65bb8c68906f3d18b0c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33084,7 +33084,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "70fe6f009d12750a23079715c216c94a11ee4ffc22c2d19a88daec9a2060ee33", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 102752, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "d1b9584a74f5383161a8513d519fd07ce5397a33d1d259a527617858df746ef8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33182,7 +33182,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "dfc685b8a33f04a299aa0b19a2cbd326d2078dc2a42c3dfc4f790adf290cddcf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "0e80afc288159f4f690ade373143ce72cde25c83f3b791e9922adc3ed0a8e041", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33280,7 +33280,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "753ac819f161b94369c301ed2accb9f76e83259cb0629bf5bc37efacf9a10b06", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "a0ef5852f39efe5c0421efec015da2a4171f8765c7fe927e56325f2a8a7d2b0b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33378,7 +33378,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "cdab4364dd79e9c1841bd9bf547f5ee9068a6ffefe78d0b29a79ee2f56ceaa42", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "df891344c107237a97b3f786195e939884817b157cc45b9d0e2e35b84dc6a3b5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33476,7 +33476,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "90c976a417868c4942ef229a3c15158a6c7d8959950eaf7995a5029354103cb2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "3305c02e38bfcb3d28e711875366dbf1fed151d99e88537da5fda86e808ff63b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33574,7 +33574,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "d48d1096ad485669e03e2f152e77b3271621c4d1f443d8d7276109b2e6aecac0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "6f16aa4d8f5bdc304ca81f5e526005fdc2e3bbd72fe1ca12392f7b6a6bed7c6a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33672,7 +33672,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "092cfc09a68fea802f4b7539fd83d1125b8a9fda3f9a46776f474dc441c74b24", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122240, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "4d05ab0a451c720bb4e88ab5d2db666aa9a7660e50bb595be5bd5066aff1c937", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33770,7 +33770,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "a90842458935af6fd40b93d28fc4d86038180339989db092a4fa1ab9972a0f32", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a", 512, "87ce5edd51a27afa7c9ffbf5d2387e8dc4c0232e26e3a89710bca8c532f32dc1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33868,7 +33868,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100a},
-{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "f9a6b0a1b8cee2c98bdbe00b1d1ce4b373daae78132ddfa0b8a927d941b18d23", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin, Bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a_cubin_len, 122080, "bmm_E4m3_E2m1E4m3_castE4m3_Fp32_sfBlk32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm103a", 512, "02edc95befa4cdcc6b71b27ef65477117373282685f80611690024c8d3965d36", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -33966,7 +33966,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm103a},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190512, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "568c1a1cf8df6272754ea150d5d815bbbba269586a3754bddd37f7f82358d5bb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190512, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "a237df7bd3db65d1bba6cc703ddfdc3a479176bc6bbee4b389d744c2b86d1741", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34064,7 +34064,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190304, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "aec89c51b2fad56ad47f92ad3f542c7713954abc8ca41b38f2acd1b889b1a398", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190304, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "ea7971bdd228fc5b54644b828b36406de90ba0d77182f3df17133571afefb3ae", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34162,7 +34162,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 211400, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "4ff0320b4f521e4b083b3cf7113a95148fb84e605daed6c1a72d20349ac5b60c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 211400, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "1c7e7c3baa2af5b494119d81f4d280ca1d6449323416ee0523ec386a3b4b49d6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -34260,7 +34260,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190512, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "b65b20d9afe4031d4ecb82c58c7949a037ec74ea914b281b33b22bdb7b80eb4c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190512, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "c751220a2e4c443d97979f3d6ac7d7720d3a26014f21ab41440a5455e0bb46c3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34358,7 +34358,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190304, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "628ee1e6d71a3a5023b14a87a2efb9b7e7f247b49007fb1c1cc58616f4b9f221", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 190304, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s5_et64x128_m64x128x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "30693ce3a1f16caab2db1baf0765be78251192726ef96e184f9c51ec1f731a58", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34456,7 +34456,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 211400, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "d63dabda3423ee3365972bc22f7f282f91ff4d4d0d014dc03c884123fc6bfecf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 211400, "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s8_et128x64_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "46e13399a04b07f57fe449713cf03d280d17f01143556091bd6659c0216e9e48", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -34554,7 +34554,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 119136, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "c8be8e6e4800737d9cb44773b3b5716a4fc177c92eb5c20bcd29ad268eda25d4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 119136, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "bc30515b7b429975bad5931d5d79c5008f9d48d044cc0fc6ac7db11daa891e09", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34652,7 +34652,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 118928, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "2e449db69022cc54d80868e2cbd113402d5cfcf09242a16999b1d41fc8d4893d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 118928, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "46496dc32a63ccddbe9d7395f894ecf0206e2049f9df5c6a8857000de49633d3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34750,7 +34750,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 119136, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "0dae4ea2ece4287e0d610d08fdc072c8327e60e9070a41ec08a625349f89e405", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 119136, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "1b17e3b38a1ad990c7062d8b31ad8142783670e20160ca0ef383127f058d0410", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34848,7 +34848,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 118928, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "a4d2b523f940861713d5d6d8022095c93076c7f3afdfd2fedea370afe42892fb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 118928, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "5a29ab9a285485afa70c1676e6826e63ef796c8d6b9fb057c02230e2b03d41a0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -34946,7 +34946,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227712, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "1b60d88ae76ee7d284c5b132de0d6cdc04ac418ef7a6f0e639dc8bb12263f957", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227712, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "dd01122bca0004877bd3429f0c7555ed1a97403c8abb0a6ee5cd4c9d2cf85ddc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -35044,7 +35044,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227552, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "21ef97af08d80ae868e66b5607fcbe495f0e1778d73181205af79279d218d4b9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227552, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "c2f6beb239f4f5fbd76034430096f724098cd147e1c2141065ce203e696641d9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -35142,7 +35142,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227712, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "a916ec688b7d76cadb8620236ab73902239f631d3ba200be2a43b9d68e05391f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227712, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "c4b718960cdcb4b236dd12193b8a42dd7f15998ee2a23142958a1e75aa3a1ae1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -35240,7 +35240,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227552, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "822155488a351e82249faf51ba71d5c426050cd86643ff0fb426e8022dd4fb6d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 227552, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x256u2_s6_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "48e95d467b28cd1fdd8248bbcacda1fff62920c7fa99b65ca2b995b46bd4c10e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -35338,7 +35338,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 212392, "bmm_E4m3_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "b743a7fe21f678a333bedde0ace75d9abf9d5bbb7ab5a1e723b820e99ab8a76a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 212392, "bmm_E4m3_E4m3E4m3_Fp32_t128x192x128_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "b8d1207e42cc2ada9fa4dc24eea61c7d429e2cd261b2491ad2a3bf9888a51e56", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -35436,7 +35436,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 212392, "bmm_E4m3_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "036839ea1222c401ea612d76c3e606a29680ba37cccd5c477d3c9cfd551f350b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 212392, "bmm_E4m3_E4m3E4m3_Fp32_t128x192x128u2_s7_et128x32_m256x192x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "248cbc52b4bf4a346d672f03bf1089892004fd3f6f9f7a84f894731a3dd8d29e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -35534,7 +35534,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 221576, "bmm_E4m3_E4m3E4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 640, "eda9b3e61dcfa9f92f49cf8d22a52fe43f0d3bd269d3ae04ecd5f5a94bdc0343", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 221576, "bmm_E4m3_E4m3E4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 640, "fcf3d88719c6472601633bd6f3238c568516aed9c5c82e686d45275df899dd68", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -35632,7 +35632,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 221576, "bmm_E4m3_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 640, "85eb284c927fb0fd8ed6af426d8787cb422f674fa34fadbdb0d32d51b190d734", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 221576, "bmm_E4m3_E4m3E4m3_Fp32_t128x256x128u2_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_eW8_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 640, "67f2b020cc0a3a1d7e486ab489c5c054bc3b35927c7bdddaa2e61e7153c4a00c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -35730,7 +35730,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133472, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "10ab907a7ba097df26fd563cf4eae4c4eb5ab39d86adefa473b92e209bdea2e6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133472, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "e8babf72e8c681af4a774b89750487b658edf6512e4b3542cc429f9d932d490e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -35828,7 +35828,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133264, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "32675874f2d9850a5ba2ca9443d42b3c18d572f2bf561b4dd305b96c718bbc04", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133264, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "4abafecdb3ad81f6b829a00068aa7a1140beed04df0fa9de12e27a6ec5b083d0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -35926,7 +35926,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133472, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "cee32d6abfec142e75369e7e1ed2fdba91b7d0f02cca1f54d92e7a47c03f32a7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133472, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "051590de3c413095434b8eecd49daed6009c3a622fd3d85500e4e77d1d547e47", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36024,7 +36024,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133264, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "63a811ee530c9309f31443ac57cc21cf4ca3b0695622c0156649471bc6a9080f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 133264, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "806ffc0da7c7d29fde413e30e386612d8239d93251b48cbec9b457977bd6bdaf", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36122,7 +36122,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213344, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "e2e3f6c782b8f5f8f79899cd165bc1294aff48c891254bab81983fe57bc57797", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213344, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "2ca83cfe15b01f6c3ac3a2800a0693b920b8839c57e7c7865c22f1ad3f9d91ba", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36220,7 +36220,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "a88cdafa339c73d36fd1a9844eb6daf6ab5665e6d399097844f1a5eabb9f5c2f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "1c183e475cb8629627b4d1d8db959993a03cb3e60eb16a6f45a0a6129ca92909", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36318,7 +36318,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213344, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "85207d5efe6b43334c3fa4fb35d25ca2f675d2c205a928d9ec4ff8a55c948253", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213344, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "4f802d24b7410f5813eb54bdd9a57442738cb0b382a825c182473ed3bd34f8ce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36416,7 +36416,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "7e693caaf37813b9e72d574a2cef3c79301c7ae071188256aa9546d8d89e421f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 213184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "8124afdd549f5df81c2e27ccd857a6f3ed6c0f086065aae9f0b19bcf00bb10d5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36514,7 +36514,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163936, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "b7cc23e587763287449ab4ba863b2b08d27270f17027fa0fe67ea6980defa2f7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163936, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "dea8a8a1b4c942206ddcc2abc81883437300ce755c7a664b58db532cc628ed7c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36612,7 +36612,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163728, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "3c0654ce1d42f1acf8d3376ef07d0cc5e34d4648da367688a67d15670079b9b9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163728, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "0d051eb049a06a1b524e9c4408a637d3bae48f0fa51bf4111c5e9353c1fa944e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36710,7 +36710,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163936, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "a7ab78c84107c8165792c8a2638255f151b5df79e2de86ac2e18945c8529ca4e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163936, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "30cb749f7e422ef8177ab6043e9813996060856304d51e665f21523ac278611b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36808,7 +36808,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163728, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "49e76aff9715a2fe18d0bfcb92015c1a35c716548c679c8775b21ac00099af01", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f_cubin_len, 163728, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW4_dynBatch_sm100f", 512, "bd5e42630ea59c8b774b99af39e36cd7427c0f7b99a99747e17a4a44f342b855", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -36906,7 +36906,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 218472, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x256_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "350232ee7808f51c10e6b6cd4ea21cb92f23dfebfd93bd8973498e5e303345d8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 218472, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x256_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "5a7e5dd837ae4ada54fba1760e7d107f91f64e809d748a458b6e22683aa94fb5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -37004,7 +37004,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256u2_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256u2_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 218472, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x256u2_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "045c06f0e063f614ae069e61bec87f14aec62e899cba52f101dda09992bb96f5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256u2_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x256u2_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f_cubin_len, 218472, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x256u2_s5_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_lbW8_dynBatch_sm100f", 512, "61402a5912836ef91e4c03a7d27061d5eb74d81455ce23c5376c3f442990c7c9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -37102,7 +37102,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "f883f62478499782ab488503e92591798fd3f95d452908dae501ee54f195f778", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "9627be9763519533c50663e146a2d0017cacfe12912c00762823f27c2c15ae90", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37200,7 +37200,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 148160, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "fec7b494b4de7df5140350a61a00d7fc2ea6502bb1be6c4ff7cfe6c9af06f665", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 148160, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "e4e92d6c3a7d92da4c3a1036526718ba8aff0f5d13802c53bf6d937031ef8909", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37298,7 +37298,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 147952, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "afba506fb430d777915f4a408bc3a034f57fa5e62249499c4ed2df00d2523f57", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 147952, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "4f9de30c65a5307d0337a1c03293395ec3c7dbe4aa76404ece65007087088037", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37396,7 +37396,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "d8410d67fb7a861ff99808eb753031348e84a398d034a15f958be8e87fb4cd5f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "75e270310554fb00533d1bc7d383871ed3144894364860c9e91469c198b59d46", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37494,7 +37494,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 148160, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "52a71c3308dc83e78500f78395b654df1dcd11d2579398fcc35ee972a3a5705f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 148160, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedP4x2x2x3_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "ca079c13d6d8a4080dadcbd4ab2deea32ed39eff53f498b733fee57be2194962", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37592,7 +37592,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 147952, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "5db8004c9eb02636b2d7b6ea2a34aa9ed7205865dacb68d76797e35d7525e867", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f_cubin_len, 147952, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s8_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tma_tmaOpt_clmp_lbW2_dynBatch_sm100f", 512, "94069504c02c5574cb56b541a9b9d9e75c2662f2ed49be9534cef0d9f0deadb5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37690,7 +37690,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214400, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "ab9bcdf7e447394f7a30de4c8d7544c4ea7a26459a06e6cfd3b66e2eccc6dbdd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214400, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "852780f7bce7a8ed482ccf881a6532006634f079f061a32b29a3e98242323a26", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37788,7 +37788,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214240, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 256, "e4e18a14f3c5079c95799a6236f3ef3640f004912988bf13de343f27e1952673", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214240, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 256, "3858db8144dd22b3179ea4e33b6d8c1edadf9e3f1230ad88047b3a06434c4d01", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37886,7 +37886,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214400, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "dc0490f7411455194a41c6ea18cda42e06c2ef9e4a49976168f98bd0d19f5ac9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214400, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedP2x1x2x3_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "4495f6cb6411589f3215f973d5a41467c846d47fa808897ca40cfd7863ce3212", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -37984,7 +37984,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214240, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 256, "55f8fc098b2770877d6dabd9d0c07cde1c5ee9fc4fa8747b0e5b5710cfbe854b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214240, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_tokSfB_schedS_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 256, "c4bfdd75a9fac7b627803ed4a0acec495bcaf0d4451472c173b3fda0c52ea351", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38082,7 +38082,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(2)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 214144, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "ec13b807da2ef6be1cf96fc06efc59f7808767cef6ca4f74cfe3335b9b6dde06", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 214144, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "1ce8c869c77d3c866e169bfabad208787de75d89c83c97fd1386c98b7d4d71a8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38180,7 +38180,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 214144, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "f592a634470e2d4308cc80c0b239a8600fcb694a5a3ba46c3f2eea22596e80b6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 214144, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "1bfad5752b32b4a7622c82a34ac77e4f19b6f587539b9951390dd7cc68133050", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38278,7 +38278,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "ffa526bb98f8fb1da0bb144eb9845098c618a901ec001da2a41c136b2ff9be99", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "cae1a95900685ea88660e0ec9e4ef7f831fb45cc510dc72c8807a09af7f8ff10", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38376,7 +38376,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196960, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "db875c699bb48f4deaf09731d04cf9a06eb581108e4eb772712259a4a7f444a3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196960, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "47311ef2fbbd0a3827c90ea61c452f1ff3301f450f2480d2661abcf61bafd3b3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38474,7 +38474,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "84b3fd5d37304f32e216ee86e4a6b41edd4c5ef96b5adc7edf4ffd1f8b8953ab", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "a2f183f3db66b8e9a69c9d6f455c751b44a0e977be5f865c8fc910648f2281df", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38572,7 +38572,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196960, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "d9e068253364f5522d477248ae6e5a1da898560dacbb36482c056796815e14f0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 196960, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "0c7e605f3f1f297897a35ce93411f7604fe00df04496bdffecf46f5bad04188c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38670,7 +38670,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219648, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "a5b961c457e063820c0dfb76ed2d3933b02e621fdbe4d4190c4381d54ed5bec8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219648, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "c13ec6548d9798accb7eecbb44f34b196584c2b590d1cdb078d3c0145549ac6c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38768,7 +38768,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219488, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "5bb4f393c863072b771b47e37bfc6e5851fb6fcdbe50b41d9a7f739d0f8caaf3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219488, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "4c7c9591a4455e7fa64923950f4f0a63e34dcbd2c38309c8707eccc3745145df", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38866,7 +38866,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219648, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "7796f400466ddcf625f39f2c0593eb0225f28cee4507dfc780fef2f6a6d9bd19", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219648, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "1f4bef2d4cb06d6103b35dcc5bd13c5ebd20ba9d987d67f087cb8cebbdd2dd55", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -38964,7 +38964,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219488, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "05bac96fb9577d124c4775f91b7d28a7510c12bf3576e238fe4e86db2ad5f83f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 219488, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "ab700ca455b8349c8639b1d6ee6eb8b3a735c27bfe122cefaa518637f2f4ad08", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39062,7 +39062,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214464, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "0647077e47ce82362920b22db1175a452114c13b962ca89fda08accbc0980623", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214464, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "f0ccb85794c3ae64849d329c94be6717e8690e4146bd2e4db3440d44ed7467f3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39160,7 +39160,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214304, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "b0b8880bfd7e2b558ab9191685e0bb65e2d9ac0f23f749afea64909683372005", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214304, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "d8ee9a49e57af5b874037598fa6bc84f4de8b531fae6c45c1e698f88d59e63e8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39258,7 +39258,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214464, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "d4fd8ae106f7dd547b07bd6ce072205f5fc60e1878e5de08eda281b14175cb67", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214464, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "723d084bc0316a77204aa4a5f3618a33f4327fb1cb94778520e6ee8d26447dc8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39356,7 +39356,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214304, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "eaf98479b20985fd182d55820b1d7a92cfca751d0049d1c203da791133686d94", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 214304, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "62d6cc50ccaacc4441d034418fb7d6cc0cbaf349f11fb26d0b0b31875ef42d18", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39454,7 +39454,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185856, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "ebd518911a98d1389a18ab4858753543ef05b57155cc3b83445a8e5c9b522888", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185856, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "0ffe39277e72d5f4e069d458e7dfd21f8b72754ae150b9b2f3f2a2180b3ce269", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39552,7 +39552,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185696, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "e5a612025817331cbf38a634efa24c0bf011e8ccd1d1d17766952128842c7b67", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185696, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "167e7c699bcee86768e2748d36157127486fb2c53334e8fef887448eb83efb6b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39650,7 +39650,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185856, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "2f1f223a053d2279a2aaa1b4207d2a26c9dbb031ee92252990b18d83ef389f85", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185856, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "05d23d9868b50d2238937cf3c5a450c87367fa82d7750804d9ddca0ac798dd11", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39748,7 +39748,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185696, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "8c328cdf3951818eb29cc2fccddd53af41a06decb6143cf35633d8c1b71b276b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 185696, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_s5_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "01d0df7e272d17b143c487e24eb8fee9420f591e2943fb0d52aab9f02e83d63e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39846,7 +39846,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221568, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "6e888790b265d8680cc451e093529c7581729fa764bc3358f8f55f425fd9f85e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221568, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "193d42d6de9b9eccb6b9fb264d51df124019461335e7dd12cbefe0d4d9e89b3d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -39944,7 +39944,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221408, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "c8949488290250c9a84a1315a0add5b32ba6e35aafabe798677593cbde653c54", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221408, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "bb559d13c64b24b16f82a51d7c9b6aae8d5985e70dac786e932e88fb3ab7224f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40042,7 +40042,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221568, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "180e1b24b3911096a09926ddf9b53fc87190808b6b5aea43a3adef2a648569a0", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221568, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "c76de9a9b2e60bb97db420ccfe9456a2c72b28cb969fdfad49cbf44ccaa86bff", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40140,7 +40140,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221408, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "dec9295828af20b773d34fddf3bca9be9c2e920ee40d2d3a8d8ddd1319a8c124", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221408, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 384, "b84a6979ac6c97ab72a6e1bb52f380a8ad5e9ec1fcab5b785cf769aa9b38c17b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40238,7 +40238,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "f945e922f285646a519a3ea8dceb9291414c8fd71228d16d99c4e017a9475cd3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "a71665ac2e84a4aaca902dd52932936806137b40a45cd8f296af027929e18f6a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40336,7 +40336,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "2b44c7477dad031b4c330c76c13723fa3c0716a8cf0ffb16f9aa4f454ea2334b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f_cubin_len, 163232, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_s4_et128x8_m128x8x64_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tmaOpt_clmp_sm100f", 512, "d62240f7f109dc9008d6d1219414dd176b7cd6ac047fba44e057c8aa41c8642c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40434,7 +40434,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "4acceab15693a1cff2b638a060d8570699b46f260ec9ecae9b30ebc0a3c89262", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "af9371bf99df995ea2ffac5a69bd29fdf6b5a0f54ba22a141b900634237e87fd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40532,7 +40532,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "ecfa5f1b2c7a05b3a98eff5f71b8d1d23cbfd00e48c15bf3b5d8e56577fc8ec6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 77600, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_transOut_noShflA_dsFp8_schedS_bN_tmaOpt_clmp_sm100f", 384, "63ec0232b071e4126ccb27830b67dc08fa3499fbf842d28320a9114712b989c1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40630,7 +40630,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "6a8f81065e881670583be70fed0a8b0f16e61f874006ba41206584df4b42c287", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "7b19d2d09bab90d3c95995fe126d86844d27d6d296692e1f809a56d68caaed7d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40728,7 +40728,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "d86d46d121d5b2d016295163530cb6306289e5bd1244e716dc34e5561a23b013", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f_cubin_len, 215168, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_bN_tmaOpt_clmp_sm100f", 256, "53f68e6b5a8ae6ef52a72876383a5bcba049c8cc7a1205a3e1b87fe660358fca", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -40826,7 +40826,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(0)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 191224, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "865e6989873533a79186440c37b4a10673a4e33289c5e26000de3f666fb45ac1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 191224, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "a9ff314f96f5cb8caff8698429e3dc3a0deddebcb93e0b9ece7cbf001f7f0bb5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -40924,7 +40924,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 191224, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "c3b168258a39eb0b2cc7ef1ad895e4503b40c77d896f67f5a198720d35152fcd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 191224, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x128u2_s7_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "f746a52f00b35727e770c35be502482772823289f0ac6c67e4293f241350345a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -41022,7 +41022,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 215560, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "debded5eaa43857fe3e7930f4dba428d2ad3ec38f356d5593d5243bd10c35538", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 215560, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "970fcc5d3e1bd23db480daca85881fafd226e0bd63ee1b1132c83efbd06c3f54", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -41120,7 +41120,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 215560, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "40b3ab170783348061bdaf4b70e06e6fa5149ba651e5047ee006496fa679dcee", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 215560, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x128x256u2_s4_et128x32_m256x128x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 896, "e7305350ddd3fbb01ca5fa32f5cb712e0c9d825dd0d80b9b4c4811d64adadfb3", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -41218,7 +41218,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197280, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "bb062b17135621db74558767b993eeab2b1ad6648bdca6f7cace22d8decfadbd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197280, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "c24d4af88b38dc299b0a1072e61966324a43a657ab201877d0f1f527424741be", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -41316,7 +41316,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "cffba8064b1a3bd2a8707071875b0b96185c8d7bed1a67e6a3ef24ef0554be37", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "1ada89c9f3bd54dbddd322d9aa644b2e584849614938cbb871cac8b1eb755c85", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -41414,7 +41414,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222984, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "775e96039d0f84e257c5dd8dd0f309c3ef9572d13f94690ce3a8b824b717cccb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222984, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "3938f7e9af10a1b6c1ccbc8ff3c5b44cba790f9c537ff5e609690f5def6ebdac", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -41512,7 +41512,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222824, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "c6fe4095a2168b324b34e90ca6f5a9960461d788940d95c3ebb99ea6c2da57c1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222824, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "4f9083896de30f1938a94fcf041162e615d5a801093dc6bfbd4a9b00b4dee393", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -41610,7 +41610,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197280, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "78f13c4ef61dbe25c685aadb4e38aca498eb5625ca90ee679aa0eeb058aec665", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197280, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "380a294dabd3e8e9d18de0585bb9fa2714d9aa33709c35618a7001dcc11324a8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -41708,7 +41708,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "8655c5858ec2707320b606a5aa29657cfb2af86af75bf5bba84dc2365be26118", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 197120, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "0f67ced61034c6a3da4dc64c912076cd3e8f2e98de3902ae934d87a2cd275b17", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -41806,7 +41806,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222984, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "58aef21d9857ba52198942d0ccaffc976dc3520023615fdeffd21068bfb2c529", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222984, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "d65cfaa78cd5f7e8c3f367a011db1c1eb8a8b20b1d2adbe58e596d9f08c42d15", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -41904,7 +41904,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222824, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "b6969769e0b552d6c5c10c9652e0068f187a9a7ee3d12eaf2f6f8946b55ed6e8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 222824, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_s6_et128x16_m256x16x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "23858af9b3c42092cb6029b0d7d979c7c70aaea3bba7b350dbd033486d6415aa", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42002,7 +42002,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 222872, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 640, "9e4bb45cf3005e1916d1808e7bbb4b95be924cbd03ece77e469f778ec3bd8b7a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 222872, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x128_s6_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 640, "ce3574293e0088cc7bd7af9b7049e5ef719e00c81368dbf994c65f9b779714c7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42100,7 +42100,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x256_s3_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x256_s3_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 222632, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x256_s3_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 640, "857c7f6e0642b49eafe7c2d5e28084bb2498954784bcd55a14e469a4c1f8d3d5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x256_s3_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x256_s3_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f_cubin_len, 222632, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x256x256_s3_et128x64_m256x256x32_cga2x1x1_16dp256b_rM_TN_transOut_schedPx3_biasM_fCp_tmOv_bN_tma_tmaOpt_clmp_swiGlu_lbW8_lsfbW4_dynBatch_sm100f", 640, "0890c16a871917585c223bd711b78efdc668d48ef3b5e6660135e51518453f79", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42198,7 +42198,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220832, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "7e708987d858b8088d243d34e325bd644934cb6b0bdf3d8afd33426c62e6ecf6", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220832, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "e5d62af8ca7104af51a8655eb61142db7ded855d2c4648ff605e64fb21adfb5a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -42296,7 +42296,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220672, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "a086d31b46d2abd898c81a9f65247285d399d8bec0fc08000f6b40623725ae86", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220672, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "3094ade13b8fe50e9ee687548554b0e369a9eeddacbb2db02dd08fc88f734869", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -42394,7 +42394,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200360, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "29a215cb2a73d82ac7af12a1e5f7773f80d343ba1ad7277dfecd98235040efe4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200360, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "7a61b6ec7b5d90d84ae253156bcbc718f96f40875525f6eeee6e62c28cdb973d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42492,7 +42492,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200200, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "f51affd0ff27d69f973388aead65902bad385473a98af3dbe4ca0b1fc01ece8a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200200, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "8a5a70b1623b8922c08f3bac76ce49bbca03e8af0d2585b0d98f304dbe54953b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42590,7 +42590,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220832, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "3eb1a3cbf41f8e584a3994cd7aa4fad59d1de07f4790c29c5cc7c1697b856ee5", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220832, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "36ac28efdf5d59cecdb271fb18d1a5e12ae57a3cd9a9c02ce95f906259e63233", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -42688,7 +42688,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220672, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "c0cd80dc12907e0302a6171f614d53f3b6bdbb3ff68642d5d5d0c4c78bcec1bb", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220672, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "383de0e2df6d4e5549af4682f500f8f466f401307c31b94462cf52d6bcf12633", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -42786,7 +42786,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200360, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "bef6a5d9c8eef8ecd2d3b4657a976573d72387b00abda0ccdcbf81e7a9dcee5c", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200360, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "f8d9e1e5ff583c916f640c4fda4349c4fa1bf700a4774b32fd6cf0ad7c56d298", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42884,7 +42884,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200200, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "739e26a1545731dd7c9617b2057de9ea50e2c63c809ac7153f7787dd60a51ec1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 200200, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_s5_et128x32_m256x32x32_cga2x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 640, "b1b7d78dc332d285205dad11d5314d8b415727217ef6937fa38c02b26324c546", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -42982,7 +42982,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 163688, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "a819830f15118a67206076a8b0c52493c3ac4ec2f4be3b902b3ff9256e7060d1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 163688, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "18e365fdb1bf8db5a26547c6e05a5f97c29c0db90432c90ef81f15990f76e8ce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -43080,7 +43080,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 163688, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "90dfcda6640703bfddec16a9bf259476664689aa58ee88e0c12454b0bf2cbebd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 163688, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x128u2_s7_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "17a38ee5b53647f8fd8edea1f3351d0477e0880525cfb2e741a0457b8c94eaea", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -43178,7 +43178,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 183880, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "af7b045e39c0ab50a54731cf9f9520857999b0581e7a106fa2024516c63f33f8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 183880, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "f2a833c78a9dd42859bc2341b3f72fb60dd72ff3d131f953acae669be023990f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -43276,7 +43276,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 183880, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "ca8d95505fb2ba7fcbc26f9859ad71c927231b34a8a1dd6ec13afb0785349a0a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f_cubin_len, 183880, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_s4_et128x64_m256x64x32_cga2x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_lbW1_lsfbW1_dynBatch_sm100f", 512, "667c54081cf5d7a23390c4a465afb6d1f87b68bca2a4092b077fe1b7189420c8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 2
@@ -43374,7 +43374,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221952, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "d8413ccf51724ce7283040c6e8347ca9c624d99d3548cb2ceaa34fadcc67f9cc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221952, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "9c5ac6c33f71d829aea6f62a8c6778e68b5f574e37cf1dc819c249b9737d4b71", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -43472,7 +43472,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "6dbbd9b1ef978a48226865e588b2881a09b59b29b82a6af5108cd1608069fb9f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "36d052c0c6c8c132c8d6d9e5c2ce1724273b85337929cfc63b83d724e66581d8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -43570,7 +43570,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 229128, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "438a76059ad59db949eade7b8701a8d66770da78b226fdcbe83eb83d4e8b63e1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 229128, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "7cccd987cfb677be68c53e2dd1ac0928ac6357227a139c87e69ae218f8865643", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -43668,7 +43668,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220776, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "0a0ede44cbd1a49aa2b1540dd11ffb88ea881948afb1b3471880ba84b1a28d5b", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220776, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "89720ab4bc9efb3a2b718456d354e5a09ce50545d4ebda9e255218f15891f657", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -43766,7 +43766,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221952, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "bbeb3bd56673ff6775655635fa1672a8f727f70e2c8cd2e73e645c8a4fd81fce", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221952, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "f7c4bbc3874185536e7198304ce5a2a4346566a67b8431e85076b0c34738a2e8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -43864,7 +43864,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "429a031610cae35ce63d29b406460e4633964aedab72483aec7f11122a9be73d", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "a582dcb8db25d28e4e24abbfd511268a214f5d7646df27d43e0aa8b3cbf32e6a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -43962,7 +43962,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 229128, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "265242297738eec6c0bcffd5ebfa0ee55e999aa15927cf5efc10191bdfd8a3f8", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 229128, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "ccb0f63ce87660352a30aa117baa05858f5004cde9f80fea0dc88d1eef14966f", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44060,7 +44060,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220776, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "d751e079b3a79f9f076165b579f4256da075335d00cfd2b786224809851b42ab", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220776, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_s6_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "7a122c452137b4b2c8c51a4b2ef98019ac04f031034eae91bb6c5a1cc7f5d4dc", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44158,7 +44158,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221664, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "b940b701c062f41cf0deddc58eb897be45a885002dfc2ffd7c4a999bc7adedc4", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221664, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "6e404c9201677c773f481473b57a5f6301a75949cb5915718c16c25df52e7670", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44256,7 +44256,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221504, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "15ec34b5daf6b1034a4c30e341168430813dc7270caa12ae69af67d30a67c9d2", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221504, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "14b27c4073212d062fdba634144b39231fd407e96ab0ca8e38cd15c1aed7365e", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44354,7 +44354,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 228840, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "e7152f1dd1322a961e9a12c2afe186bbba3ba75f9fdf21bbf2fdf4e2152b0cf9", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 228840, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "f05ad8f69c19ce94cee2f8dcb05d854f942fd42165e6f73a9f24014c165beb13", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44452,7 +44452,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220488, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "eeb3cd75e6d78afb1cd472e37a6980da6bd2981f81c00f3db9f35004a497e563", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220488, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "82cda53aa11558cb7bb939d9b474ded27bf4f212ecbdc7e497ba2ab6f6267224", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44550,7 +44550,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221664, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "8a4ef1c0fb88e48fdd758ec3275614a2cfba9e61a4ddb99c1d7e057a0dd66555", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221664, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "b246f53763b5b501d330ad8737e3ed4ce2206ff88232d5f8924240c58f045272", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44648,7 +44648,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221504, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "c3fe2a658ecb4fad0ccd8f29293d30c9a5df0bb26bffd17dd6f5426c4e3ee4e1", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 221504, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "9ec40431f477bd04e0ac1ab649c145d858e60a59e48819b48958056a6d0521cd", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44746,7 +44746,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 228840, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "3fc734003bf2085711d47513e82b06bcc923f8a2325d594ae69f2c38608aa178", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 228840, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedP2x1x2x3_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "d46e557151d9486632ae9cef179f3a591dcfa63068fac12957d0569462131bd7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -44844,7 +44844,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mRouteSfsImpl */ {batchedGemm::RouteImpl(1)}
 , /* mUseTmaOobOpt */ 1
  }, gemm::SmVersion::Sm100f},
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220488, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "2e1a7ce7fa788d1d628c91c94ce8ad430fe88a862dfb67505c5c77c497d9f84a", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f_cubin_len, 220488, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_rM_splitK2_TN_transOut_schedS_biasM_bN_tma_tmaOpt_clmp_swiGlu_dynBatch_sm100f", 512, "5b674b9a08a0d0f029cc428ddbcfb4211524b038c19ad7738fd231e321729fc7", "", nullptr, nullptr, nullptr, 0, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
