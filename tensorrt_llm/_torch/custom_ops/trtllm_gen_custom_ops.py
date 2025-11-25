@@ -157,8 +157,13 @@ class FP4BlockScaleMoEInputs:
     hidden_states_scale: torch.Tensor
     gemm1_weights: torch.Tensor
     gemm1_weights_scale: torch.Tensor
+    gemm1_bias: torch.Tensor
+    gemm1_alpha: torch.Tensor
+    gemm1_beta: torch.Tensor
+    gemm1_clamp_limit: torch.Tensor
     gemm2_weights: torch.Tensor
     gemm2_weights_scale: torch.Tensor
+    gemm2_bias: torch.Tensor
     output1_scale_scalar: torch.Tensor
     output1_scale_gate_scalar: torch.Tensor
     output2_scale_scalar: torch.Tensor
@@ -173,6 +178,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
     def __init__(self, num_experts: int, top_k: int, n_group: Optional[int],
                  topk_group: Optional[int], intermediate_size: int,
+                 valid_hidden_size: int, valid_intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
                  routing_method_type: int, do_finalize: bool):
@@ -182,6 +188,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
+        self.valid_hidden_size = valid_hidden_size
+        self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -194,7 +202,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts)
+        return (self.top_k, self.intermediate_size, self.valid_hidden_size,
+                self.valid_intermediate_size, self.local_num_experts)
 
     def get_runner(self):
         instance_key = ()
@@ -216,14 +225,16 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.hidden_states_scale, args.gemm1_weights,
-            args.gemm1_weights_scale, args.gemm2_weights,
-            args.gemm2_weights_scale, args.output1_scale_scalar,
-            args.output1_scale_gate_scalar, args.output2_scale_scalar,
-            self.num_experts, self.top_k, self.n_group, self.topk_group,
-            self.intermediate_size, self.local_expert_offset,
-            self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, self.do_finalize, tactic,
-            args.topk_weights, args.topk_ids)
+            args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
+            args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
+            args.gemm2_weights_scale, args.gemm2_bias,
+            args.output1_scale_scalar, args.output1_scale_gate_scalar,
+            args.output2_scale_scalar, self.num_experts, self.top_k,
+            self.n_group, self.topk_group, self.intermediate_size,
+            self.valid_hidden_size, self.valid_intermediate_size,
+            self.local_expert_offset, self.local_num_experts,
+            self.routed_scaling_factor, self.routing_method_type,
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -245,6 +256,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             num_tokens,
+            self.valid_hidden_size or hidden_size,
+            self.valid_intermediate_size or self.intermediate_size,
         )
 
         return tactics
@@ -340,8 +353,13 @@ def fp4_block_scale_moe_runner(
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
+        gemm1_clamp_limit: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: torch.Tensor,
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
@@ -350,6 +368,8 @@ def fp4_block_scale_moe_runner(
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
+        valid_hidden_size: Optional[int],
+        valid_intermediate_size: Optional[int],
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
@@ -365,6 +385,8 @@ def fp4_block_scale_moe_runner(
         n_group,
         topk_group,
         intermediate_size,
+        valid_hidden_size,
+        valid_intermediate_size,
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
@@ -394,8 +416,13 @@ def fp4_block_scale_moe_runner(
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
+        gemm2_bias,
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
@@ -419,8 +446,13 @@ def fp4_block_scale_moe_runner(
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
+        gemm2_bias,
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
@@ -465,8 +497,13 @@ def _(routing_logits,
       hidden_states_scale,
       gemm1_weights,
       gemm1_weights_scale,
+      gemm1_bias,
+      gemm1_alpha,
+      gemm1_beta,
+      gemm1_clamp_limit,
       gemm2_weights,
       gemm2_weights_scale,
+      gemm2_bias,
       output1_scale_scalar,
       output1_scale_gate_scalar,
       output2_scale_scalar,
@@ -481,10 +518,16 @@ def _(routing_logits,
       routing_method_type,
       do_finalize,
       topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+      topk_ids: Optional[torch.Tensor] = None,
+      valid_hidden_size: Optional[int] = None,
+      valid_intermediate_size: Optional[int] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] * 2
+        # Use valid_hidden_size if provided, otherwise use padded hidden_size * 2 (since it's packed)
+        if valid_hidden_size is not None:
+            hidden_size = valid_hidden_size
+        else:
+            hidden_size = hidden_states.shape[1] * 2
         return [
             hidden_states.new_empty((num_tokens, hidden_size),
                                     dtype=torch.bfloat16)
