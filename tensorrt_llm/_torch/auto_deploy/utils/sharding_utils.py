@@ -1285,7 +1285,7 @@ class ShardingTransformContainer(BaseModel):
     factory_config: Dict[str, Any] = Field(default_factory=dict)
     manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
-    support_partial_config: bool = False
+    support_partial_config: bool = Field(default=True)
     sharding_source: List[ShardingSource] = Field(
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
