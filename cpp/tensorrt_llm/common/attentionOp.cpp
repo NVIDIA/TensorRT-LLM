@@ -1886,6 +1886,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
+
+        // Skip-softmax attention parameters
         fmhaParams.skipSoftmaxThreshold = mSkipSoftmaxThreshold;
 #ifdef SKIP_SOFTMAX_STAT
         fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
@@ -1896,6 +1898,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             TLLM_THROW("To print skip softmax stat, please run build_wheel.py with -DSKIP_SOFTMAX_STAT");
         }
 #endif
+
         if (mAttentionChunkSize)
         {
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;

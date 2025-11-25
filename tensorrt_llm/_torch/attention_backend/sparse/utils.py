@@ -1,7 +1,9 @@
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
 from .dsa import DSACacheManager, DSATrtllmAttention
-from .rocket import (KVCacheManager, RocketKVCacheManager,
-                     RocketTrtllmAttention, RocketVanillaAttention,
-                     TrtllmAttention)
+from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
+                     RocketVanillaAttention)
 
 
 def get_sparse_attn_kv_cache_manager(
