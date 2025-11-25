@@ -2710,7 +2710,9 @@ class TorchLlmArgs(BaseLlmArgs):
     disable_flashinfer_sampling: bool = Field(
         default=True,
         description="Disable the use of FlashInfer.sampling.",
-        status="prototype")
+        status="deprecated",
+        deprecated="This option is likely to be removed in the future.",
+    )
 
     @property
     def quant_config(self) -> QuantConfig:
