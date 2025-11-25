@@ -509,17 +509,16 @@ def _create_kv_cache_manager(
     """
     config = model_engine.model.model_config.pretrained_config
     quant_config = model_engine.model.model_config.quant_config
-    
+
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                    num_attention_heads)
+                                  num_attention_heads)
     head_dim = getattr(config, "head_dim", None)
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-    ):
+    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
     ):
@@ -533,8 +532,7 @@ def _create_kv_cache_manager(
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.
-            SELFKONLY,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_hidden_layers,
             num_kv_heads=1,
             head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
@@ -554,8 +552,7 @@ def _create_kv_cache_manager(
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
             raise ValueError(
-                "MambaHybridCacheManager + beam search is not supported yet."
-            )
+                "MambaHybridCacheManager + beam search is not supported yet.")
 
         if not estimating_kv_cache and kv_connector_manager is not None:
             raise NotImplementedError(
@@ -564,9 +561,7 @@ def _create_kv_cache_manager(
 
         config = model_engine.model.model_config.pretrained_config
         num_layers = config.hybrid_override_pattern.count("*")
-        layer_mask = [
-            char == "*" for char in config.hybrid_override_pattern
-        ]
+        layer_mask = [char == "*" for char in config.hybrid_override_pattern]
         mamba_num_layers = config.hybrid_override_pattern.count("M")
         mamba_layer_mask = [
             char == "M" for char in config.hybrid_override_pattern
@@ -581,8 +576,7 @@ def _create_kv_cache_manager(
             mamba_num_layers,
             mamba_layer_mask,
             config.torch_dtype,
-            model_engine.model.model_config.quant_config.
-            mamba_ssm_cache_dtype,
+            model_engine.model.model_config.quant_config.mamba_ssm_cache_dtype,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -601,8 +595,7 @@ def _create_kv_cache_manager(
     elif is_qwen3_next(config):
         if max_beam_width > 1:
             raise ValueError(
-                "MambaHybridCacheManager + beam search is not supported yet."
-            )
+                "MambaHybridCacheManager + beam search is not supported yet.")
 
         if not estimating_kv_cache and kv_connector_manager is not None:
             raise NotImplementedError(
@@ -610,14 +603,14 @@ def _create_kv_cache_manager(
             )
         config = model_engine.model.model_config.pretrained_config
         mamba_layer_mask = [
-            True if i % config.full_attention_interval
-            != config.full_attention_interval - 1 else False
-            for i in range(num_hidden_layers)
+            True if i %
+            config.full_attention_interval != config.full_attention_interval -
+            1 else False for i in range(num_hidden_layers)
         ]
         layer_mask = [
-            False if i % config.full_attention_interval
-            != config.full_attention_interval - 1 else True
-            for i in range(num_hidden_layers)
+            False if i %
+            config.full_attention_interval != config.full_attention_interval -
+            1 else True for i in range(num_hidden_layers)
         ]
         num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
             config.full_attention_interval - 1)
@@ -632,8 +625,7 @@ def _create_kv_cache_manager(
             num_mamba_layers,
             mamba_layer_mask,
             config.torch_dtype,
-            model_engine.model.model_config.quant_config.
-            mamba_ssm_cache_dtype,
+            model_engine.model.model_config.quant_config.mamba_ssm_cache_dtype,
             # kv cache parameters
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
