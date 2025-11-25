@@ -1280,10 +1280,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
-def launchBuildDockerImagesAndUpdateImageTags(pipeline, testFilter, enableFailFast, globalVars) {
-    launchStages(pipeline, false, testFilter, enableFailFast, globalVars, true)
-}
-
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -1345,7 +1341,7 @@ pipeline {
             }
             steps {
                 script {
-                    launchBuildDockerImagesAndUpdateImageTags(this, testFilter, enableFailFast, globalVars)
+                    launchStages(this, false, testFilter, enableFailFast, globalVars, true)
                 }
             }
         }
