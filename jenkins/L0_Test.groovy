@@ -1272,8 +1272,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     tail -f $outputPath &
                     tailPid=\$!
                     # Wait until sbatch job is done.
-                    while squeue -j \$jobId -o %T >/dev/null 2>&1; do
-                        sleep 300
+                    while true; do
+                        state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | \
+                            awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
+                        if [[ -z "\$state" || "\$state" == "RUNNING" || \
+                            "\$state" == "PENDING"]]; then
+                            sleep 300
+                        else
+                            echo "Job \$jobId finished with state: \$state"
+                            break
+                        fi
                     done
                     # Kill tail -f process
                     kill \$tailPid
@@ -1320,7 +1328,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
                 def scriptStatus = """#!/bin/bash
                     jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    squeue -j \$jobId -h
+                    sacct -j \$jobId --format=JobIDRaw,State --noheader |\
+                        awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}'
                 """
                 pipeline.writeFile(file: scriptStatusPathLocal, text: scriptStatus)
                 Utils.copyFileToRemoteHost(
@@ -1349,7 +1358,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 sh "cat $scriptStatusPathLocal"
                 while (true) {
-                    // Check if the job is done by running squeue via SSH
+                    // Check if the job is done by running sacct via SSH
                     def result = Utils.exec(
                         pipeline,
                         returnStdout: true,
