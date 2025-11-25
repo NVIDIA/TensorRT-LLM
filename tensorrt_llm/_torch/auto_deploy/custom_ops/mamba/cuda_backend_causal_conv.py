@@ -204,9 +204,7 @@ def _cuda_cached_causal_conv1d(
 
         if y_dec.dim() == 3:
             y_dec = y_dec.squeeze(-1)
-        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(
-            y_dec.to(y_flat.dtype)
-        )
+        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(y_dec)
 
     # Custom op must not return an alias of any input; return a fresh tensor
     return y
