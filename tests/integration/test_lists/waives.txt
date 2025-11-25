@@ -394,7 +394,6 @@ accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False] SKI
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True] SKIP (https://nvbugs/5651854)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/5601682)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False] SKIP (https://nvbugs/5655584)
-accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill SKIP (https://nvbugs/5608930)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False] SKIP (https://nvbugspro.nvidia.com/bug/5651854)
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[phi4-multimodal-instruct-fp4-multimodals/Phi-4-multimodal-instruct-FP4-0.8-image] SKIP (https://nvbugs/5568836)
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[phi4-multimodal-instruct-fp4-multimodals/Phi-4-multimodal-instruct-FP4-0.8-image] SKIP (https://nvbugs/5568836)

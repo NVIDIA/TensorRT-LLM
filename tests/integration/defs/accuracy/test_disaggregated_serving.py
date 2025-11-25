@@ -1081,20 +1081,24 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_chunked_prefill(self):
+        # bs=1 will stabilize the result, but the test will be much slower
+        max_batch_size = 32
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT"
+                "backend": "UCX"
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
+            "max_batch_size": max_batch_size,
         }
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT"
-            }
+                "backend": "UCX"
+            },
+            "max_batch_size": max_batch_size,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
