@@ -835,15 +835,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
-            def outputPath = "${jobWorkspace}/job-output.log"
+            def sbatchLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
-            def scriptLaunchPathNode = "${jobWorkspace}/slurm_launch.sh"
+            def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
-            def scriptSubmitPathNode = "${jobWorkspace}/slurm_submit.sh"
+            def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
-            def scriptTrackPathNode = "${jobWorkspace}/slurm_track.sh"
+            def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def scriptStatusPathLocal = Utils.createTempLocation(pipeline, "./slurm_status.sh")
-            def scriptStatusPathNode = "${jobWorkspace}/slurm_status.sh"
+            def scriptStatusPathNode = "${jobWorkspace}/${jobUID}-slurm_status.sh"
             def isAarch64 = config.contains("aarch64")
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
@@ -978,7 +978,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     srunArgs.add("--mpi=pmi2")
                 }
                 def scriptContent = """#!/bin/bash
-                    #SBATCH --output=${outputPath}
+                    #SBATCH --output=${sbatchLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
@@ -1014,7 +1014,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def scriptSubmit = """#!/bin/bash
                     set -Eeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
-                    touch ${outputPath}
+                    touch ${sbatchLogPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Job submission failed, no job ID returned."
@@ -1045,14 +1045,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
                 def scriptTrack = """#!/bin/bash
                     jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    tail -f $outputPath &
+                    tail -f ${sbatchLogPath} &
                     tailPid=\$!
                     # Wait until sbatch job is done.
                     while true; do
-                        state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | \
-                            awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
-                        if [[ -z "\$state" || "\$state" == "RUNNING" || \
-                            "\$state" == "PENDING"]]; then
+                        state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
+                        if [[ -z \$state || \$state == "RUNNING" || \$state == "PENDING" ]]; then
+                            echo "job is still running"
                             sleep 300
                         else
                             echo "Job \$jobId finished with state: \$state"
@@ -1078,8 +1077,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
                 def scriptStatus = """#!/bin/bash
                     jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    sacct -j \$jobId --format=JobIDRaw,State --noheader |\
-                        awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}'
+                    sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}'
                 """
                 pipeline.writeFile(file: scriptStatusPathLocal, text: scriptStatus)
                 Utils.copyFileToRemoteHost(
@@ -1089,7 +1087,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptStatusPathNode,
                     true
                 )
-                sh "cat $scriptStatusPathLocal"
                 while (true) {
                     // Check if the job is done by running sacct via SSH
                     def result = Utils.exec(
@@ -1099,13 +1096,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             remote,
                             scriptStatusPathNode
                         )
-                    )
-                    println(result)
-                    if (result == "") {
-                        echo "Job is done."
-                        break
-                    } else {
+                    ).trim()
+                    if (!result || result == "RUNNING" || result == "PENDING") {
                         echo "Job is still running, pulling the job log."
+                        // Pulling the sbatch output log
                         Utils.exec(
                             pipeline,
                             timeout: false,
@@ -1114,6 +1108,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 scriptTrackPathNode
                             )
                         )
+                    } else {
+                        echo "Job is done."
+                        break
                     }
                 }
             }
