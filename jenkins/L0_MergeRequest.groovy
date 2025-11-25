@@ -1263,8 +1263,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, o
     }
 
     if (onlyBuildImage) {
-        def requiredStages = ["Build-Docker-Images", "Release Check"]
-        stages = stages.findAll { key, _ -> requiredStages.contains(key) }
+        stages = stages.findAll { key, value -> key.contains("Release Check") } + dockerBuildJob
         echo "Only execute Build-Docker-Images and Release Check stages, build and update docker images and tags"
     }
 
