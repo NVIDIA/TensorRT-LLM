@@ -1,0 +1,8 @@
+name: libnuma1
+description: NUMA memory allocation library
+source: container
+path_components: []
+aliases: []
+basename_matches: []
+linker_flags_matches:
+- -lnuma
