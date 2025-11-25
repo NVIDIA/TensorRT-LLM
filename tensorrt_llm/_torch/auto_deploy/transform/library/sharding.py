@@ -1090,7 +1090,6 @@ def _insert_sharded_moe(
     ep_size = config.process_grid[ShardingDim.EP]["w"]
     tp_rank = config.process_grid[ShardingDim.TP]["p"]
     tp_size = config.process_grid[ShardingDim.TP]["w"]
-    print(f"ep_rank: {ep_rank}, ep_size: {ep_size}, tp_rank: {tp_rank}, tp_size: {tp_size}")
     num_experts = len(node.args[3])
     args = list(node.args)
 
@@ -1211,8 +1210,7 @@ def _split_range_last_remainder(n: int, world_size: int, rank: int):
 def _insert_sharded_mxfp4_mlp_ep(
     gm: GraphModule,
     node: Node,
-    rank: int,
-    world_size: int,
+    config: ShardingTransformConfig,
 ):
     """
     Transform a call to auto_deploy::triton_mxfp4_moe into:
@@ -1238,6 +1236,7 @@ def _insert_sharded_mxfp4_mlp_ep(
     gate_up_blocks_node = node.args[IDX_GATE_UP_BLOCKS]
     num_experts = int(gate_up_blocks_node.meta["val"].shape[0])
 
+    rank, world_size = config.rank, config.world_size
     local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
 
     # Prepare new args with slices for this rank
@@ -2346,7 +2345,9 @@ def detect_dp_bmm_shard(
     )
 
 
-def get_process_grid_from_config(config: ShardingTransformConfig) -> Tuple[int, int]:
+def get_process_grid_from_config(
+    config: ShardingTransformConfig,
+) -> Dict[ShardingDim, Dict[str, int]]:
     rank, world_size = config.rank, config.world_size
     if len(config.process_grid) > 0:
         ad_logger.debug(f"EP + TP sharding process grid: {config.process_grid}")
