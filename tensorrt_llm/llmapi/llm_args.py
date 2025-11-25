@@ -322,7 +322,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return cls(**data)
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "trtllm"
+        return backend == "pytorch"
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
