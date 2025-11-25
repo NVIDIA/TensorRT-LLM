@@ -248,6 +248,7 @@ class KVCacheManager(BaseResourceManager):
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_num_tokens = max_num_tokens
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -559,14 +560,15 @@ class KVCacheManager(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        self.update_kv_cache_draft_token_location(scheduled_batch,
-                                                  attn_metadata,
-                                                  kv_cache_dtype_byte_size)
-        # rewind kv cache
-        for request in scheduled_batch.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if request.py_rewind_len > 0:
-                    self.rewind_kv_cache(request, request.py_rewind_len)
+        if not self.is_draft:
+            self.update_kv_cache_draft_token_location(scheduled_batch,
+                                                      attn_metadata,
+                                                      kv_cache_dtype_byte_size)
+            # rewind kv cache
+            for request in scheduled_batch.generation_requests:
+                if request.state != LlmRequestState.GENERATION_COMPLETE:
+                    if request.py_rewind_len > 0:
+                        self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
@@ -613,7 +615,7 @@ class KVCacheManager(BaseResourceManager):
         requests = scheduled_batch.all_requests()
         accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = self.locate_accepted_draft_tokens(
             requests)
-        past_key_value_lengths = attn_metadata.kv_lens_cuda
+        past_key_value_lengths = attn_metadata.kv_lens_cuda[:len(requests)]
         if attn_metadata.kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_block_offsets is not None and attn_metadata.host_kv_cache_pool_pointers is not None and attn_metadata.host_kv_cache_pool_mapping is not None:
             use_paged_kv_cache = True
         else:
@@ -632,7 +634,7 @@ class KVCacheManager(BaseResourceManager):
                 self.num_layers,
                 self.num_kv_heads,
                 int(self.head_dim * kv_cache_dtype_byte_size),
-                self.max_draft_len,
+                self.max_total_draft_tokens,
                 self.max_attention_window_vec[0],
                 rewind_draft_token_separate_adjustments,
                 None,
