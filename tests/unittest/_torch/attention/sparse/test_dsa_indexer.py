@@ -308,9 +308,9 @@ def test_deepgemm_fp8_mqa_logits_basic():
     """
     torch.manual_seed(0)
 
-    num_heads, head_dim = 32, 128
-    seq_len = 512
-    seq_len_kv = 1024
+    num_heads, head_dim = 64, 128
+    seq_len = 2048
+    seq_len_kv = 4096
     #[seq_len, num_heads, head_dim]
     q = torch.randn(
         seq_len,
@@ -335,8 +335,8 @@ def test_deepgemm_fp8_mqa_logits_basic():
     )
     # ks[i] -> ke[i] for each q[i]
     ks = torch.zeros(seq_len, dtype=torch.int, device="cuda")
-    ke = torch.arange(seq_len, dtype=torch.int, device="cuda") + (
-        seq_len_kv - seq_len) + 1  # +1 for exclusive end
+    ke = torch.arange(seq_len, dtype=torch.int,
+                      device="cuda") + (seq_len_kv - seq_len)
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)

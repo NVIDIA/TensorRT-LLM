@@ -255,8 +255,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with LLM(model=target_model_dir,
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
-                 speculative_config=spec_config,
-                 build_config=None) as llm:
+                 speculative_config=spec_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -3040,8 +3039,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   enable_chunked_prefill=enable_chunked_prefill,
                   max_num_tokens=256 if enable_chunked_prefill else 8192,
-                  speculative_config=spec_config,
-                  build_config=None)
+                  speculative_config=spec_config)
 
         with llm:
             task = GSM8K(self.MODEL_NAME)
@@ -4266,3 +4264,49 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             if temp_dir and os.path.exists(temp_dir):
                 import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestStarcoder2_3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-3b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-3b/"
+
+    @skip_pre_hopper
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestStarcoder2_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-7b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b/"
+
+    @skip_pre_hopper
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-15b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-15b/"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

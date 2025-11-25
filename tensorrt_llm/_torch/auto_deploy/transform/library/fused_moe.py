@@ -742,7 +742,7 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
             torch.nn.Parameter(w3_weight_scale_stacked, requires_grad=False),
         )
 
-        additional_args = []
+        additional_nodes = []
         if backend == "trtllm":
             # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
             # to avoid computing them at runtime.
@@ -765,30 +765,32 @@ def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "
                 new_key_gemm2_dequant,
                 torch.nn.Parameter(gemm2_dequant, requires_grad=False),
             )
-            additional_args = [
-                graph.get_attr(new_key_gemm1_dequant),
-                graph.get_attr(new_key_gemm2_act_quant),
-                graph.get_attr(new_key_gemm2_dequant),
+            additional_nodes = [
+                new_key_gemm1_dequant,
+                new_key_gemm2_act_quant,
+                new_key_gemm2_dequant,
             ]
+
         # Create new node with get_attr for stacked parameters
         with graph.inserting_before(node):
+            args = (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                graph.get_attr(new_key_w1),
+                graph.get_attr(new_key_w2),
+                graph.get_attr(new_key_w3),
+                graph.get_attr(new_key_w1_input_scale),
+                graph.get_attr(new_key_w2_input_scale),
+                graph.get_attr(new_key_w3_input_scale),
+                graph.get_attr(new_key_w1_weight_scale),
+                graph.get_attr(new_key_w2_weight_scale),
+                graph.get_attr(new_key_w3_weight_scale),
+            )
+            additional_args = (graph.get_attr(node) for node in additional_nodes)
             new_node = graph.call_function(
                 replacement_op,
-                args=(
-                    hidden_states,
-                    selected_experts,
-                    routing_weights,
-                    graph.get_attr(new_key_w1),
-                    graph.get_attr(new_key_w2),
-                    graph.get_attr(new_key_w3),
-                    graph.get_attr(new_key_w1_input_scale),
-                    graph.get_attr(new_key_w2_input_scale),
-                    graph.get_attr(new_key_w3_input_scale),
-                    graph.get_attr(new_key_w1_weight_scale),
-                    graph.get_attr(new_key_w2_weight_scale),
-                    graph.get_attr(new_key_w3_weight_scale),
-                    *additional_args,
-                ),
+                args=(*args, *additional_args),
                 kwargs=node.kwargs,
             )
 
