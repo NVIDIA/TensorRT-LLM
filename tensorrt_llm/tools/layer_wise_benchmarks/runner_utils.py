@@ -247,7 +247,7 @@ class RunnerMixin(ABC):
             def select_alltoall_method_type(self):
                 # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
                 # by replacing `top_k` with `fake_top_k`
-                top_k = self.routing_method.top_k
+                top_k = self.routing_method.experts_per_token
                 if scaled_from <= top_k:
                     fake_top_k = mapping.moe_ep_size + 1
                 else:
