@@ -381,6 +381,10 @@ accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-c
 accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4
 accuracy/test_llm_api_pytorch.py::TestCodestral_22B_V01::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency]
+accuracy/test_llm_api_pytorch.py::TestStarcoder2_3B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestStarcoder2_7B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestStarcoder2_15B::test_auto_dtype
+
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestLlava_V1_6_Mistral_7B::test_auto_dtype
