@@ -51,6 +51,11 @@ class TritonDecoder(Decoder):
         self.draft_llm_model_name = draft_llm_model_name
         self.multimodal_encoders_name = multimodal_encoders_name
 
+        # `exclude_input_in_output` configuration for target and draft model.
+        # Don't directly access this variable from outside of this instance.
+        self._exclude_input_in_output_for_target = None
+        self._exclude_input_in_output_for_draft = None
+
         self._preproc_outputs = [
             "INPUT_ID", "DECODER_INPUT_ID", "REQUEST_INPUT_LEN",
             "REQUEST_DECODER_INPUT_LEN", "BAD_WORDS_IDS", "STOP_WORDS_IDS",
@@ -613,3 +618,98 @@ class TritonDecoder(Decoder):
             num_input_tokens=gen_res.num_input_tokens,
             num_output_tokens=gen_res.num_output_tokens)
         return response
+
+    def _load_each_model_config(self, model_config_api_baseurl: str,
+                                model_name: str, n_retries: int,
+                                retry_interval_sec: int):
+        import time
+
+        # NOTE: Assuming gRPC endpoint is running.
+        # TODO: Making it possible to switch HTTP/gRPC
+        import tritonclient.grpc as grpcclient
+
+        # NOTE: Assuming URL consists of:
+        # /v2/models/{model_name}/config
+        if not model_config_api_baseurl.endswith("/v2/models/"):
+            raise RuntimeError("model_config_api_baseurl is unexpected format: "
+                               f"{model_config_api_baseurl=}")
+        model_config_api_url = "".join(
+            [model_config_api_baseurl, model_name, "/config"])
+
+        with grpcclient.InferenceServerClient(
+                url=model_config_api_url) as client:
+            is_model_ready = False
+            for _ in range(n_retries):
+                if not client.is_model_ready(model_name):
+                    time.sleep(retry_interval_sec)
+                    continue
+                is_model_ready = True
+                break
+            if not is_model_ready:
+                raise RuntimeError(
+                    "Unexpectedly a model has not been ready yet."
+                    f" Tried URL: {model_config_api_url}")
+
+            model_config = client.get_model_config(model_name)
+            raw_config = model_config.config
+            exclude_input_in_output = raw_config.parameters.get(
+                "exclude_input_in_output", None)
+            if exclude_input_in_output is None:
+                # `exclude_input_in_output` is not specified in parameters.
+                # Set False as a default value.
+                return False
+
+            return exclude_input_in_output.string_value.lower() in [
+                "true", "yes", "1", "t"
+            ]
+
+    @override
+    def load_model_configs(self,
+                           model_config_api_baseurl: Optional[str] = None,
+                           target_model_name: Optional[str] = None,
+                           draft_model_name: Optional[str] = None,
+                           n_retries: Optional[int] = 5,
+                           retry_interval_sec: Optional[int] = 3):
+        if self._exclude_input_in_output_for_target is not None and self._exclude_input_in_output_for_draft is not None:
+            # Already loaded. Skip.
+            return
+        if model_config_api_baseurl is None:
+            raise RuntimeError("model_config_api_baseurl must be specified.")
+        if target_model_name is None:
+            raise RuntimeError("target_model_name must be specified.")
+        if draft_model_name is None:
+            raise RuntimeError("draft_model_name must be specified.")
+
+        self._exclude_input_in_output_for_target = self._load_each_model_config(
+            model_config_api_baseurl, target_model_name, n_retries,
+            retry_interval_sec)
+        self._exclude_input_in_output_for_draft = self._load_each_model_config(
+            model_config_api_baseurl, draft_model_name, n_retries,
+            retry_interval_sec)
+        return
+
+    @override
+    def is_input_excluded_from_output_for_target(self,
+                                                 assume_loaded: bool = False
+                                                 ) -> bool:
+        if self._exclude_input_in_output_for_target is None:
+            if assume_loaded:
+                raise RuntimeError(
+                    "exclude_input_in_output should have been loaded from target model, but not yet."
+                )
+            else:
+                return False
+        return self._exclude_input_in_output_for_target
+
+    @override
+    def is_input_excluded_from_output_for_draft(self,
+                                                assume_loaded: bool = False
+                                                ) -> bool:
+        if self._exclude_input_in_output_for_draft is None:
+            if assume_loaded:
+                raise RuntimeError(
+                    "exclude_input_in_output should have been loaded from draft model, but not yet."
+                )
+            else:
+                return False
+        return self._exclude_input_in_output_for_draft
