@@ -1,5 +1,6 @@
+import time
 from enum import Enum
-from typing import List, Type
+from typing import Any, Dict, List, Tuple, Type
 
 from .controller import ParallelProcess
 from .task import ChatTask, DropKVCacheTask, GenerationTask, Task
@@ -15,6 +16,10 @@ class TaskCollection:
         pass
 
     def after_yield(self, tasks: List[Task]):
+        pass
+
+    @staticmethod
+    def get_global_info() -> Any:
         pass
 
 
@@ -95,6 +100,70 @@ class GenerationTokenCounter(TaskCollection):
                 if task.output_tokens:
                     post_worker_token_sum += len(task.output_tokens)
         self.generation_token_count += post_worker_token_sum - self.pre_worker_token_sum
+
+
+class ChatTokenCounter(TaskCollection):
+
+    # prompt tokens, completion tokens
+    statistics: Dict[str, List[Tuple[int, int]]] = {}
+
+    def __init__(self, statistics_name: str):
+        super().__init__()
+        self.statistics_name = statistics_name
+        if statistics_name not in ChatTokenCounter.statistics:
+            ChatTokenCounter.statistics[statistics_name] = []
+
+    def before_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if not isinstance(task, ChatTask):
+                continue
+            task.enable_token_counting = True
+
+    def after_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if not isinstance(task, ChatTask):
+                continue
+            ChatTokenCounter.statistics[self.statistics_name].append(
+                (task.prompt_tokens_num, task.completion_tokens_num))
+
+    def get_global_info() -> Any:
+        return ChatTokenCounter.statistics
+
+
+class TaskTimer(TaskCollection):
+
+    statistics: Dict[str, Dict[type, List[float]]] = {}
+
+    def __init__(self, statistics_name: str, task_types: List[Type[Task]]):
+        super().__init__()
+        self.statistics_name = statistics_name
+        self.task_types = task_types
+        self.start_time_map = {}
+        if statistics_name not in TaskTimer.statistics:
+            TaskTimer.statistics[statistics_name] = {}
+        for task_type in task_types:
+            if task_type not in TaskTimer.statistics[statistics_name]:
+                TaskTimer.statistics[statistics_name][task_type] = []
+
+    def before_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if type(task) not in self.task_types:
+                continue
+
+            self.start_time_map[id(task)] = time.time()
+
+    def after_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if type(task) not in self.task_types:
+                continue
+
+            end_time = time.time()
+            TaskTimer.statistics[self.statistics_name][type(task)].append(
+                end_time - self.start_time_map[id(task)])
+            del self.start_time_map[id(task)]
+
+    def get_global_info() -> Any:
+        return TaskTimer.statistics
 
 
 class SubRequestMarker(TaskCollection):
