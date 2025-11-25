@@ -977,7 +977,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
-def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:], onlyBuildImage = false) {
+def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     String globalVarsJson = writeJSON returnText: true, json: globalVars
     parameters += [
@@ -1016,7 +1016,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
     return status
 }
 
-def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, onlyBuildImage = false)
 {
     stages = [
         "Release Check": {
