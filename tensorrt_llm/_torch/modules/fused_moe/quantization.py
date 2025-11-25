@@ -1918,27 +1918,24 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             w3_reference = all_w3_pre_quant_scales[0]
             w1_reference = all_w1_pre_quant_scales[0]
 
+            def check_consistency(scale, ref_scale, scale_name, expert_id):
+                if not torch.allclose(scale, ref_scale, rtol=1e-5, atol=1e-8):
+                    max_diff = (scale - ref_scale).abs().max()
+                    msg = (
+                        f"MoE pre_quant_scale: expert {expert_id} {scale_name} "
+                        f"differs from expert {module.initial_local_expert_ids[0]}! Max diff: {max_diff:.6e}. "
+                        f"All experts should have identical pre_quant_scale since they share the same input."
+                    )
+                    logger.error(msg)
+                    raise ValueError(msg)
+
             for i, (w3_scale, w1_scale) in enumerate(
                     zip(all_w3_pre_quant_scales[1:],
                         all_w1_pre_quant_scales[1:]), 1):
-                if not torch.allclose(
-                        w3_scale, w3_reference, rtol=1e-5, atol=1e-8):
-                    max_diff = (w3_scale - w3_reference).abs().max()
-                    logger.warning(
-                        f"MoE pre_quant_scale: expert {module.initial_local_expert_ids[i]} w3.pre_quant_scale "
-                        f"differs from expert {module.initial_local_expert_ids[0]}! Max diff: {max_diff:.6e}. "
-                        f"All experts should have identical pre_quant_scale since they share the same input. "
-                        f"Using the first expert's value.")
-                    break
-                if not torch.allclose(
-                        w1_scale, w1_reference, rtol=1e-5, atol=1e-8):
-                    max_diff = (w1_scale - w1_reference).abs().max()
-                    logger.warning(
-                        f"MoE pre_quant_scale: expert {module.initial_local_expert_ids[i]} w1.pre_quant_scale "
-                        f"differs from expert {module.initial_local_expert_ids[0]}! Max diff: {max_diff:.6e}. "
-                        f"All experts should have identical pre_quant_scale since they share the same input. "
-                        f"Using the first expert's value.")
-                    break
+                check_consistency(w3_scale, w3_reference, "w3.pre_quant_scale",
+                                  module.initial_local_expert_ids[i])
+                check_consistency(w1_scale, w1_reference, "w1.pre_quant_scale",
+                                  module.initial_local_expert_ids[i])
 
             # Take the maximum pre_quant_scale between w3 and w1 from the first expert
             # (all experts should have the same values)
