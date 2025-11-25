@@ -30,7 +30,8 @@ Key Features:
 - Disaggregated inference support
 
 Usage:
-    python -m tensorrt_llm.commands.serve grpc /path/to/model \\
+    python -m tensorrt_llm.commands.serve /path/to/model \\
+        --grpc \\
         --host 0.0.0.0 \\
         --port 50051
 """

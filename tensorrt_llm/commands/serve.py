@@ -589,6 +589,11 @@ class ChoiceWithAlias(click.Choice):
                   "Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
                   "prototype"))
+@click.option("--grpc",
+              is_flag=True,
+              default=False,
+              help="Run gRPC server instead of OpenAI HTTP server. "
+              "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -604,8 +609,8 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
-    """Running an OpenAI API compatible server
+        custom_module_dirs: list[Path], chat_template: Optional[str], grpc: bool):
+    """Running an OpenAI API compatible server (or gRPC server with --grpc flag)
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
@@ -682,9 +687,15 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, tool_parser, chat_template,
-                  metadata_server_cfg, server_role, disagg_cluster_config,
-                  multimodal_server_config)
+
+    if grpc:
+        # gRPC mode: launch gRPC server instead of OpenAI HTTP server
+        launch_grpc_server(host, port, llm_args)
+    else:
+        # Default: launch OpenAI HTTP server
+        launch_server(host, port, llm_args, tool_parser, chat_template,
+                      metadata_server_cfg, server_role, disagg_cluster_config,
+                      multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
@@ -758,131 +769,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         metadata_server_config_file)
 
     launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
-
-
-@click.command("grpc")
-@click.argument("model", type=str)
-@click.option("--tokenizer",
-              type=str,
-              default=None,
-              help="Path | Name of the tokenizer.")
-@click.option("--host",
-              type=str,
-              default="0.0.0.0",
-              help="Hostname of the gRPC server.")
-@click.option("--port", type=int, default=50051, help="Port of the gRPC server.")
-@click.option(
-    "--backend",
-    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
-                         {"trt": "tensorrt"}),
-    default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-@click.option("--max_beam_width",
-              type=int,
-              default=BuildConfig.model_fields["max_beam_width"].default,
-              help="Maximum number of beams for beam search decoding.")
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
-              help="Maximum number of requests that the engine can schedule.")
-@click.option(
-    "--max_num_tokens",
-    type=int,
-    default=BuildConfig.model_fields["max_num_tokens"].default,
-    help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
-@click.option(
-    "--max_seq_len",
-    type=int,
-    default=BuildConfig.model_fields["max_seq_len"].default,
-    help="Maximum total length of one request, including prompt and outputs. "
-    "If unspecified, the value is deduced from the model config.")
-@click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
-@click.option("--pp_size",
-              type=int,
-              default=1,
-              help='Pipeline parallelism size.')
-@click.option("--ep_size",
-              type=int,
-              default=None,
-              help="expert parallelism size")
-@click.option("--cluster_size",
-              type=int,
-              default=None,
-              help="expert cluster parallelism size")
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
-@click.option("--kv_cache_free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help="Free GPU memory fraction reserved for KV Cache, "
-              "after allocating model weights and buffers.")
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help="Flag for HF transformers.")
-@click.option(
-    "--extra_llm_api_options",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
-@click.option(
-    "--reasoning_parser",
-    type=click.Choice(ReasoningParserFactory.parsers.keys()),
-    default=None,
-    help="[Experimental] Specify the parser for reasoning models.",
-)
-def grpc(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        trust_remote_code: bool, extra_llm_api_options: Optional[str],
-        reasoning_parser: Optional[str]):
-    """Running a gRPC server for high-performance communication
-
-    MODEL: model name | HF checkpoint path | TensorRT engine path
-
-    The gRPC server accepts pre-tokenized requests and returns raw token IDs,
-    enabling efficient binary communication with external routers like sgl-router.
-    """
-    logger.set_level(log_level)
-
-    llm_args, _ = get_llm_args(
-        model=model,
-        tokenizer=tokenizer,
-        backend=backend,
-        max_beam_width=max_beam_width,
-        max_batch_size=max_batch_size,
-        max_num_tokens=max_num_tokens,
-        max_seq_len=max_seq_len,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        moe_expert_parallel_size=ep_size,
-        moe_cluster_parallel_size=cluster_size,
-        gpus_per_node=gpus_per_node,
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-        trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser)
-
-    llm_args_extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
-    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
-
-    launch_grpc_server(host, port, llm_args)
 
 
 @click.command("disaggregated")
@@ -1201,7 +1087,6 @@ class DefaultGroup(click.Group):
 main = DefaultGroup(
     commands={
         "serve": serve,
-        "grpc": grpc,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder
