@@ -308,6 +308,15 @@ parser_keywords = [
     ("routingIndicesHistogram", "routingIndicesHistogramKernel<"),
     ("routingIndicesOffsets", "routingIndicesOffsetsKernel<"),
     ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
+    ("CuteDSLMoePermute", "cute_dsl::moePermuteKernel"),
+    (
+        "CuteDSLGroupedGemmSwiglu",
+        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"],
+    ),
+    (
+        "CuteDSLGroupedGemmFinalize",
+        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_finalize_fusion"],
+    ),
 ]
 warned_names = set()
 
