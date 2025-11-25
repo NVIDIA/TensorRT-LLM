@@ -783,6 +783,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # (amax_input * amax_weight) / (448*6 * 448*6)
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
+        module.scalar_alpha = 1.0
 
         # K, V scales for NVFP4 KV cache
         module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
@@ -807,7 +808,11 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        if IS_CUTLASS_DSL_AVAILABLE and module.use_cute_dsl_nvfp4_blockscaling_mm:
+        # cute dsl nvfp4 gemm blackwell is only supported for bfloat16 on sm100
+        if (IS_CUTLASS_DSL_AVAILABLE and get_sm_version() == 100
+                and module.use_cute_dsl_nvfp4_blockscaling_mm
+                and module.dtype == torch.bfloat16 and os.environ.get(
+                    "DISABLE_CUTE_DSL_NVFP4_DENSE_GEMM", "0") != "1"):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
@@ -1903,7 +1908,7 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
-        use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
+        use_cute_dsl_nvfp4_blockscaling_mm: bool = True,
         use_cublaslt_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
     ):
