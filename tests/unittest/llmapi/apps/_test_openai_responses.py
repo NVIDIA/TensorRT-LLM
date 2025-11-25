@@ -86,7 +86,9 @@ def check_tool_calling(response, first_resp=True, prefix=""):
 @pytest.mark.asyncio(loop_scope="module")
 async def test_reasoning(client: openai.AsyncOpenAI, model: str):
     response = await client.responses.create(
-        model=model, input="Which one is larger as numeric, 9.9 or 9.11?")
+        model=model,
+        input="Which one is larger as numeric, 9.9 or 9.11?",
+        max_output_tokens=1024)
 
     check_reponse(response, "test_reasoning: ")
 
@@ -96,9 +98,10 @@ async def test_reasoning_effort(client: openai.AsyncOpenAI, model: str):
     for effort in ["low", "medium", "high"]:
         response = await client.responses.create(
             model=model,
-            instructions="Use less than 1024 tokens for reasoning",
+            instructions="Use less than 1024 tokens for the whole response",
             input="Which one is larger as numeric, 9.9 or 9.11?",
-            reasoning={"effort": effort})
+            reasoning={"effort": effort},
+            max_output_tokens=1024)
         check_reponse(response, f"test_reasoning_effort_{effort}: ")
 
 
@@ -121,20 +124,23 @@ async def test_chat(client: openai.AsyncOpenAI, model: str):
                                              }, {
                                                  "role": "user",
                                                  "content": "Tell me a joke."
-                                             }])
+                                             }],
+                                             max_output_tokens=1024)
     check_reponse(response, "test_chat: ")
 
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_multi_turn_chat(client: openai.AsyncOpenAI, model: str):
     response = await client.responses.create(model=model,
-                                             input="What is the answer of 1+1?")
+                                             input="What is the answer of 1+1?",
+                                             max_output_tokens=1024)
     check_reponse(response, "test_multi_turn_chat_1: ")
 
     response_2 = await client.responses.create(
         model=model,
         input="What is the answer of previous question?",
-        previous_response_id=response.id)
+        previous_response_id=response.id,
+        max_output_tokens=1024)
     check_reponse(response_2, "test_multi_turn_chat_2: ")
 
 
@@ -168,11 +174,10 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
         }
     }
     messages = [{"role": "user", "content": "What is the weather like in SF?"}]
-    response = await client.responses.create(
-        model=model,
-        input=messages,
-        tools=[tool_get_current_weather],
-    )
+    response = await client.responses.create(model=model,
+                                             input=messages,
+                                             tools=[tool_get_current_weather],
+                                             max_output_tokens=1024)
     messages.extend(response.output)
     function_call = check_tool_calling(response, True, "test_tool_calls: ")
 
@@ -188,7 +193,8 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
 
     response = await client.responses.create(model=model,
                                              input=messages,
-                                             tools=[tool_get_current_weather])
+                                             tools=[tool_get_current_weather],
+                                             max_output_tokens=1024)
 
     check_tool_calling(response, False, "test_tool_calls: ")
 
@@ -199,7 +205,7 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
         model=model,
         input="Explain the theory of relativity in brief.",
         stream=True,
-    )
+        max_output_tokens=1024)
 
     reasoning_deltas, message_deltas = list(), list()
     async for event in stream:
@@ -240,12 +246,11 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
         }
     }
     messages = [{"role": "user", "content": "What is the weather like in SF?"}]
-    stream = await client.responses.create(
-        model=model,
-        input=messages,
-        tools=[tool_get_current_weather],
-        stream=True,
-    )
+    stream = await client.responses.create(model=model,
+                                           input=messages,
+                                           tools=[tool_get_current_weather],
+                                           stream=True,
+                                           max_output_tokens=1024)
 
     function_call = None
     reasoning_deltas = list()
