@@ -67,7 +67,7 @@ class GPUState:
 
 class GPUClockLock:
 
-    def __init__(self, gpu_id, interval_ms):
+    def __init__(self, gpu_id, interval_ms, enable_clock_locking=False):
         """
         Sets up clock values and tears down every run. At the end of the session call teardown to complete session and
         reset GPU clocks.
@@ -75,6 +75,7 @@ class GPUClockLock:
         Args:
             gpu_id (str): GPU identifier, either comma-separated UUIDs or comma-separated indices in string.
             interval_ms (float): Interval duration between monitoring samples.
+            enable_clock_locking (bool): If True, enable GPU clock locking. Default is False.
         """
         # Initialize pynvml
         self._nvml_initialized = False
@@ -84,6 +85,7 @@ class GPUClockLock:
         self._gpu_id = gpu_id
         self._gpu_id_list = [int(id) for id in gpu_id.split(",")]
         self._mobile_disable_clock_locking = False
+        self._enable_clock_locking = enable_clock_locking
 
         # Create GPU handles, one per GPU.
         try:
@@ -207,6 +209,10 @@ class GPUClockLock:
         Implements fail-fast semantics: if any GPU fails to lock, all operations
         are rolled back and an exception is raised.
         """
+        if not self._enable_clock_locking:
+            print_warning("Clock locking is not enabled inside TRTLLM code")
+            return
+
         if self._mobile_disable_clock_locking:
             print_info("Clock locking disabled for mobile/Jetson devices")
             return
@@ -428,6 +434,11 @@ class GPUClockLock:
         The "num_entries" argument specifies the number of consecutive entries the monitoring data needs to be invalid
         before considering the entire dataset as invalid
         """
+
+        if not self._enable_clock_locking:
+            print_info(
+                "Skipped gpu monitoring validation (clock locking not enabled)")
+            return
 
         if self._mobile_disable_clock_locking:
             print_info("Skipped gpu monitoring validation for mobile board")
