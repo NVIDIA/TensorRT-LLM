@@ -1715,7 +1715,6 @@ class TorchSampler(Sampler):
             seq_slots=seq_slots_host,
             return_log_probs=return_log_probs,
             seq_lens=seq_lens_host,
-            resource_manager=resource_manager,
         )
 
         finish_reasons = self.store.finish_reasons
@@ -2396,7 +2395,6 @@ class TorchSampler(Sampler):
         seq_slots: torch.Tensor,
         seq_lens: torch.Tensor | None = None,
         return_log_probs: bool,
-        resource_manager: Optional[ResourceManager] = None,
     ) -> torch.Tensor:
         seq_slots = seq_slots.to(dtype=torch.int32)  # int32 suffices here
 
