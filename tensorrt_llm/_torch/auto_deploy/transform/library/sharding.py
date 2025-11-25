@@ -34,6 +34,7 @@ from ...utils.node_utils import (
     get_all_layer_subgraphs,
     is_any_attention_op,
     is_any_lin_op,
+    is_any_moe_op,
     is_any_ssm_op,
     is_op,
     subgraph,
@@ -463,6 +464,8 @@ def _process_column_sharding(
     """
     Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
     """
+    if subgraph_nodes is None:
+        subgraph_nodes = subgraph(linear_nodes, boundary_condition=is_any_lin_op)
     fused_weight_dims = None
     # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
     split_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.split_with_sizes]))
@@ -489,6 +492,17 @@ def _process_column_sharding(
                     f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
                 )
                 return
+    chunk_nodes = list(filtered_nodes(subgraph_nodes, ops=torch.ops.aten.chunk))
+    if len(chunk_nodes) > 0:
+        assert len(linear_nodes) == 1
+        linear_node = linear_nodes[0]
+        assert len(chunk_nodes) == 1, "Expecting exactly one chunk node for fused weights"
+        num_chunks = chunk_nodes[0].args[1]
+        weight_dim = linear_node.meta["val"].shape[2]
+        fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+
+    # check if there are any attention nodes in the subgraph
+    attention_nodes = list(filtered_nodes(subgraph_nodes, is_any_attention_op))
 
     added_nodes: int = 0
     for linear_node in linear_nodes:
@@ -501,12 +515,12 @@ def _process_column_sharding(
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_weight_dims,
-                layer_type=LayerType.MLP if min_local_shape == 1 else LayerType.ATTENTION,
+                layer_type=LayerType.ATTENTION if len(attention_nodes) > 0 else LayerType.MLP,
             )
         )
     if added_nodes == 0:
         ad_logger.debug("No nodes were added for column sharding. Skipping.")
-        return 0
+        return
 
     nodes_to_validate = [
         n for n in subgraph_nodes if is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape])
@@ -533,9 +547,12 @@ def _process_column_sharding(
         assert world_size is not None, "World size is required to update the split node params"
 
         # fused weight may either be processed by several slice nodes or a single split node
-        assert len(split_nodes) > 0 or len(slice_nodes) > 0, (
-            "Expecting at least one split or slice node for fused weights"
+        assert len(split_nodes) > 0 or len(slice_nodes) > 0 or len(chunk_nodes) > 0, (
+            "Expecting at least one split or slice or chunk node for fused weights"
         )
+
+        assert len(linear_nodes) == 1, "Expecting exactly one linear node for fused weights"
+        linear_node = linear_nodes[0]
         if len(split_nodes) > 0:
             user = split_nodes[0]
             orig_sizes = user.args[1]
@@ -547,8 +564,8 @@ def _process_column_sharding(
                     rank=rank, world_size=world_size, target_node=user.name, args=tuple(args)
                 )
             )
-        else:
-            for slice_node in linear_node.users:
+        elif len(slice_nodes) > 0:
+            for slice_node in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice):
                 args = list(slice_node.args)
                 args[2] = args[2] // world_size
                 args[3] = args[3] // world_size
@@ -560,6 +577,7 @@ def _process_column_sharding(
                         args=tuple(args),
                     )
                 )
+        # chunk nodes do not need to be updated
 
 
 def detect_sharding_from_config(
@@ -618,6 +636,7 @@ def detect_sharding_from_config(
     num_shards = 0
     num_simple_shards = 0
     num_row_col_shards = 0
+    num_ssm_shards = 0
 
     for lin_node in filtered_nodes(gm.graph.nodes, is_any_lin_op):
         # use node's weight name to get the module name
@@ -643,18 +662,14 @@ def detect_sharding_from_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
                 if config == "colwise":
-                    if transform_container.add(
-                        WeightShardingInfo.from_node(
-                            lin_node,
-                            split_dim=SplitDimension.COLUMN,
-                            rank=rank,
-                            world_size=world_size,
-                            dist_op=None,
-                            min_local_shape=min_local_shape,
-                            layer_type=layer_type,
-                        )
-                    ):
-                        num_row_col_shards += 1
+                    _process_column_sharding(
+                        linear_nodes=[lin_node],
+                        subgraph_nodes=None,
+                        transform_container=transform_container,
+                        rank=rank,
+                        world_size=world_size,
+                        min_local_shape=min_local_shape,
+                    )
                 elif config == "rowwise":
                     if transform_container.add(
                         WeightShardingInfo.from_node(
@@ -669,18 +684,9 @@ def detect_sharding_from_config(
                     ):
                         num_row_col_shards += 1
                 elif config == "mamba":
-                    transform_container.add(
-                        WeightShardingInfo.from_node(
-                            lin_node,
-                            split_dim=SplitDimension.COLUMN,
-                            rank=rank,
-                            world_size=world_size,
-                            dist_op=None,
-                            min_local_shape=min_local_shape,
-                            layer_type=LayerType.MAMBA_FULL,
-                        )
+                    num_ssm_shards += int(
+                        _process_ssm_sharding(gm, lin_node, transform_container, rank, world_size)
                     )
-                    num_row_col_shards += 1
                 elif "sequence" in config:
                     # TODO: Sequence parallelism is not supported yet.
                     ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
@@ -735,7 +741,6 @@ def detect_sharding_from_config(
                     ):
                         num_simple_shards += 1
                 else:
-                    num_shards -= 1
                     ad_logger.debug(
                         f"Unsupported sharding action {config}. "
                         f"Linear node {lin_node} will not be sharded."
@@ -744,8 +749,8 @@ def detect_sharding_from_config(
                 break
 
     ad_logger.info(
-        f"Applied {num_shards} TP shards (simple: {num_simple_shards}, "
-        f"row-col pattern: {num_row_col_shards})"
+        f"Applied {num_shards} TP shards from config (simple: {num_simple_shards}, "
+        f"row-col pattern: {num_row_col_shards}, ssm: {num_ssm_shards})"
     )
 
     num_matches = len(transform_container.weight_sharding_transforms)
@@ -760,7 +765,7 @@ def detect_sharding_from_config(
 
 def detect_ssm_shard(
     gm: GraphModule,
-    sharding_config: ShardingTransformContainer,
+    transform_container: ShardingTransformContainer,
 ) -> TransformInfo:
     """A transformation to apply sharding to the model following SSM parallelism.
     TODO: This is a TEMPORARY place for this logic due to the incompatibility between the
@@ -768,14 +773,14 @@ def detect_ssm_shard(
     The goal is to have a unified single pass over the graph to detect layers and apply
     appropriate sharding transformations.
     """
-    rank, world_size = sharding_config.rank, sharding_config.world_size
+    rank, world_size = transform_container.rank, transform_container.world_size
     if world_size < 2:
         ad_logger.info("Skipping TP sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
     ad_logger.info("Running SSM sharding detection")
 
     # find all ssm nodes in the graph
-    ssm_nodes = filtered_nodes(gm.graph.nodes, ops=torch.ops.auto_deploy.torch_ssm)
+    ssm_nodes = filtered_nodes(gm.graph.nodes, is_any_ssm_op)
     num_ssm_shards = 0
     for ssm_node in ssm_nodes:
         # We assume that one ssm node defines a subgraph corresponding
@@ -784,7 +789,7 @@ def detect_ssm_shard(
         in_proj_node, _ = bfs(ssm_node, is_any_lin_op, attr_next="args", include_root=False)
 
         num_ssm_shards += int(
-            _process_ssm_sharding(gm, in_proj_node, sharding_config, rank, world_size)
+            _process_ssm_sharding(gm, in_proj_node, transform_container, rank, world_size)
         )
 
     ad_logger.info(f"Found {num_ssm_shards} SSM shards")
@@ -825,17 +830,6 @@ def detect_column_row_shard(
 
     layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
 
-    # acceptable attention nodes between sharded GEMMs
-    shardable_attention_nodes = {
-        torch.ops.auto_deploy.torch_attention_sdpa,
-        torch.ops.auto_deploy.torch_attention,
-    }
-
-    # acceptable SSM nodes between sharded GEMMs
-    shardable_ssm_nodes = {
-        torch.ops.auto_deploy.torch_ssm,
-    }
-
     num_shards = 0
     num_simple_shards = 0
     num_ssm_shards = 0
@@ -852,8 +846,8 @@ def detect_column_row_shard(
             )
             continue
 
-        ssm_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_ssm_nodes))
-        attention_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_attention_nodes))
+        ssm_nodes = list(filtered_nodes(layer_subgraph, is_any_ssm_op))
+        attention_nodes = list(filtered_nodes(layer_subgraph, is_any_attention_op))
         min_local_shape = 1
         layer_type = LayerType.MLP
 
@@ -886,10 +880,10 @@ def detect_column_row_shard(
                 qkv_proj_node = opening[0]
                 slice_nodes = list(filtered_nodes(qkv_proj_node.users, ops=torch.ops.aten.slice))
                 if len(slice_nodes) > 0:
-                    # extract num_kv_heads * head_dim from the last slice node
+                    # extract num_kv_heads * head_dim from the second slice node
                     assert len(slice_nodes) == 3, "Expecting exactly 3 slice nodes for fused QKV"
                     num_kv_heads = (
-                        slice_nodes[-1].args[3] - slice_nodes[-1].args[2]
+                        slice_nodes[1].args[3] - slice_nodes[1].args[2]
                     ) // min_local_shape
                     if num_kv_heads % world_size != 0:
                         ad_logger.debug(
@@ -899,16 +893,14 @@ def detect_column_row_shard(
                         num_simple_shards += _process_simple_shard(
                             nodes_linear, rank, world_size, sharding_config
                         )
-                        # TODO: handle the case where num_kv_heads is divisible by world_size
+                        # TODO: handle the case where num_kv_heads is not divisible by world_size
                         continue
-
             num_attention_shards += 1
         else:
             layer_type = LayerType.MLP
 
         # column-row sharding
         _process_column_sharding(
-            gm,
             linear_nodes=opening,
             subgraph_nodes=layer_subgraph,
             transform_container=sharding_config,
@@ -938,8 +930,9 @@ def detect_column_row_shard(
     )
 
     ad_logger.info(
-        f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_column_row_shards}, "
-        f"ssm: {num_ssm_shards}, attention: {num_attention_shards})"
+        f"Heuristics found {num_shards} TP shards (simple: {num_simple_shards}, "
+        f"ssm: {num_ssm_shards}, "
+        f"row-col: {num_column_row_shards}, (including attention: {num_attention_shards}))"
     )
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
@@ -1181,15 +1174,7 @@ def detect_ep_shard(
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     num_moe_patterns = 0
     for node in list(gm.graph.nodes):
-        if not is_op(
-            node,
-            (
-                torch.ops.auto_deploy.torch_moe,
-                torch.ops.auto_deploy.torch_quant_fp8_moe,
-                torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-                torch.ops.auto_deploy.triton_mxfp4_moe,
-            ),
-        ):
+        if not is_any_moe_op(node):
             continue
         if transform_container.add(
             EPShardingInfo.from_node(
