@@ -1071,7 +1071,6 @@ class TorchSampler(Sampler):
             model_outputs,
             new_tokens,
             num_context_logits_prefix_sum,
-            resource_manager=resource_manager,
         )
 
         finish_reasons = self.store.finish_reasons
@@ -1655,8 +1654,6 @@ class TorchSampler(Sampler):
         model_outputs: dict[str, torch.Tensor],
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
-        *,
-        resource_manager: Optional[ResourceManager] = None,
     ) -> tuple[list[LlmRequest], torch.Tensor, torch.Tensor]:
         raw_logits_cuda = model_outputs["logits"]
 
