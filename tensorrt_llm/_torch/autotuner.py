@@ -835,7 +835,7 @@ class AutoTuner:
                         f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
                         key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    logger.info_once(
+                    logger.debug_once(
                         f"[Autotuner] Exception captured: {e}",
                         key=(custom_op, "debug_autotuning_exception"),
                     )
@@ -1191,8 +1191,8 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def print_profiling_cache(self):
-        logger.info(f"[Autotuner] The profiling_cache entries:")
-        logger.info(
+        logger.debug(f"[Autotuner] The profiling_cache entries:")
+        logger.debug(
             f"[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
         )
         for key, value in self.profiling_cache.cache.items():
@@ -1274,7 +1274,7 @@ class AutoTuner:
             runner_idx = runners.index(runner)
             runner_tactic_list.append((runner_idx, tactic))
 
-        logger.info(
+        logger.debug(
             f"[Autotuner][replay]: Testing configuration: {runner_tactic_list}")
 
         # Replay the contexts with given (runner, tactic) pairs

@@ -34,7 +34,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
-    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
+    class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
@@ -55,11 +55,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
 
-            # Validate SM version at initialization
-            if get_sm_version() != 100:
-                raise ValueError(
-                    f"SM version {get_sm_version()} is not supported. "
-                    f"CuteDSL NVFP4 requires SM 100 (Blackwell).")
+            # Note: SM version check is done in get_valid_tactics() instead of __init__
+            # to allow graceful fallback to other backends in auto mode
 
         # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
         def __hash__(self):
@@ -76,6 +73,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
+            # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 (B200)
+            # SM 103 (B300) is not supported yet
+            sm_version = get_sm_version()
+            if sm_version != 100:
+                logger.debug(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL NVFP4 only supports SM 100 (B200). Skipping all tactics."
+                )
+                return []
+
             assert inputs[0].dim() == 2
             assert inputs[1].dim() == 2
 
@@ -376,6 +383,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Direct usage is discouraged. Consider using nvfp4_gemm instead
             for automatic backend selection with better performance.
         """
+        # Validate SM version before attempting to use CuteDSL
+        sm_version = get_sm_version()
+        if sm_version != 100:
+            raise ValueError(
+                f"CuteDSL NVFP4 backend requires SM 100 (B200), but got SM {sm_version}. "
+                f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
+            )
+
         tuner = AutoTuner.get()
 
         runner = CuteDSLNVFP4BlackwellLinear(output_dtype)
@@ -385,6 +400,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             [runner],
             runner.__class__.tuning_config,
             inputs,
+        )
 
         output = runner(inputs, tactic=best_tactic)
         return output
