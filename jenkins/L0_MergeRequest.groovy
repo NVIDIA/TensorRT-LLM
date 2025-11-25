@@ -1340,7 +1340,7 @@ pipeline {
         stage("Build Docker Images and update Image Tags") {
             when {
                 expression {
-                    testFilter[(DISABLE_DOCKER_IMAGE_BUILD)] == true
+                    testFilter[(DISABLE_MULTI_GPU_TEST)] == true
                 }
             }
             steps {
