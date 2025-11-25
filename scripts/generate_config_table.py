@@ -4,6 +4,25 @@ from collections import defaultdict
 
 import yaml
 
+# Mapping for model display names, URLs, and filename shortening prefixes
+MODEL_INFO = {
+    "deepseek-ai/DeepSeek-R1-0528": {
+        "display_name": "DeepSeek-R1",
+        "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+        "prefix_to_strip": "deepseek_r1_0528_",
+    },
+    "nvidia/DeepSeek-R1-0528-FP4-v2": {
+        "display_name": "DeepSeek-R1 (NVFP4)",
+        "url": "https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2",
+        "prefix_to_strip": "deepseek_r1_0528_fp4_v2_",
+    },
+    "openai/gpt-oss-120b": {
+        "display_name": "gpt-oss-120b",
+        "url": "https://huggingface.co/openai/gpt-oss-120b",
+        "prefix_to_strip": "gpt_oss_120b_",
+    },
+}
+
 
 def generate_rst(yaml_path, output_file=None):
     """Generate RST table from YAML config database.
@@ -32,27 +51,34 @@ def generate_rst(yaml_path, output_file=None):
     for model in sorted_models:
         lines.append(f".. start-{model}")
         lines.append("")
+
+        # Determine title text
+        if model in MODEL_INFO:
+            info = MODEL_INFO[model]
+            title_text = f"`{info['display_name']} <{info['url']}>`_"
+        else:
+            title_text = model
+
         # Section Header for Model
         lines.append(f".. _{model}:")
         lines.append("")
-        lines.append(model)
-        lines.append("^" * len(model))
+        lines.append(title_text)
+        lines.append("^" * len(title_text))
         lines.append("")
 
         # Table Header
         lines.append(".. list-table::")
         lines.append("   :width: 100%")
         lines.append("   :header-rows: 1")
-        # Adjusted widths removing 'Model Name' (originally 20)
-        # Distributing remaining space roughly to Config/Command which are long
-        lines.append("   :widths: 12 15 18 10 20 25")
+        # Widths: GPU, Perf Profile, Config, Command, Recommended Request Settings (ISL/OSL, Concurrency)
+        lines.append("   :widths: 12 15 20 25 15 13")
         lines.append("")
         lines.append("   * - GPU")
         lines.append("     - Performance Profile")
-        lines.append("     - ISL / OSL")
-        lines.append("     - Concurrency")
         lines.append("     - Config")
         lines.append("     - Command")
+        lines.append("     - Best ISL / OSL")
+        lines.append("     - Best Concurrency")
 
         # Process entries for this model
         subgroups = model_groups[model]
@@ -103,15 +129,22 @@ def generate_rst(yaml_path, output_file=None):
                 command = f"trtllm-serve {model} --extra_llm_api_options {full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)
+
+                # Shorten config filename if applicable
+                if model in MODEL_INFO:
+                    prefix = MODEL_INFO[model].get("prefix_to_strip", "")
+                    if config_filename.startswith(prefix):
+                        config_filename = config_filename[len(prefix) :]
+
                 github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{full_config_path}"
                 config_link = f"`{config_filename} <{github_url}>`_"
 
                 lines.append(f"   * - {gpu}")
                 lines.append(f"     - {profile}")
-                lines.append(f"     - {isl} / {osl}")
-                lines.append(f"     - {conc}")
                 lines.append(f"     - {config_link}")
                 lines.append(f"     - ``{command}``")
+                lines.append(f"     - {isl} / {osl}")
+                lines.append(f"     - {conc}")
 
         lines.append("")  # Space between tables
         lines.append(f".. end-{model}")
