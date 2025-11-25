@@ -25,11 +25,11 @@
 #include "KernelTraits.h"
 #include "trtllm/gen/CudaArchDecl.h"
 #include "trtllm/gen/DtypeDecl.h"
-#include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/MmaDecl.h"
+#include "trtllm/gen/SfLayoutDecl.h"
 #ifndef TLLM_GEN_EXPORT_INTERFACE
-#include "trtllm/gen/GenCtx.h"
 #include "trtllm/gen/CudaRunner.h"
+#include "trtllm/gen/GenCtx.h"
 #else
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #include <string>
@@ -720,9 +720,10 @@ inline bool checkAndUpdateGemmOptions(
 #endif // TLLM_PUBLIC_RELEASE
 
     // Check that the A cast is supported.
-    // Currently, we only support {MxFp4, NvFp4} -> Bf16.
+    // Currently, we only support {MxFp4, NvFp4, MxInt4} -> Bf16.
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
-            || ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1)
+            || ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1
+                    || options.mDtypeA == tg::Dtype::MxInt4)
                 && options.mDtypeMmaA == tg::Dtype::Bfloat16)
             || (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3),
         "Unsupported cast for A: ", tg::dtypeToString(options.mDtypeA), " -> ", tg::dtypeToString(options.mDtypeMmaA));
@@ -1423,6 +1424,19 @@ inline bool checkAndUpdateGemmOptions(
         }
     }
 
+    if (isBlackwell && !options.mUseCustomMmaSchedule && !options.mUseDeepSeekFp8
+        && options.mTileScheduler == TileScheduler::Persistent)
+    {
+        if (updateOptions)
+        {
+            options.mUseCustomMmaSchedule = true;
+        }
+        else
+        {
+            TLLM_CHECK_ERROR(false, "TileScheduler::Persistent and !UseCustomMmaSchedule is not supported.");
+        }
+    }
+
     if (options.mEnablesDelayedEarlyExit && options.mEnablesEarlyExit)
     {
         TLLM_LOG_WARNING(
@@ -1623,8 +1637,8 @@ inline CUresult loadCubinData(CUmodule* module, Config const& config)
     // Trtllm links the cubin into the executable while Flashinfer loads the cubin from storage.
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #ifdef TLLM_GEN_GEMM_CUBIN_PATH
-    static std::string const tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
-    std::string const sha256 = config.mHash ? config.mHash : "";
+    static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+    const std::string sha256 = config.mHash ? config.mHash : "";
     std::string fileName = config.mFunctionName;
     if (!fileName.empty())
     {
