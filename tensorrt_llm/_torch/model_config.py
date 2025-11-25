@@ -285,6 +285,19 @@ class ModelConfig(Generic[TConfig]):
             quant_config.exclude_modules = [
                 "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
             ]
+
+        # --- NVFP4 GPT‑OSS WAR: only MoE is NVFP4 ---
+        if quant_config.quant_algo == "NVFP4":
+            # Exclude all non‑MoE linears; adjust patterns as needed
+            quant_config.exclude_modules = [
+                'block.*.attn.qkv',
+                'block.*.attn.out',
+                'block.*.mlp.gate',
+                'embedding',
+                'unembedding',
+            ]
+        # --------------------------------------------
+
         return quant_config, layer_quant_config
 
     @staticmethod

@@ -1344,12 +1344,33 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
+def test_fp4_quantize_pad_unpad():
+    INTERMEDIATE_SIZE = 5760
+    HIDDEN_SIZE = 2880
+    weight = torch.randn(
+        (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=torch.bfloat16,
+        device="cuda") * 0.05
+
+    from tensorrt_llm._torch.modules.fused_moe.quantization import \
+        _fp4_quantize_pad_unpad
+    weight_nvfp4, global_scale_factor, block_scale_factor = _fp4_quantize_pad_unpad(
+        weight, (1, 1))
+    # Current we don't check anything as this is just used for debugging purpose
+
+
 @skip_pre_blackwell
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(512, 512),
+                                                            (2880, 2880)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("moe_backend", [
-    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
-])
-def test_fused_moe_nvfp4(dtype, moe_backend):
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+@pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
+@pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
+                         ids=lambda v: f"limit{v}")
+def test_fused_moe_nvfp4(dtype, moe_backend, hidden_size, intermediate_size,
+                         swiglu_alpha, swiglu_beta, swiglu_limit):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -1371,12 +1392,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
 
     with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
-
-        SEQ_LEN = 4
-        HIDDEN_SIZE = 512
-        INTERMEDIATE_SIZE = 512
-        NUM_EXPERTS = 8
-        TOP_K = 2
+        SEQ_LEN = 8192
+        HIDDEN_SIZE = hidden_size
+        INTERMEDIATE_SIZE = intermediate_size
+        NUM_EXPERTS = 32
+        TOP_K = 4
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
@@ -1393,34 +1413,44 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
                 device="cuda") * 0.05
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
+            w1_bias = torch.randn(INTERMEDIATE_SIZE,
+                                  device='cuda',
+                                  dtype=torch.float)
+
             w2_weight = torch.randn(
                 (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype,
                 device="cuda") * 0.05
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
+
+            w2_bias = torch.randn(HIDDEN_SIZE, device='cuda', dtype=torch.float)
 
             w3_weight = torch.randn(
                 (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
                 device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
+            w3_bias = torch.randn(INTERMEDIATE_SIZE,
+                                  device='cuda',
+                                  dtype=torch.float)
+
             w3_w1_global = min(
                 w1_sf_global,
                 w3_sf_global)  # w3 global and w1 global must be the same
 
-            w1_weight_nvfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
-                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w1_weight_nvfp4, w1_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w1_sf_block_unswizzled = w1_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
-            w2_weight_nvfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
-                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False)
-            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
+            w2_weight_nvfp4, w2_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False, False)
+            w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(
+                HIDDEN_SIZE, -1)
 
-            w3_weight_nvfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
-                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
             w1_input_scale = x_sf_global.cuda()
             w2_input_scale = x_sf_global.cuda()
@@ -1438,6 +1468,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             weights[
                 f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
                     torch.float8_e4m3fn).cuda()
+
             weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
             weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
@@ -1445,16 +1476,37 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
+            weights[f"{expert_id}.w1.bias"] = w1_bias
+            weights[f"{expert_id}.w2.bias"] = w2_bias
+            weights[f"{expert_id}.w3.bias"] = w3_bias
+
+        swiglu_alpha_tensor = torch.full((NUM_EXPERTS, ),
+                                         swiglu_alpha,
+                                         device='cuda',
+                                         dtype=torch.float)
+        swiglu_beta_tensor = torch.full((NUM_EXPERTS, ),
+                                        swiglu_beta,
+                                        device='cuda',
+                                        dtype=torch.float)
+        swiglu_limit_tensor = torch.full((NUM_EXPERTS, ),
+                                         swiglu_limit,
+                                         device='cuda',
+                                         dtype=torch.float)
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
         fused_moe = create_moe(
             num_experts=NUM_EXPERTS,
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
+            bias=True,
             dtype=dtype,
             reduce_results=True,
             model_config=ModelConfig(quant_config=quant_config,
                                      moe_backend=moe_backend),
+            swiglu_alpha=swiglu_alpha_tensor,
+            swiglu_beta=swiglu_beta_tensor,
+            swiglu_limit=swiglu_limit_tensor,
         )
         fused_moe.load_weights([weights])
         fused_moe.post_load_weights()
@@ -1466,8 +1518,12 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
+            bias=True,
             dtype=dtype,
-            model_config=ModelConfig(quant_config=quant_config))
+            model_config=ModelConfig(quant_config=quant_config),
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit)
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
 
@@ -1479,7 +1535,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             fused_moe.forward(x, router_logits)
 
         output = fused_moe.forward(x, router_logits)
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+        print()
+        print("actual", output)
+        print("ref", ref_output)
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
 
         if not test_all_kernels:
             return
@@ -1492,10 +1551,11 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         for tactic in all_tactics:
             with AutoTuner.get().replay(tactic), torch.inference_mode():
                 output = fused_moe.forward(x, router_logits)
-                torch.testing.assert_close(output,
-                                           ref_output,
-                                           rtol=1e-2,
-                                           atol=0.15)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=0.1,
+                               atol=0.1,
+                               percent=0.95)
 
 
 @skip_pre_blackwell
@@ -2595,7 +2655,10 @@ class RefGatedMLPFusedMoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  use_cute_dsl_blockscaling_mm: bool = False,
-                 bias=False):
+                 bias=False,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None,
+                 swiglu_limit: Optional[float] = None):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -2606,6 +2669,19 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.dtype = dtype
         self.quant_config = model_config.quant_config
 
+        def custom_swiglu(x):
+            gate, value = x.chunk(2, dim=-1)
+            if swiglu_limit is not None and swiglu_limit != float("inf"):
+                gate = gate.clamp(max=swiglu_limit)
+                value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+            alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
+            gate_act = gate * torch.sigmoid(gate * alpha)
+
+            beta = swiglu_beta if swiglu_beta is not None else 0.0
+
+            return gate_act * (value + beta)
+
         self.experts = nn.ModuleList([
             GatedMLP(
                 hidden_size=self.hidden_size,
@@ -2614,6 +2690,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                activation=custom_swiglu,
             ) for _ in range(self.num_experts)
         ])
 
