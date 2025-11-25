@@ -166,6 +166,11 @@ class OpenaiWorker(Worker):
             task.messages.append(
                 AssistantMessage(content, reasoning, reasoning_content,
                                  tool_calls))
+
+            if task.enable_token_counting:
+                task.prompt_tokens_num = response.usage.prompt_tokens
+                task.completion_tokens_num = response.usage.completion_tokens
+
             return TaskStatus.SUCCESS
 
         except Exception as e:

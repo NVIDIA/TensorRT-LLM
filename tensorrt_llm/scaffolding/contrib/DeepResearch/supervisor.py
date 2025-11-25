@@ -13,14 +13,18 @@ from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.task import (
     AssistantMessage,
     ChatTask,
+    MCPCallTask,
     SystemMessage,
     Task,
     UserMessage,
 )
 from tensorrt_llm.scaffolding.task_collection import (
+    ChatTokenCounter,
     DropKVCacheWorkerTag,
+    TaskTimer,
     drop_kv_cache_scope,
     sub_request_node,
+    with_task_collection,
 )
 from tensorrt_llm.scaffolding.worker import Worker
 
@@ -190,6 +194,7 @@ def create_open_deep_research_scaffolding_llm(
     mcp_worker: Worker,
     max_tokens: int = 16 * 1024,
     max_parallel_requests: int = 1024,
+    enable_statistics: bool = False,
 ) -> ScaffoldingLlm:
     gerneration_controller = NativeGenerationController(
         sampling_params={
@@ -198,8 +203,33 @@ def create_open_deep_research_scaffolding_llm(
         }
     )
 
-    research_chat_with_tools_controller = ChatWithMCPController(gerneration_controller)
-    research_compress_controller = Compressor(
+    supervisor_type = Supervisor
+    compressor_type = Compressor
+    chat_with_mcp_type = ChatWithMCPController
+    researcher_type = Researcher
+
+    if enable_statistics:
+        supervisor_type = with_task_collection(
+            "supervisor_tokens", ChatTokenCounter, statistics_name="supervisor"
+        )(supervisor_type)
+        compressor_type = with_task_collection(
+            "compress_tokens", ChatTokenCounter, statistics_name="compress"
+        )(compressor_type)
+        chat_with_mcp_type = with_task_collection(
+            "chat_with_mcp_tokens", ChatTokenCounter, statistics_name="chat_with_mcp"
+        )(chat_with_mcp_type)
+        researcher_type = with_task_collection(
+            "researcher_tokens", ChatTokenCounter, statistics_name="researcher"
+        )(researcher_type)
+        supervisor_type = with_task_collection(
+            "supervisor_timer",
+            TaskTimer,
+            statistics_name="supervisor",
+            task_types=[ChatTask, MCPCallTask],
+        )(supervisor_type)
+
+    research_chat_with_tools_controller = chat_with_mcp_type(gerneration_controller)
+    research_compress_controller = compressor_type(
         gerneration_controller,
         system_prompts=[
             SystemMessage(
@@ -209,7 +239,7 @@ def create_open_deep_research_scaffolding_llm(
         ],
     )
 
-    research_controller = Researcher(
+    research_controller = researcher_type(
         research_chat_with_tools_controller, research_compress_controller
     )
 
@@ -217,9 +247,10 @@ def create_open_deep_research_scaffolding_llm(
     research_planning_controller = gerneration_controller
     final_report_controller = gerneration_controller
 
-    supervisor_controller = Supervisor(
+    supervisor_controller = supervisor_type(
         brief_controller, research_planning_controller, research_controller, final_report_controller
     )
+
     scaffolding_llm = ScaffoldingLlm(
         supervisor_controller,
         {
