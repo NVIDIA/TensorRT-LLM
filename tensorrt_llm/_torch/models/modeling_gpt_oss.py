@@ -798,15 +798,8 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                     g, u = tensor[..., ::2], tensor[..., 1::2]
                     return torch.cat([g, u], dim=-1)
 
-                print("up projection shape before deinterleave:", gate_up.shape)
                 gate_up = deinterleave(gate_up)
-                print("up projection shape after deinterleave:", gate_up.shape)
-
-                print("up projection bias shape before deinterleave:",
-                      gate_up_bias.shape)
                 gate_up_bias = deinterleave(gate_up_bias)
-                print("up projection bias shape after deinterleave:",
-                      gate_up_bias.shape)
 
                 # Only fp32 bias is supported for NVFP4 MoE.
                 if gate_up_bias.dtype != torch.float32:
@@ -835,13 +828,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 # Per-expert block scales (transpose to expected layout)
                 if 'gate_up_proj_weight_scale' in module_weights:
                     gu_ws = module_weights['gate_up_proj_weight_scale']
-                    print(
-                        "up projection weight scale shape before deinterleave:",
-                        gu_ws.shape)
                     gu_ws = deinterleave(gu_ws)
-                    print(
-                        "up projection weight scale shape after deinterleave:",
-                        gu_ws.shape)
                     moe_weights['gate_up_proj_weight_scale'] = [
                         gu_ws[i, :, :] for i in range(num_expert)
                     ]

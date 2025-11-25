@@ -453,7 +453,7 @@ class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 public:
     explicit FP4BlockScaleMoeRunner()
         // Update this as new cubins come in
-        : mSupportedTileN{8, 16, 32, 64, 128}
+        : mSupportedTileN{8, 16, 32, 64, 128, 256}
     {
         for (int tileN : mSupportedTileN)
         {
@@ -462,8 +462,14 @@ public:
     }
 
     [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens)
     {
+        // WAR: TileN 256 kernels crash for GPT-OSS 3072 (after padding) hidden size
+        if (hiddenSize == 3072 && mSupportedTileN.back() == 256)
+        {
+            mSupportedTileN.pop_back();
+        }
+
         // returns (tileN, config)
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
@@ -527,7 +533,7 @@ public:
 private:
     using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
-    std::vector<int32_t> const mSupportedTileN;
+    std::vector<int32_t> mSupportedTileN;
     std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
 
     btg::Dtype mDtypeElt{btg::Dtype::E2m1};
