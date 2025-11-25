@@ -600,10 +600,10 @@ class ExecutorRequestQueue:
                 payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
+            if self.send_requests_handler is not None:
+                with nvtx_range("wait_prev_send_requests_handler"):
+                    self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                if self.send_requests_handler is not None:
-                    with nvtx_range("wait_prev_send_requests_handler"):
-                        self.send_requests_handler.wait()
                 self.send_requests_handler = self.dist.isend_object(
                     payloads, self.dist.next_pp_rank, tag)
 
