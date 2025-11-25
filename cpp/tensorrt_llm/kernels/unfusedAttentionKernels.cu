@@ -2126,7 +2126,6 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
         reinterpret_cast<DstPack&>(dst[i]) = dstPack;
     }
     // Handle tail elements
-#pragma unroll
     for (int64_t j = aligned_size; j < size; j++){
         dst[j] = Dst{float{src[j]} * scale};
     }
