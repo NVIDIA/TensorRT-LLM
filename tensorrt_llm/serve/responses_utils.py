@@ -741,7 +741,7 @@ def _create_output_messages(
 
 def _get_chat_completion_function_tools(
         tools: Optional[List[Tool]]) -> List[ChatCompletionToolsParam]:
-    function_tools: List[ChatCompletionToolsParam]() = []
+    function_tools: List[ChatCompletionToolsParam] = []
     if tools is None:
         return function_tools
 
@@ -962,7 +962,7 @@ async def _create_output_content(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     tools: Optional[List[Tool]] = None,
-) -> List[ResponseOutputItem]:
+) -> Tuple[List[ResponseOutputItem], List[ChatCompletionMessageParam]]:
     output_items: List[ResponseOutputItem] = []
     output_messages: List[ChatCompletionMessageParam] = []
     available_tools = _get_chat_completion_function_tools(tools)
@@ -1036,7 +1036,8 @@ async def _create_output_content(
 
 
 async def _create_output_content_harmony(
-        final_res: RequestOutput) -> List[ResponseOutputItem]:
+        final_res: RequestOutput
+) -> Tuple[List[ResponseOutputItem], List[Message]]:
     output_messages = _parse_output_tokens(final_res.outputs[0].token_ids)
     output_content = []
 
@@ -1423,6 +1424,17 @@ def _generate_streaming_event(
     delta_text = output.text_diff
     calls = []
 
+    def check_parser(parser_id: Optional[str],
+                     parser_dict: Optional[Dict[int, BaseReasoningParser]]):
+        if parser_id is not None:
+            if parser_dict is None:
+                raise RuntimeError(
+                    f"Parser({parser_id}) dictionary is not provided for streaming"
+                )
+
+    check_parser(reasoning_parser_id, reasoning_parser_dict)
+    check_parser(tool_parser_id, tool_parser_dict)
+
     delta_text, reasoning_delta_text = _apply_reasoning_parser(
         reasoning_parser_id=reasoning_parser_id,
         output_index=output_idx,
@@ -1446,13 +1458,6 @@ def _generate_streaming_event(
         repr(
             f" ---------> delta text: {delta_text}, reasoning delta text: {reasoning_delta_text}, calls: {calls}"
         ))
-
-    if reasoning_parser_dict is None:
-        raise RuntimeError(
-            "Reasoning parser dictionary is not provided for streaming")
-    if output_idx not in reasoning_parser_dict:
-        raise RuntimeError(
-            f"Reasoning parser for output index {output_idx} is not found")
 
     # Check if we need to send done events for completed sections
     should_send_reasoning_done, should_send_text_done, reasoning_full_content, text_full_content = _should_send_done_events(
