@@ -609,6 +609,15 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
         quant_config = self.model_config.quant_config
         if quant_config.exclude_modules:
+            if quant_config.quant_algo == "NVFP4":
+                quant_config.exclude_modules = [
+                    'block.*.attn.qkv',
+                    'block.*.attn.out',
+                    'block.*.mlp.gate',
+                    'embedding',
+                    'unembedding',
+                ]
+
             for i, module in enumerate(quant_config.exclude_modules):
                 names = module.split(".")
                 if names[-1] in params_map_reverse:
