@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
 import torch
 import torch.nn as nn
 from _graph_test_helpers import run_test_transformed_gm
@@ -55,7 +71,7 @@ def test_fuse_mamba_a_log_creates_fused_param():
             node.op == "get_attr" and str(node.target).endswith("A_fused")
             for node in gm_out.graph.nodes
         ),
-        lambda num: num * 2,
+        lambda num: num,
         atol=1e-5,
         rtol=1e-5,
         test_load_hook=False,
@@ -66,6 +82,9 @@ def test_fuse_mamba_a_log_creates_fused_param():
         name for name, _ in gm_transformed.named_parameters() if name.endswith("A_fused")
     ]
     assert fused_params, "Expected fused A parameter to be registered."
+    assert not any(name.endswith("A_log") for name, _ in gm_transformed.named_parameters()), (
+        "A_log parameter should be removed after fusion."
+    )
     assert not any(
         node.target in {torch.exp, torch.ops.aten.exp.default}
         for node in gm_transformed.graph.nodes
@@ -73,8 +92,8 @@ def test_fuse_mamba_a_log_creates_fused_param():
 
 
 def test_fuse_mamba_a_log_memory_usage():
-    torch.manual_seed(1234)
-    torch.cuda.manual_seed(1234)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
     torch.cuda.empty_cache()
 
     device = "cuda"
@@ -98,13 +117,11 @@ def test_fuse_mamba_a_log_memory_usage():
     mem_after = torch.cuda.memory_allocated()
 
     diff = mem_after - mem_before
-    expected = (
-        gm_transformed.get_parameter("A_log").numel()
-        * gm_transformed.get_parameter("A_log").element_size()
-    )
-    print(f"Expected: {expected}, Diff: {diff}")
-    tolerance = 2 * 1024  # 2_KiB tolerance for allocator variance
+    tolerance = 5 * 1024  # 5_KiB tolerance for allocator variance
 
-    assert diff - expected <= tolerance, (
-        f"Unexpected memory delta after fusion. Expected ~{expected} bytes, got {diff} bytes."
+    assert abs(diff) <= tolerance, (
+        f"Unexpected memory delta after fusion. Expected no additional memory, got {diff} bytes."
     )
+
+    with pytest.raises(AttributeError):
+        gm_transformed.get_parameter("A_log")

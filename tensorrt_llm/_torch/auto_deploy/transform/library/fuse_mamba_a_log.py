@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Transform to fuse A_log into A for Mamba/NemotronH models."""
 
 import operator
@@ -32,6 +47,13 @@ def _set_attr_by_name(obj, name, value):
     for part in parts[:-1]:
         obj = getattr(obj, part)
     setattr(obj, parts[-1], value)
+
+
+def _del_attr_by_name(obj, name):
+    parts = name.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    delattr(obj, parts[-1])
 
 
 _PATTERN_INPUT_NAME = "a_log_like"
@@ -80,6 +102,35 @@ def _ensure_a_fused_param(gm: GraphModule, param_name: str) -> Optional[str]:
         nn.Parameter(a_fused, requires_grad=False),
     )
     return new_param_name
+
+
+def _remove_unused_a_log_params(gm: GraphModule) -> bool:
+    """Remove detached A_log parameters after fusion."""
+
+    def _is_a_log_node(node: Node) -> bool:
+        return (
+            node.op == "get_attr" and isinstance(node.target, str) and node.target.endswith("A_log")
+        )
+
+    used_a_log_targets = {str(node.target) for node in gm.graph.nodes if _is_a_log_node(node)}
+    removed = False
+
+    def _maybe_remove(name: str) -> None:
+        nonlocal removed
+        if not name.endswith("A_log") or name in used_a_log_targets:
+            return
+        try:
+            _del_attr_by_name(gm, name)
+            removed = True
+        except AttributeError:
+            ad_logger.warning(f"Failed to delete unused parameter {name} from GraphModule.")
+
+    for name, _ in list(gm.named_parameters()):
+        _maybe_remove(name)
+    for name, _ in list(gm.named_buffers()):
+        _maybe_remove(name)
+
+    return removed
 
 
 def _has_a_log_attr(match: Match) -> bool:
@@ -176,6 +227,7 @@ class FuseMambaALog(BaseTransform):
 
         if num_matches > 0:
             gm.graph.eliminate_dead_code()
+            _remove_unused_a_log_params(gm)
 
         return gm, TransformInfo(
             skipped=False,
