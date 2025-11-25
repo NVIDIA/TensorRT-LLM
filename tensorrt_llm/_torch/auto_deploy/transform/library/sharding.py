@@ -117,20 +117,19 @@ class ShardingTransformExecutor(BaseTransform):
             return transform.check_and_apply(gm, node_dict[transform.target_node])
 
         num_matches = 0
-        for tp_transform in shared_config.sharding_transform_container.weight_sharding_transforms:
+        transforms = shared_config.sharding_transform_container
+        for tp_transform in transforms.weight_sharding_transforms:
             if check_and_apply(tp_transform):
                 num_matches += 1
-        for bmm_transform in shared_config.sharding_transform_container.bmm_transforms:
+        for bmm_transform in transforms.bmm_transforms:
             if check_and_apply(bmm_transform):
                 num_matches += 1
-        for ep_transform in shared_config.sharding_transform_container.ep_transforms:
+        for ep_transform in transforms.ep_transforms:
             if check_and_apply(ep_transform):
                 num_matches += 1
 
         # post-sharding cleanup transformations
-        for (
-            update_transform
-        ) in shared_config.sharding_transform_container.parameter_update_transforms:
+        for update_transform in transforms.parameter_update_transforms:
             if not check_and_apply(update_transform):
                 ad_logger.warning(f"Invalid parameter update transformation {update_transform}.")
 
