@@ -216,6 +216,11 @@ class ChatTask(StreamGenerationTask):
     messages: list[RoleMessage] = field(default_factory=list)
     tools: Any = field(default=None)
 
+    # for token counting
+    enable_token_counting: bool = field(default=False)
+    prompt_tokens_num: int = field(default=0)
+    completion_tokens_num: int = field(default=0)
+
     # for sub request marker
     sub_request_markers: list[tuple[str, int]] = field(default_factory=list)
     unique_id: Optional[int] = field(default=None)

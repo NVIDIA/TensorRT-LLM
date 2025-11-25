@@ -10,9 +10,10 @@ from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, OpenAIToolDescription, RewardTask,
                    StreamGenerationTask, SystemMessage, Task, TaskStatus,
                    UserMessage)
-from .task_collection import (DropKVCacheWorkerTag, GenerationTokenCounter,
-                              TaskCollection, drop_kv_cache_scope,
-                              sub_request_node, with_task_collection)
+from .task_collection import (ChatTokenCounter, DropKVCacheWorkerTag,
+                              GenerationTokenCounter, TaskCollection, TaskTimer,
+                              drop_kv_cache_scope, sub_request_node,
+                              with_task_collection)
 from .worker import (MCPWorker, OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker,
                      Worker)
 
@@ -50,6 +51,8 @@ __all__ = [
     "TaskCollection",
     "with_task_collection",
     "GenerationTokenCounter",
+    "ChatTokenCounter",
+    "TaskTimer",
     "sub_request_node",
     "async_scaffolding_benchmark",
     "ScaffoldingBenchRequest",
