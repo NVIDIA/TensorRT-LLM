@@ -476,14 +476,22 @@ class TorchDist(Distributed):
         if self.cluster_info is not None:
             return self.cluster_info
 
-        if ray.is_initialized():
+        is_ray_initialized = False
+        try:
+            if ray.is_initialized():
+                is_ray_initialized = True
+        except Exception:
+            pass
+
+        if is_ray_initialized:
             node_ip = ray.util.get_node_ip_address()
+            gpu_index = [int(id) for id in ray.get_gpu_ids()]
+            assert len(gpu_index) == 1
+            gpu_id = gpu_index[0]
         else:
-            raise RuntimeError("Ray is not initialized")
-
-        gpu_index = [int(id) for id in ray.get_gpu_ids()]
-
-        assert len(gpu_index) == 1
+            import socket
+            node_ip = socket.gethostbyname(socket.gethostname())
+            gpu_id = torch.cuda.current_device()
 
         # Gather node ip
         node_list = [None] * torch.distributed.get_world_size()
@@ -492,7 +500,7 @@ class TorchDist(Distributed):
 
         # Gather gpu index
         gpu_list = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gpu_list, gpu_index[0])
+        torch.distributed.all_gather_object(gpu_list, gpu_id)
 
         # Gather rank
         rank_list = [None] * torch.distributed.get_world_size()
@@ -639,8 +647,15 @@ class TorchDist(Distributed):
                   obj: int | float | torch.Tensor,
                   op=torch.distributed.ReduceOp.SUM):
         is_base_type = isinstance(obj, int) or isinstance(obj, float)
+        device = torch.device(
+            "cuda") if dist.get_backend() == "nccl" else torch.device("cpu")
+
         if is_base_type:
-            obj = torch.tensor(obj)
+            obj = torch.tensor(obj, device=device)
+        elif isinstance(obj, torch.Tensor):
+            # Ensure tensor is on the correct device
+            if obj.device != device:
+                obj = obj.to(device)
 
         dist.all_reduce(obj, op=op)
 
