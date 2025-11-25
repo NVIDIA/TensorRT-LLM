@@ -1520,15 +1520,16 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
+        assert isinstance(gm, GraphModule), "Expecting GraphModule"
+        self.config.factory_config = factory.get_sharding_config() if factory else {}
+        transform_container = shared_config.sharding_transform_container
+        transform_container.init_params(self.config, local_rank, world_size)
+
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        assert isinstance(gm, GraphModule), "Expecting GraphModule"
-        self.config.factory_config = factory.get_sharding_config() if factory else {}
-        transform_container = shared_config.sharding_transform_container
-        transform_container.init_params(self.config, local_rank, world_size)
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
         for source in config.sharding_source:
