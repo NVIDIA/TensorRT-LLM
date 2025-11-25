@@ -1221,19 +1221,11 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        if self.fuse_a_indexer_k_weight:
-            q, compressed_kv, k_pe, indexer_k, indexer_weights = self.kv_a_proj_with_mqa(
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                    self.indexer.head_dim, self.indexer.n_heads
-                ], -1)
-        else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
-                ], -1)
-            indexer_k = None
-            indexer_weights = None
+        q, compressed_kv, k_pe, indexer_k = self.kv_a_proj_with_mqa(
+            hidden_states).split([
+                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
+                self.indexer.head_dim
+            ], -1)
 
         # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
@@ -1255,7 +1247,6 @@ class MLA(nn.Module):
             attn_metadata,
             position_ids,
             indexer_k=indexer_k,  # indexer K proj
-            indexer_weights=indexer_weights,  # indexer weights proj
         )
 
         assert q.shape[
@@ -1709,6 +1700,9 @@ class MLA(nn.Module):
             device=q.device,
         )
 
+        # Compute helix_position_offsets for helix parallelism.
+        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
+
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -1722,10 +1716,18 @@ class MLA(nn.Module):
             maybe_execute_in_parallel(
                 lambda: torch.ops.trtllm.bmm_out(
                     q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                lambda: self.mqa.mla_rope_generation(fused_q,
+                                                     q_pe,
+                                                     latent_cache,
+                                                     attn_metadata,
+                                                     cu_q_seqlens,
+                                                     cu_kv_seqlens,
+                                                     fmha_scheduler_counter,
+                                                     mla_bmm1_scale,
+                                                     mla_bmm2_scale,
+                                                     quant_q_buffer,
+                                                     helix_position_offsets=
+                                                     helix_position_offsets),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1743,10 +1745,18 @@ class MLA(nn.Module):
                     q_nope_out,
                     self.k_b_proj_trans_dequant,
                 ),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                lambda: self.mqa.mla_rope_generation(fused_q,
+                                                     q_pe,
+                                                     latent_cache,
+                                                     attn_metadata,
+                                                     cu_q_seqlens,
+                                                     cu_kv_seqlens,
+                                                     fmha_scheduler_counter,
+                                                     mla_bmm1_scale,
+                                                     mla_bmm2_scale,
+                                                     quant_q_buffer,
+                                                     helix_position_offsets=
+                                                     helix_position_offsets),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
