@@ -13,3 +13,9 @@ moe_config:
 num_postprocess_workers: 4
 print_iter_log: true
 stream_interval: 20
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 20000
+max_seq_len: 9236
