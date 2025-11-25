@@ -919,15 +919,12 @@ class PyExecutor:
                     if not self.dist.is_last_pp_rank:
                         recv_object_funct = self.dist.recv_object_from_isend if self._disable_mpi \
                             else self.dist.recv_object
-                        torch.cuda.nvtx.range_push(
-                            "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        sample_state.host = recv_object_funct(
-                            src=self.dist.prev_pp_rank,
-                            tag=prev_microbatch_id,
-                        )
-                    else:
-                        torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
+                        with nvtx_range("recv_sample_state"):
+                            sample_state.host = recv_object_funct(
+                                src=self.dist.prev_pp_rank,
+                                tag=prev_microbatch_id,
+                            )
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
@@ -939,7 +936,6 @@ class PyExecutor:
                                     sample_state.host,
                                     dest=self.dist.next_pp_rank,
                                     tag=prev_microbatch_id)
-                    torch.cuda.nvtx.range_pop()
 
                 # Stage 3: Finalize previous batch that finished sample state communication
                 # In last pp rank, stage 2 and 3 process different previous batches
@@ -1003,6 +999,7 @@ class PyExecutor:
 
                 self.iter_counter += 1
 
+    @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, microbatch_id):
         if self.send_handles[microbatch_id] is not None:
             self.send_handles[microbatch_id].wait()
@@ -1640,7 +1637,6 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
-    @nvtx_range("_fetch_and_activate_new_requests")
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
