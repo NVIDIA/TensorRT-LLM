@@ -10,3 +10,9 @@ kv_cache_config:
 stream_interval: 10
 moe_config:
   backend: CUTLASS
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 8320
+max_seq_len: 9416

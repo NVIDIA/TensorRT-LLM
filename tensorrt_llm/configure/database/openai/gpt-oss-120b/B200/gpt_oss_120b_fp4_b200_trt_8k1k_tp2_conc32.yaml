@@ -14,3 +14,9 @@ stream_interval: 20
 num_postprocess_workers: 4
 moe_config:
   backend: TRTLLM
+tensor_parallel_size: 2
+moe_expert_parallel_size: 2
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 20000
+max_seq_len: 9236

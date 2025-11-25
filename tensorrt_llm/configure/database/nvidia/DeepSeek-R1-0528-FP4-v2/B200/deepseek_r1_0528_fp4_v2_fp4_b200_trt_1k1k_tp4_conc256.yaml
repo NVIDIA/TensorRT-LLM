@@ -14,3 +14,9 @@ attention_dp_config:
   batching_wait_iters: 0
   enable_balance: true
   timeout_iters: 60
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 1344
+max_seq_len: 2068
