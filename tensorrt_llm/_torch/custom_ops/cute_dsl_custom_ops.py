@@ -83,12 +83,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # full shamoo
             mma_tiler_mn_candidates = [
+                (256, 64),
+                (128, 64),
+                (256, 192),
+                (128, 192),
                 (256, 128),
                 (128, 128),
                 (128, 256),
                 (256, 256),
-                (256, 64),
-                (128, 64),
             ]
             cluster_shape_mn_candidates = [
                 (1, 1),
@@ -265,6 +267,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     swap_ab,
+                    options=f"--opt-level 2",
                 )
 
                 CuteDSLNVFP4BlackwellLinear.kernel_dict[

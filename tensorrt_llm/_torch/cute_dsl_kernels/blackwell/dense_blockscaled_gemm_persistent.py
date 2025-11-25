@@ -58,9 +58,10 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
+from custom_pipeline import (
     PipelineTmaUmma, PipelineUmmaAsync)
 
+# from testing import benchmark
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
@@ -81,7 +82,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             * Float8E4M3FN/Float8E5M2
         - Constraints:
             * MMA tiler M must be 128 or 256 (use_2cta_instrs).
-            * MMA tiler N must be 128 or 256.
+            * MMA tiler N must be 64/128/192/256
             * Cluster shape M must be a multiple of 2 if MMA tiler M is 256.
             * Cluster shape M/N must be positive and a power of 2, with total cluster size <= 16.
             * Cluster shape M/N must be <= 4 for scale factor multicasts due to limited scale factor size.
@@ -100,6 +101,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        use_prefetch: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -125,7 +127,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
-
+        self.use_prefetch = use_prefetch
         self.cta_group = (tcgen05.CtaGroup.TWO
                           if self.use_2cta_instrs else tcgen05.CtaGroup.ONE)
 
@@ -215,6 +217,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        self.cta_tile_shape_mnk_sfb = (
+            self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler_sfb[1],
+            self.mma_tiler_sfb[2],
+        )
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -242,6 +249,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_layout,
             self.c_dtype,
         )
+
+        self.epi_tile_n = cute.size(self.epi_tile[1])
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
@@ -291,6 +300,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epi_tile,
             self.num_c_stage,
         )
+
+        self.overlapping_accum = self.num_acc_stage == 1
+        sf_atom_mn = 32
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
+
+        # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
+        self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n
+
+        # TODO: [alel] Currently set prefetch dist to num_ab_stage, we may have more option for prefetch dist auto tuning
+        self.prefetch_dist = self.num_ab_stage
 
     @cute.jit
     def __call__(
@@ -433,6 +455,30 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.cluster_layout_sfb_vmnk.shape,
             internal_type=cutlass.Int16,
         )
+        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+            x = tma_tensor_sfb.stride[0][1]
+            y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
+
+            new_shape = (
+                (
+                    tma_tensor_sfb.shape[0][0],
+                    ((2, 2), y)
+                ),
+                tma_tensor_sfb.shape[1],
+                tma_tensor_sfb.shape[2]
+            )
+            # Use right multiplication for ScaledBasis (3 * x instead of x * 3)
+            x_times_3 = 3 * x
+            new_stride = (
+                (
+                    tma_tensor_sfb.stride[0][0],
+                    ((x, x), x_times_3)
+                ),
+                tma_tensor_sfb.stride[1],
+                tma_tensor_sfb.stride[2]
+            )
+            tma_tensor_sfb_new_layout = cute.make_layout(new_shape, stride=new_stride)
+            tma_tensor_sfb = cute.make_tensor(tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout)
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -541,6 +587,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             smem=self.shared_storage.size_in_bytes(),
+            min_blocks_per_mp=1,
             stream=stream,
         )
         return
@@ -804,8 +851,29 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(
-            cute.append(acc_shape, self.num_acc_stage))
+        if cutlass.const_expr(self.overlapping_accum):
+            num_acc_stage_overlapped = 2
+            tCtAcc_fake = tiled_mma.make_fragment_C(
+                cute.append(acc_shape, num_acc_stage_overlapped)
+            )
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = cute.make_tensor(
+                tCtAcc_fake.iterator,
+                cute.make_layout(
+                    tCtAcc_fake.shape,
+                    stride = (
+                        tCtAcc_fake.stride[0],
+                        tCtAcc_fake.stride[1],
+                        tCtAcc_fake.stride[2],
+                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1]
+                    ) 
+                )
+            )
+        else:
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = tiled_mma.make_fragment_C(
+                cute.append(acc_shape, self.num_acc_stage)
+            )
 
         #
         # Cluster wait before tensor memory alloc
@@ -860,6 +928,26 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tBgSFB_slice = tBgSFB[(None, slice_n, None,
                                        mma_tile_coord_mnl[2])]
 
+                if cutlass.const_expr(self.use_prefetch):
+                    # Prefetch both A and B (default behavior)
+                    for pf_k_block in cutlass.range(0, min(self.prefetch_dist, k_block_cnt), unroll=1):
+                        cute.prefetch(
+                            tma_atom_a,
+                            tAgA_slice[(None, pf_k_block)],
+                        )
+                        cute.prefetch(
+                            tma_atom_b,
+                            tBgB_slice[(None, pf_k_block)],
+                        )
+                        cute.prefetch(
+                            tma_atom_sfa,
+                            tAgSFA_slice[(None, pf_k_block)],
+                        )
+                        cute.prefetch(
+                            tma_atom_sfb,
+                            tBgSFB_slice[(None, pf_k_block)],
+                        )
+
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -908,6 +996,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         mcast_mask=sfb_full_mcast_mask,
                     )
 
+                    # Prefetch: Rolling prefetch for next tiles
+                    if cutlass.const_expr(self.use_prefetch):
+                        if k_block < k_block_cnt - self.prefetch_dist:
+                            future_k_block = ab_producer_state.count + self.prefetch_dist
+                            # Prefetch both A and B (default behavior)
+                            cute.prefetch(
+                                tma_atom_a,
+                                tAgA_slice[(None, future_k_block)],
+                            )
+                            cute.prefetch(
+                                tma_atom_b,
+                                tBgB_slice[(None, future_k_block)],
+                            )
+                            cute.prefetch(
+                                tma_atom_sfa,
+                                tAgSFA_slice[(None, future_k_block)],
+                            )
+                            cute.prefetch(
+                                tma_atom_sfb,
+                                tBgSFB_slice[(None, future_k_block)],
+                            )
+
                     # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
@@ -954,7 +1064,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             # Make SFA tmem tensor
             sfa_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
+                acc_tmem_ptr + self.num_accumulator_tmem_cols,
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_M, MMA_K)
@@ -968,9 +1078,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             # Make SFB tmem tensor
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr +
-                tcgen05.find_tmem_tensor_col_offset(tCtAcc_base) +
-                tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+                acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_N, MMA_K)
@@ -1010,10 +1118,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     cur_tile_coord[2],
                 )
 
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_producer_state.phase ^ 1
+                else:
+                    acc_stage_index = acc_producer_state.index
+
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[(None, None, None,
-                                      acc_producer_state.index)]
+                                      acc_stage_index)]
 
                 # Peek (try_wait) AB buffer full for k_block = 0
                 ab_consumer_state.reset_count()
@@ -1029,13 +1142,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
                 tCtSFB_mma = tCtSFB
-                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+                    # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
+                    offset = cutlass.Int32(2) if mma_tile_coord_mnl[1] % 2 == 1 else cutlass.Int32(0)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols
+                        + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     # Move in increments of 64 columns of SFB
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
-                        acc_tmem_ptr +
-                        tcgen05.find_tmem_tensor_col_offset(tCtAcc_base) +
-                        tcgen05.find_tmem_tensor_col_offset(tCtSFA) + offset,
+                        acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols
+                        + offset,
                         dtype=self.sf_dtype,
                     )
                     tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
@@ -1230,10 +1351,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     *mma_tile_coord_mnl,
                 )]
 
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_consumer_state.phase
+                    reverse_subtile = cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
+                else:
+                    acc_stage_index = acc_consumer_state.index
+
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None,
-                                          acc_consumer_state.index)]
+                                          acc_stage_index)]
 
                 #
                 # Wait for accumulator buffer full
@@ -1249,12 +1376,26 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
                 for subtile_idx in cutlass.range(subtile_cnt):
+                    real_subtile_idx = subtile_idx
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if reverse_subtile:
+                            real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
+                    #
+                    # Async arrive accumulator buffer empty ealier when overlapping_accum is enabled
+                    #
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if subtile_idx == self.iter_acc_early_release_in_epilogue:
+                            # Fence for TMEM load
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_consumer_state.advance()
                     #
                     # Convert to C type
                     #
@@ -1291,7 +1432,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx)],
+                            bSG_gC[(None, real_subtile_idx)],
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
@@ -1304,9 +1445,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
+                if cutlass.const_expr(not self.overlapping_accum):
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
@@ -1755,7 +1897,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if not mma_tiler_mn[0] in [128, 256]:
             is_valid = False
-        if not mma_tiler_mn[1] in [64, 128, 256]:
+        if not mma_tiler_mn[1] in [64, 128, 192, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
@@ -2026,11 +2168,13 @@ def run(
     c_major: str,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
+    use_prefetch: bool = False,
     tolerance: float = 1e-01,
     warmup_iterations: int = 0,
     iterations: int = 1,
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
+    # use_cupti: bool = False,
     **kwargs,
 ):
     """Runs and benchmarks the persistent batched dense block-scaled GEMM.
@@ -2079,11 +2223,13 @@ def run(
     print(
         f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}"
     )
+    print(f"Use prefetch: {'True' if use_prefetch else 'False'}")
     print(f"Tolerance: {tolerance}")
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
+    # print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
 
     # Unpack parameters
     m, n, k, l = mnkl
@@ -2236,6 +2382,7 @@ def run(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
+        use_prefetch,
     )
 
     # Compute max active clusters on current device
@@ -2257,6 +2404,7 @@ def run(
         1.0,  # alpha
         max_active_clusters,
         current_stream,
+        options=f"--opt-level 2",
     )
 
     # Compute reference result
@@ -2353,6 +2501,15 @@ def run(
         warmup_iterations=warmup_iterations,
         iterations=iterations,
     )
+    # exec_time = benchmark(
+    #     compiled_gemm,
+    #     workspace_generator=generate_tensors,
+    #     workspace_count=workspace_count,
+    #     stream=current_stream,
+    #     warmup_iterations=warmup_iterations,
+    #     iterations=iterations,
+    #     use_cupti=use_cupti,
+    # )
 
     return exec_time  # Return execution time in microseconds
 
@@ -2400,6 +2557,12 @@ if __name__ == "__main__":
     parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
     parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
     parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
+    parser.add_argument(
+        "--use_prefetch",
+        action="store_true",
+        default=False,
+        help="Enable TMA prefetch for both A and B matrices (default: False)",
+    )
     parser.add_argument("--tolerance",
                         type=float,
                         default=1e-01,
@@ -2423,6 +2586,18 @@ if __name__ == "__main__":
         default=False,
         help="Use circular buffer tensor sets to ensure L2 cold cache",
     )
+    # parser.add_argument(
+    #     "--use_cupti",
+    #     action="store_true",
+    #     default=False,
+    #     help="Use CUPTI to measure execution time",
+    # )
+    # parser.add_argument(
+    #     "--print_duration",
+    #     action="store_true",
+    #     default=False,
+    #     help="Print execution time",
+    # )
 
     args = parser.parse_args()
 
@@ -2446,10 +2621,34 @@ if __name__ == "__main__":
         args.c_major,
         args.mma_tiler_mn,
         args.cluster_shape_mn,
+        args.use_prefetch,
         args.tolerance,
         args.warmup_iterations,
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
     )
+
+    # TODO: [alel] Would like to involve cupti testing here, but need to double check how to add cupti wheel in framework
+    # exec_time = run(
+    #     args.mnkl,
+    #     args.ab_dtype,
+    #     args.sf_dtype,
+    #     args.sf_vec_size,
+    #     args.c_dtype,
+    #     args.a_major,
+    #     args.b_major,
+    #     args.c_major,
+    #     args.mma_tiler_mn,
+    #     args.cluster_shape_mn,
+    #     args.use_prefetch,
+    #     args.tolerance,
+    #     args.warmup_iterations,
+    #     args.iterations,
+    #     args.skip_ref_check,
+    #     args.use_cold_l2,
+    #     #args.use_cupti,
+    # )
+    # if args.print_duration:
+    #     print(f"Execution time: {exec_time} us")
     print("PASS")
