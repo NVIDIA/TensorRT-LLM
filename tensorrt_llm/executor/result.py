@@ -23,7 +23,6 @@ from .._ray_utils import unwrap_ray_errors
 from .._utils import mpi_disabled, nvtx_range_debug, ray_use_rpc
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
@@ -871,7 +870,6 @@ class GenerationResult(GenerationResultBase):
             response = self._handle_ray_response(response)
         else:
             response = await self.aqueue.get()
-        global_tracer().log_instant("result_step.get")
         self._handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
