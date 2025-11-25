@@ -128,7 +128,21 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WID
 
 ## Parse profiles
 
-Coming soon.
+Run the following command in the container:
+
+```bash
+python3 parse.py --world-size 4
+
+# Specify the location of the .nsys-rep file
+python3 parse.py --profile-dir ./profiles --world-size 4 --rank 0
+```
+
+It can parse only GEN phase profiles for now.
+
+You will receive three reports, each containing kernel timing statistics grouped by module:
+1. A printed report on stdout
+2. A CSV report at `profiles/report_np4_rank0.csv`
+3. An HTML report at `profiles/report_np4_rank0.html`
 
 ## Trouble shooting
 

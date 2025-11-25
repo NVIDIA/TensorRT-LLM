@@ -4,7 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CUDA Kernel Latency Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <script
+        src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js"
+        integrity="sha384-F07Cpw5v8spSU0H113F33m2NQQ/o6GqPTnTjf45ssG4Q6q58ZwhxBiQtIaqvnSpR"
+        crossorigin="anonymous">
+    </script>
     <style>
         :root {
             --bg-color: #1e1e1e;
@@ -380,7 +384,7 @@
 
                 html += `<td class="data-cell col-${colIdx}" onclick="handleCellClick('${uniqueId}', ${colIdx})">
                             <div class="progress-bar" style="width: ${pct}%;"></div>
-                            <div class="cell-content">${fmt(val)}</div>
+                            <div class="cell-content">${val ? fmt(val) : ""}</div>
                          </td>`;
             });
             html += `</tr>`;
@@ -467,12 +471,19 @@
     function updateBarChart() {
         if (!barChartInst) barChartInst = echarts.init(document.getElementById('barChart'));
 
-        const data = (activeRowNode.time || activeRowNode.calculatedTime).map(v => parseFloat(fmt(v)));
+        const data = activeRowNode.time || activeRowNode.calculatedTime;
         const barColor = (activeRowNode.name === 'Total') ? '#00b894' : '#007acc';
 
         const option = {
             backgroundColor: 'transparent',
-            tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+            tooltip: {
+                trigger: 'axis',
+                axisPointer: { type: 'shadow' },
+                formatter: function(params) {
+                    const param = params[0];
+                    return `${param.name}<br/>${param.marker} <b>${param.value.toFixed(1)}</b>`;
+                }
+            },
             grid: { top: 30, bottom: 60, left: 50, right: 20 },
             xAxis: {
                 type: 'category',
@@ -514,7 +525,7 @@
 
                 const isCollapsed = domRow.classList.contains('collapsed');
                 const isLeaf = !node.children || node.children.length === 0;
-                const val = parseFloat(fmt((node.time || node.calculatedTime)[activeColIndex]));
+                const val = (node.time || node.calculatedTime)[activeColIndex];
                 const isSelected = (currentId === activeRowId);
 
                 const item = {
@@ -545,6 +556,9 @@
             backgroundColor: 'transparent',
             tooltip: {
                 trigger: 'item',
+                formatter: function(param) {
+                    return `${param.name}<br/>${param.marker} <b>${param.value.toFixed(1)}</b>`;
+                }
             },
             series: {
                 type: 'sunburst',
@@ -554,7 +568,7 @@
                 label: { rotate: 'radial', minAngle: 5 },
                 itemStyle: { borderRadius: 2 },
                 emphasis: { focus: 'ancestor' },
-                animationDuration: 0,
+                animationDuration: 300,
                 color: ['#a63a3a', '#2f4554', '#266b4b', '#a88432', '#603675', '#3b5090']
             }
         };

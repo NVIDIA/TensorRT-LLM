@@ -1,5 +1,6 @@
 import argparse
 import bisect
+import csv
 import json
 import re
 import sqlite3
@@ -15,6 +16,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--profile-dir", type=str, default="profiles")
 parser.add_argument("--world-size", "--np", type=int)
 parser.add_argument("--rank", type=int, default=0)
+parser.add_argument("--warmup-times", type=int)
 group = parser.add_mutually_exclusive_group(required=False)
 group.add_argument("--error-on-unknown-kernel", action="store_true", dest="error_on_unknown_kernel")
 group.add_argument(
@@ -87,6 +89,7 @@ def shortest_common_supersequence(a, b):
 profile_dir = Path(args.profile_dir)
 nsys_rep_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.nsys-rep"
 sqlite_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.sqlite"
+csv_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.csv"
 html_file_path = profile_dir / f"report_np{args.world_size}_rank{args.rank}.html"
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
@@ -301,6 +304,9 @@ parser_keywords = [
     ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
     ("torchMul", "at::native::binary_internal::MulFunctor<"),
     ("applyBiasRopeUpdateKVCache", "tensorrt_llm::kernels::applyBiasRopeUpdateKVCacheV2<"),
+    ("routingIndicesHistogramScores", "routingRenormalize::routingIndicesHistogramScoresKernel<"),
+    ("routingIndicesHistogram", "routingIndicesHistogramKernel<"),
+    ("routingIndicesOffsets", "routingIndicesOffsetsKernel<"),
 ]
 warned_names = set()
 
@@ -319,19 +325,39 @@ def parse_kernel_name(demangledName):
         warned_names.add(name)
         if args.error_on_unknown_kernel:
             raise NotImplementedError(f"Unknown kernel name: {name}")
-    return name[:20]
+    return name[:30]
 
 
 converted_seqs = []
 for runs in kernels:
+    warmup_times = run_args["warmup_times"] if args.warmup_times is None else args.warmup_times
     converted_seq = []
+    # Kernel time
     for i, (demangledName, _, _, ranges) in enumerate(runs[0]):
         name = parse_kernel_name(demangledName)
         category = (*ranges, name)
         time_list = [run[i][2] - run[i][1] for run in runs]
-        time_list = time_list[run_args["warmup_times"] :]
-        t = np.mean(time_list).tolist()
+        t = np.mean(time_list[warmup_times:]).tolist()
         converted_seq.append((category, t))
+    # Space and Overlap
+    overlap_list = []
+    space_list = []
+    for run in runs:
+        sorted_run = sorted(run, key=lambda op: op[1])
+        last_end = sorted_run[0][1]
+        overlap_time = 0
+        space_time = 0
+        for _, start, end, _ in sorted_run:
+            if start > last_end:
+                space_time += start - last_end
+            else:
+                overlap_time += min(last_end, end) - start
+            last_end = max(last_end, end)
+        overlap_list.append(-overlap_time)
+        space_list.append(space_time)
+    converted_seq.append((("Overlap",), np.mean(overlap_list[warmup_times:]).tolist()))
+    converted_seq.append((("Space",), np.mean(space_list[warmup_times:]).tolist()))
+    converted_seq.append((("Total",), sum(t for _, t in converted_seq)))
     converted_seqs.append(converted_seq)
 
 merged_title = []
@@ -355,6 +381,7 @@ for problem in problem_set:
     )
 
 stack = []
+csv_data = [["", *[problem["text"] for problem in problem_set]]]
 js_data = []
 js_stack = [js_data]
 max_title_len = max((len(title) - 1) * 3 + len(title[-1]) for title in merged_title)
@@ -374,20 +401,26 @@ for title, time_data in zip(merged_title, merged_data):
         stack.append(level_title)
         level = len(stack)
         print("|--" * (level - 1) + level_title)
+        csv_data.append(["|--" * (level - 1) + level_title])
         js_stack.append([])
     level = len(stack) + 1
     print(
         "|--" * (level - 1) + title[-1] + " " * (max_title_len - (level - 1) * 3 - len(title[-1])),
-        *[f"{x / 1000:-6.2f}" for x in time_data],
+        *[f"{x / 1000:-6.1f}" for x in time_data],
     )
-    js_stack[-1].append(
-        {
-            "name": title[-1],
-            "time": [x / 1000 for x in time_data],
-        }
-    )
-# TODO: Print overlap and space
-# TODO: Statistics
+    csv_data.append(["|--" * (level - 1) + title[-1], *[f"{x / 1000:.1f}" for x in time_data]])
+    if title != ("Total",):
+        js_stack[-1].append(
+            {
+                "name": title[-1],
+                "time": [x / 1000 for x in time_data],
+            }
+        )
+# TODO: Group repeated modules
+with csv_file_path.open("w", newline="") as f:
+    csv_writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+    for row in csv_data:
+        csv_writer.writerow(row)
 js_header_config = [{"name": problem["text"]} for problem in problem_set]
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
 template = jinja2.Environment(loader=loader).get_template("template.html")
