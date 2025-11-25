@@ -25,6 +25,7 @@ l0_a10:
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
   - unittest/others/test_time_breakdown.py
+  - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
