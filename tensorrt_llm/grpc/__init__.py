@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+TensorRT-LLM gRPC module for high-performance communication with external routers.
+
+This module provides a gRPC server interface that accepts pre-tokenized requests
+and returns raw token IDs, enabling efficient binary communication with Rust-based
+routers like sgl-router.
+
+Key Features:
+- Pre-tokenized input (no Python tokenization overhead)
+- Raw token ID output (no Python detokenization overhead)
+- Streaming support with delta tokens
+- Full sampling parameter support
+- Guided decoding (JSON schema, regex, grammar)
+- LoRA and prompt tuning support
+- Disaggregated inference support
+
+Usage:
+    python -m tensorrt_llm.entrypoints.grpc_server \\
+        --model /path/to/model \\
+        --host 0.0.0.0 \\
+        --port 50051
+"""
+
+from pathlib import Path
+
+# Module directory for proto files
+GRPC_MODULE_DIR = Path(__file__).parent
+
+# Proto file path
+PROTO_FILE = GRPC_MODULE_DIR / "trtllm_engine.proto"
+
+# Try to import generated protobuf modules
+try:
+    from . import trtllm_engine_pb2
+    from . import trtllm_engine_pb2_grpc
+    PROTOS_AVAILABLE = True
+except ImportError:
+    PROTOS_AVAILABLE = False
+    trtllm_engine_pb2 = None
+    trtllm_engine_pb2_grpc = None
+
+__all__ = [
+    "GRPC_MODULE_DIR",
+    "PROTO_FILE",
+    "PROTOS_AVAILABLE",
+    "trtllm_engine_pb2",
+    "trtllm_engine_pb2_grpc",
+]
