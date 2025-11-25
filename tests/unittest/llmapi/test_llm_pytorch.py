@@ -917,6 +917,99 @@ def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
                                      backend="pytorch")
 
 
+@skip_ray
+@pytest.mark.parametrize("temperature", [None, 0.8, 1.0])
+@pytest.mark.parametrize("top_k", [None, 10, 0])
+@pytest.mark.parametrize("top_p", [None, 0.5, 1.0])
+# temperature: 0.0 is greedy sampling and will be covered by below test
+# top_k: 0 means all logits
+# top_p: 1 means no top-p filtering
+def test_llm_logprobs_modes_basic(temperature, top_k, top_p):
+    """
+    Test processed_logprobs mode works correctly in PyTorch backend.
+    Validates that:
+    - processed_logprobs returns non-positive values (log probabilities)
+    """
+    llm = LLM(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
+    )
+
+    prompts = ["The future of AI is"]
+    sampling_params = SamplingParams(
+        max_tokens=5,
+        logprobs=3,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        logprobs_mode="processed_logprobs",
+        seed=42,
+        return_context_logits=True,
+        return_generation_logits=True,
+    )
+
+    outputs = list(llm.generate(prompts, sampling_params))
+    assert len(outputs) == 1
+
+    output = outputs[0]
+    assert len(output.outputs) == 1
+    logprobs_list = output.outputs[0].logprobs
+
+    assert logprobs_list is not None
+    assert len(logprobs_list) > 0
+
+    # Collect all logprob values
+    all_values = []
+    for token_logprobs in logprobs_list:
+        for logprob_obj in token_logprobs.values():
+            all_values.append(logprob_obj.logprob)
+
+    # Validate that processed_logprobs returns non-positive values (log probabilities)
+    for val in all_values:
+        assert val <= 0.0, f"processed_logprobs should have non-positive values, got {val}"
+
+    del llm
+
+
+@skip_ray
+def test_llm_logprobs_mode_backward_compatibility():
+    """
+    Test that default behavior without specifying logprobs_mode.
+    """
+    llm = LLM(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
+    )
+
+    prompt = ["once upon a time"]
+
+    # Explicit processed_logprobs
+    explicit_params = SamplingParams(
+        max_tokens=10,
+        logprobs=2,
+        logprobs_mode="processed_logprobs",
+        seed=123,
+    )
+    explicit_outputs = list(llm.generate(prompt, explicit_params))
+
+    # Default (should be processed_logprobs)
+    default_params = SamplingParams(
+        max_tokens=10,
+        logprobs=2,
+        seed=123,
+    )
+    default_outputs = list(llm.generate(prompt, default_params))
+
+    # Should produce same tokens
+    explicit_tokens = explicit_outputs[0].outputs[0].token_ids
+    default_tokens = default_outputs[0].outputs[0].token_ids
+
+    assert explicit_tokens == default_tokens, (
+        "Default should match explicit processed_logprobs")
+
+    del llm
+
+
 class TestLlmError:
 
     def test_max_num_token_check(self):

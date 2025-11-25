@@ -904,7 +904,7 @@ class TorchSampler(Sampler):
             else _request_strategy(request, vocab_size=2**31)
         )
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(
+        _, draft_probs, _ = sample(
             draft_sampling_strategy,
             request.py_draft_logits,
             generator=generator,
@@ -1692,7 +1692,16 @@ class TorchSampler(Sampler):
         # Handle top-k logprobs. This is done outside the sampling loop,
         # because the returned logprobs are specified to not reflect temperature scaling,
         # top-k/top-p masking, etc.
+
         if return_log_probs:
+            logprobs_mode = None
+            for req in requests:
+                if req.py_num_logprobs:
+                    logprob_params = getattr(req, "_logprob_params", None)
+                    if logprob_params and hasattr(logprob_params, "logprobs_mode"):
+                        logprobs_mode = logprob_params.logprobs_mode
+                    break
+
             assert logits_cuda.dim() == 2, "logits should be 2D"
             logprobs_req_indices = [
                 req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
@@ -1701,10 +1710,34 @@ class TorchSampler(Sampler):
             logprobs_logit_indices_cuda = logprobs_logit_indices.to(
                 device=logits_cuda.device, non_blocking=True
             )
-            logprobs_cuda = F.log_softmax(
-                logits_cuda[logprobs_logit_indices_cuda].to(dtype=torch.float32, non_blocking=True),
-                dim=-1,
-            )
+
+            # Compute logprobs based on mode
+            if logprobs_mode == "processed_logprobs":
+                # Process logits with the same transformations as sampling (temperature, top-k, top-p)
+                # but without actually sampling
+                logprobs_list = []
+                for req_id in logprobs_req_indices:
+                    req = requests[req_id]
+                    strategy = _request_strategy(req, vocab_size=logits_cuda.size(1))
+                    req_logits_indices = logits_cuda_indexer[req_id]
+                    req_logits = logits_cuda[req_logits_indices].to(
+                        dtype=torch.float32, non_blocking=True
+                    )
+                    # Use sample() to get processed logprobs (after temperature, top-k, top-p applied)
+                    _, _, req_logprobs = sample(strategy, req_logits, return_probs=True)
+                    logprobs_list.append(req_logprobs)
+                # Concatenate all logprobs
+                logprobs_cuda = torch.cat(logprobs_list, dim=0)
+            else:
+                # For raw_logprobs and other modes, use raw logits (before sampling modifications)
+                raw_logits_for_logprobs = raw_logits_cuda[:sum_steps]
+                logprobs_cuda = F.log_softmax(
+                    raw_logits_for_logprobs[logprobs_logit_indices_cuda].to(
+                        dtype=torch.float32, non_blocking=True
+                    ),
+                    dim=-1,
+                )
+
             topk_vals_cuda, topk_indices_cuda = torch.topk(
                 logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
             )

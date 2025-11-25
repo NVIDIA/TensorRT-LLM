@@ -137,7 +137,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor],
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             probs = self._prepare_probs_with_temperature(logits, group_logit_indices, None)
-            new_tokens, _ = greedy_search_sampling_batch(probs, return_probs=False)
+            new_tokens, _, _ = greedy_search_sampling_batch(probs, return_probs=False)
             return new_tokens, probs
 
         @classmethod
@@ -370,7 +370,8 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             if group_logit_indices is not None:
                 logits = logits[group_logit_indices]
-            return greedy_search_sampling_batch(logits, return_probs=False)
+            tokens, probs, _ = greedy_search_sampling_batch(logits, return_probs=False)
+            return tokens, probs
 
     class TopKTopPSampleOnly(StrategyImplSampleOnly):
         def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):

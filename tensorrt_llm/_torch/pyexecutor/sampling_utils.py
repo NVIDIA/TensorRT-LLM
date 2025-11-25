@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Generic, Literal, Optional, TypeAlias, TypeVar, cast
 
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -95,7 +96,7 @@ def top_k_sampling_batch(
     top_k: int,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
         logits,
@@ -112,7 +113,7 @@ def top_p_sampling_batch(
     top_p: float,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
         logits,
@@ -128,7 +129,7 @@ def temperature_sampling_batch(
     *,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # NB: To be replaced by a more efficient implementation.
     return top_k_top_p_sampling_batch(
         logits,
@@ -146,7 +147,7 @@ def top_k_top_p_sampling_batch(
     top_p: float,
     temperature: float,
     generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
@@ -189,21 +190,26 @@ def top_k_top_p_sampling_batch(
     # compute probability distribution
     softmax = torch.softmax(logits, dim=-1)
 
+    # compute log probabilities
+    logprobs = F.log_softmax(logits, dim=-1)
+
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(softmax, num_samples=1, generator=generator).squeeze(-1)
-    return next_tokens, softmax
+    return next_tokens, softmax, logprobs
 
 
 def greedy_search_sampling_batch(
     logits,
     *,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     next_tokens = torch.argmax(logits, dim=-1)
     softmax: Optional[torch.Tensor] = None
+    logprobs: Optional[torch.Tensor] = None
     if return_probs:
         softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+        logprobs = F.log_softmax(logits, dim=-1)
+    return next_tokens, softmax, logprobs
 
 
 def get_rejected_indices(
@@ -254,24 +260,36 @@ def sample(
     *,
     generator: Optional[torch.Generator] = None,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Sample from logits using the specified strategy.
+
+    Args:
+        strategy: Sampling strategy tuple (strategy_name, *params)
+        logits: Input logits tensor
+        generator: Optional random generator
+        return_probs: If True, return softmax probabilities and log probabilities
+
+    Returns:
+        Tuple of (sampled_tokens, softmax_probs, logprobs)
+    """
     match strategy:
         case ("top_k", top_k, temperature):
-            tokens, softmax = top_k_sampling_batch(
+            tokens, softmax, logprobs = top_k_sampling_batch(
                 logits,
                 top_k=top_k,
                 temperature=temperature,
                 generator=generator,
             )
         case ("top_p", top_p, temperature):
-            tokens, softmax = top_p_sampling_batch(
+            tokens, softmax, logprobs = top_p_sampling_batch(
                 logits,
                 top_p=top_p,
                 generator=generator,
                 temperature=temperature,
             )
         case ("top_k_top_p", top_k, top_p, temperature):
-            tokens, softmax = top_k_top_p_sampling_batch(
+            tokens, softmax, logprobs = top_k_top_p_sampling_batch(
                 logits,
                 top_k=top_k,
                 top_p=top_p,
@@ -279,14 +297,16 @@ def sample(
                 generator=generator,
             )
         case ("temperature", temperature):
-            tokens, softmax = temperature_sampling_batch(
+            tokens, softmax, logprobs = temperature_sampling_batch(
                 logits,
                 temperature=temperature,
                 generator=generator,
             )
         case ("greedy", None):
-            tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
-    return tokens, softmax
+            tokens, softmax, logprobs = greedy_search_sampling_batch(
+                logits, return_probs=return_probs
+            )
+    return tokens, softmax, logprobs
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType")
@@ -338,12 +358,13 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
 
         assert all(strategy == group_key for strategy in strategies), "group must be consistent"
 
-        return sample(
+        tokens, probs, _ = sample(
             group_key,
             logits,
             generator=generator,
             return_probs=return_probs,
         )
+        return tokens, probs
 
 
 class _AcceptSyncCompute:
