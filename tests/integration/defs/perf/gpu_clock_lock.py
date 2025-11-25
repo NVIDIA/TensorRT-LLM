@@ -29,6 +29,7 @@ import time
 import psutil  # type: ignore
 # Nvidia
 import pynvml  # type: ignore
+import yaml
 from defs.trt_test_alternative import print_error, print_info, print_warning
 
 from .misc import clean_device_product_name, get_device_subtype
@@ -145,18 +146,57 @@ class GPUClockLock:
     def get_target_gpu_clocks(self):
         """
         Get the target GPU clocks (sm_clk and mem_clk) for the first GPU in the list.
+        Returns the clock frequencies from gpu_configs.yml
         """
         if self._gpu_handles and len(self._gpu_handles) > 0:
             try:
-                # Get maximum supported clocks for the first GPU
+                # Get GPU name and clean it
                 handle = self._gpu_handles[0]
-                max_sm_clk = pynvml.nvmlDeviceGetMaxClockInfo(
-                    handle, pynvml.NVML_CLOCK_SM)
-                max_mem_clk = pynvml.nvmlDeviceGetMaxClockInfo(
-                    handle, pynvml.NVML_CLOCK_MEM)
-                return (max_sm_clk, max_mem_clk)
+                gpu_name = pynvml.nvmlDeviceGetName(handle)
+                cleaned_gpu_name = clean_device_product_name(gpu_name)
+
+                # Load clock frequencies from gpu_configs.yml
+                config_path = os.path.join(
+                    os.path.dirname(__file__),
+                    "../../perf_configs/gpu_configs.yml")
+
+                with open(config_path, 'r') as f:
+                    gpu_configs = yaml.safe_load(f)
+
+                # Look up the GPU in the config
+                if cleaned_gpu_name in gpu_configs.get('GPUs', {}):
+                    gpu_config = gpu_configs['GPUs'][cleaned_gpu_name]
+                    sm_clk = gpu_config.get('sm_clk')
+                    mem_clk = gpu_config.get('mem_clk')
+
+                    if sm_clk is not None and mem_clk is not None:
+                        print_info(
+                            f"Using configured clocks for {cleaned_gpu_name}: SM={sm_clk} MHz, MEM={mem_clk} MHz"
+                        )
+                        return (sm_clk, mem_clk)
+                    else:
+                        print_warning(
+                            f"Clock values missing in config for {cleaned_gpu_name}"
+                        )
+                        return None
+                else:
+                    print_warning(
+                        f"GPU '{cleaned_gpu_name}' not found in gpu_configs.yml"
+                    )
+                    return None
+
+            except FileNotFoundError:
+                print_warning(f"Config file not found at {config_path}")
+                return None
+            except yaml.YAMLError as e:
+                print_warning(f"Failed to parse gpu_configs.yml: {e}")
+                return None
             except pynvml.NVMLError as e:
-                print_warning(f"Failed to get max clock info: {e}")
+                print_warning(f"Failed to get GPU info: {e}")
+                return None
+            except Exception as e:
+                print_warning(
+                    f"Unexpected error getting target GPU clocks: {e}")
                 return None
         return None
 
