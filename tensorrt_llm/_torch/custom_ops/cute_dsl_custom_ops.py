@@ -34,7 +34,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
-    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
+    class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
@@ -48,10 +48,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self, output_dtype: torch.dtype):
             super().__init__()
 
-            if get_sm_version() not in [100, 103]:
-                raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
-                )
+
 
             if output_dtype != torch.bfloat16:
                 raise ValueError(
@@ -69,6 +66,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
+            # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
+            sm_version = get_sm_version()
+            if sm_version not in [100, 103]:
+                logger.debug(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL NVFP4 only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
+                )
+                return []
+
             assert inputs[0].dim() == 2
             assert inputs[1].dim() == 2
 
@@ -369,6 +375,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Direct usage is discouraged. Consider using nvfp4_gemm instead
             for automatic backend selection with better performance.
         """
+        # Validate SM version before attempting to use CuteDSL
+        sm_version = get_sm_version()
+        if sm_version not in [100, 103]:
+            raise ValueError(
+                f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
+                f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
+            )
+
         tuner = AutoTuner.get()
 
         runner = CuteDSLNVFP4BlackwellLinear(output_dtype)
@@ -378,6 +392,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             [runner],
             runner.__class__.tuning_config,
             inputs,
+        )
 
         output = runner(inputs, tactic=best_tactic)
         return output

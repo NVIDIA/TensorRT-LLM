@@ -748,29 +748,42 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Add CuteDSL runner if available
         if backend in ["auto", "cutedsl"]:
             if IS_CUTLASS_DSL_AVAILABLE:
-                # Check if CuteDSL actually supports the current shape
-                from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-                    CuteDSLNVFP4BlackwellLinear
-                cutedsl_runner = CuteDSLNVFP4BlackwellLinear(self.output_dtype)
-                cutedsl_tactics = cutedsl_runner.get_valid_tactics(
-                    inputs, profile)
+                # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
+                sm_version = get_sm_version()
+                if sm_version != 100:
+                    if backend == "cutedsl":
+                        # Explicitly requested CuteDSL but SM version not supported
+                        raise ValueError(
+                            f"CuteDSL NVFP4 backend requires SM 100 (B200), but got SM {sm_version}. "
+                            f"CuteDSL NVFP4 is not supported on this GPU architecture. "
+                            f"Please use backend='auto' to automatically select a compatible backend."
+                        )
+                    # else: backend='auto' → silently skip CuteDSL
+                else:
+                    # SM version OK, check if CuteDSL supports the current shape
+                    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+                        CuteDSLNVFP4BlackwellLinear
+                    cutedsl_runner = CuteDSLNVFP4BlackwellLinear(
+                        self.output_dtype)
+                    cutedsl_tactics = cutedsl_runner.get_valid_tactics(
+                        inputs, profile)
 
-                if cutedsl_tactics:
-                    # CuteDSL supports this shape
-                    tactics.append("cutedsl")
-                elif backend == "cutedsl":
-                    # Explicitly requested CuteDSL but it doesn't support this shape
-                    m, n, k = inputs[0].shape[0], inputs[1].shape[
-                        0], inputs[0].shape[1] * 2
-                    raise ValueError(
-                        f"CuteDSL backend does not support the current shape:\n"
-                        f"  M={m}, N={n}, K={k}\n"
-                        f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
-                        f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
-                        f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
-                        f"Please use backend='auto' to automatically select a compatible backend."
-                    )
-                # else: backend='auto' and CuteDSL doesn't support → silently skip
+                    if cutedsl_tactics:
+                        # CuteDSL supports this shape
+                        tactics.append("cutedsl")
+                    elif backend == "cutedsl":
+                        # Explicitly requested CuteDSL but it doesn't support this shape
+                        m, n, k = inputs[0].shape[0], inputs[1].shape[
+                            0], inputs[0].shape[1] * 2
+                        raise ValueError(
+                            f"CuteDSL backend does not support the current shape:\n"
+                            f"  M={m}, N={n}, K={k}\n"
+                            f"CuteDSL requires 16-byte alignment for major (contiguous) dimensions:\n"
+                            f"  - K must be divisible by 32 (FP4 K-major layout): K%32={'0✓' if k % 32 == 0 else str(k%32)+'✗'}\n"
+                            f"  - Or the combination of (M, N, K, tiling, cluster shape) is not supported\n"
+                            f"Please use backend='auto' to automatically select a compatible backend."
+                        )
+                    # else: backend='auto' and CuteDSL doesn't support shape → silently skip
             elif backend == "cutedsl":
                 raise ValueError(
                     "CuteDSL backend is not available. "
