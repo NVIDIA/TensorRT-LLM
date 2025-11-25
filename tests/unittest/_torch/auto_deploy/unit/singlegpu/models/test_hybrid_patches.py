@@ -25,7 +25,7 @@ def setup_custom_model_cls_registry(request):
     register_custom_model = request.node.callspec.params.get("register_custom_model", False)
     if register_custom_model:
         AutoModelForCausalLMFactory.register_custom_model_cls(
-            model_type="nemotron_h",
+            config_cls_name="NemotronHConfig",
             custom_model_cls=NemotronHForCausalLM,
         )
     yield

@@ -761,10 +761,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                 }
-                TLLM_CHECK(cacheBufferId.has_value());
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
+                TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+
                 bufferCoverTargetNum = bufferCoverTargetNumtmp;
                 remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 
