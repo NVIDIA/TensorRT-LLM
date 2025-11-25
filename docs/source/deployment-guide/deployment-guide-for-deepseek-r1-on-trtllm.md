@@ -110,6 +110,22 @@ append: EOF
 ```
 ````
 
+### Pre-configured Scenarios
+
+The following tables list recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
+   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
+```
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
+   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
+```
+
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server with the DeepSeek-R1 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
