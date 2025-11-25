@@ -1,13 +1,36 @@
 import copy
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import List, Optional, Type
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..pyexecutor.resource_manager import BaseResourceManager
+
+# Environment variable name for forcing the number of accepted tokens in speculative decoding
+FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+
+def get_force_num_accepted_tokens() -> int:
+    """
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.
+
+    Returns:
+        int: The forced number of accepted tokens, or 0 if not set or invalid.
+    """
+    env_value = os.environ.get(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR, "0")
+    try:
+        return int(env_value)
+    except ValueError:
+        logger.warning(
+            f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid integer, "
+            f"got '{env_value}'. Using default value 0.")
+        return 0
 
 
 class SpeculativeDecodingMode(IntEnum):

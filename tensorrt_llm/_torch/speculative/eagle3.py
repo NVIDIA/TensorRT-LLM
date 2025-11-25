@@ -1,11 +1,9 @@
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -14,7 +12,7 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata
+from .interface import SpecMetadata, get_force_num_accepted_tokens
 from .mtp import MTPSampler
 from .spec_tree_manager import SpecTreeManager
 
@@ -321,15 +319,7 @@ class Eagle3OneModelWorker(nn.Module):
         self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
-
-        env_value = os.environ.get("TLLM_EAGLE3_FORCE_NUM_ACCEPTED_TOKENS", "0")
-        try:
-            self.force_num_accepted_tokens = int(env_value)
-        except ValueError:
-            logger.warning(
-                f"TLLM_EAGLE3_FORCE_NUM_ACCEPTED_TOKENS must be a valid integer, "
-                f"got '{env_value}'. Using default value 0.")
-            self.force_num_accepted_tokens = 0
+        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -494,7 +484,9 @@ class Eagle3OneModelWorker(nn.Module):
             dim=-1).sum(1)
         # Check for environment variable override
         if self.force_num_accepted_tokens != 0:
-            num_accepted_tokens[num_contexts:] = self.force_num_accepted_tokens
+            force_num_accepted_tokens = min(self.force_num_accepted_tokens,
+                                            self.max_draft_len + 1)
+            num_accepted_tokens[num_contexts:] = force_num_accepted_tokens
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
