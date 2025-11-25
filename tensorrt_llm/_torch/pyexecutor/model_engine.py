@@ -135,10 +135,12 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        is_sm_disagg_ctx_phase: bool = False,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
+        weight_sharing_model: Optional[torch.nn.Module] = None,
     ):
         self.forward_pass_callable = None
         self.ub_buffers = None
@@ -148,6 +150,9 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len,
             max_batch_size,
         ) = llm_args.get_runtime_sizes()
+        if is_sm_disagg_ctx_phase:
+            max_num_tokens = llm_args.sm_disagg_config.context_max_num_tokens
+            max_batch_size = llm_args.sm_disagg_config.context_max_batch_size
 
         self.batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
@@ -165,6 +170,7 @@ class PyTorchModelEngine(ModelEngine):
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
         self.llm_args = llm_args
+        self.sm_disagg_enabled = llm_args.sm_disagg_config is not None
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
@@ -195,6 +201,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
+                weight_sharing_model=weight_sharing_model,
             )
             self.model, moe_load_balancer = loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
@@ -368,6 +375,7 @@ class PyTorchModelEngine(ModelEngine):
         if self.use_mrope:
             self.mrope_position_ids_cuda = torch.empty(
                 (3, 1, self.max_num_tokens), dtype=torch.int, device='cuda')
+        self.iter_counter = 0
 
         # Pre-allocated buffers for draft model to avoid implicit synchronization
         # These are used to build index tensors without creating tensors from Python lists
@@ -1452,8 +1460,10 @@ class PyTorchModelEngine(ModelEngine):
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
-            # (3) the first step in the generation server of disaggregated serving
-            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+            # (3) the first step in the generation server of disaggregated serving; or
+            # (4) the first step in the generation phase of SM-level disaggregation
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None \
+                    or self.sm_disagg_enabled and request.max_num_generated_tokens == 0:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
                 if not (request.is_attention_dp_dummy
@@ -1577,8 +1587,10 @@ class PyTorchModelEngine(ModelEngine):
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
-                # (3) the first step in the generation server of disaggregated serving
-                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                # (3) the first step in the generation server of disaggregated serving; or
+                # (4) the first step in the generation phase of SM-level disaggregation
+                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None \
+                        or self.sm_disagg_enabled and request.max_num_generated_tokens == 0:
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
@@ -2547,6 +2559,8 @@ class PyTorchModelEngine(ModelEngine):
                 spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        self.iter_counter += 1
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 

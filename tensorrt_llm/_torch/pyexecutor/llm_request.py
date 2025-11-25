@@ -816,3 +816,11 @@ def get_draft_token_length(request: LlmRequest) -> int:
     if request.py_draft_tokens is not None:
         return len(request.py_draft_tokens)
     return 0
+
+
+def get_context_requests(requests: List[LlmRequest]):
+    return [req for req in requests if req.is_context_init_state]
+
+
+def get_generation_requests(requests: List[LlmRequest]):
+    return [req for req in requests if not req.is_context_init_state]

@@ -424,6 +424,29 @@ class AttentionDpConfig(StrictBaseModel):
         return cls(**data)
 
 
+class SmDisaggConfig(StrictBaseModel):
+    """
+    Configuration for SM-level disaggregation.
+    """
+    context_sm_percent: float = Field(
+        default=0.5,
+        description="Percentage of SMs allocated to context phase.")
+    context_max_num_tokens: int = Field(
+        default=0,
+        description=
+        "The maximum number of tokens for context phase. If less than or equal to 0, the same value as generation phase is used."
+    )
+    context_max_batch_size: int = Field(
+        default=0,
+        description=
+        "The maximum batch size for context phase. If less than or equal to 0, the same value as generation phase is used."
+    )
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
 class _ParallelConfig(StrictBaseModel):
     """The model distribution configs for LLM."""
     tp_size: int = 1
@@ -2547,6 +2570,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Disable the overlap scheduler.",
         status="beta")
 
+    sm_disagg_config: Optional[SmDisaggConfig] = Field(
+        default=None,
+        description="SM-level disaggregation config.",
+        status="prototype")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -2965,6 +2993,23 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_and_sync_sm_disagg_config(self) -> 'TorchLlmArgs':
+        """Validate SM-level disaggregation configuration."""
+        if self.sm_disagg_config is None:
+            return self
+
+        config = self.sm_disagg_config
+        if not 0 < config.context_sm_percent < 1:
+            raise ValueError(
+                "sm_disagg_config.context_sm_percent must be in the range (0, 1)"
+            )
+        if config.context_max_num_tokens <= 0:
+            config.context_max_num_tokens = self.max_num_tokens
+        if config.context_max_batch_size <= 0:
+            config.context_max_batch_size = self.max_batch_size
         return self
 
     @model_validator(mode='after')
