@@ -126,7 +126,9 @@ def generate_rst(yaml_path, output_file=None):
                         profile = "Balanced"
 
                 full_config_path = os.path.join("tensorrt_llm/configure", config_path)
-                command = f"trtllm-serve {model} --extra_llm_api_options {full_config_path}"
+                command = (
+                    f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{config_path}"
+                )
 
                 config_filename = os.path.basename(full_config_path)
 
