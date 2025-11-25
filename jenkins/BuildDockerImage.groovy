@@ -550,37 +550,11 @@ def updateCIImageTag() {
         "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python312)"],
     ]
 
-
     def filePath = "jenkins/current_image_tags.properties"
 
-    echo "Updating ${filePath} with new image tags"
-
-    // Read the current file lines
-    def lines = readFile(filePath).split("\n") as List
-
-    // Replace lines for our four keys
-    def updatedLines = lines.collect { line ->
-        def resultLine = line
-        imageTagKeys.each { key ->
-            if (line.startsWith(key + "=")) {
-                resultLine = "${key}=${newImageTags[key]}"
-            }
-        }
-        resultLine
-    }
-
-    // Write back the updated file
-    writeFile file: filePath, text: updatedLines.join("\n") + "\n"
-
     withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_PASSWORD')]) {
-        // Setup git user if necessary
-        sh """
-        git config user.name "ci-bot"
-        """
-
         // The user fork's repo URL, expected to be available in env.gitlabSourceRepoHttpUrl or can be customized as needed
         def forkRepoUrl = env.gitlabSourceRepoHttpUrl ?: LLM_REPO
-
         def currentBranch = env.gitlabBranch ?: params.branch
 
         // Remove any possible existing remote named 'fork' to avoid duplication
@@ -612,14 +586,35 @@ def updateCIImageTag() {
                     git config user.email "${signedEmail}"
                     """
                 } else {
-                    echo "Failed to extract user.name and user.email from Signed-off-by, skipping git config update"
+                    echo "Failed to extract user.name and user.email from Signed-off-by, using default ci-bot"
                 }
             } else {
-                echo "Signed-off-by format parse failed: ${lastSignedBy}"
+                echo "Signed-off-by format parse failed: ${lastSignedBy}, using default ci-bot"
             }
         } else {
-            echo "No Signed-off-by found in the latest commit message"
+            echo "No Signed-off-by found in the latest commit message, using default ci-bot"
         }
+
+        // Now update the file (after checkout)
+        echo "Updating ${filePath} with new image tags"
+
+        // Read the current file lines
+        def lines = readFile(filePath).split("\n") as List
+
+        // Replace lines for our four keys
+        def updatedLines = lines.collect { line ->
+            def resultLine = line
+            imageTagKeys.each { key ->
+                if (line.startsWith(key + "=")) {
+                    resultLine = "${key}=${newImageTags[key]}"
+                }
+            }
+            resultLine
+        }
+
+        // Write back the updated file
+        writeFile file: filePath, text: updatedLines.join("\n") + "\n"
+
         sh """
         git add ${filePath}
         git commit -s -m "[auto] Update CI image tags with newly built images" || echo "No changes to commit"
