@@ -1,5 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
+
+AgentHierarchy = List[Tuple[str, int]]
 
 
 @dataclass(slots=True, kw_only=True)
@@ -13,3 +15,5 @@ class SchedulingParams:
 
     attention_dp_rank: Optional[int] = None
     attention_dp_relax: Optional[bool] = None
+
+    agent_hierarchy: Optional[AgentHierarchy] = None

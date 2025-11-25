@@ -33,6 +33,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -146,7 +147,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -206,6 +208,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mAgentHierarchy(std::move(agent_hierarchy))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -1948,6 +1951,11 @@ public:
         return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
     }
 
+    [[nodiscard]] std::optional<std::vector<std::tuple<std::string, int>>> const& getAgentHierarchy() const
+    {
+        return mAgentHierarchy;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -2139,6 +2147,8 @@ protected:
 
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
+
+    std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
 private:
     void initialize(
@@ -2333,7 +2343,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2367,7 +2378,7 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime)
+            arrivalTime, std::move(agent_hierarchy))
     {
     }
 

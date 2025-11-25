@@ -54,7 +54,7 @@ class SupervisorTask(Task):
         return task
 
 
-@sub_request_node("OpenDeepResearch", is_top_level=True)
+@sub_request_node("agent_deep_research", is_top_level=True)
 @drop_kv_cache_scope()
 class Supervisor(Controller):
     tools = [conduct_research_tool, complete_research_tool, think_tool]
@@ -186,12 +186,15 @@ class Supervisor(Controller):
 
 
 def create_open_deep_research_scaffolding_llm(
-    generation_worker: Worker, mcp_worker: Worker
+    generation_worker: Worker,
+    mcp_worker: Worker,
+    max_tokens: int = 16 * 1024,
+    max_parallel_requests: int = 1024,
 ) -> ScaffoldingLlm:
     gerneration_controller = NativeGenerationController(
         sampling_params={
             "temperature": 0.9,
-            "max_tokens": 16386,
+            "max_tokens": max_tokens,
         }
     )
 
@@ -224,6 +227,7 @@ def create_open_deep_research_scaffolding_llm(
             ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
             DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
         },
+        max_parallel_requests=max_parallel_requests,
     )
 
     return scaffolding_llm

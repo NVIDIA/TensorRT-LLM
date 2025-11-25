@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
@@ -207,6 +208,8 @@ class BindCapacityScheduler(CapacityScheduler):
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
+        agent_percentage: float = 0.0,
+        agent_types: Optional[list[str]] = None,
     ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
@@ -219,6 +222,8 @@ class BindCapacityScheduler(CapacityScheduler):
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
             no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
+            agent_percentage=agent_percentage,
+            agent_types=agent_types,
         )
 
     def schedule_request(
