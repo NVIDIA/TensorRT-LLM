@@ -279,9 +279,16 @@ class KvCacheCreator:
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
 
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
+        max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(
+        ) // self._tokens_per_block * self._tokens_per_block
+
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
-            0].sampling_config.beam_width
+        return min(
+            num_cache_blocks * self._tokens_per_block *
+            self._dummy_reqs[0].sampling_config.beam_width,
+            max_num_tokens_in_memory)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
