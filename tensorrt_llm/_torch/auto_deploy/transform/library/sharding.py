@@ -1138,13 +1138,13 @@ def _insert_sharded_moe(
         )
         return lst[expert_start:expert_end]
 
-    w1_list_sharded = get_partition(args[3], ep_size, ep_rank)
-    w2_list_sharded = get_partition(args[4], ep_size, ep_rank)
-    w3_list_sharded = get_partition(args[5], ep_size, ep_rank)
+    w_up_list_sharded = get_partition(args[3], ep_size, ep_rank)
+    w_down_list_sharded = get_partition(args[4], ep_size, ep_rank)
+    w_gate_list_sharded = get_partition(args[5], ep_size, ep_rank)
 
     # if tp_size > 1, we do 2D EP+TP sharding.
     # we add TP sharding of all expert weights.
-    for w_up in w1_list_sharded + w2_list_sharded:
+    for w_up in w_up_list_sharded + w_gate_list_sharded:
         shard_weight_tensor(
             gm=gm,
             weight_tensor=gm.get_parameter(w_up.target),
@@ -1155,7 +1155,7 @@ def _insert_sharded_moe(
         )
     # here we don't need to add all-reduce: it's enough to have
     # just one all-reduce after the whole EP+TP sharded MoE node.
-    for w_down in w3_list_sharded:
+    for w_down in w_down_list_sharded:
         shard_weight_tensor(
             gm=gm,
             weight_tensor=gm.get_parameter(w_down.target),
@@ -1168,9 +1168,9 @@ def _insert_sharded_moe(
     # -- Update args --
     args[1] = selected_experts_local
     args[2] = final_scales_local
-    args[3] = w1_list_sharded
-    args[4] = w2_list_sharded
-    args[5] = w3_list_sharded
+    args[3] = w_up_list_sharded
+    args[4] = w_down_list_sharded
+    args[5] = w_gate_list_sharded
 
     # Shard scales for quantized ops
     for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
@@ -2348,7 +2348,7 @@ def detect_dp_bmm_shard(
 def get_process_grid_from_config(config: ShardingTransformConfig) -> Tuple[int, int]:
     rank, world_size = config.rank, config.world_size
     if len(config.process_grid) > 0:
-        ad_logger.info(f"EP + TP sharding process grid: {config.process_grid}")
+        ad_logger.debug(f"EP + TP sharding process grid: {config.process_grid}")
         ep_size = config.process_grid[ShardingDim.EP]
         tp_size = config.process_grid[ShardingDim.TP]
         # the order of the keys (ep,tp) vs (tp,ep) determines how ranks
