@@ -110,22 +110,6 @@ append: EOF
 ```
 ````
 
-### Pre-configured Scenarios
-
-The following tables list recommended configurations from the comprehensive database for different performance profiles.
-
-```{eval-rst}
-.. include:: comprehensive_table.rst
-   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
-   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
-```
-
-```{eval-rst}
-.. include:: comprehensive_table.rst
-   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
-   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
-```
-
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server with the DeepSeek-R1 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
@@ -170,7 +154,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 #### `trust_remote_code`
 
-&emsp;**Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 #### `kv_cache_config`
 
@@ -445,3 +429,19 @@ $$
 $$
 \text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
 $$
+
+## Preconfigured Recipes
+
+The following tables list recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
+   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
+```
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
+   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
+```
