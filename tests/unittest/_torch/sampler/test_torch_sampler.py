@@ -529,6 +529,10 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         @dataclass
         class UutResult:
+            selected_requests: list[LlmRequest]
+            req_num_generation_steps_list: list[int]
+            req_num_generation_steps: torch.Tensor
+            req_offsets: torch.Tensor
             selected_logits: torch.Tensor
 
         @dataclass

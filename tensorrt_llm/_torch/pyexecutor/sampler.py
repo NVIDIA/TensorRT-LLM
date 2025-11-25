@@ -73,7 +73,7 @@ from .sampling_utils import (
     sample_rejected,
     torch_multi_arange,
 )
-from .scheduler import ScheduledRequests
+from .scheduler import RequestList, ScheduledRequests
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -1058,8 +1058,8 @@ class TorchSampler(Sampler):
             self.handle_logprobs(req, state, beam=BEAM, count=processed)
             req.py_decoding_iter += 1
 
-    def return_log_probs(self, scheduled_requests: ScheduledRequests) -> bool:
-        return any(req.py_return_log_probs for req in scheduled_requests.all_requests())
+    def _return_log_probs(self, requests: RequestList) -> bool:
+        return any(req.py_return_log_probs for req in requests)
 
     @override
     @torch.inference_mode()
@@ -1076,26 +1076,23 @@ class TorchSampler(Sampler):
         #     latter case, there is always only 1 token per request because draft
         #     tokens are sampled one-by-one.
 
-        requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
-        seq_slots_host = torch.tensor(
-            [r.py_seq_slot for r in requests],
-            dtype=torch.int64,  # for index_fill_
-            pin_memory=True,
-        )
-        new_tokens_host = self._process_requests(
+
+        sampling_requests, seq_slots_host, new_tokens_host = self._process_requests(
             scheduled_requests,
             model_outputs,
             new_tokens,
             num_context_logits_prefix_sum,
-            seq_slots=seq_slots_host,
             resource_manager=resource_manager,
         )
 
         finish_reasons = self.store.finish_reasons
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
         self._write_finish_reasons(
-            requests, finish_reasons=finish_reasons, seq_slots=seq_slots, new_tokens=new_tokens
+            sampling_requests,
+            finish_reasons=finish_reasons,
+            seq_slots=seq_slots,
+            new_tokens=new_tokens,
         )
         finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
 
@@ -1207,12 +1204,13 @@ class TorchSampler(Sampler):
         requests: list[LlmRequest],
         model_outputs: dict[str, torch.Tensor],
         *,
-        cuda_device: torch.device,
         logits_cuda_indexer: _PackedStepIndexer,
         req_num_steps: torch.Tensor,
         req_offsets: torch.Tensor,
         token_dtype: torch.dtype,
     ) -> _BatchedSamplingResult:
+        cuda_device = logits_cuda.device
+
         grouped_requests = _group_requests_by_strategy_key(
             requests,
             pin_memory=True,
@@ -1400,23 +1398,37 @@ class TorchSampler(Sampler):
         raw_logits_cuda: torch.Tensor,
         *,
         num_context_logits_prefix_sum: list[int],
-    ) -> torch.Tensor:
-        requests = scheduled_requests.all_requests()
+    ) -> tuple[list[LlmRequest], list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
+        finished_context_requests = []
+        finished_context_req_offsets = []
+        for req, offset in zip(
+            scheduled_requests.context_requests, num_context_logits_prefix_sum[1:]
+        ):
+            if req.is_last_context_chunk:
+                finished_context_requests.append(req)
+                finished_context_req_offsets.append(offset)
+        # Add the total number of context logits to the finished context request offsets
+        finished_context_req_offsets.append(num_context_logits_prefix_sum[-1])
 
-        req_num_generation_steps_list = [1 + get_draft_token_length(req) for req in requests]
+        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
+
+        req_num_generation_steps_list = [
+            1 + get_draft_token_length(req) for req in sampling_requests
+        ]
         req_num_generation_steps = torch.tensor(
             req_num_generation_steps_list, dtype=torch.int32, pin_memory=True
         )
-        # NB: These offsets consider generated tokens _only_ (draft and target, but not context)
-        #     and are thus only correct after _select_generated_logits() below.
+        # NB: These offsets consider generated tokens _only_ (draft and target, but not context).
+        #     Filter out the context tokens below.
         req_offsets, sum_steps = _PackedStepIndexer.calculate_request_offsets(
             req_num_generation_steps, pin_memory=True
         )
 
         generation_requests_total_steps = (
             # NB: requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
-            sum_steps - cast(int, req_offsets[len(scheduled_requests.context_requests)].item())
-            if scheduled_requests.generation_requests
+            sum_steps - cast(int, req_offsets[len(finished_context_requests)].item())
+            if len(scheduled_requests.generation_requests) > 0
             else 0
         )
         num_logits_to_keep = sum_steps
@@ -1426,57 +1438,51 @@ class TorchSampler(Sampler):
         #
         # NB: Context request logits always precede generation request logits, also
         #     requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
-        if any(r.py_return_context_logits for r in scheduled_requests.context_requests):
-            assert (
-                len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
-            )
+        if any(r.py_return_context_logits for r in finished_context_requests):
             req_num_generation_steps_cuda = req_num_generation_steps.to(
                 raw_logits_cuda.device, non_blocking=True
             )
             context_req_offsets_cuda = torch.tensor(
-                num_context_logits_prefix_sum, dtype=torch.int32, pin_memory=True
+                finished_context_req_offsets, dtype=torch.int32, pin_memory=True
             ).to(device=raw_logits_cuda.device, non_blocking=True)
 
             if scheduled_requests.generation_requests:
-                # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
-                # only end-offsets of the token storage locations matter.
-                next_context_req_offsets_cuda = context_req_offsets_cuda.roll(
-                    -1
-                )  # trailing '0' is overwritten below
                 # Since logits for generation requests are densely packed, cover them all by a single
                 # fictituous entry in 'context_req_offsets_cuda'.
                 req_num_steps_fictitious_cuda = req_num_generation_steps_cuda[
-                    : (len(scheduled_requests.context_requests) + 1)
+                    : (len(finished_context_requests) + 1)
                 ].clone()
                 req_num_steps_fictitious_cuda[-1].fill_(generation_requests_total_steps)
-                next_context_req_offsets_cuda[-1].copy_(
-                    next_context_req_offsets_cuda[-2] + req_num_steps_fictitious_cuda[-1],
-                    non_blocking=True,
-                )
+                context_req_offsets_cuda[-1].add_(req_num_steps_fictitious_cuda[-1])
             else:
                 req_num_steps_fictitious_cuda = req_num_generation_steps_cuda[
-                    : len(scheduled_requests.context_requests)
+                    : len(finished_context_requests)
                 ]
-                # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
-                # only end-offsets of the token storage locations matter.
-                next_context_req_offsets_cuda = next_context_req_offsets_cuda[1:]
+                # No generation requests, so remove the last extra offset
+                context_req_offsets_cuda = context_req_offsets_cuda[:-1]
 
             # Now, the generated tokens for context request i are at indices
-            #    range(next_context_req_offsets_cuda[i] - req_num_steps_fictitious_cuda[i],
-            #          next_context_req_offsets_cuda[i])
+            #    range(context_req_offsets_cuda[i] - req_num_steps_fictitious_cuda[i],
+            #          context_req_offsets_cuda[i])
             # And if generation requests are present, those tensors each include a trailing entry selecting
             # all tokens/logits generated by all generation requests.
             indices_to_keep_cuda = torch_multi_arange(
-                starts=(next_context_req_offsets_cuda - req_num_steps_fictitious_cuda),
-                ends=next_context_req_offsets_cuda,
+                starts=(context_req_offsets_cuda - req_num_steps_fictitious_cuda),
+                ends=context_req_offsets_cuda,
                 output_length=num_logits_to_keep,
             )
 
             raw_logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
 
-        logits_cuda = raw_logits_cuda[:sum_steps]
+        logits_cuda = raw_logits_cuda[:num_logits_to_keep]
 
-        return req_num_generation_steps_list, req_num_generation_steps, req_offsets, logits_cuda
+        return (
+            sampling_requests,
+            req_num_generation_steps_list,
+            req_num_generation_steps,
+            req_offsets,
+            logits_cuda,
+        )
 
     @staticmethod
     def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
@@ -1662,26 +1668,31 @@ class TorchSampler(Sampler):
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
         *,
-        seq_slots: torch.Tensor,
         resource_manager: Optional[ResourceManager] = None,
-    ) -> torch.Tensor:
-        seq_slots = seq_slots.to(dtype=torch.int32)  # int32 suffices here
-
+    ) -> tuple[list[LlmRequest], torch.Tensor, torch.Tensor]:
         raw_logits_cuda = model_outputs["logits"]
 
-        requests = scheduled_requests.all_requests()
-        cuda_device = raw_logits_cuda.device
-
-        req_num_steps_list, req_num_steps, req_offsets, logits_cuda = self._select_generated_logits(
-            scheduled_requests,
-            raw_logits_cuda,
-            num_context_logits_prefix_sum=num_context_logits_prefix_sum,
+        sampling_requests, req_num_steps_list, req_num_steps, req_offsets, logits_cuda = (
+            self._select_generated_logits(
+                scheduled_requests,
+                raw_logits_cuda,
+                num_context_logits_prefix_sum=num_context_logits_prefix_sum,
+            )
         )
 
-        # Handle embedding bias
-        self._apply_embedding_bias(logits_cuda, requests, req_num_steps)
+        seq_slots_host = torch.tensor(
+            [r.py_seq_slot for r in sampling_requests],
+            dtype=torch.int64,  # for index_fill_
+            pin_memory=True,
+        )
+        seq_slots = seq_slots_host.to(dtype=torch.int32)  # int32 suffices here
 
-        logits_cuda = self._apply_min_length_penalty(logits_cuda, requests, req_num_steps_list)
+        # Handle embedding bias
+        self._apply_embedding_bias(logits_cuda, sampling_requests, req_num_steps)
+
+        logits_cuda = self._apply_min_length_penalty(
+            logits_cuda, sampling_requests, req_num_steps_list
+        )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
@@ -1695,10 +1706,10 @@ class TorchSampler(Sampler):
         # Handle top-k logprobs. This is done outside the sampling loop,
         # because the returned logprobs are specified to not reflect temperature scaling,
         # top-k/top-p masking, etc.
-        if self.return_log_probs(scheduled_requests):
+        if self._return_log_probs(sampling_requests):
             assert logits_cuda.dim() == 2, "logits should be 2D"
             logprobs_req_indices = [
-                req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
+                req_id for req_id, req in enumerate(sampling_requests) if req.py_num_logprobs
             ]
             logprobs_logit_indices = logits_cuda_indexer[logprobs_req_indices]
             logprobs_logit_indices_cuda = logprobs_logit_indices.to(
@@ -1709,7 +1720,7 @@ class TorchSampler(Sampler):
                 dim=-1,
             )
             topk_vals_cuda, topk_indices_cuda = torch.topk(
-                logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
+                logprobs_cuda, k=max(req.py_num_logprobs for req in sampling_requests), dim=-1
             )
             # Use a single D2H copy to reduce overheads
             topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
@@ -1720,7 +1731,7 @@ class TorchSampler(Sampler):
             for req_id, steps in zip(
                 logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
             ):
-                req = requests[req_id]
+                req = sampling_requests[req_id]
                 next_offset = current_offset + steps
                 # NB: Assigning views on memory which is being filled asynchronously
                 req.py_topk_logprobs_vals = topk_vals[
@@ -1734,9 +1745,8 @@ class TorchSampler(Sampler):
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
-            requests,
+            sampling_requests,
             model_outputs,
-            cuda_device=cuda_device,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=req_offsets,
             req_num_steps=req_num_steps,
@@ -1752,7 +1762,7 @@ class TorchSampler(Sampler):
         )
 
         # NB: update_requests syncs w/ device computation and async D2H copies
-        return new_tokens_host
+        return sampling_requests, seq_slots_host, new_tokens_host
 
     @override
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
