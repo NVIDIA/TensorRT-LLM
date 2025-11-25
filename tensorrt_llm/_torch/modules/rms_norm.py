@@ -78,20 +78,30 @@ class RMSNorm(nn.Module):
 
         if self.use_cuda_tile:
             # TODO:
-            # 1. Fuse residual handling to kernels;
-            # 2. Fuse Gemma-style RMS norm to kernels.
+            # 1. Fuse Gemma-style RMS norm to kernels.
             from ..custom_ops.cuda_tile_custom_ops import cuda_tile_rms_norm
+            from ..custom_ops.cuda_tile_custom_ops import cuda_tile_rms_norm_fuse_residual_
 
             if isinstance(residual, torch.Tensor):
-                hidden_states = (hidden_states.float() + residual.float()).to(hidden_states.dtype)
-                residual = hidden_states
-            hidden_states = cuda_tile_rms_norm(
-                x=hidden_states,
-                weight=(self.weight + 1) if self.use_gemma else self.weight,
-                eps=self.variance_epsilon,
-                static_persistent=False,
-                gather=True,  # gather=False cases subsequent device assertion failures.
-            )
+                # Use fused residual kernel
+                hidden_states = hidden_states.contiguous()
+                residual = residual.contiguous()
+                cuda_tile_rms_norm_fuse_residual_(
+                    x=hidden_states,
+                    residual=residual,
+                    weight=(self.weight + 1) if self.use_gemma else self.weight,
+                    eps=self.variance_epsilon,
+                    static_persistent=True,
+                    gather=True,  # gather=False cases subsequent device assertion failures.
+                )
+            else:
+                hidden_states = cuda_tile_rms_norm(
+                    x=hidden_states,
+                    weight=(self.weight + 1) if self.use_gemma else self.weight,
+                    eps=self.variance_epsilon,
+                    static_persistent=True,
+                    gather=True,
+                )
         elif IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
