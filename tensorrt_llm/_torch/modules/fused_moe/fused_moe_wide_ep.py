@@ -206,6 +206,11 @@ class WideEPMoE(MoE):
             return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
 
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if AlltoallMethodType[
+                all2all_method_type] == AlltoallMethodType.NVLinkOneSided:
+            raise NotImplementedError(
+                "NVLinkOneSided is not supported for WideEPMoE. Please use NVLinkTwoSided or switch to CutlassFusedMoE."
+            )
         if all2all_method_type is not None:
             return AlltoallMethodType[all2all_method_type]
 
