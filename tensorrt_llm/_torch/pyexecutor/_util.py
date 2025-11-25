@@ -873,7 +873,9 @@ def create_py_executor_instance(
             kv_cache_manager.impl if kv_cache_manager is not None else None,
             peft_cache_manager.impl if peft_cache_manager is not None else None,
             scheduler_config.capacity_scheduler_policy,
-            two_step_lookahead=mapping.has_pp())
+            two_step_lookahead=mapping.has_pp(),
+            agent_percentage=pytorch_backend_config.agent_percentage,
+            agent_types=pytorch_backend_config.agent_types)
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)

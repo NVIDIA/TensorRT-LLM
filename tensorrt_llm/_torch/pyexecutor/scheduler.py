@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
@@ -148,6 +149,8 @@ class BindCapacityScheduler(CapacityScheduler):
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
         GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
+        agent_percentage: float = 0.0,
+        agent_types: Optional[list[str]] = None,
     ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
@@ -159,7 +162,9 @@ class BindCapacityScheduler(CapacityScheduler):
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
-            no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE)
+            no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
+            agent_percentage=agent_percentage,
+            agent_types=agent_types)
 
     def schedule_request(
         self, active_requests: RequestList
@@ -222,6 +227,12 @@ class SimpleScheduler(RequestScheduler):
                          inflight_request_ids: set[int]) -> SchedulerOutput:
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
+
+        # Debug printing controlled by environment variable DEBUG_AGENT_HIERARCHY
+        if os.environ.get('DEBUG_AGENT_HIERARCHY') == '1':
+            print(
+                f"has {len(active_requests)} reqs, only scheduled {len(fitting_requests)} reqs"
+            )
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)

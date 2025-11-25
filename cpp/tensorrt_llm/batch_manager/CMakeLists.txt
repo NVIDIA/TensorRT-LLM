@@ -61,7 +61,8 @@ set(SRCS
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
-    cacheTransBuffer.cpp)
+    cacheTransBuffer.cpp
+    agentTree.cpp)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")

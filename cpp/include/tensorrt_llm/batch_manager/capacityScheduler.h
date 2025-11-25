@@ -30,6 +30,11 @@ namespace kv_cache_manager
 class BaseKVCacheManager;
 }
 class BasePeftCacheManager;
+
+namespace agent_tree
+{
+class AgentTreeNode; // Forward declaration for agent tree
+}
 } // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager
@@ -108,7 +113,8 @@ class GuaranteedNoEvictScheduler : public BaseCapacityScheduler
 public:
     GuaranteedNoEvictScheduler(SizeType32 maxNumRequests,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE, float agentPercentage = 0.0,
+        std::optional<std::vector<std::string>> agentTypes = std::nullopt);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -124,6 +130,9 @@ protected:
 
 private:
     SizeType32 mMaxNumRequests;
+
+    // Agent tree root node for request sorting (created once in constructor)
+    std::shared_ptr<agent_tree::AgentTreeNode> mAgentTreeRoot;
 };
 
 /// @brief Schedule requests using the STATIC_BATCH policy
@@ -148,7 +157,8 @@ public:
     explicit CapacityScheduler(SizeType32 maxNumRequests, executor::CapacitySchedulerPolicy capacitySchedulerPolicy,
         bool hasKvCacheManager, bool twoStepsLookAhead = false,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE, float agentPercentage = 0.0,
+        std::optional<std::vector<std::string>> agentTypes = std::nullopt);
 
     /**
      * @brief Schedules requests following the selected policy.
