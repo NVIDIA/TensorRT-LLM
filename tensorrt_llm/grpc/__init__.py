@@ -54,10 +54,31 @@ except ImportError:
     trtllm_engine_pb2 = None
     trtllm_engine_pb2_grpc = None
 
+# Try to import request manager
+try:
+    from .grpc_request_manager import (
+        GrpcRequestManager,
+        create_sampling_params_from_proto,
+        create_lora_request_from_proto,
+        create_disaggregated_params_from_proto,
+    )
+    REQUEST_MANAGER_AVAILABLE = True
+except ImportError:
+    REQUEST_MANAGER_AVAILABLE = False
+    GrpcRequestManager = None
+    create_sampling_params_from_proto = None
+    create_lora_request_from_proto = None
+    create_disaggregated_params_from_proto = None
+
 __all__ = [
     "GRPC_MODULE_DIR",
     "PROTO_FILE",
     "PROTOS_AVAILABLE",
+    "REQUEST_MANAGER_AVAILABLE",
     "trtllm_engine_pb2",
     "trtllm_engine_pb2_grpc",
+    "GrpcRequestManager",
+    "create_sampling_params_from_proto",
+    "create_lora_request_from_proto",
+    "create_disaggregated_params_from_proto",
 ]
