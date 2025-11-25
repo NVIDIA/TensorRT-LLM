@@ -94,7 +94,7 @@ class SampleStateTensors:
 
 @dataclass(kw_only=True)
 class SampleState:
-    scheduled_requests: ScheduledRequests
+    requests: RequestList
 
     device: Optional[SampleStateTensors] = None
     host: Optional[SampleStateTensors] = None
@@ -105,7 +105,7 @@ class SampleState:
 class Sampler(ABC):
     SampleState = SampleState
 
-    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
+    def setup_sampler_step(self, requests: RequestList):
         pass
 
     def get_cache_indirection(self) -> torch.Tensor | None:
@@ -130,8 +130,8 @@ class Sampler(ABC):
         raise NotImplementedError
 
     @staticmethod
-    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
-        for req in scheduled_requests:
+    def beam_width(requests: Iterable[LlmRequest]) -> int:
+        for req in requests:
             return req.sampling_config.beam_width
         return 0
 
@@ -158,8 +158,9 @@ class EarlyStopSampler(Sampler):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleState:
+        assert not scheduled_requests.generation_requests
         host = SampleStateTensors(new_tokens=torch.empty(0))
-        return SampleState(scheduled_requests=scheduled_requests, host=host)
+        return SampleState(requests=scheduled_requests.context_requests, host=host)
 
     @override
     def update_requests(
@@ -168,9 +169,7 @@ class EarlyStopSampler(Sampler):
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         assert isinstance(state, SampleState)
-        scheduled_requests = state.scheduled_requests
-        assert not scheduled_requests.generation_requests
-        for idx, request in enumerate(scheduled_requests.context_requests):
+        for request in state.requests:
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
@@ -190,7 +189,7 @@ class MultimodalResult:
 
 @dataclass(kw_only=True)
 class SampleStateWithMMResult:
-    scheduled_requests: ScheduledRequests
+    requests: RequestList
 
     data: MultimodalResult
 
@@ -208,9 +207,10 @@ class EarlyStopWithMMResult(Sampler):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateWithMMResult:
+        assert not scheduled_requests.generation_requests
         # from model_outputs to MultimodalResult
         data = MultimodalResult(mm_embeddings=model_outputs["mm_embeddings"])
-        return SampleStateWithMMResult(scheduled_requests=scheduled_requests, data=data)
+        return SampleStateWithMMResult(requests=scheduled_requests.context_requests, data=data)
 
     @override
     def update_requests(
@@ -220,10 +220,9 @@ class EarlyStopWithMMResult(Sampler):
     ) -> None:
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateWithMMResult)
-        scheduled_requests = state.scheduled_requests
-        assert not scheduled_requests.generation_requests
+        requests = state.requests
         mm_embeddings = state.data.mm_embeddings
-        for request, mm_embedding in zip(scheduled_requests.context_requests, mm_embeddings):
+        for request, mm_embedding in zip(requests, mm_embeddings):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
@@ -1025,18 +1024,7 @@ class TorchSampler(Sampler):
 
         new_tokens_list = new_tokens.tolist()
 
-        for req in state.scheduled_requests.context_requests:
-            if (
-                req.state == LlmRequestState.GENERATION_COMPLETE
-                or req.context_remaining_length != 0
-            ):
-                continue
-            add_token(req, new_tokens_list, beam=BEAM)
-            self.finish_if_reason(req, finish_reasons, step=0)
-            self.handle_logprobs(req, state, beam=BEAM, count=1)
-            req.py_decoding_iter += 1
-
-        for req in state.scheduled_requests.generation_requests:
+        for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             processed = 1
@@ -1099,7 +1087,7 @@ class TorchSampler(Sampler):
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         return SampleStateTorch(
-            scheduled_requests=scheduled_requests,
+            requests=sampling_requests,
             device=SampleStateTensors(new_tokens=new_tokens),
             host=SampleStateTensorsHostTorch(
                 new_tokens=new_tokens_host, finish_reasons=finish_reasons_host
