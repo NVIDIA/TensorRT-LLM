@@ -361,12 +361,23 @@ def create_py_executor(
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import \
-                        ChainDrafter
+                    from tensorrt_llm._torch.speculative.drafting_loops import (
+                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                    from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    return ChainDrafter(spec_config.max_draft_len,
-                                        spec_config.max_total_draft_tokens,
-                                        model)
+                    use_tree_drafter = isinstance(
+                        draft_spec_config, EagleDecodingConfig
+                    ) and not draft_spec_config.is_linear_tree
+
+                    if use_tree_drafter:
+                        return TreeDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            model)
+                    else:
+                        return LinearDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, model)
             else:
                 drafting_loop_wrapper = None
 
@@ -413,6 +424,11 @@ def create_py_executor(
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.max_total_draft_tokens
+
+    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
+        logger.warning(
+            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
+        )
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens

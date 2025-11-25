@@ -1601,6 +1601,37 @@ class TestBatchedSampling:
 
         patch_ctx.setattr(flashinfer.sampling, "sampling_from_logits", _mock_flashinfer_from_logits)
 
+        def _mock_flashinfer_top_k(
+            probs: torch.Tensor,
+            *,
+            top_k: torch.Tensor,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+        ) -> torch.Tensor:
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=top_k[row_idx],
+                        top_p=None,
+                        temperature=None,
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(flashinfer.sampling, "top_k_sampling_from_probs", _mock_flashinfer_top_k)
+
         def _mock_flashinfer_top_p(
             probs: torch.Tensor,
             *,

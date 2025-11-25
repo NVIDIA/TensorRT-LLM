@@ -15,10 +15,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/runtime/torchUtils.h"
-
+#include "tensorrt_llm/kernels/speculativeDecoding/draftTokenTreeKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/mtpKernels.h"
+#include "tensorrt_llm/runtime/torchUtils.h"
 
 namespace th = torch;
 namespace tl = tensorrt_llm;
@@ -261,6 +262,78 @@ std::tuple<th::Tensor, th::Tensor> mtp_relaxed_acceptance_op(th::Tensor& reqSlot
     return std::make_tuple(acceptedTokens, numAcceptedTokens);
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void extract_real_draft_tokens_op(th::Tensor newDraftTokens, th::Tensor draftTokensBuffer,
+    th::Tensor tokensGatherIdxForDrafterModel, th::Tensor topKList, th::Tensor draftTokensIndicesCumsum,
+    int64_t curDraftIdx, int64_t batchSize, int64_t maxDraftLen, int64_t maxTotalDraftTokens, int64_t maxTopK)
+{
+    // Args:
+    // curDraftIdx: int
+    // batchSize: int
+    // maxTotalDraftTokens: int
+    // maxTopK: int
+    // tokensGatherIdxForDrafterModel: Tensor, int32, indices of the draft tokens that need to be expand this layer
+    //     shape: [numTokensExpandThisLayer]
+    // topKList: Tensor, int32, top k value for each expandable token
+    //     shape: [numTokensExpandThisLayer]
+    // draftTokensIndicesCumsum: Tensor, int32, the cumulative sum of the write back indices for each draft layer
+    //     shape: [maxDraftLen + 1]
+    // newDraftTokens: Tensor, int64, the new draft tokens. We only need to extract this layer's tokens and write back
+    // to the draftTokensBuffer
+    //     shape: [batchSize, maxTotalDraftTokens + 1 if curDraftIdx > 0 else 1, maxTopK]
+    // draftTokensBuffer: Tensor, int64, the buffer to store the real draft tokens
+    //     shape: [maxBatchSize, maxTotalDraftTokens + 1]
+
+    // Check the data types
+    TLLM_CHECK(tokensGatherIdxForDrafterModel.scalar_type() == torch::kInt32);
+    TLLM_CHECK(topKList.scalar_type() == torch::kInt32);
+    TLLM_CHECK(draftTokensIndicesCumsum.scalar_type() == torch::kInt32);
+    TLLM_CHECK(newDraftTokens.scalar_type() == torch::kInt64);
+    TLLM_CHECK(draftTokensBuffer.scalar_type() == torch::kInt64);
+
+    // Check the shape of 'tokensGatherIdxForDrafterModel' and 'topKList'
+    auto numTokensExpandThisLayer = tokensGatherIdxForDrafterModel.size(0);
+    TLLM_CHECK(numTokensExpandThisLayer > 0);
+    TLLM_CHECK(topKList.size(0) == numTokensExpandThisLayer);
+
+    // Check the shape of 'draftTokensIndicesCumsum'
+    TLLM_CHECK(draftTokensIndicesCumsum.size(0) == maxDraftLen + 1);
+
+    // Check the shape of 'newDraftTokens'
+    TLLM_CHECK(newDraftTokens.size(0) == batchSize);
+    if (curDraftIdx == 0)
+    {
+        TLLM_CHECK(newDraftTokens.size(1) == 1);
+        TLLM_CHECK(newDraftTokens.size(2) == maxTopK);
+    }
+    else
+    {
+        TLLM_CHECK(newDraftTokens.size(1) == maxTotalDraftTokens + 1);
+        TLLM_CHECK(newDraftTokens.size(2) == maxTopK);
+    }
+
+    // Check the shape of 'draftTokensBuffer'
+    TLLM_CHECK(draftTokensBuffer.size(1) == maxTotalDraftTokens + 1);
+
+    auto stream = at::cuda::getCurrentCUDAStream(newDraftTokens.get_device());
+
+    // Fill params
+    tk::ExtractRealDraftTokensParam params;
+    params.curDraftIdx = curDraftIdx;
+    params.batchSize = batchSize;
+    params.maxDraftLen = maxDraftLen;
+    params.maxTotalDraftTokens = maxTotalDraftTokens;
+    params.maxTopK = maxTopK;
+    params.numTokensExpandThisLayer = numTokensExpandThisLayer;
+    params.tokensGatherIdxForDrafterModel = reinterpret_cast<int32_t*>(tokensGatherIdxForDrafterModel.data_ptr());
+    params.topKList = reinterpret_cast<int32_t*>(topKList.data_ptr());
+    params.draftTokensIndicesCumsum = reinterpret_cast<int32_t*>(draftTokensIndicesCumsum.data_ptr());
+    params.newDraftTokens = reinterpret_cast<int64_t*>(newDraftTokens.data_ptr());
+    params.draftTokensBuffer = reinterpret_cast<int64_t*>(draftTokensBuffer.data_ptr());
+
+    tk::invokeExtractRealDraftTokens(params, stream);
+}
+
 } // end namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -322,4 +395,19 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mtp_relaxed_acceptance_op", &torch_ext::mtp_relaxed_acceptance_op);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "extract_real_draft_tokens_op(Tensor newDraftTokens, Tensor draftTokensBuffer, "
+        "Tensor tokensGatherIdxForDrafterModel, Tensor topKList, Tensor draftTokensIndicesCumsum, "
+        "int curDraftIdx, int batchSize, int maxDraftLen, int maxTotalDraftTokens, int maxTopK) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("extract_real_draft_tokens_op", &torch_ext::extract_real_draft_tokens_op);
 }

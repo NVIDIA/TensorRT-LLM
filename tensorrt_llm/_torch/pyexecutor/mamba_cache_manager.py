@@ -195,6 +195,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        is_estimating_kv_cache: bool = False,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -231,6 +232,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             dtype=dtype,
             spec_config=spec_config,
             layer_mask=layer_mask,
+            is_estimating_kv_cache=is_estimating_kv_cache,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
