@@ -299,6 +299,12 @@ class Decoder:
                 return True
         return False
 
+    def _is_exclude_input_in_output(self, request: Request,
+                                    excluded_from_output: bool) -> bool:
+        if request.exclude_input_in_output is not None:
+            return request.exclude_input_in_output[0][0]
+        return excluded_from_output
+
     def _spec_generate(
             self, preproc: PreprocResponse,
             request: Request) -> Generator[GenerationResponse, None, None]:
@@ -340,7 +346,16 @@ class Decoder:
                     if draft_response.generation_logits is not None:
                         draft_logits = draft_response.generation_logits[0][0]
 
-                input_draft_tokens = draft_output_ids[len(input_ids):seq_len]
+                draft_output_id_head_index = len(input_ids)
+                if self._is_exclude_input_in_output(
+                        request,
+                        self.is_input_excluded_from_output_for_draft(
+                            assume_loaded=True)):
+                    # Input is excluded from draft output
+                    # when `exclude_input_in_output` is specified.
+                    draft_output_id_head_index = 0
+                input_draft_tokens = draft_output_ids[
+                    draft_output_id_head_index:seq_len]
                 if len(input_draft_tokens) > 0:
                     draft_request = DraftRequest(
                         draft_input_ids=np.expand_dims(input_draft_tokens, 0))
@@ -356,7 +371,23 @@ class Decoder:
             target_response = self._generate_non_streaming(
                 cur_preproc, request, draft_request)
             last_input_ids = input_ids
-            input_ids = target_response.output_ids[0][0]
+            if self._is_exclude_input_in_output(
+                    request,
+                    self.is_input_excluded_from_output_for_target(
+                        assume_loaded=True)):
+                # Input is excluded from target output
+                # when `exclude_input_in_output` is specified.
+                input_ids = np.concatenate(
+                    (last_input_ids, target_response.output_ids[0][0]))
+
+                # Replace values with merged information.
+                # This is required for the output of this function.
+                target_response.output_ids = np.expand_dims(input_ids,
+                                                            axis=(0, 1))
+                target_response.sequence_length[0][0] = len(
+                    target_response.output_ids[0][0])
+            else:
+                input_ids = target_response.output_ids[0][0]
             cur_preproc = PreprocResponse.with_new_inputs(
                 cur_preproc, np.expand_dims(input_ids, 0),
                 np.array([[len(input_ids)]], dtype=np.int32))
@@ -464,3 +495,20 @@ class Decoder:
 
     def reset_decoder(self):
         self._accumulated_tokens = []
+
+    def load_model_configs(self,
+                           target_model_config_api_url: Optional[str] = None,
+                           draft_model_config_api_url: Optional[str] = None,
+                           n_retries: Optional[int] = 5,
+                           retry_interval_sec: Optional[int] = 3):
+        raise NotImplementedError()
+
+    def is_input_excluded_from_output_for_target(self,
+                                                 assume_loaded: bool = False
+                                                 ) -> bool:
+        raise NotImplementedError()
+
+    def is_input_excluded_from_output_for_draft(self,
+                                                assume_loaded: bool = False
+                                                ) -> bool:
+        raise NotImplementedError()
