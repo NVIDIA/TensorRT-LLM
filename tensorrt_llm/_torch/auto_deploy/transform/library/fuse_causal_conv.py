@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.mamba.cuda_backend_causal_conv import cuda_cached_causal_conv1d_wrapper
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -85,10 +86,12 @@ class FuseCausalConvActivation(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
 
+        target_op = cuda_cached_causal_conv1d_wrapper
+
         # Step 1: Identify causal_conv + activation pattern
         matches = _match_causal_conv_activation_pattern(
             graph,
-            target_op=torch.ops.auto_deploy.cuda_cached_causal_conv1d,
+            target_op=target_op,
         )
 
         # Step 2: Replace matched patterns with fused version
@@ -98,7 +101,7 @@ class FuseCausalConvActivation(BaseTransform):
                 # Replace the last arg (activation=None) with activation_name
                 new_args = list(conv_node.args[:-1]) + [activation_name]
                 fused_node = graph.call_function(
-                    torch.ops.auto_deploy.cuda_cached_causal_conv1d,
+                    target_op,
                     args=tuple(new_args),
                 )
 
