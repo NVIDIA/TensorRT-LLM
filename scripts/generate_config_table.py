@@ -70,15 +70,15 @@ def generate_rst(yaml_path, output_file=None):
         lines.append(".. list-table::")
         lines.append("   :width: 100%")
         lines.append("   :header-rows: 1")
-        # Widths: GPU, Perf Profile, Config, Command, Recommended Request Settings (ISL/OSL, Concurrency)
-        lines.append("   :widths: 12 15 20 25 15 13")
+        # Widths: GPU, Perf Profile, ISL/OSL, Concurrency, Config, Command
+        lines.append("   :widths: 12 15 15 13 20 25")
         lines.append("")
         lines.append("   * - GPU")
         lines.append("     - Performance Profile")
+        lines.append("     - ISL / OSL")
+        lines.append("     - Concurrency")
         lines.append("     - Config")
         lines.append("     - Command")
-        lines.append("     - Best ISL / OSL")
-        lines.append("     - Best Concurrency")
 
         # Process entries for this model
         subgroups = model_groups[model]
@@ -126,9 +126,7 @@ def generate_rst(yaml_path, output_file=None):
                         profile = "Balanced"
 
                 full_config_path = os.path.join("tensorrt_llm/configure", config_path)
-                command = (
-                    f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{config_path}"
-                )
+                command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)
 
@@ -143,10 +141,10 @@ def generate_rst(yaml_path, output_file=None):
 
                 lines.append(f"   * - {gpu}")
                 lines.append(f"     - {profile}")
-                lines.append(f"     - {config_link}")
-                lines.append(f"     - ``{command}``")
                 lines.append(f"     - {isl} / {osl}")
                 lines.append(f"     - {conc}")
+                lines.append(f"     - {config_link}")
+                lines.append(f"     - ``{command}``")
 
         lines.append("")  # Space between tables
         lines.append(f".. end-{model}")
