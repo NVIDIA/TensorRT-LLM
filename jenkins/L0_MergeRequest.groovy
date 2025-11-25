@@ -977,7 +977,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
-def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
+def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:], onlyBuildImage = false) {
     def parameters = getCommonParameters()
     String globalVarsJson = writeJSON returnText: true, json: globalVars
     parameters += [
@@ -1262,6 +1262,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
     }
 
+    if (onlyBuildImage) {
+        def requiredStages = ["Build-Docker-Images", "Release Check"]
+        stages = stages.findAll { key, _ -> requiredStages.contains(key) }
+        echo "Only execute Build-Docker-Images and Release Check stages, build and update docker images and tags"
+    }
+
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
@@ -1272,6 +1278,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
     parallelJobs.failFast = enableFailFast
     pipeline.parallel parallelJobs
+}
+
+def launchBuildDockerImagesAndUpdateImageTags(pipeline, testFilter, enableFailFast, globalVars) {
+    launchStages(pipeline, false, testFilter, enableFailFast, globalVars, true)
 }
 
 pipeline {
@@ -1324,6 +1334,18 @@ pipeline {
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
                     echo "Check the passed GitLab bot testFilter parameters."
+                }
+            }
+        }
+        stage("Build Docker Images and update Image Tags") {
+            when {
+                expression {
+                    testFilter[(DISABLE_DOCKER_IMAGE_BUILD)] == true
+                }
+            }
+            steps {
+                script {
+                    launchBuildDockerImagesAndUpdateImageTags(this, testFilter, enableFailFast, globalVars)
                 }
             }
         }
