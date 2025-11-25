@@ -121,7 +121,7 @@ Command line arguments are comma separated, for example, `--batch-size 1,2,4`. C
 
 Run with OpenMPI:
 
-```
+```bash
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size 1,2,4 --seq-len-q 1024,8192
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
 ```

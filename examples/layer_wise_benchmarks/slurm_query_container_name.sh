@@ -13,9 +13,9 @@ fi
 
 if [ "$count" -gt 1 ]; then
     echo "Error: Multiple containers found" >&2
-    for match in "$matches"; do
+    while IFS= read -r match; do
         echo "- ${match#$prefix}" >&2
-    done
+    done <<< "$matches"
     exit 1
 fi
 
