@@ -2175,14 +2175,14 @@ class TorchSampler(Sampler):
                 num_context_logits_prefix_sum, dtype=torch.int32, pin_memory=True
             ).to(device=raw_logits_cuda.device, non_blocking=True)
 
-            # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
-            # only end-offsets of the token storage locations matter.
-            next_context_req_offsets_cuda = context_req_offsets_cuda.roll(
-                -1
-            )  # trailing '0' is overwritten below
-            # Since logits for generation requests are densely packed, cover them all by a single
-            # fictituous entry in 'context_req_offsets_cuda'.
             if scheduled_requests.generation_requests:
+                # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
+                # only end-offsets of the token storage locations matter.
+                next_context_req_offsets_cuda = context_req_offsets_cuda.roll(
+                    -1
+                )  # trailing '0' is overwritten below
+                # Since logits for generation requests are densely packed, cover them all by a single
+                # fictituous entry in 'context_req_offsets_cuda'.
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
                     : (len(scheduled_requests.context_requests) + 1)
                 ].clone()
@@ -2195,7 +2195,9 @@ class TorchSampler(Sampler):
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
                     : len(scheduled_requests.context_requests)
                 ]
-                next_context_req_offsets_cuda = next_context_req_offsets_cuda[:-1]
+                # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
+                # only end-offsets of the token storage locations matter.
+                next_context_req_offsets_cuda = context_req_offsets_cuda[1:]
 
             # Now, the generated tokens for context request i are at indices
             #    range(next_context_req_offsets_cuda[i] - req_num_steps_fictitious_cuda[i],
