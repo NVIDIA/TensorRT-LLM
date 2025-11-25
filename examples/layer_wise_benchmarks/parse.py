@@ -258,7 +258,7 @@ parser_keywords = [
     ("CountAndIndice", "computeCountAndIndiceDevice"),
     ("Cumsum", "computeCumsumDevice"),
     ("moveIndice", "moveIndiceDevice"),
-    ("AllToAll", "moeAllToAllKernel"),
+    ("moeAllToAll", "moeAllToAllKernel"),
     ("memsetExpertIds", "memsetExpertIdsDevice"),
     ("blockSum", "blockExpertPrefixSumKernel"),
     ("globalSum", "globalExpertPrefixSumKernel"),
@@ -307,6 +307,7 @@ parser_keywords = [
     ("routingIndicesHistogramScores", "routingRenormalize::routingIndicesHistogramScoresKernel<"),
     ("routingIndicesHistogram", "routingIndicesHistogramKernel<"),
     ("routingIndicesOffsets", "routingIndicesOffsetsKernel<"),
+    ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
 ]
 warned_names = set()
 
@@ -318,7 +319,9 @@ def parse_kernel_name(demangledName):
         return "Memset"
     name = string_ids[demangledName]
     for dst, src in parser_keywords:
-        if src in name:
+        if not isinstance(src, (tuple, list)):
+            src = [src]
+        if all(keyword in name for keyword in src):
             return dst
     if name not in warned_names:
         print(f"Unknown kernel name: {name}")
