@@ -103,7 +103,7 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
     inputs_pre_hook: Callable = None
-    use_cold_l2_cache: bool = False
+    use_cold_l2_cache: bool = True
     use_cuda_graph: bool = True
 
 
