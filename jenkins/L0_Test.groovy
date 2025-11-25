@@ -933,15 +933,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
-            def outputPath = "${jobWorkspace}/job-output.log"
+            def sbatchLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
-            def scriptLaunchPathNode = "${jobWorkspace}/slurm_launch.sh"
+            def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
-            def scriptSubmitPathNode = "${jobWorkspace}/slurm_submit.sh"
+            def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
-            def scriptTrackPathNode = "${jobWorkspace}/slurm_track.sh"
+            def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def scriptStatusPathLocal = Utils.createTempLocation(pipeline, "./slurm_status.sh")
-            def scriptStatusPathNode = "${jobWorkspace}/slurm_status.sh"
+            def scriptStatusPathNode = "${jobWorkspace}/${jobUID}-slurm_status.sh"
             def isAarch64 = config.contains("aarch64")
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
@@ -1138,8 +1138,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
-                // Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
-                def scriptLaunchPrefix = """#!/bin/bash
+                def scriptContent = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
@@ -1235,9 +1234,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     rm -rf "${jobWorkspace}/results.xml"
                     rm -rf "${jobWorkspace}/report.csv"
                     rm -rf "${jobWorkspace}/unfinished_test.txt"
-                    rm -rf "${outputPath}"
+                    rm -rf "${sbatchLogPath}"
 
-                    touch "${outputPath}"
+                    touch ${sbatchLogPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
@@ -1269,14 +1268,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
                 def scriptTrack = """#!/bin/bash
                     jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    tail -f $outputPath &
+                    tail -f ${sbatchLogPath} &
                     tailPid=\$!
                     # Wait until sbatch job is done.
                     while true; do
-                        state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | \
-                            awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
-                        if [[ -z "\$state" || "\$state" == "RUNNING" || \
-                            "\$state" == "PENDING"]]; then
+                        state=\$(sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}')
+                        if [[ -z \$state || \$state == "RUNNING" || \$state == "PENDING" ]]; then
+                            echo "job is still running"
                             sleep 300
                         else
                             echo "Job \$jobId finished with state: \$state"
@@ -1328,8 +1326,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
                 def scriptStatus = """#!/bin/bash
                     jobId=\$(cat $jobWorkspace/slurm_job_id.txt)
-                    sacct -j \$jobId --format=JobIDRaw,State --noheader |\
-                        awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}'
+                    sacct -j \$jobId --format=JobIDRaw,State --noheader | awk -v jobId=\$jobId '""\$1"" == jobId {print \$2}'
                 """
                 pipeline.writeFile(file: scriptStatusPathLocal, text: scriptStatus)
                 Utils.copyFileToRemoteHost(
@@ -1366,13 +1363,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             remote,
                             scriptStatusPathNode
                         )
-                    )
-                    println(result)
-                    if (result == "") {
-                        echo "Job is done."
-                        break
-                    } else {
+                    ).trim()
+                    if (!result || result == "RUNNING" || result == "PENDING") {
                         echo "Job is still running, pulling the job log."
+                        // Pulling the sbatch output log
                         Utils.exec(
                             pipeline,
                             timeout: false,
@@ -1381,6 +1375,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 scriptTrackPathNode
                             )
                         )
+                    } else {
+                        echo "Job is done."
+                        break
                     }
                 }
             }
