@@ -1078,7 +1078,6 @@ class TorchSampler(Sampler):
 
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
-        return_log_probs = self.return_log_probs(scheduled_requests)
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in requests],
             dtype=torch.int64,  # for index_fill_
@@ -1090,7 +1089,6 @@ class TorchSampler(Sampler):
             new_tokens,
             num_context_logits_prefix_sum,
             seq_slots=seq_slots_host,
-            return_log_probs=return_log_probs,
             resource_manager=resource_manager,
         )
 
@@ -1643,7 +1641,6 @@ class TorchSampler(Sampler):
         num_context_logits_prefix_sum: list[int],
         *,
         seq_slots: torch.Tensor,
-        return_log_probs: bool,
         resource_manager: Optional[ResourceManager] = None,
     ) -> torch.Tensor:
         seq_slots = seq_slots.to(dtype=torch.int32)  # int32 suffices here
@@ -1692,7 +1689,7 @@ class TorchSampler(Sampler):
         # Handle top-k logprobs. This is done outside the sampling loop,
         # because the returned logprobs are specified to not reflect temperature scaling,
         # top-k/top-p masking, etc.
-        if return_log_probs:
+        if self.return_log_probs(scheduled_requests):
             assert logits_cuda.dim() == 2, "logits should be 2D"
             logprobs_req_indices = [
                 req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
