@@ -2,7 +2,6 @@ import os
 import pytest
 import torch
 
-os.environ['TRTLLM_ENABLE_KVCACHE_PRECISION_CONVERSION'] = '1'
 os.environ['TRTLLM_KVCACHE_ENABLE_PRECISION_CONVERSION'] = '1'
 
 import tensorrt_llm
@@ -21,24 +20,20 @@ AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 DataType = tensorrt_llm.bindings.DataType
 
-COMBO_CONFIGS = {
+TEST_CONFIGS = {
     "ctx_fp8_gen_fp8_xfer_fp8": (DataType.FP8, DataType.FP8, "FP8"),
     "ctx_fp16_gen_fp8_xfer_fp8": (DataType.HALF, DataType.FP8, "FP8"),
     "ctx_fp16_gen_fp8_xfer_fp16": (DataType.HALF, DataType.FP8, "FP16"),
     "ctx_fp8_gen_fp16_xfer_fp8": (DataType.FP8, DataType.HALF, "FP8"),
     "ctx_fp16_gen_fp16_xfer_fp16": (DataType.HALF, DataType.HALF, "FP16"),
-    # "ctx_fp32_gen_fp32_xfer_fp32": (DataType.FLOAT, DataType.FLOAT, "FP32"),
-    # "ctx_fp32_gen_fp16_xfer_fp16": (DataType.FLOAT, DataType.HALF, "FP16"),
-    # "ctx_fp16_gen_fp32_xfer_fp16": (DataType.HALF, DataType.FLOAT, "FP16"),
-    # "ctx_fp32_gen_fp32_xfer_fp16": (DataType.FLOAT, DataType.FLOAT, "FP16"),
-    # "ctx_fp32_gen_fp8_xfer_fp8": (DataType.FLOAT, DataType.FP8, "FP8"),
-    # "ctx_fp8_gen_fp32_xfer_fp8": (DataType.FP8, DataType.FLOAT, "FP8"),
-    # "ctx_fp32_gen_fp32_xfer_fp8": (DataType.FLOAT, DataType.FLOAT, "FP8"),
-    "ctx_fp16_gen_fp8_xfer_nvfp4": (DataType.HALF, DataType.FP8, "NVFP4"),
-    "ctx_fp8_gen_fp16_xfer_nvfp4": (DataType.FP8, DataType.HALF, "NVFP4"),
-    "ctx_fp16_gen_fp16_xfer_nvfp4": (DataType.HALF, DataType.HALF, "NVFP4"),
+    "ctx_fp32_gen_fp32_xfer_fp32": (DataType.FLOAT, DataType.FLOAT, "FP32"),
+    "ctx_fp32_gen_fp16_xfer_fp16": (DataType.FLOAT, DataType.HALF, "FP16"),
+    "ctx_fp16_gen_fp32_xfer_fp16": (DataType.HALF, DataType.FLOAT, "FP16"),
+    "ctx_fp32_gen_fp32_xfer_fp16": (DataType.FLOAT, DataType.FLOAT, "FP16"),
+    "ctx_fp32_gen_fp8_xfer_fp8": (DataType.FLOAT, DataType.FP8, "FP8"),
+    "ctx_fp8_gen_fp32_xfer_fp8": (DataType.FP8, DataType.FLOAT, "FP8"),
+    "ctx_fp32_gen_fp32_xfer_fp8": (DataType.FLOAT, DataType.FLOAT, "FP8")
 }
-
 
 def create_kv_cache_manager(mapping, dtype):
     return KVCacheManager(
@@ -49,7 +44,7 @@ def create_kv_cache_manager(mapping, dtype):
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=1,
         num_kv_heads=1,
-        head_dim=1,
+        head_dim=16,
         tokens_per_block=2,
         max_seq_len=256,  # Match max_tokens to allow full transfer
         max_batch_size=1,
@@ -69,28 +64,22 @@ def fill_kv_cache_buffer(kv_cache_manager):
 
 @pytest.fixture(scope="function")
 def ctx_gen_transfer_dtype(request):
-    if request.param not in COMBO_CONFIGS:
+    if request.param not in TEST_CONFIGS:
         raise ValueError(f"Invalid ctx/gen/transfer combo: {request.param}")
-    combo = COMBO_CONFIGS[request.param]
+    combo = TEST_CONFIGS[request.param]
     print(f"CTX/GEN/TRANSFER combo {request.param}: {combo}", flush=True)
     return combo
 
-
-# TODO: Test MLA TODO: Test MLA TODO: Test MLA 
-
-@pytest.mark.parametrize(
+@pytest.mark.parametrize( # TODO: Layerwise, MLA, etc.
     "ctx_gen_transfer_dtype",
-    list(COMBO_CONFIGS.keys()),
-    ids=list(COMBO_CONFIGS.keys()),
+    list(TEST_CONFIGS.keys()),
+    ids=list(TEST_CONFIGS.keys()),
     indirect=True)
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT],
                          ids=["mha"])
 def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
                                              attention_type):
-    print(f"TEST FUNCTION ENTERED with ctx/gen/transfer={ctx_gen_transfer_dtype}, attention={attention_type}", flush=True)
-    # Init kv_cache manager and cache transceiver
-    print("A", flush=True)
     
     mapping = Mapping(world_size=1, rank=0)
     ctx_kv_cache_dtype, gen_kv_cache_dtype, transfer_dtype = ctx_gen_transfer_dtype
@@ -101,8 +90,6 @@ def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
         backend="DEFAULT",
         max_tokens_in_buffer=256,
         transfer_dtype=transfer_dtype)
-
-    print("C", flush=True)
     
     kv_cache_transceiver_ctx = None
     kv_cache_transceiver_gen = None
@@ -117,8 +104,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
         kv_cache_transceiver_gen = create_kv_cache_transceiver(
             mapping, dist, kv_cache_manager_gen, attention_type,
             cache_transceiver_config)
-
-        print("Filling in cache buffer", flush=True)
+        
         fill_kv_cache_buffer(kv_cache_manager_ctx)
 
         # init ctx request
@@ -131,21 +117,13 @@ def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
                 sampling_params._get_sampling_config()),
             is_streaming=False,
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
-        
-        print(f"ctx_request: {ctx_request}", flush=True)
 
         kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
                                                ctx_request.prompt_len, 1,
                                                ctx_request)
         
-        print(f"kv_cache_manager_ctx: {kv_cache_manager_ctx}", flush=True)
-        print("Sending ctx request", flush=True)
-        # send ctx request
         kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
-
-        print("Init gen request", flush=True)
-
-        # init gen request
+        
         gen_request = LlmRequest(
             request_id=0,
             max_new_tokens=1,
@@ -160,29 +138,14 @@ def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
                                                gen_request.prompt_len, 1,
                                                gen_request)
         
-        print(f"kv_cache_manager_gen: {kv_cache_manager_gen}", flush=True)
-        print("Sending gen request", flush=True)
-        # send gen request
         kv_cache_transceiver_gen.request_and_receive_async(gen_request)
         
-        print("Checking context transfer status", flush=True)
         kv_cache_transceiver_ctx.check_context_transfer_status(1)
-        
-        print("Checking gen transfer status", flush=True)
         kv_cache_transceiver_gen.check_gen_transfer_status(1)
         
-        print("Done", flush=True)
-
         ctx_buf = kv_cache_manager_ctx.get_buffers(0).to(torch.float32)
         gen_buf = kv_cache_manager_gen.get_buffers(0).to(torch.float32)
         
-        print("================================================= FINAL VALUES OF THE CACHES =================================================")
-        print("ctx_buf: ", ctx_buf)
-        print("gen_buf: ", gen_buf)
-        
-        # print("ctx_buf: ", ctx_buf.flatten().argsort())
-        # print("gen_buf: ", gen_buf.flatten().argsort())
-
         torch.testing.assert_close(
             gen_buf,
             ctx_buf,
@@ -190,18 +153,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_transfer_dtype,
             atol=1e-3,
             msg="Different KV-cache values after transfer",
         )
-        
-        # torch.testing.assert_close(
-        #     gen_buf.flatten().argsort(),
-        #     ctx_buf.flatten().argsort(),
-        #     rtol=5e-3,
-        #     atol=1e-3,
-        #     msg="Different KV-cache values after transfer",
-        # )
     
     finally:
-        # Cleanup resources to prevent hanging between tests
-        print("Cleaning up resources...", flush=True)
         try:
             if kv_cache_transceiver_ctx is not None:
                 del kv_cache_transceiver_ctx

@@ -1,0 +1,186 @@
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/utils/import_utils.py:32: UserWarning: Failed to import huggingface plugin due to: AttributeError("module 'transformers.modeling_utils' has no attribute 'Conv1D'"). You may ignore this warning if you do not need this plugin.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.56.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.2.0rc2
+/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_fields.py:198: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  warnings.warn(
+[11/25/2025-03:28:48] [TRT-LLM] [I] Using LLM with PyTorch backend
+[11/25/2025-03:28:48] [TRT-LLM] [I] Set PluginConfig.nccl_plugin to None.
+[11/25/2025-03:28:48] [TRT-LLM] [I] neither checkpoint_format nor checkpoint_loader were provided, checkpoint_format will be set to HF.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type llama to instantiate a model of type . This is not supported for all configurations of models and can yield errors.
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0m[11/25/2025-03:28:55] [TRT-LLM] [I] Generating a new HMAC key for server proxy_request_queue
+[11/25/2025-03:28:55] [TRT-LLM] [I] Generating a new HMAC key for server worker_init_status_queue
+[11/25/2025-03:28:55] [TRT-LLM] [I] Generating a new HMAC key for server proxy_result_queue
+[11/25/2025-03:28:55] [TRT-LLM] [I] Generating a new HMAC key for server proxy_stats_queue
+[11/25/2025-03:28:55] [TRT-LLM] [I] Generating a new HMAC key for server proxy_kv_cache_events_queue
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Multiple distributions found for package optimum. Picked distribution: optimum
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/utils/import_utils.py:32: UserWarning: Failed to import huggingface plugin due to: AttributeError("module 'transformers.modeling_utils' has no attribute 'Conv1D'"). You may ignore this warning if you do not need this plugin.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.56.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.2.0rc2
+ninja: no work to do.
+/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_fields.py:198: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  warnings.warn(
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[11/25/2025-03:29:08] [TRT-LLM] [I] ATTENTION RUNTIME FEATURES:  AttentionRuntimeFeatures(chunked_prefill=False, cache_reuse=True, has_speculative_draft_tokens=False, chunk_size=8192, chunked_prefill_buffer_batch_size=4)
+[11/25/2025-03:29:08] [TRT-LLM] [I] Validating KV Cache config against kv_cache_dtype="auto"
+[11/25/2025-03:29:08] [TRT-LLM] [I] KV cache quantization set to "auto". Using checkpoint KV quantization.
+`torch_dtype` is deprecated! Use `dtype` instead!
+[11/25/2025-03:29:08] [TRT-LLM] [I] Use 5.61 GB for model weights.
+[11/25/2025-03:29:08] [TRT-LLM] [I] Prefetching 5.61GB checkpoint files.
+[11/25/2025-03:29:08] [TRT-LLM] [I] Prefetching /home/dev_user/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-NVFP4/snapshots/bdb54e24298451af785c0ac63c1b485e9b7400a2/model-00002-of-00002.safetensors to memory...
+[11/25/2025-03:29:08] [TRT-LLM] [I] Prefetching /home/dev_user/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-NVFP4/snapshots/bdb54e24298451af785c0ac63c1b485e9b7400a2/model-00001-of-00002.safetensors to memory...
+[11/25/2025-03:29:08] [TRT-LLM] [I] Finished prefetching /home/dev_user/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-NVFP4/snapshots/bdb54e24298451af785c0ac63c1b485e9b7400a2/model-00002-of-00002.safetensors.
+[11/25/2025-03:29:09] [TRT-LLM] [I] Finished prefetching /home/dev_user/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-NVFP4/snapshots/bdb54e24298451af785c0ac63c1b485e9b7400a2/model-00001-of-00002.safetensors.
+Loading safetensors weights in parallel:   0%|          | 0/2 [00:00<?, ?it/s][11/25/2025-03:29:09] [TRT-LLM] [I] Start to load safetensor file /home/dev_user/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-NVFP4/snapshots/bdb54e24298451af785c0ac63c1b485e9b7400a2/model-00002-of-00002.safetensors
+[11/25/2025-03:29:09] [TRT-LLM] [I] Start to load safetensor file /home/dev_user/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-NVFP4/snapshots/bdb54e24298451af785c0ac63c1b485e9b7400a2/model-00001-of-00002.safetensors
+Loading safetensors weights in parallel: 100%|██████████| 2/2 [00:00<00:00, 163.14it/s]
+Loading weights:   0%|          | 0/649 [00:00<?, ?it/s]Loading weights:   1%|          | 8/649 [00:00<00:08, 73.39it/s]Loading weights:  24%|██▍       | 159/649 [00:00<00:00, 884.57it/s]Loading weights:  52%|█████▏    | 339/649 [00:00<00:00, 1281.55it/s]Loading weights:  80%|███████▉  | 519/649 [00:00<00:00, 1466.34it/s]Loading weights: 100%|██████████| 649/649 [00:00<00:00, 1147.82it/s]
+Model init total -- 2.04s
+[11/25/2025-03:29:10] [TRT-LLM] [I] max_seq_len is not specified, using inferred value 131072
+[11/25/2025-03:29:10] [TRT-LLM] [I] Using Sampler: TorchSampler
+[11/25/2025-03:29:10] [TRT-LLM] [W] Both free_gpu_memory_fraction and max_tokens are set (to 0.9 and 8224 with free memory 21.767196655273438 of total memory 23.742691040039062, respectively). The smaller value will be used.
+[11/25/2025-03:29:10] [TRT-LLM] [W] Attention window size 131073 exceeds upper bound 8224 for available blocks. Reducing to 8224.
+[11/25/2025-03:29:10] [TRT-LLM] [W] Adjusted max_attention_window_vec to [8224]
+[11/25/2025-03:29:10] [TRT-LLM] [W] Adjusted window size 131073 to 8224 in blocks_per_window
+[11/25/2025-03:29:10] [TRT-LLM] [W] Adjusted max_seq_len to 8224
+[TensorRT-LLM][INFO] Max KV cache blocks per sequence: 4097 [window size=8224], tokens per block=32, primary blocks=257, secondary blocks=0, max sequence length=131073
+[TensorRT-LLM][INFO] Number of tokens per block: 32.
+[TensorRT-LLM][INFO] [MemUsageChange] Allocated 0.50 GiB for max tokens in paged KV cache (8224).
+[11/25/2025-03:29:10] [TRT-LLM] [I] max_seq_len=8224, max_num_requests=2048, max_num_tokens=8192, max_batch_size=2048
+[11/25/2025-03:29:10] [TRT-LLM] [I] Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server hangs or lower-than-expected performance.
+[TensorRT-LLM][INFO] CacheTransBufferManager: Using explicit transfer dtype: 6 (local cache dtype: 6)
+[TensorRT-LLM][INFO] TESTING!! CacheTransBufferManager: mTransferDataType: 6
+[TensorRT-LLM][INFO] CacheTransBufferManager: mMaxNumTokens:2048, mRecvBufferCount:1, mSendBufferCount:1,mTransferBufferSize:136314880, mPreAllocBufferSize:272629760,mOnlyUseDynamicBuffer:0 mUseFabricMemory:0 mDataType:6 mTransferDataType:6
+[TensorRT-LLM][INFO][0] UcxConnectionManager::UcxConnectionManager localIp: 192.168.1.1
+[TensorRT-LLM][INFO][0] UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: tcp://192.168.1.1:38423
+[TensorRT-LLM][INFO][0] UcxConnectionManager::UcxConnectionManager ip: 192.168.1.1, port: 38423
+[TensorRT-LLM][INFO] UCX Connection Manager created
+[11/25/2025-03:29:10] [TRT-LLM] [I] Running autotuner warmup...
+[11/25/2025-03:29:10] [TRT-LLM] [I] [Autotuner] Autotuning process starts ...
+[TensorRT-LLM][WARNING] Attention workspace size is not enough, increase the size from 0 bytes to 67724800 bytes
+[11/25/2025-03:29:12] [TRT-LLM] [I] [Autotuner] Autotuning process ends
+[11/25/2025-03:29:12] [TRT-LLM] [I] [Autotuner] Cache size after warmup is 56
+[11/25/2025-03:29:12] [TRT-LLM] [I] Creating CUDA graph instances for 34 batch sizes.
+[11/25/2025-03:29:12] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=128, draft_len=0
+[TensorRT-LLM][WARNING] Attention workspace size is not enough, increase the size from 67724800 bytes to 103809024 bytes
+[11/25/2025-03:29:12] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=64, draft_len=0
+[11/25/2025-03:29:13] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=32, draft_len=0
+[11/25/2025-03:29:13] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=31, draft_len=0
+[11/25/2025-03:29:14] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=30, draft_len=0
+[11/25/2025-03:29:14] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=29, draft_len=0
+[11/25/2025-03:29:14] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=28, draft_len=0
+[11/25/2025-03:29:15] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=27, draft_len=0
+[11/25/2025-03:29:15] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=26, draft_len=0
+[11/25/2025-03:29:16] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=25, draft_len=0
+[11/25/2025-03:29:16] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=24, draft_len=0
+[11/25/2025-03:29:16] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=23, draft_len=0
+[11/25/2025-03:29:17] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=22, draft_len=0
+[11/25/2025-03:29:17] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=21, draft_len=0
+[11/25/2025-03:29:17] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=20, draft_len=0
+[11/25/2025-03:29:18] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=19, draft_len=0
+[11/25/2025-03:29:18] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=18, draft_len=0
+[11/25/2025-03:29:19] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=17, draft_len=0
+[11/25/2025-03:29:19] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=16, draft_len=0
+[11/25/2025-03:29:19] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=15, draft_len=0
+[11/25/2025-03:29:20] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=14, draft_len=0
+[11/25/2025-03:29:20] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=13, draft_len=0
+[11/25/2025-03:29:21] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=12, draft_len=0
+[11/25/2025-03:29:21] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=11, draft_len=0
+[11/25/2025-03:29:21] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=10, draft_len=0
+[11/25/2025-03:29:22] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=9, draft_len=0
+[11/25/2025-03:29:22] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=8, draft_len=0
+[11/25/2025-03:29:23] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=7, draft_len=0
+[11/25/2025-03:29:23] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=6, draft_len=0
+[11/25/2025-03:29:23] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=5, draft_len=0
+[11/25/2025-03:29:24] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=4, draft_len=0
+[11/25/2025-03:29:24] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=3, draft_len=0
+[11/25/2025-03:29:25] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=2, draft_len=0
+[11/25/2025-03:29:25] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=1, draft_len=0
+[11/25/2025-03:29:25] [TRT-LLM] [I] global_steady_clock_offset at each rank: [0.0]
+[11/25/2025-03:29:25] [TRT-LLM] [I] Setting global_steady_clock_offset: 0.0 seconds for rank 0
+[11/25/2025-03:29:25] [TRT-LLM] [I] Memory used after loading model weights (inside torch) in memory usage profiling: 7.98 GiB
+[11/25/2025-03:29:25] [TRT-LLM] [I] Memory used after loading model weights (outside torch) in memory usage profiling: 2.49 GiB
+[TensorRT-LLM][WARNING] [kv cache manager] storeContextBlocks: Can not find sequence for request 2048
+[11/25/2025-03:29:26] [TRT-LLM] [I] Memory dynamically allocated during inference (inside torch) in memory usage profiling: 0.97 GiB
+[11/25/2025-03:29:26] [TRT-LLM] [I] Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: 2.58 GiB
+[11/25/2025-03:29:26] [TRT-LLM] [I] Peak memory during memory usage profiling (torch + non-torch): 11.53 GiB, available KV cache memory when calculating max tokens: 75.55 GiB, fraction is set 0.9, kv size is 65536. device total memory 94.97 GiB, , tmp kv_mem 0.50 GiB
+[11/25/2025-03:29:26] [TRT-LLM] [I] Estimated max memory in KV cache : 75.55 GiB
+[11/25/2025-03:29:26] [TRT-LLM] [W] Both free_gpu_memory_fraction and max_tokens are set (to 0.9 and 1237846 with free memory 21.226669311523438 of total memory 23.742691040039062, respectively). The smaller value will be used.
+[TensorRT-LLM][INFO] Max KV cache blocks per sequence: 4097 [window size=131073], tokens per block=32, primary blocks=38683, secondary blocks=0, max sequence length=131073
+[TensorRT-LLM][INFO] Number of tokens per block: 32.
+[TensorRT-LLM][INFO] [MemUsageChange] Allocated 75.55 GiB for max tokens in paged KV cache (1237856).
+[11/25/2025-03:29:26] [TRT-LLM] [I] max_seq_len=131073, max_num_requests=2048, max_num_tokens=8192, max_batch_size=2048
+[11/25/2025-03:29:26] [TRT-LLM] [I] Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server hangs or lower-than-expected performance.
+[TensorRT-LLM][INFO] CacheTransBufferManager: Using explicit transfer dtype: 6 (local cache dtype: 6)
+[TensorRT-LLM][INFO] TESTING!! CacheTransBufferManager: mTransferDataType: 6
+[TensorRT-LLM][INFO] CacheTransBufferManager: mMaxNumTokens:2048, mRecvBufferCount:1, mSendBufferCount:1,mTransferBufferSize:136314880, mPreAllocBufferSize:272629760,mOnlyUseDynamicBuffer:0 mUseFabricMemory:0 mDataType:6 mTransferDataType:6
+[TensorRT-LLM][INFO][0] UcxConnectionManager::UcxConnectionManager localIp: 192.168.1.1
+[TensorRT-LLM][INFO][0] UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: tcp://192.168.1.1:43285
+[TensorRT-LLM][INFO][0] UcxConnectionManager::UcxConnectionManager ip: 192.168.1.1, port: 43285
+[TensorRT-LLM][INFO] UCX Connection Manager created
+[11/25/2025-03:29:26] [TRT-LLM] [I] Running autotuner warmup...
+[11/25/2025-03:29:26] [TRT-LLM] [I] [Autotuner] Autotuning process starts ...
+[TensorRT-LLM][WARNING] Attention workspace size is not enough, increase the size from 0 bytes to 67724800 bytes
+[11/25/2025-03:29:26] [TRT-LLM] [I] [Autotuner] Autotuning process ends
+[11/25/2025-03:29:26] [TRT-LLM] [I] [Autotuner] Cache size after warmup is 56
+[11/25/2025-03:29:26] [TRT-LLM] [I] Creating CUDA graph instances for 34 batch sizes.
+[11/25/2025-03:29:26] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=128, draft_len=0
+[TensorRT-LLM][WARNING] Attention workspace size is not enough, increase the size from 67724800 bytes to 138412032 bytes
+[11/25/2025-03:29:26] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=64, draft_len=0
+[11/25/2025-03:29:27] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=32, draft_len=0
+[11/25/2025-03:29:27] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=31, draft_len=0
+[11/25/2025-03:29:28] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=30, draft_len=0
+[11/25/2025-03:29:28] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=29, draft_len=0
+[11/25/2025-03:29:29] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=28, draft_len=0
+[11/25/2025-03:29:29] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=27, draft_len=0
+[11/25/2025-03:29:30] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=26, draft_len=0
+[11/25/2025-03:29:30] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=25, draft_len=0
+[11/25/2025-03:29:31] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=24, draft_len=0
+[11/25/2025-03:29:31] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=23, draft_len=0
+[11/25/2025-03:29:32] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=22, draft_len=0
+[11/25/2025-03:29:32] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=21, draft_len=0
+[11/25/2025-03:29:32] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=20, draft_len=0
+[11/25/2025-03:29:33] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=19, draft_len=0
+[11/25/2025-03:29:33] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=18, draft_len=0
+[11/25/2025-03:29:34] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=17, draft_len=0
+[11/25/2025-03:29:34] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=16, draft_len=0
+[11/25/2025-03:29:35] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=15, draft_len=0
+[11/25/2025-03:29:35] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=14, draft_len=0
+[11/25/2025-03:29:36] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=13, draft_len=0
+[11/25/2025-03:29:36] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=12, draft_len=0
+[11/25/2025-03:29:37] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=11, draft_len=0
+[11/25/2025-03:29:37] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=10, draft_len=0
+[11/25/2025-03:29:38] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=9, draft_len=0
+[11/25/2025-03:29:38] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=8, draft_len=0
+[11/25/2025-03:29:39] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=7, draft_len=0
+[11/25/2025-03:29:39] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=6, draft_len=0
+[11/25/2025-03:29:40] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=5, draft_len=0
+[11/25/2025-03:29:40] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=4, draft_len=0
+[11/25/2025-03:29:41] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=3, draft_len=0
+[11/25/2025-03:29:41] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=2, draft_len=0
+[11/25/2025-03:29:41] [TRT-LLM] [I] Run generation-only CUDA graph warmup for batch size=1, draft_len=0
+[11/25/2025-03:29:42] [TRT-LLM] [I] global_steady_clock_offset at each rank: [0.0]
+[11/25/2025-03:29:42] [TRT-LLM] [I] Setting global_steady_clock_offset: 0.0 seconds for rank 0
+[11/25/2025-03:29:42] [TRT-LLM] [I] Setting PyTorch memory fraction to 0.18630772088192746 (17.69378662109375 GiB)
+[11/25/2025-03:29:42] [TRT-LLM] [I] get signal from executor worker
+INFO:     Started server process [10013]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://localhost:8403 (Press CTRL+C to quit)
+INFO:     127.0.0.1:38800 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40348 - "GET /health HTTP/1.1" 200 OK
+[TensorRT-LLM][WARNING] Mixed-precision disaggregated serving detected: local cache dtype=6, remote cache dtype=7, transfer dtype=6. For mixed-precision serving, it is recommended to explicitly set transfer_dtype in CacheTransceiverConfig. Example: CacheTransceiverConfig(transfer_dtype='FP8') for FP16 context to FP8 generation transfer.
+[TensorRT-LLM][INFO] ============= RECEIVE ON GEN SIDE SETTINGS =============
+[TensorRT-LLM][INFO] preAllocRecvBuffer  data type: FP8
+[TensorRT-LLM][INFO] dataType: FP8
+[TensorRT-LLM][INFO] ============= RECEIVE ON GEN SIDE SETTINGS =============
+INFO:     127.0.0.1:51274 - "POST /v1/completions HTTP/1.1" 200 OK

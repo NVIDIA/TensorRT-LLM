@@ -88,36 +88,36 @@ void convertKVCacheBlock(void* dstData, void const* srcData, size_t blockVolume,
         kernels::invokeConversion<__nv_bfloat16, __nv_fp8_e4m3>(reinterpret_cast<__nv_bfloat16*>(dstData),
             reinterpret_cast<__nv_fp8_e4m3 const*>(srcData), blockVolume, nullptr, stream);
     }
-    // else if (srcDataType == nvinfer1::DataType::kFLOAT && destDataType == nvinfer1::DataType::kHALF)
-    // {
-    //     kernels::invokeConversion<half, float>(reinterpret_cast<half*>(dstData), reinterpret_cast<float const*>(srcData),
-    //         blockVolume, nullptr, stream);
-    // }
-    // else if (srcDataType == nvinfer1::DataType::kHALF && destDataType == nvinfer1::DataType::kFLOAT)
-    // {
-    //     kernels::invokeConversion<float, half>(reinterpret_cast<float*>(dstData),
-    //         reinterpret_cast<half const*>(srcData), blockVolume, nullptr, stream);
-    // }
-    // else if (srcDataType == nvinfer1::DataType::kFLOAT && destDataType == nvinfer1::DataType::kFP8)
-    // {
-    //     kernels::invokeConversion<__nv_fp8_e4m3, float>(reinterpret_cast<__nv_fp8_e4m3*>(dstData),
-    //         reinterpret_cast<float const*>(srcData), blockVolume, nullptr, stream);
-    // }
-    // else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kFLOAT)
-    // {
-    //     kernels::invokeConversion<float, __nv_fp8_e4m3>(reinterpret_cast<float*>(dstData),
-    //         reinterpret_cast<__nv_fp8_e4m3 const*>(srcData), blockVolume, nullptr, stream);
-    // }
-    // else if (srcDataType == nvinfer1::DataType::kFLOAT && destDataType == nvinfer1::DataType::kBF16)
-    // {
-    //     kernels::invokeConversion<__nv_bfloat16, float>(reinterpret_cast<__nv_bfloat16*>(dstData),
-    //         reinterpret_cast<float const*>(srcData), blockVolume, nullptr, stream);
-    // }
-    // else if (srcDataType == nvinfer1::DataType::kBF16 && destDataType == nvinfer1::DataType::kFLOAT)
-    // {
-    //     kernels::invokeConversion<float, __nv_bfloat16>(reinterpret_cast<float*>(dstData),
-    //         reinterpret_cast<__nv_bfloat16 const*>(srcData), blockVolume, nullptr, stream);
-    // }
+    else if (srcDataType == nvinfer1::DataType::kFLOAT && destDataType == nvinfer1::DataType::kHALF)
+    {
+        kernels::invokeConversion<half, float>(reinterpret_cast<half*>(dstData), reinterpret_cast<float const*>(srcData),
+            blockVolume, nullptr, stream);
+    }
+    else if (srcDataType == nvinfer1::DataType::kHALF && destDataType == nvinfer1::DataType::kFLOAT)
+    {
+        kernels::invokeConversion<float, half>(reinterpret_cast<float*>(dstData),
+            reinterpret_cast<half const*>(srcData), blockVolume, nullptr, stream);
+    }
+    else if (srcDataType == nvinfer1::DataType::kFLOAT && destDataType == nvinfer1::DataType::kFP8)
+    {
+        kernels::invokeConversion<__nv_fp8_e4m3, float>(reinterpret_cast<__nv_fp8_e4m3*>(dstData),
+            reinterpret_cast<float const*>(srcData), blockVolume, nullptr, stream);
+    }
+    else if (srcDataType == nvinfer1::DataType::kFP8 && destDataType == nvinfer1::DataType::kFLOAT)
+    {
+        kernels::invokeConversion<float, __nv_fp8_e4m3>(reinterpret_cast<float*>(dstData),
+            reinterpret_cast<__nv_fp8_e4m3 const*>(srcData), blockVolume, nullptr, stream);
+    }
+    else if (srcDataType == nvinfer1::DataType::kFLOAT && destDataType == nvinfer1::DataType::kBF16)
+    {
+        kernels::invokeConversion<__nv_bfloat16, float>(reinterpret_cast<__nv_bfloat16*>(dstData),
+            reinterpret_cast<float const*>(srcData), blockVolume, nullptr, stream);
+    }
+    else if (srcDataType == nvinfer1::DataType::kBF16 && destDataType == nvinfer1::DataType::kFLOAT)
+    {
+        kernels::invokeConversion<float, __nv_bfloat16>(reinterpret_cast<float*>(dstData),
+            reinterpret_cast<__nv_bfloat16 const*>(srcData), blockVolume, nullptr, stream);
+    }
     else
     {
         TLLM_THROW("Unsupported KV-cache precision conversion from %s to %s", dataTypeToString(srcDataType).c_str(),
@@ -951,14 +951,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             {
                 preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);
                 TLLM_CHECK(preAllocRecvBuffer != nullptr);
-                
-                
-                // TLLM_CHECK(preAllocRecvBuffer->getDataType() == dataType); <-- KEY ASSERT CHANGED HERE
-
-                TLLM_LOG_INFO("============= RECEIVE ON GEN SIDE SETTINGS =============");
-                TLLM_LOG_INFO("preAllocRecvBuffer  data type: %s", dataTypeToString(preAllocRecvBuffer->getDataType()).c_str());
-                TLLM_LOG_INFO("dataType: %s", dataTypeToString(dataType).c_str());
-                TLLM_LOG_INFO("============= RECEIVE ON GEN SIDE SETTINGS =============");
+                TLLM_LOG_DEBUG("preAllocRecvBuffer  data type: %s", dataTypeToString(preAllocRecvBuffer->getDataType()).c_str());
+                TLLM_LOG_DEBUG("dataType: %s", dataTypeToString(dataType).c_str());
             }
 
             auto recvBufferFun = [&](int deviceId, size_t processIdx)

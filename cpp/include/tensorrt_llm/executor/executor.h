@@ -1486,6 +1486,7 @@ private:
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
     std::optional<int> mKvTransferTimeoutMs;
+    
     /// @brief Data type for KV cache transfer, can be different from both the context and generation cache data types. 
     /// It is recommended to use the smaller dtype between ctx and gen for efficiency. If not specified, uses the local cache's data type.
     /// When transferring between servers with different precision, this must be explicitly set.

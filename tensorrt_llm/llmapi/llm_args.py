@@ -1494,9 +1494,21 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
                 binding_dtype = binding_dtype_map.get(transfer_dtype_value.upper())
                 if binding_dtype is None:
                     raise ValueError(f"Unsupported transfer_dtype '{transfer_dtype_value}'")
+                if transfer_dtype_value.upper() == "NVFP4":
+                    raise ValueError(
+                        "transfer_dtype 'NVFP4' is not supported for transfer_dtype currently. "
+                        "Please choose FP32/FP16/BF16/FP8 when configuring CacheTransceiverConfig.")
             elif isinstance(transfer_dtype_value, BindingsDataType):
+                if transfer_dtype_value == BindingsDataType.NVFP4:
+                    raise ValueError(
+                        "transfer_dtype 'NVFP4' is not supported for transfer_dtype currently. "
+                        "Please choose FP32/FP16/BF16/FP8 when configuring CacheTransceiverConfig.")
                 binding_dtype = transfer_dtype_value
             elif isinstance(transfer_dtype_value, executor_bindings.DataType):
+                if transfer_dtype_value == executor_bindings.DataType.NVFP4:
+                    raise ValueError(
+                        "transfer_dtype 'NVFP4' is not supported for transfer_dtype currently. "
+                        "Please choose FP32/FP16/BF16/FP8/INT8 when configuring CacheTransceiverConfig.")
                 transfer_dtype_executor = transfer_dtype_value
                 binding_dtype = None
             else:

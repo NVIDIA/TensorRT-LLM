@@ -2340,6 +2340,12 @@ INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
 INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
 INSTANTIATE_invokeConversion(half, __nv_fp8_e4m3);
 INSTANTIATE_invokeConversion(__nv_bfloat16, __nv_fp8_e4m3);
+INSTANTIATE_invokeConversion(half, float);
+INSTANTIATE_invokeConversion(float, half);
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, float);
+INSTANTIATE_invokeConversion(float, __nv_fp8_e4m3);
+INSTANTIATE_invokeConversion(__nv_bfloat16, float);
+INSTANTIATE_invokeConversion(float, __nv_bfloat16);
 #undef INSTANTIATE_invokeConversion
 
 template <typename T>

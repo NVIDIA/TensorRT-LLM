@@ -1,0 +1,4710 @@
+{
+  "results": {
+    "mmlu_generative": {
+      "exact_match,get_response": 0.5101837345107535,
+      "exact_match_stderr,get_response": 0.004044756255603909,
+      "alias": "mmlu (generative)"
+    },
+    "humanities": {
+      "exact_match,get_response": 0.4663124335812965,
+      "exact_match_stderr,get_response": 0.007004667069924037,
+      "alias": " - humanities"
+    },
+    "mmlu_formal_logic_generative": {
+      "alias": "  - formal_logic",
+      "exact_match,get_response": 0.4126984126984127,
+      "exact_match_stderr,get_response": 0.04403438954768177
+    },
+    "mmlu_high_school_european_history_generative": {
+      "alias": "  - high_school_european_history",
+      "exact_match,get_response": 0.6242424242424243,
+      "exact_match_stderr,get_response": 0.03781887353205982
+    },
+    "mmlu_high_school_us_history_generative": {
+      "alias": "  - high_school_us_history",
+      "exact_match,get_response": 0.5294117647058824,
+      "exact_match_stderr,get_response": 0.03503235296367992
+    },
+    "mmlu_high_school_world_history_generative": {
+      "alias": "  - high_school_world_history",
+      "exact_match,get_response": 0.6919831223628692,
+      "exact_match_stderr,get_response": 0.03005238933560569
+    },
+    "mmlu_international_law_generative": {
+      "alias": "  - international_law",
+      "exact_match,get_response": 0.7355371900826446,
+      "exact_match_stderr,get_response": 0.04026187527591204
+    },
+    "mmlu_jurisprudence_generative": {
+      "alias": "  - jurisprudence",
+      "exact_match,get_response": 0.5370370370370371,
+      "exact_match_stderr,get_response": 0.04820403072760628
+    },
+    "mmlu_logical_fallacies_generative": {
+      "alias": "  - logical_fallacies",
+      "exact_match,get_response": 0.558282208588957,
+      "exact_match_stderr,get_response": 0.03901591825836184
+    },
+    "mmlu_moral_disputes_generative": {
+      "alias": "  - moral_disputes",
+      "exact_match,get_response": 0.6040462427745664,
+      "exact_match_stderr,get_response": 0.02632981334194624
+    },
+    "mmlu_moral_scenarios_generative": {
+      "alias": "  - moral_scenarios",
+      "exact_match,get_response": 0.2871508379888268,
+      "exact_match_stderr,get_response": 0.015131608849963743
+    },
+    "mmlu_philosophy_generative": {
+      "alias": "  - philosophy",
+      "exact_match,get_response": 0.5337620578778135,
+      "exact_match_stderr,get_response": 0.028333277109562807
+    },
+    "mmlu_prehistory_generative": {
+      "alias": "  - prehistory",
+      "exact_match,get_response": 0.5648148148148148,
+      "exact_match_stderr,get_response": 0.027586006221607715
+    },
+    "mmlu_professional_law_generative": {
+      "alias": "  - professional_law",
+      "exact_match,get_response": 0.4511082138200782,
+      "exact_match_stderr,get_response": 0.012709037347346233
+    },
+    "mmlu_world_religions_generative": {
+      "alias": "  - world_religions",
+      "exact_match,get_response": 0.1286549707602339,
+      "exact_match_stderr,get_response": 0.025679342723276936
+    },
+    "other": {
+      "exact_match,get_response": 0.5516575474734471,
+      "exact_match_stderr,get_response": 0.008649839722110324,
+      "alias": " - other"
+    },
+    "mmlu_business_ethics_generative": {
+      "alias": "  - business_ethics",
+      "exact_match,get_response": 0.48,
+      "exact_match_stderr,get_response": 0.050211673156867795
+    },
+    "mmlu_clinical_knowledge_generative": {
+      "alias": "  - clinical_knowledge",
+      "exact_match,get_response": 0.660377358490566,
+      "exact_match_stderr,get_response": 0.02914690474779833
+    },
+    "mmlu_college_medicine_generative": {
+      "alias": "  - college_medicine",
+      "exact_match,get_response": 0.5317919075144508,
+      "exact_match_stderr,get_response": 0.03804749744364763
+    },
+    "mmlu_global_facts_generative": {
+      "alias": "  - global_facts",
+      "exact_match,get_response": 0.06,
+      "exact_match_stderr,get_response": 0.023868325657594204
+    },
+    "mmlu_human_aging_generative": {
+      "alias": "  - human_aging",
+      "exact_match,get_response": 0.57847533632287,
+      "exact_match_stderr,get_response": 0.03314190222110657
+    },
+    "mmlu_management_generative": {
+      "alias": "  - management",
+      "exact_match,get_response": 0.5145631067961165,
+      "exact_match_stderr,get_response": 0.04948637324026637
+    },
+    "mmlu_marketing_generative": {
+      "alias": "  - marketing",
+      "exact_match,get_response": 0.7264957264957265,
+      "exact_match_stderr,get_response": 0.029202540153431177
+    },
+    "mmlu_medical_genetics_generative": {
+      "alias": "  - medical_genetics",
+      "exact_match,get_response": 0.65,
+      "exact_match_stderr,get_response": 0.0479372485441102
+    },
+    "mmlu_miscellaneous_generative": {
+      "alias": "  - miscellaneous",
+      "exact_match,get_response": 0.5223499361430396,
+      "exact_match_stderr,get_response": 0.017862091778507862
+    },
+    "mmlu_nutrition_generative": {
+      "alias": "  - nutrition",
+      "exact_match,get_response": 0.5915032679738562,
+      "exact_match_stderr,get_response": 0.028146405993096358
+    },
+    "mmlu_professional_accounting_generative": {
+      "alias": "  - professional_accounting",
+      "exact_match,get_response": 0.48936170212765956,
+      "exact_match_stderr,get_response": 0.02982074719142248
+    },
+    "mmlu_professional_medicine_generative": {
+      "alias": "  - professional_medicine",
+      "exact_match,get_response": 0.6875,
+      "exact_match_stderr,get_response": 0.02815637344037142
+    },
+    "mmlu_virology_generative": {
+      "alias": "  - virology",
+      "exact_match,get_response": 0.3674698795180723,
+      "exact_match_stderr,get_response": 0.03753267402120574
+    },
+    "social sciences": {
+      "exact_match,get_response": 0.5927851803704908,
+      "exact_match_stderr,get_response": 0.008711025573893631,
+      "alias": " - social sciences"
+    },
+    "mmlu_econometrics_generative": {
+      "alias": "  - econometrics",
+      "exact_match,get_response": 0.45614035087719296,
+      "exact_match_stderr,get_response": 0.046854730419077895
+    },
+    "mmlu_high_school_geography_generative": {
+      "alias": "  - high_school_geography",
+      "exact_match,get_response": 0.5555555555555556,
+      "exact_match_stderr,get_response": 0.035402943770953675
+    },
+    "mmlu_high_school_government_and_politics_generative": {
+      "alias": "  - high_school_government_and_politics",
+      "exact_match,get_response": 0.7253886010362695,
+      "exact_match_stderr,get_response": 0.032210245080411544
+    },
+    "mmlu_high_school_macroeconomics_generative": {
+      "alias": "  - high_school_macroeconomics",
+      "exact_match,get_response": 0.6102564102564103,
+      "exact_match_stderr,get_response": 0.024726967886647078
+    },
+    "mmlu_high_school_microeconomics_generative": {
+      "alias": "  - high_school_microeconomics",
+      "exact_match,get_response": 0.6764705882352942,
+      "exact_match_stderr,get_response": 0.030388353551886804
+    },
+    "mmlu_high_school_psychology_generative": {
+      "alias": "  - high_school_psychology",
+      "exact_match,get_response": 0.6055045871559633,
+      "exact_match_stderr,get_response": 0.020954642108587485
+    },
+    "mmlu_human_sexuality_generative": {
+      "alias": "  - human_sexuality",
+      "exact_match,get_response": 0.4580152671755725,
+      "exact_match_stderr,get_response": 0.04369802690578756
+    },
+    "mmlu_professional_psychology_generative": {
+      "alias": "  - professional_psychology",
+      "exact_match,get_response": 0.5359477124183006,
+      "exact_match_stderr,get_response": 0.020175488765484036
+    },
+    "mmlu_public_relations_generative": {
+      "alias": "  - public_relations",
+      "exact_match,get_response": 0.3,
+      "exact_match_stderr,get_response": 0.04389311454644286
+    },
+    "mmlu_security_studies_generative": {
+      "alias": "  - security_studies",
+      "exact_match,get_response": 0.636734693877551,
+      "exact_match_stderr,get_response": 0.03078905113903081
+    },
+    "mmlu_sociology_generative": {
+      "alias": "  - sociology",
+      "exact_match,get_response": 0.746268656716418,
+      "exact_match_stderr,get_response": 0.03076944496729602
+    },
+    "mmlu_us_foreign_policy_generative": {
+      "alias": "  - us_foreign_policy",
+      "exact_match,get_response": 0.66,
+      "exact_match_stderr,get_response": 0.04760952285695237
+    },
+    "stem": {
+      "exact_match,get_response": 0.45417063114494133,
+      "exact_match_stderr,get_response": 0.008384660428902397,
+      "alias": " - stem"
+    },
+    "mmlu_abstract_algebra_generative": {
+      "alias": "  - abstract_algebra",
+      "exact_match,get_response": 0.27,
+      "exact_match_stderr,get_response": 0.04461960433384741
+    },
+    "mmlu_anatomy_generative": {
+      "alias": "  - anatomy",
+      "exact_match,get_response": 0.5407407407407407,
+      "exact_match_stderr,get_response": 0.04304979692464242
+    },
+    "mmlu_astronomy_generative": {
+      "alias": "  - astronomy",
+      "exact_match,get_response": 0.5394736842105263,
+      "exact_match_stderr,get_response": 0.04056242252249034
+    },
+    "mmlu_college_biology_generative": {
+      "alias": "  - college_biology",
+      "exact_match,get_response": 0.7638888888888888,
+      "exact_match_stderr,get_response": 0.03551446610810826
+    },
+    "mmlu_college_chemistry_generative": {
+      "alias": "  - college_chemistry",
+      "exact_match,get_response": 0.36,
+      "exact_match_stderr,get_response": 0.04824181513244218
+    },
+    "mmlu_college_computer_science_generative": {
+      "alias": "  - college_computer_science",
+      "exact_match,get_response": 0.48,
+      "exact_match_stderr,get_response": 0.050211673156867795
+    },
+    "mmlu_college_mathematics_generative": {
+      "alias": "  - college_mathematics",
+      "exact_match,get_response": 0.3,
+      "exact_match_stderr,get_response": 0.046056618647183814
+    },
+    "mmlu_college_physics_generative": {
+      "alias": "  - college_physics",
+      "exact_match,get_response": 0.4117647058823529,
+      "exact_match_stderr,get_response": 0.04897104952726367
+    },
+    "mmlu_computer_security_generative": {
+      "alias": "  - computer_security",
+      "exact_match,get_response": 0.66,
+      "exact_match_stderr,get_response": 0.04760952285695237
+    },
+    "mmlu_conceptual_physics_generative": {
+      "alias": "  - conceptual_physics",
+      "exact_match,get_response": 0.5659574468085107,
+      "exact_match_stderr,get_response": 0.032400380867927465
+    },
+    "mmlu_electrical_engineering_generative": {
+      "alias": "  - electrical_engineering",
+      "exact_match,get_response": 0.4413793103448276,
+      "exact_match_stderr,get_response": 0.04137931034482758
+    },
+    "mmlu_elementary_mathematics_generative": {
+      "alias": "  - elementary_mathematics",
+      "exact_match,get_response": 0.17989417989417988,
+      "exact_match_stderr,get_response": 0.019782119832766423
+    },
+    "mmlu_high_school_biology_generative": {
+      "alias": "  - high_school_biology",
+      "exact_match,get_response": 0.7,
+      "exact_match_stderr,get_response": 0.02606936229533514
+    },
+    "mmlu_high_school_chemistry_generative": {
+      "alias": "  - high_school_chemistry",
+      "exact_match,get_response": 0.5123152709359606,
+      "exact_match_stderr,get_response": 0.035169204442208966
+    },
+    "mmlu_high_school_computer_science_generative": {
+      "alias": "  - high_school_computer_science",
+      "exact_match,get_response": 0.55,
+      "exact_match_stderr,get_response": 0.04999999999999999
+    },
+    "mmlu_high_school_mathematics_generative": {
+      "alias": "  - high_school_mathematics",
+      "exact_match,get_response": 0.3074074074074074,
+      "exact_match_stderr,get_response": 0.028133252578815632
+    },
+    "mmlu_high_school_physics_generative": {
+      "alias": "  - high_school_physics",
+      "exact_match,get_response": 0.3708609271523179,
+      "exact_match_stderr,get_response": 0.03943966699183629
+    },
+    "mmlu_high_school_statistics_generative": {
+      "alias": "  - high_school_statistics",
+      "exact_match,get_response": 0.4583333333333333,
+      "exact_match_stderr,get_response": 0.03398110890294636
+    },
+    "mmlu_machine_learning_generative": {
+      "alias": "  - machine_learning",
+      "exact_match,get_response": 0.3482142857142857,
+      "exact_match_stderr,get_response": 0.04521829902833585
+    }
+  },
+  "groups": {
+    "mmlu_generative": {
+      "exact_match,get_response": 0.5101837345107535,
+      "exact_match_stderr,get_response": 0.004044756255603909,
+      "alias": "mmlu (generative)"
+    },
+    "humanities": {
+      "exact_match,get_response": 0.4663124335812965,
+      "exact_match_stderr,get_response": 0.007004667069924037,
+      "alias": " - humanities"
+    },
+    "other": {
+      "exact_match,get_response": 0.5516575474734471,
+      "exact_match_stderr,get_response": 0.008649839722110324,
+      "alias": " - other"
+    },
+    "social sciences": {
+      "exact_match,get_response": 0.5927851803704908,
+      "exact_match_stderr,get_response": 0.008711025573893631,
+      "alias": " - social sciences"
+    },
+    "stem": {
+      "exact_match,get_response": 0.45417063114494133,
+      "exact_match_stderr,get_response": 0.008384660428902397,
+      "alias": " - stem"
+    }
+  },
+  "group_subtasks": {
+    "humanities": [
+      "mmlu_logical_fallacies_generative",
+      "mmlu_world_religions_generative",
+      "mmlu_international_law_generative",
+      "mmlu_high_school_world_history_generative",
+      "mmlu_high_school_european_history_generative",
+      "mmlu_prehistory_generative",
+      "mmlu_professional_law_generative",
+      "mmlu_moral_disputes_generative",
+      "mmlu_formal_logic_generative",
+      "mmlu_high_school_us_history_generative",
+      "mmlu_jurisprudence_generative",
+      "mmlu_moral_scenarios_generative",
+      "mmlu_philosophy_generative"
+    ],
+    "social sciences": [
+      "mmlu_security_studies_generative",
+      "mmlu_sociology_generative",
+      "mmlu_professional_psychology_generative",
+      "mmlu_econometrics_generative",
+      "mmlu_high_school_macroeconomics_generative",
+      "mmlu_us_foreign_policy_generative",
+      "mmlu_high_school_microeconomics_generative",
+      "mmlu_high_school_government_and_politics_generative",
+      "mmlu_high_school_geography_generative",
+      "mmlu_human_sexuality_generative",
+      "mmlu_high_school_psychology_generative",
+      "mmlu_public_relations_generative"
+    ],
+    "other": [
+      "mmlu_miscellaneous_generative",
+      "mmlu_virology_generative",
+      "mmlu_professional_accounting_generative",
+      "mmlu_marketing_generative",
+      "mmlu_human_aging_generative",
+      "mmlu_nutrition_generative",
+      "mmlu_global_facts_generative",
+      "mmlu_business_ethics_generative",
+      "mmlu_professional_medicine_generative",
+      "mmlu_management_generative",
+      "mmlu_medical_genetics_generative",
+      "mmlu_college_medicine_generative",
+      "mmlu_clinical_knowledge_generative"
+    ],
+    "stem": [
+      "mmlu_electrical_engineering_generative",
+      "mmlu_high_school_physics_generative",
+      "mmlu_machine_learning_generative",
+      "mmlu_computer_security_generative",
+      "mmlu_abstract_algebra_generative",
+      "mmlu_college_chemistry_generative",
+      "mmlu_high_school_statistics_generative",
+      "mmlu_high_school_computer_science_generative",
+      "mmlu_conceptual_physics_generative",
+      "mmlu_high_school_chemistry_generative",
+      "mmlu_high_school_biology_generative",
+      "mmlu_anatomy_generative",
+      "mmlu_college_physics_generative",
+      "mmlu_high_school_mathematics_generative",
+      "mmlu_college_computer_science_generative",
+      "mmlu_elementary_mathematics_generative",
+      "mmlu_college_mathematics_generative",
+      "mmlu_astronomy_generative",
+      "mmlu_college_biology_generative"
+    ],
+    "mmlu_generative": [
+      "stem",
+      "other",
+      "social sciences",
+      "humanities"
+    ]
+  },
+  "configs": {
+    "mmlu_abstract_algebra_generative": {
+      "task": "mmlu_abstract_algebra_generative",
+      "task_alias": "abstract_algebra",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "abstract_algebra",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about abstract algebra.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_anatomy_generative": {
+      "task": "mmlu_anatomy_generative",
+      "task_alias": "anatomy",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "anatomy",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about anatomy.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_astronomy_generative": {
+      "task": "mmlu_astronomy_generative",
+      "task_alias": "astronomy",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "astronomy",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about astronomy.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_business_ethics_generative": {
+      "task": "mmlu_business_ethics_generative",
+      "task_alias": "business_ethics",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "business_ethics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about business ethics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_clinical_knowledge_generative": {
+      "task": "mmlu_clinical_knowledge_generative",
+      "task_alias": "clinical_knowledge",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "clinical_knowledge",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about clinical knowledge.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_college_biology_generative": {
+      "task": "mmlu_college_biology_generative",
+      "task_alias": "college_biology",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "college_biology",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about college biology.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_college_chemistry_generative": {
+      "task": "mmlu_college_chemistry_generative",
+      "task_alias": "college_chemistry",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "college_chemistry",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about college chemistry.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_college_computer_science_generative": {
+      "task": "mmlu_college_computer_science_generative",
+      "task_alias": "college_computer_science",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "college_computer_science",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about college computer science.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_college_mathematics_generative": {
+      "task": "mmlu_college_mathematics_generative",
+      "task_alias": "college_mathematics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "college_mathematics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about college mathematics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_college_medicine_generative": {
+      "task": "mmlu_college_medicine_generative",
+      "task_alias": "college_medicine",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "college_medicine",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about college medicine.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_college_physics_generative": {
+      "task": "mmlu_college_physics_generative",
+      "task_alias": "college_physics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "college_physics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about college physics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_computer_security_generative": {
+      "task": "mmlu_computer_security_generative",
+      "task_alias": "computer_security",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "computer_security",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about computer security.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_conceptual_physics_generative": {
+      "task": "mmlu_conceptual_physics_generative",
+      "task_alias": "conceptual_physics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "conceptual_physics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about conceptual physics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_econometrics_generative": {
+      "task": "mmlu_econometrics_generative",
+      "task_alias": "econometrics",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "econometrics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about econometrics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_electrical_engineering_generative": {
+      "task": "mmlu_electrical_engineering_generative",
+      "task_alias": "electrical_engineering",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "electrical_engineering",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about electrical engineering.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_elementary_mathematics_generative": {
+      "task": "mmlu_elementary_mathematics_generative",
+      "task_alias": "elementary_mathematics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "elementary_mathematics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about elementary mathematics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_formal_logic_generative": {
+      "task": "mmlu_formal_logic_generative",
+      "task_alias": "formal_logic",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "formal_logic",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about formal logic.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_global_facts_generative": {
+      "task": "mmlu_global_facts_generative",
+      "task_alias": "global_facts",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "global_facts",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about global facts.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_biology_generative": {
+      "task": "mmlu_high_school_biology_generative",
+      "task_alias": "high_school_biology",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_biology",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school biology.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_chemistry_generative": {
+      "task": "mmlu_high_school_chemistry_generative",
+      "task_alias": "high_school_chemistry",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_chemistry",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school chemistry.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_computer_science_generative": {
+      "task": "mmlu_high_school_computer_science_generative",
+      "task_alias": "high_school_computer_science",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_computer_science",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school computer science.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_european_history_generative": {
+      "task": "mmlu_high_school_european_history_generative",
+      "task_alias": "high_school_european_history",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_european_history",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school european history.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_geography_generative": {
+      "task": "mmlu_high_school_geography_generative",
+      "task_alias": "high_school_geography",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_geography",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school geography.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_government_and_politics_generative": {
+      "task": "mmlu_high_school_government_and_politics_generative",
+      "task_alias": "high_school_government_and_politics",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_government_and_politics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school government and politics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_macroeconomics_generative": {
+      "task": "mmlu_high_school_macroeconomics_generative",
+      "task_alias": "high_school_macroeconomics",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_macroeconomics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school macroeconomics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_mathematics_generative": {
+      "task": "mmlu_high_school_mathematics_generative",
+      "task_alias": "high_school_mathematics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_mathematics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school mathematics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_microeconomics_generative": {
+      "task": "mmlu_high_school_microeconomics_generative",
+      "task_alias": "high_school_microeconomics",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_microeconomics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school microeconomics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_physics_generative": {
+      "task": "mmlu_high_school_physics_generative",
+      "task_alias": "high_school_physics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_physics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school physics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_psychology_generative": {
+      "task": "mmlu_high_school_psychology_generative",
+      "task_alias": "high_school_psychology",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_psychology",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school psychology.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_statistics_generative": {
+      "task": "mmlu_high_school_statistics_generative",
+      "task_alias": "high_school_statistics",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_statistics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school statistics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_us_history_generative": {
+      "task": "mmlu_high_school_us_history_generative",
+      "task_alias": "high_school_us_history",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_us_history",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school us history.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_high_school_world_history_generative": {
+      "task": "mmlu_high_school_world_history_generative",
+      "task_alias": "high_school_world_history",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "high_school_world_history",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about high school world history.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_human_aging_generative": {
+      "task": "mmlu_human_aging_generative",
+      "task_alias": "human_aging",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "human_aging",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about human aging.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_human_sexuality_generative": {
+      "task": "mmlu_human_sexuality_generative",
+      "task_alias": "human_sexuality",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "human_sexuality",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about human sexuality.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_international_law_generative": {
+      "task": "mmlu_international_law_generative",
+      "task_alias": "international_law",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "international_law",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about international law.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_jurisprudence_generative": {
+      "task": "mmlu_jurisprudence_generative",
+      "task_alias": "jurisprudence",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "jurisprudence",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about jurisprudence.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_logical_fallacies_generative": {
+      "task": "mmlu_logical_fallacies_generative",
+      "task_alias": "logical_fallacies",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "logical_fallacies",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about logical fallacies.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_machine_learning_generative": {
+      "task": "mmlu_machine_learning_generative",
+      "task_alias": "machine_learning",
+      "tag": "mmlu_stem_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "machine_learning",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about machine learning.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_management_generative": {
+      "task": "mmlu_management_generative",
+      "task_alias": "management",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "management",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about management.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_marketing_generative": {
+      "task": "mmlu_marketing_generative",
+      "task_alias": "marketing",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "marketing",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about marketing.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_medical_genetics_generative": {
+      "task": "mmlu_medical_genetics_generative",
+      "task_alias": "medical_genetics",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "medical_genetics",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about medical genetics.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_miscellaneous_generative": {
+      "task": "mmlu_miscellaneous_generative",
+      "task_alias": "miscellaneous",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "miscellaneous",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about miscellaneous.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_moral_disputes_generative": {
+      "task": "mmlu_moral_disputes_generative",
+      "task_alias": "moral_disputes",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "moral_disputes",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about moral disputes.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_moral_scenarios_generative": {
+      "task": "mmlu_moral_scenarios_generative",
+      "task_alias": "moral_scenarios",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "moral_scenarios",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about moral scenarios.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_nutrition_generative": {
+      "task": "mmlu_nutrition_generative",
+      "task_alias": "nutrition",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "nutrition",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about nutrition.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_philosophy_generative": {
+      "task": "mmlu_philosophy_generative",
+      "task_alias": "philosophy",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "philosophy",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about philosophy.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_prehistory_generative": {
+      "task": "mmlu_prehistory_generative",
+      "task_alias": "prehistory",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "prehistory",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about prehistory.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_professional_accounting_generative": {
+      "task": "mmlu_professional_accounting_generative",
+      "task_alias": "professional_accounting",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "professional_accounting",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about professional accounting.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_professional_law_generative": {
+      "task": "mmlu_professional_law_generative",
+      "task_alias": "professional_law",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "professional_law",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about professional law.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_professional_medicine_generative": {
+      "task": "mmlu_professional_medicine_generative",
+      "task_alias": "professional_medicine",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "professional_medicine",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about professional medicine.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_professional_psychology_generative": {
+      "task": "mmlu_professional_psychology_generative",
+      "task_alias": "professional_psychology",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "professional_psychology",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about professional psychology.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_public_relations_generative": {
+      "task": "mmlu_public_relations_generative",
+      "task_alias": "public_relations",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "public_relations",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about public relations.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_security_studies_generative": {
+      "task": "mmlu_security_studies_generative",
+      "task_alias": "security_studies",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "security_studies",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about security studies.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_sociology_generative": {
+      "task": "mmlu_sociology_generative",
+      "task_alias": "sociology",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "sociology",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about sociology.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_us_foreign_policy_generative": {
+      "task": "mmlu_us_foreign_policy_generative",
+      "task_alias": "us_foreign_policy",
+      "tag": "mmlu_social_sciences_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "us_foreign_policy",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about us foreign policy.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_virology_generative": {
+      "task": "mmlu_virology_generative",
+      "task_alias": "virology",
+      "tag": "mmlu_other_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "virology",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about virology.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    },
+    "mmlu_world_religions_generative": {
+      "task": "mmlu_world_religions_generative",
+      "task_alias": "world_religions",
+      "tag": "mmlu_humanities_generative",
+      "dataset_path": "cais/mmlu",
+      "dataset_name": "world_religions",
+      "test_split": "test",
+      "fewshot_split": "dev",
+      "doc_to_text": "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:",
+      "doc_to_target": "{{['A', 'B', 'C', 'D'][answer]}}",
+      "unsafe_code": false,
+      "description": "The following are multiple choice questions (with answers) about world religions.\n\n",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "fewshot_config": {
+        "sampler": "first_n"
+      },
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_punctuation": true,
+          "ignore_case": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "</s>",
+          "\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "get_response",
+          "filter": [
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)(?=\\n|$)"
+            },
+            {
+              "function": "remove_whitespace"
+            },
+            {
+              "function": "regex",
+              "regex_pattern": "^(.*?)\\s*$"
+            },
+            {
+              "function": "take_first"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 3.0,
+        "base_url": "http://localhost:8400/v1/completions",
+        "model": "FP16-FP16",
+        "tokenizer": "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
+      }
+    }
+  },
+  "versions": {
+    "humanities": null,
+    "mmlu_abstract_algebra_generative": 3.0,
+    "mmlu_anatomy_generative": 3.0,
+    "mmlu_astronomy_generative": 3.0,
+    "mmlu_business_ethics_generative": 3.0,
+    "mmlu_clinical_knowledge_generative": 3.0,
+    "mmlu_college_biology_generative": 3.0,
+    "mmlu_college_chemistry_generative": 3.0,
+    "mmlu_college_computer_science_generative": 3.0,
+    "mmlu_college_mathematics_generative": 3.0,
+    "mmlu_college_medicine_generative": 3.0,
+    "mmlu_college_physics_generative": 3.0,
+    "mmlu_computer_security_generative": 3.0,
+    "mmlu_conceptual_physics_generative": 3.0,
+    "mmlu_econometrics_generative": 3.0,
+    "mmlu_electrical_engineering_generative": 3.0,
+    "mmlu_elementary_mathematics_generative": 3.0,
+    "mmlu_formal_logic_generative": 3.0,
+    "mmlu_generative": 3,
+    "mmlu_global_facts_generative": 3.0,
+    "mmlu_high_school_biology_generative": 3.0,
+    "mmlu_high_school_chemistry_generative": 3.0,
+    "mmlu_high_school_computer_science_generative": 3.0,
+    "mmlu_high_school_european_history_generative": 3.0,
+    "mmlu_high_school_geography_generative": 3.0,
+    "mmlu_high_school_government_and_politics_generative": 3.0,
+    "mmlu_high_school_macroeconomics_generative": 3.0,
+    "mmlu_high_school_mathematics_generative": 3.0,
+    "mmlu_high_school_microeconomics_generative": 3.0,
+    "mmlu_high_school_physics_generative": 3.0,
+    "mmlu_high_school_psychology_generative": 3.0,
+    "mmlu_high_school_statistics_generative": 3.0,
+    "mmlu_high_school_us_history_generative": 3.0,
+    "mmlu_high_school_world_history_generative": 3.0,
+    "mmlu_human_aging_generative": 3.0,
+    "mmlu_human_sexuality_generative": 3.0,
+    "mmlu_international_law_generative": 3.0,
+    "mmlu_jurisprudence_generative": 3.0,
+    "mmlu_logical_fallacies_generative": 3.0,
+    "mmlu_machine_learning_generative": 3.0,
+    "mmlu_management_generative": 3.0,
+    "mmlu_marketing_generative": 3.0,
+    "mmlu_medical_genetics_generative": 3.0,
+    "mmlu_miscellaneous_generative": 3.0,
+    "mmlu_moral_disputes_generative": 3.0,
+    "mmlu_moral_scenarios_generative": 3.0,
+    "mmlu_nutrition_generative": 3.0,
+    "mmlu_philosophy_generative": 3.0,
+    "mmlu_prehistory_generative": 3.0,
+    "mmlu_professional_accounting_generative": 3.0,
+    "mmlu_professional_law_generative": 3.0,
+    "mmlu_professional_medicine_generative": 3.0,
+    "mmlu_professional_psychology_generative": 3.0,
+    "mmlu_public_relations_generative": 3.0,
+    "mmlu_security_studies_generative": 3.0,
+    "mmlu_sociology_generative": 3.0,
+    "mmlu_us_foreign_policy_generative": 3.0,
+    "mmlu_virology_generative": 3.0,
+    "mmlu_world_religions_generative": 3.0,
+    "other": null,
+    "social sciences": null,
+    "stem": null
+  },
+  "n-shot": {
+    "mmlu_abstract_algebra_generative": 0,
+    "mmlu_anatomy_generative": 0,
+    "mmlu_astronomy_generative": 0,
+    "mmlu_business_ethics_generative": 0,
+    "mmlu_clinical_knowledge_generative": 0,
+    "mmlu_college_biology_generative": 0,
+    "mmlu_college_chemistry_generative": 0,
+    "mmlu_college_computer_science_generative": 0,
+    "mmlu_college_mathematics_generative": 0,
+    "mmlu_college_medicine_generative": 0,
+    "mmlu_college_physics_generative": 0,
+    "mmlu_computer_security_generative": 0,
+    "mmlu_conceptual_physics_generative": 0,
+    "mmlu_econometrics_generative": 0,
+    "mmlu_electrical_engineering_generative": 0,
+    "mmlu_elementary_mathematics_generative": 0,
+    "mmlu_formal_logic_generative": 0,
+    "mmlu_global_facts_generative": 0,
+    "mmlu_high_school_biology_generative": 0,
+    "mmlu_high_school_chemistry_generative": 0,
+    "mmlu_high_school_computer_science_generative": 0,
+    "mmlu_high_school_european_history_generative": 0,
+    "mmlu_high_school_geography_generative": 0,
+    "mmlu_high_school_government_and_politics_generative": 0,
+    "mmlu_high_school_macroeconomics_generative": 0,
+    "mmlu_high_school_mathematics_generative": 0,
+    "mmlu_high_school_microeconomics_generative": 0,
+    "mmlu_high_school_physics_generative": 0,
+    "mmlu_high_school_psychology_generative": 0,
+    "mmlu_high_school_statistics_generative": 0,
+    "mmlu_high_school_us_history_generative": 0,
+    "mmlu_high_school_world_history_generative": 0,
+    "mmlu_human_aging_generative": 0,
+    "mmlu_human_sexuality_generative": 0,
+    "mmlu_international_law_generative": 0,
+    "mmlu_jurisprudence_generative": 0,
+    "mmlu_logical_fallacies_generative": 0,
+    "mmlu_machine_learning_generative": 0,
+    "mmlu_management_generative": 0,
+    "mmlu_marketing_generative": 0,
+    "mmlu_medical_genetics_generative": 0,
+    "mmlu_miscellaneous_generative": 0,
+    "mmlu_moral_disputes_generative": 0,
+    "mmlu_moral_scenarios_generative": 0,
+    "mmlu_nutrition_generative": 0,
+    "mmlu_philosophy_generative": 0,
+    "mmlu_prehistory_generative": 0,
+    "mmlu_professional_accounting_generative": 0,
+    "mmlu_professional_law_generative": 0,
+    "mmlu_professional_medicine_generative": 0,
+    "mmlu_professional_psychology_generative": 0,
+    "mmlu_public_relations_generative": 0,
+    "mmlu_security_studies_generative": 0,
+    "mmlu_sociology_generative": 0,
+    "mmlu_us_foreign_policy_generative": 0,
+    "mmlu_virology_generative": 0,
+    "mmlu_world_religions_generative": 0
+  },
+  "higher_is_better": {
+    "humanities": {
+      "exact_match": true
+    },
+    "mmlu_abstract_algebra_generative": {
+      "exact_match": true
+    },
+    "mmlu_anatomy_generative": {
+      "exact_match": true
+    },
+    "mmlu_astronomy_generative": {
+      "exact_match": true
+    },
+    "mmlu_business_ethics_generative": {
+      "exact_match": true
+    },
+    "mmlu_clinical_knowledge_generative": {
+      "exact_match": true
+    },
+    "mmlu_college_biology_generative": {
+      "exact_match": true
+    },
+    "mmlu_college_chemistry_generative": {
+      "exact_match": true
+    },
+    "mmlu_college_computer_science_generative": {
+      "exact_match": true
+    },
+    "mmlu_college_mathematics_generative": {
+      "exact_match": true
+    },
+    "mmlu_college_medicine_generative": {
+      "exact_match": true
+    },
+    "mmlu_college_physics_generative": {
+      "exact_match": true
+    },
+    "mmlu_computer_security_generative": {
+      "exact_match": true
+    },
+    "mmlu_conceptual_physics_generative": {
+      "exact_match": true
+    },
+    "mmlu_econometrics_generative": {
+      "exact_match": true
+    },
+    "mmlu_electrical_engineering_generative": {
+      "exact_match": true
+    },
+    "mmlu_elementary_mathematics_generative": {
+      "exact_match": true
+    },
+    "mmlu_formal_logic_generative": {
+      "exact_match": true
+    },
+    "mmlu_generative": {
+      "exact_match": true
+    },
+    "mmlu_global_facts_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_biology_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_chemistry_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_computer_science_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_european_history_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_geography_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_government_and_politics_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_macroeconomics_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_mathematics_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_microeconomics_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_physics_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_psychology_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_statistics_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_us_history_generative": {
+      "exact_match": true
+    },
+    "mmlu_high_school_world_history_generative": {
+      "exact_match": true
+    },
+    "mmlu_human_aging_generative": {
+      "exact_match": true
+    },
+    "mmlu_human_sexuality_generative": {
+      "exact_match": true
+    },
+    "mmlu_international_law_generative": {
+      "exact_match": true
+    },
+    "mmlu_jurisprudence_generative": {
+      "exact_match": true
+    },
+    "mmlu_logical_fallacies_generative": {
+      "exact_match": true
+    },
+    "mmlu_machine_learning_generative": {
+      "exact_match": true
+    },
+    "mmlu_management_generative": {
+      "exact_match": true
+    },
+    "mmlu_marketing_generative": {
+      "exact_match": true
+    },
+    "mmlu_medical_genetics_generative": {
+      "exact_match": true
+    },
+    "mmlu_miscellaneous_generative": {
+      "exact_match": true
+    },
+    "mmlu_moral_disputes_generative": {
+      "exact_match": true
+    },
+    "mmlu_moral_scenarios_generative": {
+      "exact_match": true
+    },
+    "mmlu_nutrition_generative": {
+      "exact_match": true
+    },
+    "mmlu_philosophy_generative": {
+      "exact_match": true
+    },
+    "mmlu_prehistory_generative": {
+      "exact_match": true
+    },
+    "mmlu_professional_accounting_generative": {
+      "exact_match": true
+    },
+    "mmlu_professional_law_generative": {
+      "exact_match": true
+    },
+    "mmlu_professional_medicine_generative": {
+      "exact_match": true
+    },
+    "mmlu_professional_psychology_generative": {
+      "exact_match": true
+    },
+    "mmlu_public_relations_generative": {
+      "exact_match": true
+    },
+    "mmlu_security_studies_generative": {
+      "exact_match": true
+    },
+    "mmlu_sociology_generative": {
+      "exact_match": true
+    },
+    "mmlu_us_foreign_policy_generative": {
+      "exact_match": true
+    },
+    "mmlu_virology_generative": {
+      "exact_match": true
+    },
+    "mmlu_world_religions_generative": {
+      "exact_match": true
+    },
+    "other": {
+      "exact_match": true
+    },
+    "social sciences": {
+      "exact_match": true
+    },
+    "stem": {
+      "exact_match": true
+    }
+  },
+  "n-samples": {
+    "mmlu_electrical_engineering_generative": {
+      "original": 145,
+      "effective": 145
+    },
+    "mmlu_high_school_physics_generative": {
+      "original": 151,
+      "effective": 151
+    },
+    "mmlu_machine_learning_generative": {
+      "original": 112,
+      "effective": 112
+    },
+    "mmlu_computer_security_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_abstract_algebra_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_college_chemistry_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_high_school_statistics_generative": {
+      "original": 216,
+      "effective": 216
+    },
+    "mmlu_high_school_computer_science_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_conceptual_physics_generative": {
+      "original": 235,
+      "effective": 235
+    },
+    "mmlu_high_school_chemistry_generative": {
+      "original": 203,
+      "effective": 203
+    },
+    "mmlu_high_school_biology_generative": {
+      "original": 310,
+      "effective": 310
+    },
+    "mmlu_anatomy_generative": {
+      "original": 135,
+      "effective": 135
+    },
+    "mmlu_college_physics_generative": {
+      "original": 102,
+      "effective": 102
+    },
+    "mmlu_high_school_mathematics_generative": {
+      "original": 270,
+      "effective": 270
+    },
+    "mmlu_college_computer_science_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_elementary_mathematics_generative": {
+      "original": 378,
+      "effective": 378
+    },
+    "mmlu_college_mathematics_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_astronomy_generative": {
+      "original": 152,
+      "effective": 152
+    },
+    "mmlu_college_biology_generative": {
+      "original": 144,
+      "effective": 144
+    },
+    "mmlu_miscellaneous_generative": {
+      "original": 783,
+      "effective": 783
+    },
+    "mmlu_virology_generative": {
+      "original": 166,
+      "effective": 166
+    },
+    "mmlu_professional_accounting_generative": {
+      "original": 282,
+      "effective": 282
+    },
+    "mmlu_marketing_generative": {
+      "original": 234,
+      "effective": 234
+    },
+    "mmlu_human_aging_generative": {
+      "original": 223,
+      "effective": 223
+    },
+    "mmlu_nutrition_generative": {
+      "original": 306,
+      "effective": 306
+    },
+    "mmlu_global_facts_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_business_ethics_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_professional_medicine_generative": {
+      "original": 272,
+      "effective": 272
+    },
+    "mmlu_management_generative": {
+      "original": 103,
+      "effective": 103
+    },
+    "mmlu_medical_genetics_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_college_medicine_generative": {
+      "original": 173,
+      "effective": 173
+    },
+    "mmlu_clinical_knowledge_generative": {
+      "original": 265,
+      "effective": 265
+    },
+    "mmlu_security_studies_generative": {
+      "original": 245,
+      "effective": 245
+    },
+    "mmlu_sociology_generative": {
+      "original": 201,
+      "effective": 201
+    },
+    "mmlu_professional_psychology_generative": {
+      "original": 612,
+      "effective": 612
+    },
+    "mmlu_econometrics_generative": {
+      "original": 114,
+      "effective": 114
+    },
+    "mmlu_high_school_macroeconomics_generative": {
+      "original": 390,
+      "effective": 390
+    },
+    "mmlu_us_foreign_policy_generative": {
+      "original": 100,
+      "effective": 100
+    },
+    "mmlu_high_school_microeconomics_generative": {
+      "original": 238,
+      "effective": 238
+    },
+    "mmlu_high_school_government_and_politics_generative": {
+      "original": 193,
+      "effective": 193
+    },
+    "mmlu_high_school_geography_generative": {
+      "original": 198,
+      "effective": 198
+    },
+    "mmlu_human_sexuality_generative": {
+      "original": 131,
+      "effective": 131
+    },
+    "mmlu_high_school_psychology_generative": {
+      "original": 545,
+      "effective": 545
+    },
+    "mmlu_public_relations_generative": {
+      "original": 110,
+      "effective": 110
+    },
+    "mmlu_logical_fallacies_generative": {
+      "original": 163,
+      "effective": 163
+    },
+    "mmlu_world_religions_generative": {
+      "original": 171,
+      "effective": 171
+    },
+    "mmlu_international_law_generative": {
+      "original": 121,
+      "effective": 121
+    },
+    "mmlu_high_school_world_history_generative": {
+      "original": 237,
+      "effective": 237
+    },
+    "mmlu_high_school_european_history_generative": {
+      "original": 165,
+      "effective": 165
+    },
+    "mmlu_prehistory_generative": {
+      "original": 324,
+      "effective": 324
+    },
+    "mmlu_professional_law_generative": {
+      "original": 1534,
+      "effective": 1534
+    },
+    "mmlu_moral_disputes_generative": {
+      "original": 346,
+      "effective": 346
+    },
+    "mmlu_formal_logic_generative": {
+      "original": 126,
+      "effective": 126
+    },
+    "mmlu_high_school_us_history_generative": {
+      "original": 204,
+      "effective": 204
+    },
+    "mmlu_jurisprudence_generative": {
+      "original": 108,
+      "effective": 108
+    },
+    "mmlu_moral_scenarios_generative": {
+      "original": 895,
+      "effective": 895
+    },
+    "mmlu_philosophy_generative": {
+      "original": 311,
+      "effective": 311
+    }
+  },
+  "config": {
+    "model": "local-completions",
+    "model_args": "base_url=http://localhost:8400/v1/completions,model=FP16-FP16,tokenizer=/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct",
+    "batch_size": "1",
+    "batch_sizes": [],
+    "device": null,
+    "use_cache": null,
+    "limit": null,
+    "bootstrap_iters": 100000,
+    "gen_kwargs": null,
+    "random_seed": 0,
+    "numpy_seed": 1234,
+    "torch_seed": 1234,
+    "fewshot_seed": 1234
+  },
+  "git_hash": "v0.20.0rc0-2073-g89889fb52",
+  "date": 1759862898.37754,
+  "pretty_env_info": "PyTorch version: 2.8.0a0+5228986c39.nv25.06\nIs debug build: False\nCUDA used to build PyTorch: 12.9\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.2 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\nClang version: 18.1.3 (1ubuntu1)\nCMake version: version 3.30.2\nLibc version: glibc-2.39\n\nPython version: 3.12.3 (main, Feb  4 2025, 14:48:35) [GCC 13.3.0] (64-bit runtime)\nPython platform: Linux-5.15.0-133-generic-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 12.9.86\nCUDA_MODULE_LOADING set to: LAZY\nGPU models and configuration: \nGPU 0: NVIDIA H100 PCIe\nGPU 1: NVIDIA H100 PCIe\nGPU 2: NVIDIA H100 PCIe\nGPU 3: NVIDIA H100 PCIe\n\nNvidia driver version: 580.82.07\ncuDNN version: Probably one of the following:\n/usr/lib/x86_64-linux-gnu/libcudnn.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_cnn.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_precompiled.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_runtime_compiled.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9.10.2\n/usr/lib/x86_64-linux-gnu/libcudnn_ops.so.9.10.2\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\n\nCPU:\nArchitecture:                         x86_64\nCPU op-mode(s):                       32-bit, 64-bit\nAddress sizes:                        43 bits physical, 48 bits virtual\nByte Order:                           Little Endian\nCPU(s):                               256\nOn-line CPU(s) list:                  0-255\nVendor ID:                            AuthenticAMD\nModel name:                           AMD EPYC 7742 64-Core Processor\nCPU family:                           23\nModel:                                49\nThread(s) per core:                   2\nCore(s) per socket:                   64\nSocket(s):                            2\nStepping:                             0\nFrequency boost:                      enabled\nCPU(s) scaling MHz:                   69%\nCPU max MHz:                          2250.0000\nCPU min MHz:                          1500.0000\nBogoMIPS:                             4500.15\nFlags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local clzero irperf xsaveerptr rdpru wbnoinvd amd_ppin arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif v_spec_ctrl umip rdpid overflow_recov succor smca sme sev sev_es\nVirtualization:                       AMD-V\nL1d cache:                            4 MiB (128 instances)\nL1i cache:                            4 MiB (128 instances)\nL2 cache:                             64 MiB (128 instances)\nL3 cache:                             512 MiB (32 instances)\nNUMA node(s):                         8\nNUMA node0 CPU(s):                    0-15,128-143\nNUMA node1 CPU(s):                    16-31,144-159\nNUMA node2 CPU(s):                    32-47,160-175\nNUMA node3 CPU(s):                    48-63,176-191\nNUMA node4 CPU(s):                    64-79,192-207\nNUMA node5 CPU(s):                    80-95,208-223\nNUMA node6 CPU(s):                    96-111,224-239\nNUMA node7 CPU(s):                    112-127,240-255\nVulnerability Gather data sampling:   Not affected\nVulnerability Itlb multihit:          Not affected\nVulnerability L1tf:                   Not affected\nVulnerability Mds:                    Not affected\nVulnerability Meltdown:               Not affected\nVulnerability Mmio stale data:        Not affected\nVulnerability Reg file data sampling: Not affected\nVulnerability Retbleed:               Vulnerable\nVulnerability Spec rstack overflow:   Vulnerable\nVulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:             Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                  Not affected\nVulnerability Tsx async abort:        Not affected\n\nVersions of relevant libraries:\n[pip3] mypy_extensions==1.1.0\n[pip3] numpy==1.26.4\n[pip3] nvidia-cuda-nvrtc-cu12==12.9.86\n[pip3] nvidia-cudnn-frontend==1.12.0\n[pip3] nvidia-nccl-cu12==2.28.3\n[pip3] nvtx==0.2.11\n[pip3] onnx==1.19.0\n[pip3] onnx_graphsurgeon==0.5.8\n[pip3] optree==0.16.0\n[pip3] pynvjitlink==0.3.0\n[pip3] pytorch-triton==3.3.0+git96316ce52.nvinternal\n[pip3] torch==2.8.0a0+5228986c39.nv25.6\n[pip3] torch_tensorrt==2.8.0a0\n[pip3] torchao==0.11.0+git\n[pip3] torchprofile==0.0.4\n[pip3] torchvision==0.22.0a0+95f10a4e\n[pip3] triton==3.3.1\n[conda] Could not collect",
+  "transformers_version": "4.55.0",
+  "lm_eval_version": "0.4.9.1",
+  "upper_git_hash": "89889fb5260948b3760e9e69bea6ce05587564a0",
+  "tokenizer_pad_token": [
+    null,
+    "None"
+  ],
+  "tokenizer_eos_token": [
+    "<|eot_id|>",
+    "128009"
+  ],
+  "tokenizer_bos_token": [
+    "<|begin_of_text|>",
+    "128000"
+  ],
+  "eot_token_id": 128009,
+  "max_length": 2047,
+  "task_hashes": {
+    "mmlu_electrical_engineering_generative": "7c8f924db3067a68e5223e6c222e55b3c2cddf00174a43cc18e3d2b63727bdf0",
+    "mmlu_high_school_physics_generative": "dd85fc130698900196624b8d4b9e09998e66ec6557dece53014bc3401c2fa859",
+    "mmlu_machine_learning_generative": "ae1ae3ad7802f4b0aacdbede4e88429005306f0dfa01f3626bd8daa33780003d",
+    "mmlu_computer_security_generative": "92b746f2981254dc9233991373b7b5bc9beeb3b4909f1ba244e5cae4536ee733",
+    "mmlu_abstract_algebra_generative": "f40ed8e978374386781e1773020fb13dc1debd3e5e4ef78b6675a0fcec930fba",
+    "mmlu_college_chemistry_generative": "82f4e2aeb65b8b51326a2229f87009c2b3eae4ef8c2eee3857a49d3543122d83",
+    "mmlu_high_school_statistics_generative": "e6f46405d41ac6d232aa29aa499e4d7ea0ce5b15a7c39a0e53f60af23ecea9e4",
+    "mmlu_high_school_computer_science_generative": "cd15a277131a9234a2b2ead8b61e2a312d4be36e86743b406013e5f74012f5fa",
+    "mmlu_conceptual_physics_generative": "7312c57ccd787417a03af2ef3c1791550a95279e2e87f49342b5eae7173ecbe9",
+    "mmlu_high_school_chemistry_generative": "2b386ce19f00d4591e12f3e6300aa4589a093d27ad38c286c5491bfa6108442e",
+    "mmlu_high_school_biology_generative": "c98f90a329ee303b96f692a97e711a5b19c133ed80573e914385d26ea685cafb",
+    "mmlu_anatomy_generative": "e78ce6858f45acf5071c370d703537ad0f24edb6b2e9b843f5607e763117a41f",
+    "mmlu_college_physics_generative": "46abe5dfdd8bd30bc41afc97fa26b4b8e75303926c491b130acc6f95bb4c3662",
+    "mmlu_high_school_mathematics_generative": "398091eff6b3eac3969ac200916148582792e9a032b1b192d145f516f8b7713b",
+    "mmlu_college_computer_science_generative": "929a90f00f9779521e9892fdc733a58d75565a6b4749f02d7d363fcab68b4678",
+    "mmlu_elementary_mathematics_generative": "d6e4f387f92ec71aeb8a22224a965c9575445b53dd3566c1fcac4a5451003948",
+    "mmlu_college_mathematics_generative": "9472826a0de07b1509d7eb2ffdbc630bedbe2ecff378dcaea061fb7fa66fdaee",
+    "mmlu_astronomy_generative": "6c7424c1737ee5446289c95a98dfdd1d9ed2b804a93a585ae7a47d4ef0080939",
+    "mmlu_college_biology_generative": "1dae1479d766334a4689c8a41cc5290c6a2a99a90f2367f6102bec923b309b01",
+    "mmlu_miscellaneous_generative": "ecd9d90976d550e82ffabe84a412e6930bd125ec30fc47a845840a32b5126fa4",
+    "mmlu_virology_generative": "a3ea01b358953f275d0494156cea6ec3217da4859b3b481cf3fe3e427f31ba00",
+    "mmlu_professional_accounting_generative": "c508842c72b1ded4c192bbcfd159aadc7a102b9de4378b9b7c9f427a7fd61338",
+    "mmlu_marketing_generative": "3a95596698272e3825fdbe8747854ea13c40cbb36a4469ae30178b81c512cbf1",
+    "mmlu_human_aging_generative": "9b89d02ed340f2addc93118aaf3404b65f97574f0a5d18f74658a837611be2a7",
+    "mmlu_nutrition_generative": "517308b183c65d5add10058add2202902f81710c724935d5f6d1c251e6e9b821",
+    "mmlu_global_facts_generative": "e302f79bbb10b3d81707685b22c98787ee18f6a6614d432fa7a990c5d9a5eb14",
+    "mmlu_business_ethics_generative": "baf583501741fa0810d46ad916d401d3c515e90485adc60397284705a46c97b4",
+    "mmlu_professional_medicine_generative": "3d7366dc3dc232a61ba40288db70ca9739107e59a3a24d71dedc0feeecb797b2",
+    "mmlu_management_generative": "622c30ae26e158f93b262b86e9943568b25fa5261b784691463ec40ac15863fd",
+    "mmlu_medical_genetics_generative": "3097ce46f79cf7804cae0e7f4026d8535f4ffa3a74668eb2edb90afae412fd02",
+    "mmlu_college_medicine_generative": "56e3152dee8d3ba7d1b087db0480132ef53a7a190da0badf4fe6c1de9911c209",
+    "mmlu_clinical_knowledge_generative": "1c11e690a0fe19a5f97d4e6f1bda67da38f36a8a4f6c04c56b85cd95422ae520",
+    "mmlu_security_studies_generative": "bf5999de2f3ad6a49542c5a0d567e112f4f07b3805876409d60c8058a90ced1c",
+    "mmlu_sociology_generative": "10720cd0dece7470bc738e36195584131a0d8193475cb5a8e8867964b329d8c4",
+    "mmlu_professional_psychology_generative": "8883d0c7a3adbb88b15893be4920381446f79e4b1b5e59e64175cd4380b20f09",
+    "mmlu_econometrics_generative": "69b2aaf6cf8326ed7ed5884442314b825b82a13f5635813513265c9727d4ef50",
+    "mmlu_high_school_macroeconomics_generative": "24ed0aef23d971fa4fba1a73a9adc62d5ec091c2f137b48fb425f33b1e2af578",
+    "mmlu_us_foreign_policy_generative": "4b63209dc31fefcb38f5e6bb4d3f5f913f0904b1f5e3345ec0b5d6b51c2906a3",
+    "mmlu_high_school_microeconomics_generative": "49c6185cbfbdd233774831345209f236316e1a4b65fdde7ef162fb719dce7e58",
+    "mmlu_high_school_government_and_politics_generative": "d3a41a20a294514c7dbdb1c192afc85b285c88eebbcfd4aefb3cb878f515176b",
+    "mmlu_high_school_geography_generative": "7340ecc538b5405e55ac41266b555dd096b64e3b5fa9c72977f8af3c67af718d",
+    "mmlu_human_sexuality_generative": "3c5f361c7bc084413b8b0e981c5c5aacd7c8f49c7f4d0f513bd2b11e0f620ca8",
+    "mmlu_high_school_psychology_generative": "55f1967083c1117aebb231ee2d0a5e74ce000ecd92431cf439a41fc2f4690f27",
+    "mmlu_public_relations_generative": "72289be9296240f3ceb55092da080b1fe64ba3e2a62c24f257cb3ae5b091f385",
+    "mmlu_logical_fallacies_generative": "91f337d95d8a3e0b3128cae694f681c7bd9db3e8ebee41cd96cd001f162a2337",
+    "mmlu_world_religions_generative": "9450b332d87747c6f4ec7a4477ba7f1d8462e2d289b9caa7483c6ed59806ee5e",
+    "mmlu_international_law_generative": "ab5d25b63fc739d7356a1ab1be616b6e1ba3d1c7b93102bbc61911dc64fd4f2c",
+    "mmlu_high_school_world_history_generative": "5e5d43634e28a82da86991c50e104e71e5ac611ea3813bda8931067d3596f33d",
+    "mmlu_high_school_european_history_generative": "a4bfb439eb2d1a8dbef3e01b8cefcd8d6f353527c5fd165573465e1ba8d4fc6f",
+    "mmlu_prehistory_generative": "44777500dbb7f1941733f04258e203abb060ef5678b751ea69e6269c30f024ef",
+    "mmlu_professional_law_generative": "ced7834d71beea8a1d852e4ba7fdd3794a3c93feb93e98b4610d54c7f7469c63",
+    "mmlu_moral_disputes_generative": "516b93ca7605688ea726e1860943bd7c75707acfce24da279379e6f7f612d568",
+    "mmlu_formal_logic_generative": "4f961b8722b612b55a5d9b622a4e4b5f4b23f427963f6cae23a2cf2ff9105a8f",
+    "mmlu_high_school_us_history_generative": "df69af40072528074fc2caa13fbc40f7d9528275122f532c6d79e01374c79431",
+    "mmlu_jurisprudence_generative": "d66ddb0583d9ad482ae3ea7a5ce282128464ee92098a67ba2048f51e661ac185",
+    "mmlu_moral_scenarios_generative": "b1882ea4abf19ed5ec698d9be36b1b71ddd7fc8988625f07e1bb9666c5e36241",
+    "mmlu_philosophy_generative": "59c32eb5b37cfa627c929ef6a43028f1468d200464a5c926af9f5bece9830809"
+  },
+  "model_source": "local-completions",
+  "model_name": "FP16-FP16",
+  "model_name_sanitized": "FP16-FP16",
+  "system_instruction": null,
+  "system_instruction_sha": null,
+  "fewshot_as_multiturn": false,
+  "chat_template": null,
+  "chat_template_sha": null,
+  "start_time": 94375.574044625,
+  "end_time": 107561.002445269,
+  "total_evaluation_time_seconds": "13185.428400644"
+}
