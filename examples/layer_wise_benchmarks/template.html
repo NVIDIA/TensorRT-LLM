@@ -226,6 +226,37 @@
         .collapsed .toggle-icon { transform: rotate(-90deg); }
         .hidden { display: none; }
 
+        /* Config Panel Styles */
+        .config-panel {
+            margin-bottom: 10px;
+            font-size: 12px;
+            color: #888;
+        }
+        .config-panel details {
+            background-color: #252526;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 4px 8px;
+        }
+        .config-panel summary {
+            cursor: pointer;
+            font-weight: bold;
+            user-select: none;
+            outline: none;
+        }
+        .config-panel summary:hover {
+            color: var(--text-color);
+        }
+        .config-panel pre {
+            margin: 5px 0 0 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-family: "Consolas", "Monaco", monospace;
+            color: #aaa;
+            padding: 5px;
+            background-color: #1e1e1e;
+            border-radius: 3px;
+        }
     </style>
 </head>
 <body>
@@ -236,6 +267,13 @@
     <span id="level-buttons"></span>
     <button onclick="expandAll()">Expand All</button>
     <span style="font-size: 12px; color: #666; margin-left: 10px;">(Tip: Arrows to move, +/- to toggle, Click charts to select)</span>
+</div>
+
+<div class="config-panel">
+    <details>
+        <summary>🔧 Configuration (Click to expand)</summary>
+        <pre>{{ runArgs }}</pre>
+    </details>
 </div>
 
 <div class="dashboard-grid">

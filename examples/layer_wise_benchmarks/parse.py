@@ -437,4 +437,8 @@ js_header_config = [{"name": problem["text"]} for problem in problem_set]
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
 template = jinja2.Environment(loader=loader).get_template("template.html")
 with html_file_path.open("w") as f:
-    f.write(template.render(headerConfig=js_header_config, rawData=js_data))
+    f.write(
+        template.render(
+            headerConfig=js_header_config, rawData=js_data, runArgs=json.dumps(run_args, indent=4)
+        )
+    )
