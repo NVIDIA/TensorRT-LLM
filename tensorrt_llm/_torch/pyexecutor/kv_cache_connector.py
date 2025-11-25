@@ -436,6 +436,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def mark_ready_requests(
             self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> List[LlmRequest]:
+        """
+        Mark scheduled KV connector requests as ready.
+        In the py executor, we mark ALL KV connector requests as async loading.
+        However, if we returned False from get_num_new_matched_tokens, we need to mark the request as ready for the upcoming context forward pass.
+        After we mark the request(s) as ready, we run scheduling again to account for the newly ready requests.
+        """
+
         ready_requests = []
         for req in fitting_disagg_gen_init_requests:
             # If we're not loading this request asynchronously, mark it as ready for the upcoming forward pass.

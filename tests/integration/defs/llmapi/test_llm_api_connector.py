@@ -84,9 +84,11 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 
     model.generate(["Hello, world"], sampling_params)
 
-    sleep(
-        1
-    )  # When using the overlap scheduler, we generate an extra token. We want to be able to track these
+    # When using the overlap scheduler, we generate an extra token. We want to be able to track calls to the connector made with this extra token.
+    # This is problematic since the final calls to the connector API occur after the final response has been returned.
+    # To get around this, we sleep for a short period of time to account for this additional time.
+    # We follow a similar pattern in the other tests.
+    sleep(1)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -421,7 +423,7 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=True,
-                     kv_cache_config=KvCacheConfig(max_tokens=120))
+                     kv_cache_config=KvCacheConfig(max_tokens=144))
 
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
 

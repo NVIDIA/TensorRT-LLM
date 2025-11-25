@@ -61,8 +61,7 @@ public:
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
 
-    std::tuple<std::vector<tb::LlmRequest::RequestIdType>, std::vector<tb::LlmRequest::RequestIdType>>
-    checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    tb::RequestsStatus checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
         NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum);
     }
@@ -95,7 +94,7 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum)
             {
                 auto result = self.checkContextTransferStatus(atLeastRequestNum);
-                return nb::make_tuple(std::get<0>(result), std::get<1>(result));
+                return nb::make_tuple(result.completedRequestIds, result.errorRequestIds);
             },
             nb::arg("at_least_request_num") = std::nullopt)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
