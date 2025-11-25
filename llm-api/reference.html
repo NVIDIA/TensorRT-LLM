@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc3" />
+  <meta name="docsearch:version" content="1.2.0rc4" />
 
 
   </head>
@@ -611,7 +611,7 @@
 <li><p><strong>batch_wait_timeout_iters</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays. Defaults to 0.</p></li>
 <li><p><strong>batch_wait_max_tokens_ratio</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays. Defaults to 0.</p></li>
 <li><p><strong>torch_compile_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="tensorrt_llm.llmapi.llm_args.TorchCompileConfig"><em>tensorrt_llm.llmapi.llm_args.TorchCompileConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Torch compile config. Defaults to None.</p></li>
-<li><p><strong>enable_autotuner</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable autotuner only when torch compile is enabled. Defaults to True.</p></li>
+<li><p><strong>enable_autotuner</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false. Defaults to True.</p></li>
 <li><p><strong>enable_layerwise_nvtx_marker</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> If true, enable layerwise nvtx marker. Defaults to False.</p></li>
 <li><p><strong>enable_min_latency</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> If true, enable min-latency mode. Currently only used for Llama4. Defaults to False.</p></li>
 <li><p><strong>stream_interval</strong> (<em>int</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The iteration interval to create responses under the streaming mode. Set this to a larger value when the batch size is large, which helps reduce the streaming overhead. Defaults to 1.</p></li>
@@ -5352,7 +5352,7 @@ a subset of the possible backends.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -17497,7 +17497,7 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_autotuner">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_autotuner</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_autotuner" title="Link to this definition">#</a></dt>
-<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable autotuner only when torch compile is enabled.</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -24315,9 +24315,9 @@ a subset of the possible backends.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 20, 2025.</p>
+  <p>Last updated on November 23, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/2128f73">2128f73</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
   
 </div></div>
       
