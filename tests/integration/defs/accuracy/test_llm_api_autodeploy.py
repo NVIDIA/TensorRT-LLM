@@ -168,6 +168,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             # Keep max_batch_size as in the PyTorch test to avoid OOM
             "max_batch_size": 128,
             # Model context length is 8K
+            "enable_chunked_prefill": True,
             "max_seq_len": 8192,
             # Set explicitly to match default build_config behavior
             "max_num_tokens": 8192,
