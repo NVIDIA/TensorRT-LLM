@@ -116,6 +116,7 @@ def _load_iteration_indexes(env_var: str):
 
 @dataclasses.dataclass
 class BatchState:
+    scheduled_requests: ScheduledRequests
     sample_state: SampleState
 
     iter_start_time: float = 0
@@ -126,8 +127,6 @@ class BatchState:
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
-    scheduled_ctx_reqs: list[LlmRequest] = None
-    finished_ctx_reqs: list[LlmRequest] = None
 
 
 class AsyncTransferManager:
@@ -1111,14 +1110,14 @@ class PyExecutor:
 
         req_stats = self._populate_req_stats(
             finished_requests, active_requests,
-            batch_state.sample_state.scheduled_requests) if (
+            batch_state.scheduled_requests) if (
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
         self._append_iter_stats(
             self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
                                     len(finished_requests),
-                                    batch_state.sample_state.scheduled_requests,
+                                    batch_state.scheduled_requests,
                                     micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
@@ -1294,7 +1293,6 @@ class PyExecutor:
                     self.micro_batches[microbatch_id] = None
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
-                    finished_ctx_reqs = self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1370,16 +1368,17 @@ class PyExecutor:
 
                             self._update_request_states(scheduled_batch)
 
+                    self._add_inflight_ids(sample_state.requests)
+
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
                     batch_state = BatchStatePP(
+                        scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
-                        scheduled_ctx_reqs=scheduled_batch.context_requests,
-                        finished_ctx_reqs=finished_ctx_reqs,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -1522,7 +1521,7 @@ class PyExecutor:
         tag = PPCommTag.SAMPLE_STATE
         microbatch_id = executed_batch.microbatch_id
         sample_state = executed_batch.sample_state
-        requests = sample_state.scheduled_requests.all_requests()
+        requests = sample_state.requests
 
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
@@ -1557,15 +1556,18 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                sample_state = executed_batch.sample_state
-                sample_state.scheduled_requests.context_requests = executed_batch.finished_ctx_reqs
                 self._update_requests(executed_batch.sample_state)
                 if self.kv_cache_transceiver:
-                    self._send_kv_async(executed_batch.finished_ctx_reqs)
+                    finished_ctx_reqs = [
+                        req for req in
+                        executed_batch.scheduled_requests.context_requests
+                        if req.is_last_context_chunk
+                    ]
+                    self._send_kv_async(finished_ctx_reqs)
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
-                previous_scheduled_batch = executed_batch.sample_state.scheduled_requests
+                previous_scheduled_batch = executed_batch.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -1575,7 +1577,7 @@ class PyExecutor:
                     previous_scheduled_batch, attn_metadata,
                     kv_cache_dtype_byte_size)
 
-                self._remove_inflight_ids(executed_batch)
+                self._remove_inflight_ids(executed_batch.sample_state.requests)
 
         if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
         ):
@@ -1585,8 +1587,6 @@ class PyExecutor:
             self._disagg_pp_termination_handler.terminate_pending_requests()
 
         if self.enable_iter_perf_stats and executed_batch is not None:
-            sample_state = executed_batch.sample_state
-            sample_state.scheduled_requests.context_requests = executed_batch.scheduled_ctx_reqs
             self._process_iter_stats(
                 finished_requests,
                 self.active_requests,
@@ -1905,7 +1905,8 @@ class PyExecutor:
                         'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
-                        BatchState(sample_state=sample_state,
+                        BatchState(scheduled_requests=scheduled_batch,
+                                   sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
@@ -2185,6 +2186,7 @@ class PyExecutor:
                             'num_ctx_tokens']
 
                     self.previous_batch = BatchState(
+                        scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
@@ -2293,7 +2295,7 @@ class PyExecutor:
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
+        scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
@@ -2312,10 +2314,15 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
+        # Collect sampling requests to update the inflight set
+        # Cf. TorchSampler._select_generated_logits
+        sampling_requests = [
+            req for req in scheduled_batch.context_requests
+            if req.is_last_context_chunk
+        ] + scheduled_batch.generation_requests
         return self.sampler.SampleState(
-            scheduled_requests=scheduled_batch,
-            sampler_event=SamplerEvent(cuda_event=sampler_event),
-        )
+            requests=sampling_requests,
+            sampler_event=SamplerEvent(cuda_event=sampler_event))
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
@@ -2880,7 +2887,7 @@ class PyExecutor:
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
-                requests = self.previous_batch.sample_state.scheduled_requests.all_requests(
+                requests = self.previous_batch.scheduled_requests.all_requests(
                 ) if self.previous_batch is not None else []
             else:
                 requests = scheduled_requests
@@ -3401,43 +3408,27 @@ class PyExecutor:
         for req in requests_to_pause:
             req.pause(self.max_input_len)
 
-    def _add_inflight_ids(self, scheduled_requests):
-        """Add request IDs of current requests to self.inflight_req_ids.
+    def _add_inflight_ids(self, requests):
+        """Add request IDs of current sampling requests to self.inflight_req_ids.
 
-        Non‑final context chunks are not added to the inflight set, so the scheduler can keep scheduling further
-        context chunks while earlier ones are in the PP pipeline. Only context requests that finish context phase
-        are inserted into the inflight set and collected into finished_ctx_reqs.
-        All generation requests are still inserted into the inflight set.
+        Non‑final context chunks should not be added to the inflight set, so the scheduler can keep scheduling
+        further context chunks while earlier ones are in the PP pipeline.
+        Only requests that sample new tokens should be added to the inflight set since their next iteration depends
+        on these new tokens, so they should be skipped in the scheduler until the new tokens are generated.
+        This includes context requests that finish context phase and generation requests.
         """
-        finished_ctx_reqs = []
-        for req in scheduled_requests.context_requests:
-            if req.is_last_context_chunk:
-                logger.debug(
-                    f"Context request with ID {req.request_id} added to DECODER model inflight set"
-                )
-                self.inflight_req_ids.insert(req.request_id)
-                finished_ctx_reqs.append(req)
-        for req in scheduled_requests.generation_requests:
+        for req in requests:
             logger.debug(
-                f"Generation request with ID {req.request_id} added to DECODER model inflight set"
+                f"Request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
-        return finished_ctx_reqs
 
-    def _remove_inflight_ids(self, batch_state: BatchStatePP):
-        """Remove request IDs of current requests from self.inflight_req_ids.
-
-        Context IDs are erased from the inflight set using batch_state.finished_ctx_reqs.
-        Generation IDs are erased using batch_state.sample_state.scheduled_requests.generation_requests.
+    def _remove_inflight_ids(self, requests):
+        """Remove request IDs of current samplingrequests from self.inflight_req_ids.
         """
-        for req in batch_state.finished_ctx_reqs:
+        for req in requests:
             logger.debug(
-                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
-            )
-            self.inflight_req_ids.erase(req.request_id)
-        for req in batch_state.sample_state.scheduled_requests.generation_requests:
-            logger.debug(
-                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
+                f"Request with ID {req.request_id} removed from DECODER model inflight set"
             )
             self.inflight_req_ids.erase(req.request_id)
 
