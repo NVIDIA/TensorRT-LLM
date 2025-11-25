@@ -4167,103 +4167,88 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_fp8_8gpus(self):
-        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
-        if not os.path.exists(original_model_dir):
-            pytest.skip(f"Model directory {original_model_dir} does not exist")
+        model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
 
-        temp_dir = None
-        try:
-            # Create modified model directory using LongBenchV2 static method
-            # This is a WAR for the fact that the model config is not modified to support long context.
-            # TODO: remove this once the model config is modified to support long context.
-            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+        # Configure model settings
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=True,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
 
-            # Configure model settings
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                            enable_block_reuse=True,
-                                            enable_partial_reuse=False,
-                                            dtype="fp8")
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
 
-            cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                                max_batch_size=32)
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
 
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+        moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
 
-            moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              speculative_config=mtp_config,
+                              moe_config=moe_config,
+                              enable_chunked_prefill=True,
+                              enable_autotuner=True)
 
-            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
-                                  kv_cache_config=kv_cache_config,
-                                  speculative_config=mtp_config,
-                                  moe_config=moe_config,
-                                  enable_chunked_prefill=True,
-                                  enable_autotuner=True)
+        # Create LLM instance and evaluate
+        with LLM(model_dir,
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 max_num_tokens=32000,
+                 max_batch_size=32,
+                 **pytorch_config) as llm:
 
-            # Create LLM instance and evaluate
-            with LLM(temp_dir,
-                     tensor_parallel_size=8,
-                     moe_expert_parallel_size=8,
-                     max_num_tokens=32000,
-                     max_batch_size=32,
-                     **pytorch_config) as llm:
+            task = LongBenchV2(self.MODEL_NAME)
 
-                task = LongBenchV2(self.MODEL_NAME)
+            sampling_params = SamplingParams(
+                max_tokens=32000,
+                truncate_prompt_tokens=128000,
+            )
 
-                sampling_params = SamplingParams(max_tokens=32000)
-
-                task.evaluate(llm, sampling_params=sampling_params)
-
-        finally:
-            # Cleanup temporary files
-            if temp_dir and os.path.exists(temp_dir):
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_nvfp4_4gpus(self):
-        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
-        temp_dir = None
-        try:
-            # Create modified model directory using LongBenchV2 static method
-            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+        model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
 
-            # Configure model settings (no MOE config for FP4 version)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                            enable_block_reuse=True,
-                                            enable_partial_reuse=False,
-                                            dtype="fp8")
+        # Configure model settings (no MOE config for FP4 version)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=True,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
 
-            cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                                max_batch_size=32)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
 
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
 
-            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
-                                  kv_cache_config=kv_cache_config,
-                                  speculative_config=mtp_config,
-                                  enable_chunked_prefill=True,
-                                  enable_autotuner=True)
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              speculative_config=mtp_config,
+                              enable_chunked_prefill=True,
+                              enable_autotuner=True)
 
-            # Create LLM instance and evaluate
-            with LLM(temp_dir,
-                     tensor_parallel_size=4,
-                     moe_expert_parallel_size=4,
-                     max_num_tokens=32000,
-                     max_batch_size=32,
-                     **pytorch_config) as llm:
+        # Create LLM instance and evaluate
+        with LLM(model_dir,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 max_num_tokens=32000,
+                 max_batch_size=32,
+                 **pytorch_config) as llm:
 
-                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-                task = LongBenchV2(self.MODEL_NAME)
+            task = LongBenchV2(self.MODEL_NAME)
 
-                sampling_params = SamplingParams(max_tokens=32000)
+            sampling_params = SamplingParams(
+                max_tokens=32000,
+                truncate_prompt_tokens=128000,
+            )
 
-                task.evaluate(llm, sampling_params=sampling_params)
-
-        finally:
-            # Cleanup temporary files
-            if temp_dir and os.path.exists(temp_dir):
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            task.evaluate(llm, sampling_params=sampling_params)
 
 
 class TestStarcoder2_3B(LlmapiAccuracyTestHarness):
