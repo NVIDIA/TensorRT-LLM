@@ -35,7 +35,8 @@ from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
                           PretrainedConfig, PreTrainedModel)
 
 from ..._utils import nvtx_range
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
@@ -864,15 +865,22 @@ def _apply_chat_template(text, conv, tokenizer):
     return text
 
 
-class VilaInputProcessor(BaseMultimodalInputProcessor):
+class VilaInputProcessor(BaseMultimodalInputProcessor,
+                         BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
                  config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True):
-        super().__init__()
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         self._config = config
+        self._model_path = model_path
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.config)
         self._dtype = self.config.model_dtype
@@ -904,6 +912,9 @@ class VilaInputProcessor(BaseMultimodalInputProcessor):
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def model_path(self) -> str:
+        return self._model_path
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self,

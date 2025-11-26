@@ -104,9 +104,15 @@ def trtllm_quant_fp8_linear(
     assert input_scale is not None
     input_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(input, input_scale)
 
+    enable_cuda_core = False
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability(0)
+        enable_cuda_core = capability == (8, 9) or capability == (12, 0)
     # Use TensorRT-LLM FP8 scaled matrix multiply
     # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
-    if input_fp8.shape[0] <= 8:  # NOTE: this kernel work with n % 2 == 0 as well??
+    if (
+        input_fp8.shape[0] <= 8 and enable_cuda_core
+    ):  # NOTE: this kernel work with n % 2 == 0 as well??
         # Use CUDA core for small M dimension (better for small batch sizes)
         output = torch.ops.trtllm.cuda_scaled_mm(
             input_fp8,
@@ -239,6 +245,7 @@ def fp8_linear_fake(
 def fused_fp8_linear_all_reduce(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
+    strategy: str,
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
@@ -247,7 +254,7 @@ def fused_fp8_linear_all_reduce(
         input, weight_fp8, bias, input_scale, weight_scale
     )
     if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM)
+        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM, strategy=strategy)
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
     return out
 
@@ -256,6 +263,7 @@ def fused_fp8_linear_all_reduce(
 def fused_fp8_linear_all_reduce_fake(
     input: torch.Tensor,
     weight_fp8: torch.Tensor,
+    strategy: str,
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,

@@ -5,6 +5,7 @@ import os
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import click
@@ -33,6 +34,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -151,6 +153,7 @@ def launch_server(
         port: int,
         llm_args: dict,
         tool_parser: Optional[str] = None,
+        chat_template: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
@@ -159,6 +162,7 @@ def launch_server(
     backend = llm_args["backend"]
     model = llm_args["model"]
     if backend == 'pytorch':
+        llm_args.pop("build_config", None)
         llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
         from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -180,7 +184,8 @@ def launch_server(
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg,
                           disagg_cluster_config=disagg_cluster_config,
-                          multimodal_server_config=multimodal_server_config)
+                          multimodal_server_config=multimodal_server_config,
+                          chat_template=chat_template)
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -244,6 +249,16 @@ class ChoiceWithAlias(click.Choice):
                          {"trt": "tensorrt"}),
     default="pytorch",
     help="The backend to use to serve the model. Default is pytorch backend.")
+@click.option(
+    "--custom_module_dirs",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    multiple=True,
+    help="Paths to custom module directories to import.",
+)
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -354,6 +369,11 @@ class ChoiceWithAlias(click.Choice):
               type=str,
               default=None,
               help="Keyword arguments for media I/O.")
+@click.option("--chat_template",
+              type=str,
+              default=None,
+              help="[Experimental] Specify a custom chat template. "
+              "Can be a file path or one-liner template string")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -366,12 +386,21 @@ def serve(
         server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
+        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+        custom_module_dirs: list[Path], chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    for custom_module_dir in custom_module_dirs:
+        try:
+            import_custom_module_from_dir(custom_module_dir)
+        except Exception as e:
+            logger.error(
+                f"Failed to import custom module from {custom_module_dir}: {e}")
+            raise e
 
     llm_args, _ = get_llm_args(
         model=model,
@@ -434,8 +463,9 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg,
-                  server_role, disagg_cluster_config, multimodal_server_config)
+    launch_server(host, port, llm_args, tool_parser, chat_template,
+                  metadata_server_cfg, server_role, disagg_cluster_config,
+                  multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
