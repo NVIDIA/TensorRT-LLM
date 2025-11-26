@@ -35,7 +35,6 @@ def torch_dist_all_gather_fake(tensor, dim=0, sizes=None):
 
 @torch.library.custom_op("auto_deploy::torch_dist_all_reduce", mutates_args=(), device_types="cuda")
 def torch_dist_all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
-    
     """All_reduce using PyTorch distributed backend. Reduction op is SUM.
 
     This op always uses torch.distributed.all_reduce and is used in demollm mode.
