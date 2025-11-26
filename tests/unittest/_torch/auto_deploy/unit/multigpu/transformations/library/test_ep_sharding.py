@@ -14,10 +14,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     EPShardingInfo,
     FP8EPShardingInfo,
     NVFP4EPShardingInfo,
+    ShardingTransformConfig,
 )
-from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm.functional import AllReduceStrategy
 
 
 def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
@@ -87,6 +88,12 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     expected_transformations = []
     # if world_size == 1, no sharding transformations should be detected
     if world_size > 1:
+        config = ShardingTransformConfig(
+            rank=rank,
+            world_size=world_size,
+            stage="sharding",
+            allreduce_strategy=AllReduceStrategy.AUTO,
+        )
         for node in gm.graph.nodes:
             if is_op(node, torch.ops.auto_deploy.torch_moe):
                 expected_transformations.append(
