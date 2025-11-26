@@ -17,12 +17,14 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
-from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           NVFP4TRTLLMGenFusedMoEMethod,
-                           W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
-                           W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
-                           W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
-                           W4A16MXFP4TRTLLMGenFusedMoEMethod)
+
+# isort: off
+from .quantization import (
+    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEMethod,
+    UnquantizedFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
+    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
+    W4A16MXFP4TRTLLMGenFusedMoEMethod)
+# isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
 
@@ -120,13 +122,13 @@ class TRTLLMGenFusedMoE(MoE):
             self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                if self.moe_alltoall_backend == "mnnvllatency":
+                if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
                     MnnvlMemory.initialize()
                     self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                         model_config.mapping)
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                         model_config.mapping)
-                elif self.moe_alltoall_backend == "mnnvlthroughput":
+                elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
                     workspace_mb = int(
                         os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
                     self.moe_a2a = MoeAlltoAll(
@@ -198,9 +200,9 @@ class TRTLLMGenFusedMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "mnnvlthroughput" (default) or "mnnvllatency"
+        # "NVLINK_ONE_SIDED" (default) or "NVLINK_TWO_SIDED"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "mnnvlthroughput").strip().lower()
+                              "NVLINK_ONE_SIDED").strip().upper()
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
@@ -256,13 +258,24 @@ class TRTLLMGenFusedMoE(MoE):
                                         requires_grad=False)
             self.register_parameter("w2_bias", self.w2_bias)
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert self._weights_created
 
         assert len(weights) == 1
         weights = weights[0]
 
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
+            self.quant_method.load_weights(self, weights,
+                                           self.weight_loading_mode)
+        else:
+            self.quant_method.load_weights(
+                self,
+                weights,
+                self.weight_loading_mode,
+                allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
@@ -362,7 +375,7 @@ class TRTLLMGenFusedMoE(MoE):
 
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -394,7 +407,7 @@ class TRTLLMGenFusedMoE(MoE):
             else:
                 token_final_scales = token_final_scales.to(torch.float32)
 
-            if self.moe_alltoall_backend == "mnnvllatency":
+            if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
                 if is_last_call:
                     loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
@@ -444,7 +457,7 @@ class TRTLLMGenFusedMoE(MoE):
 
                 if token_final_scales is not None:
                     token_final_scales = token_final_scales.to(torch.bfloat16)
-            elif self.moe_alltoall_backend == "mnnvlthroughput":
+            elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,
                                      ceil_div(x_col, self.scaling_vector_size))
@@ -510,7 +523,7 @@ class TRTLLMGenFusedMoE(MoE):
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
         # TODO: use_workspace_output only supports w4a8_mxfp4_mxfp8 (gpt-oss) for now
-        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput" and self.has_w4a8_mxfp4_mxfp8:
+        if self.enable_alltoall and self.moe_alltoall_backend == "NVLINK_ONE_SIDED" and self.has_w4a8_mxfp4_mxfp8:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
             use_workspace_output = True
@@ -774,7 +787,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Combine results if using alltoall
         if self.enable_alltoall:
-            if self.moe_alltoall_backend == "mnnvllatency":
+            if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
                 if alltoall_info is not None:
                     final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
                         final_hidden_states,
@@ -787,7 +800,7 @@ class TRTLLMGenFusedMoE(MoE):
                         use_low_precision_combine,
                         token_count=token_count,
                     )
-            elif self.moe_alltoall_backend == "mnnvlthroughput":
+            elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
                 # If use_workspace_output=True, the MoE result is already in workspace
                 # Otherwise, we need to reshape and pass it
                 if use_workspace_output:

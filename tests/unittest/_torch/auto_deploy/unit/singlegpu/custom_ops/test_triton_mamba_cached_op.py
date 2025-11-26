@@ -163,7 +163,6 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         dt,
         dt_bias,
         seq_len,
-        seq_start,
         slot_idx,
         use_initial_states,
         cu_seqlens,

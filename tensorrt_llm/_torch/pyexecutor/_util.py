@@ -472,6 +472,7 @@ class KvCacheCreator:
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
                 sparse_attn_config=sparse_attn_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -518,6 +519,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         elif is_qwen3_next(config):
             if self._max_beam_width > 1:
@@ -568,6 +570,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         else:
             # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
@@ -595,6 +598,7 @@ class KvCacheCreator:
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
                 sparse_attn_config=sparse_attn_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -674,8 +678,10 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
+    max_num_sequences = max_batch_size * mapping.pp_size
+
     logger.info(
-        f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
+        f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
     for key, value in llm_args.extra_resource_managers.items():
@@ -759,8 +765,6 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
-
-    max_num_sequences = max_batch_size * mapping.pp_size
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)

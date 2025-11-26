@@ -234,6 +234,15 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
+        qkv_shard_indices_mapping = {
+            "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
+            "k":
+            (self.q_size * (2 if self.attn_output_gate else 1), self.kv_size),
+            "v":
+            (self.q_size * (2 if self.attn_output_gate else 1) + self.kv_size,
+             self.kv_size),
+        }
+
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size * (2 if self.attn_output_gate else 1) +
@@ -249,7 +258,8 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-            use_custom_cublas_mm=use_custom_cublas_mm)
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -1700,6 +1710,9 @@ class MLA(nn.Module):
             device=q.device,
         )
 
+        # Compute helix_position_offsets for helix parallelism.
+        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
+
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -1713,10 +1726,18 @@ class MLA(nn.Module):
             maybe_execute_in_parallel(
                 lambda: torch.ops.trtllm.bmm_out(
                     q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                lambda: self.mqa.mla_rope_generation(fused_q,
+                                                     q_pe,
+                                                     latent_cache,
+                                                     attn_metadata,
+                                                     cu_q_seqlens,
+                                                     cu_kv_seqlens,
+                                                     fmha_scheduler_counter,
+                                                     mla_bmm1_scale,
+                                                     mla_bmm2_scale,
+                                                     quant_q_buffer,
+                                                     helix_position_offsets=
+                                                     helix_position_offsets),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1734,10 +1755,18 @@ class MLA(nn.Module):
                     q_nope_out,
                     self.k_b_proj_trans_dequant,
                 ),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                lambda: self.mqa.mla_rope_generation(fused_q,
+                                                     q_pe,
+                                                     latent_cache,
+                                                     attn_metadata,
+                                                     cu_q_seqlens,
+                                                     cu_kv_seqlens,
+                                                     fmha_scheduler_counter,
+                                                     mla_bmm1_scale,
+                                                     mla_bmm2_scale,
+                                                     quant_q_buffer,
+                                                     helix_position_offsets=
+                                                     helix_position_offsets),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,

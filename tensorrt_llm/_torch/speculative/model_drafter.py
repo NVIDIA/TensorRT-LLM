@@ -187,6 +187,9 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
         new_request.py_is_first_draft = True
+        # For tree decoding, we need to store the accepted tokens indices for these requests,
+        # which will be used to update the hidden_states_read_indices.
+        new_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
         return new_request
 
     def _create_draft_request_for_request(
@@ -621,11 +624,14 @@ class ModelDrafter(Drafter):
                 continue
             target_model_req.py_draft_tokens = []
             py_draft_logits = []
-            for token_idx in range(self.max_draft_len):
+            for token_idx in range(self.max_total_draft_tokens):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])
-            target_model_req.py_draft_logits = torch.stack(py_draft_logits)
+
+            # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
+            if self.disable_overlap_scheduler:
+                target_model_req.py_draft_logits = torch.stack(py_draft_logits)
 
     def process_dynamic_draft_outputs(
             self,
