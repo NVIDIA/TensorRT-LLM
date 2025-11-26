@@ -5,7 +5,7 @@ import unittest
 import pytest
 import torch
 from utils.llm_data import llm_models_root
-from utils.util import similar
+from utils.util import similar, skip_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
@@ -20,6 +20,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # It is set with acceptance window and acceptance threshold in spec_config.
 # This test set the max_concurrency to a large value to prevent spec decode turned off due to number of effective requests > max_concurrency,
 # So that we can only focus on the turning off effect from the SpeculationGate.
+@skip_blackwell  # TODO: Remove after fixing TRTLLM-GEN FMHA segfault on Blackwell
 @pytest.mark.high_cuda_memory
 def test_spec_gate_e2e():
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
