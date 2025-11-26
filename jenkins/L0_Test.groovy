@@ -798,7 +798,6 @@ def getPytestBaseCommandLine(
         "--cov-report=",
         "--cov-config=${coverageConfigFile}",
         "--periodic-junit",
-        "--periodic-interval=1800",     // 30 minutes
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
     ]
