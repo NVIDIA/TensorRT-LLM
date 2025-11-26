@@ -350,7 +350,7 @@ P99 E2EL (ms):                            [result]
 For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
 
 $$
-\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{#Output Tokens} - 1}
 $$
 
 Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
@@ -360,7 +360,7 @@ $$
 $$
 
 $$
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{#Output Tokens across requests}}
 $$
 
 #### End-to-End (E2E) Latency
@@ -368,12 +368,14 @@ $$
 
 #### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
+
 $$
-\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+\text{Total TPS} = \frac{\text{#Input Tokens}+\text{#Output Tokens}}{T_{last} - T_{first}}
 $$
 
 #### Tokens Per Second (TPS) or Output Token Throughput
   * how many output tokens the system generates each second.
+
 $$
-\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+\text{TPS} = \frac{\text{#Output Tokens}}{T_{last} - T_{first}}
 $$
