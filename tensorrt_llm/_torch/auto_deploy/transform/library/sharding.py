@@ -317,6 +317,24 @@ def _process_ssm_sharding(
         "conv1d": split_sizes_1,
     }
 
+    # ##############################################################
+    # ####### shard the entry_node (the first linear layer) ########
+    # ##############################################################
+    if not sharding_config.add(
+        WeightShardingInfo.from_node(
+            entry_node,
+            split_dim=SplitDimension.COLUMN,
+            rank=rank,
+            world_size=world_size,
+            dist_op=None,
+            min_local_shape=min_local_shape,
+            fused_weight_dims=fused_weight_dims["in_proj"],
+            layer_type=LayerType.MAMBA,
+        )
+    ):
+        # the layer was already sharded. Skipping.
+        return 0
+
     # # ##############################################################
     # # ############## update split nodes ############################
     # # ##############################################################
@@ -356,22 +374,6 @@ def _process_ssm_sharding(
     sharding_config.add(
         ParameterUpdateInfo(
             rank=rank, world_size=world_size, target_node=conv1d_node.name, args=tuple(conv_args)
-        )
-    )
-
-    # ##############################################################
-    # ####### shard the entry_node (the first linear layer) ########
-    # ##############################################################
-    sharding_config.add(
-        WeightShardingInfo.from_node(
-            entry_node,
-            split_dim=SplitDimension.COLUMN,
-            rank=rank,
-            world_size=world_size,
-            dist_op=None,
-            min_local_shape=min_local_shape,
-            fused_weight_dims=fused_weight_dims["in_proj"],
-            layer_type=LayerType.MAMBA,
         )
     )
 
@@ -910,7 +912,7 @@ def detect_column_row_shard(
         )
 
         # shard single row node
-        sharding_config.add(
+        if sharding_config.add(
             WeightShardingInfo.from_node(
                 closing,
                 split_dim=SplitDimension.ROW,
@@ -920,9 +922,8 @@ def detect_column_row_shard(
                 min_local_shape=min_local_shape,
                 layer_type=layer_type,
             )
-        )
-
-        num_column_row_shards += 1
+        ):
+            num_column_row_shards += 1
 
     # simple shard remaining linear nodes
     num_simple_shards += _process_simple_shard(
