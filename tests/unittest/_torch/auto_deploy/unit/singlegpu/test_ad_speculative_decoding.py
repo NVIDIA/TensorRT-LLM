@@ -39,7 +39,7 @@ def test_ad_speculative_decoding_smoke():
 
     # Configure KV cache
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.0001,
+        free_gpu_memory_fraction=0.01,
     )
 
     experiment_config["args"]["runtime"] = "trtllm"
