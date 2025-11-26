@@ -1198,8 +1198,11 @@ class PyExecutor:
                         with request_context(
                                 is_draft=self.draft_model_engine is not None,
                                 scheduled_requests=scheduled_batch):
+                            print(f"============================ before prepare_draft_tokens ============================")
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, self.resource_manager)
+                            print(f"============================ after prepare_draft_tokens ============================")
+                            import pdb; pdb.set_trace()
                             # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
                             self.drafter.pad_draft_tokens_for_cuda_graph(
                                 scheduled_batch)
@@ -1209,7 +1212,10 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
+                    print(f"============================ before _forward_step ============================")
                     batch_outputs = self._forward_step(scheduled_batch)
+                    print(f"============================ after _forward_step ============================")
+                    import pdb; pdb.set_trace()
                     if self.guided_decoder is not None:
                         self.guided_decoder.execute(batch_outputs['logits'])
 

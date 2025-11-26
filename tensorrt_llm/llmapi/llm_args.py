@@ -780,7 +780,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
             setattr(self, attr_name, attr_value)
 
         assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
-
+        
         # Static tree logic
         # Checks whether the input eagle choices is valid
         # and reset the max_draft_len and num_eagle_layers if necessary
@@ -802,12 +802,24 @@ class EagleDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = len(self.eagle_choices)
 
         # Dynamic tree logic
-        if self.use_dynamic_tree:
+        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
+            self.use_dynamic_tree = True
+            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK is required for dynamic tree"
             assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
-            assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
-            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
-            assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+            total_history_draft_tokens = self.dynamic_tree_max_topK + self.dynamic_tree_max_topK * self.dynamic_tree_max_topK * (self.max_draft_len - 1)
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
 
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)")
+            else:
+                assert self.max_total_draft_tokens <= total_history_draft_tokens and self.max_total_draft_tokens >= default_max_total_draft_tokens, f"max_total_draft_tokens should be between {default_max_total_draft_tokens} and {total_history_draft_tokens}"
+            assert self.max_total_draft_tokens + 1 <= 32
+        
+        # Linear tree
+        if self.max_total_draft_tokens is None:
+            self.max_total_draft_tokens = self.max_draft_len
+            
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)

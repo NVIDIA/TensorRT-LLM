@@ -855,6 +855,7 @@ class TorchSampler(Sampler):
         # For the target model, we will do the tree verification logic.
         seq_slot = request.py_seq_slot
         assert seq_slot is not None
+        # import pdb; pdb.set_trace()
         eagle_paths = spec_tree_manager.get_eagle_paths(seq_slot)
 
         all_draft_tokens = torch.tensor(request.py_draft_tokens)  # [max_total_draft_tokens]
