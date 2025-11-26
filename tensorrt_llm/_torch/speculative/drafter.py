@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from typing import Dict, List, Optional, final
 
 from tensorrt_llm.logger import logger
@@ -67,16 +68,20 @@ class Drafter(ABC):
     def pad_draft_tokens_for_cuda_graph(
             self, scheduled_requests: ScheduledRequests) -> None:
         """
-        Pad draft tokens to the static max total draft tokens for CUDA graph compatibility.
+        Pad draft tokens to max total draft tokens for CUDA graph compatibility.
+
+        When draft_len_schedule is used, pads to the current dynamic max_total_draft_tokens.
+        Otherwise, pads to the static max for consistent CUDA graph tensor sizes.
 
         Args:
             scheduled_requests: The scheduled requests to pad
         """
+        # Use dynamic max when draft_len_schedule is active, otherwise use static max
+        target_draft_len = self.max_total_draft_tokens if self.draft_len_schedule is not None else self._static_max_total_draft_tokens
         for req in scheduled_requests.generation_requests:
             num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
-                0 for _ in range(self._static_max_total_draft_tokens -
-                                 num_draft_tokens))
+                0 for _ in range(target_draft_len - num_draft_tokens))
 
     def get_draft_len_for_batch_size(self, runtime_batch_size: int) -> int:
         """
