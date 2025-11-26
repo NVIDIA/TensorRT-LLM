@@ -767,6 +767,7 @@ class WeightShardingInfo(ShardingTransformInfo):
             min_local_shape=self.min_local_shape,
             fused_weight_dims=self.fused_weight_dims,
             quantization_cb=self.quantization_cb,
+            allreduce_strategy=self.allreduce_strategy,
         )
 
 
