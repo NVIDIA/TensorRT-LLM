@@ -210,6 +210,7 @@ public:
     virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
     virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
 
+    /// Check all requests transferring context, and return the requests that have completed or encountered an error.
     virtual RequestsStatus checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
