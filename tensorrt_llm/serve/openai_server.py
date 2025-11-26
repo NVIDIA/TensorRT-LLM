@@ -240,6 +240,7 @@ class OpenAIServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/config", self.get_config, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
@@ -333,6 +334,15 @@ class OpenAIServer:
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
+
+    async def get_config(self) -> JSONResponse:
+        """Return full runtime configuration for debugging/testing.
+
+        This endpoint exposes all llm.args fields as JSON, serving as
+        the source of truth for the server's runtime configuration.
+        """
+        config = self.llm.args.model_dump(mode="json")
+        return JSONResponse(content=config)
 
     async def get_model(self) -> JSONResponse:
         model_list = ModelList(data=[ModelCard(id=self.model)])
