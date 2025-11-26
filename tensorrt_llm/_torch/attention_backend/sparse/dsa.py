@@ -978,38 +978,42 @@ class Indexer(nn.Module):
                                            )  # Bytes per block
         scale_base_offset = tokens_per_block * head_dim  # Offset to scale region in block
 
-        token_idx = 0
-        for req_idx, req_id in enumerate(request_ids):
-            num_tokens = seq_lens[req_idx].item()
-            start_pos = start_positions[req_idx].item()
-            global_positions = torch.arange(start_pos,
-                                            start_pos + num_tokens,
-                                            dtype=torch.int64,
-                                            device='cpu')
+        batch_size = len(request_ids)
 
-            block_indices_in_seq = global_positions // tokens_per_block
-            pos_in_blocks = global_positions % tokens_per_block
+        # Create request indices repeated by seq_lens (which request each token belongs to)
+        req_indices = torch.repeat_interleave(
+            torch.arange(batch_size, dtype=torch.int64, device='cpu'), seq_lens)
 
-            max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
-            assert (block_indices_in_seq < max_blocks).all(), \
-                f"Block index out of bounds for req {req_idx}: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+        # Create within-sequence token offsets (0, 1, 2, ... for each sequence)
+        token_offsets = torch.cat([
+            torch.arange(seq_lens[i].item(), dtype=torch.int64, device='cpu')
+            for i in range(batch_size)
+        ])
 
-            # Gather block IDs
-            block_ids = metadata.host_indexer_k_cache_block_offsets[
-                req_idx, block_indices_in_seq]
+        # Compute global positions for all tokens in the batch
+        global_positions = start_positions[req_indices] + token_offsets
 
-            assert (block_ids >= 0).all(), \
-                f"Unallocated block (block_id < 0) found for req {req_idx} at positions {torch.where(block_ids < 0)[0].tolist()}"
+        # Compute block indices and positions in blocks
+        block_indices_in_seq = global_positions // tokens_per_block
+        pos_in_blocks = global_positions % tokens_per_block
 
-            fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
-            scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+        max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+        assert (block_indices_in_seq < max_blocks).all(), \
+            f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
 
-            metadata.host_slot_mapping_fp8[token_idx:token_idx +
-                                           num_tokens] = fp8_flat_indices
-            metadata.host_slot_mapping_scale[token_idx:token_idx +
-                                             num_tokens] = scale_flat_indices
+        # Gather block IDs
+        block_ids = metadata.host_indexer_k_cache_block_offsets[
+            req_indices, block_indices_in_seq]
 
-            token_idx += num_tokens
+        assert (block_ids >= 0).all(), \
+            f"Unallocated block (block_id < 0) found at positions {torch.where(block_ids < 0)[0].tolist()}"
+
+        # Compute flat indices for all tokens in the batch
+        fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
+        scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+
+        metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
+        metadata.host_slot_mapping_scale[:total_tokens] = scale_flat_indices
 
         metadata.slot_mapping_fp8[:total_tokens].copy_(
             metadata.host_slot_mapping_fp8[:total_tokens], non_blocking=True)
@@ -1031,40 +1035,44 @@ class Indexer(nn.Module):
                                                          dtype=torch.int64,
                                                          pin_memory=True)
 
-            token_idx = 0
-            for req_idx in range(num_contexts):  # Only context requests
-                total_kv = total_kv_per_request[req_idx].item()
-                kv_positions = torch.arange(total_kv,
-                                            dtype=torch.int64,
-                                            device='cpu')
+            # Create request indices repeated by total_kv_per_request for each request
+            req_indices = torch.repeat_interleave(
+                torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
+                total_kv_per_request)
 
-                block_indices_in_seq = kv_positions // tokens_per_block
-                pos_in_blocks = kv_positions % tokens_per_block
+            # Create within-sequence KV position offsets (0, 1, 2, ... for each request)
+            kv_positions = torch.cat([
+                torch.arange(total_kv_per_request[i].item(),
+                             dtype=torch.int64,
+                             device='cpu') for i in range(num_contexts)
+            ])
 
-                max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[
-                    1]
-                assert (block_indices_in_seq < max_blocks).all(), \
-                    f"Block index out of bounds for req {req_idx}: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+            block_indices_in_seq = kv_positions // tokens_per_block
+            pos_in_blocks = kv_positions % tokens_per_block
 
-                # Gather block IDs
-                block_ids = metadata.host_indexer_k_cache_block_offsets[
-                    req_idx, block_indices_in_seq]
+            # Assertions
+            max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+            assert (block_indices_in_seq < max_blocks).all(), \
+                f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
 
-                assert (block_ids >= 0).all(), \
-                    f"Unallocated block (block_id < 0) found for req {req_idx} at positions {torch.where(block_ids < 0)[0].tolist()}"
+            # Gather block IDs using advanced indexing (vectorized)
+            block_ids = metadata.host_indexer_k_cache_block_offsets[
+                req_indices, block_indices_in_seq]
 
-                fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
-                scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+            assert (block_ids >= 0).all(), \
+                f"Unallocated block (block_id < 0) found at positions {torch.where(block_ids < 0)[0].tolist()}"
 
-                host_slot_mapping_fp8_fullkv[token_idx:token_idx +
-                                             total_kv] = fp8_flat_indices
-                host_slot_mapping_scale_fullkv[token_idx:token_idx +
-                                               total_kv] = scale_flat_indices
+            # Compute flat indices for all kv slots in the batch
+            fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
+            scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
 
-                token_idx += total_kv
+            metadata.host_slot_mapping_fp8_fullkv[:
+                                                  total_kv_len] = fp8_flat_indices
+            metadata.host_slot_mapping_scale_fullkv[:
+                                                    total_kv_len] = scale_flat_indices
 
-            assert token_idx == total_kv_len, \
-                f"host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv length mismatch: token_idx={token_idx} != total_kv_len={total_kv_len}"
+            assert len(fp8_flat_indices) == total_kv_len, \
+                f"host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv length mismatch: {len(fp8_flat_indices)} != total_kv_len={total_kv_len}"
 
             # Store extended mappings for indexer full KV gathering
             metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(
