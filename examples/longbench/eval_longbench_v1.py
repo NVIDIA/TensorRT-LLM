@@ -165,7 +165,7 @@ def parse_arguments() -> argparse.Namespace:
                         type=str,
                         default='auto',
                         help='KV cache data type')
-    parser.add_argument('--tokens_per_block', type=int, default=64)
+    parser.add_argument('--tokens_per_block', type=int, default=32)
     parser.add_argument('--kv_cache_fraction',
                         type=float,
                         default=0.7,
