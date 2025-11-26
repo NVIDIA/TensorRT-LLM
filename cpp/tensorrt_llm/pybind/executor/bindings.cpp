@@ -19,6 +19,7 @@
 #include "executor.h"
 #include "executorConfig.h"
 #include "request.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
@@ -35,7 +36,8 @@ namespace py = pybind11;
 namespace tle = tensorrt_llm::executor;
 using SizeType32 = tle::SizeType32;
 
-namespace tensorrt_llm::pybind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::executor
 {
 
 template <typename T>
@@ -262,4 +264,5 @@ void initBindings(pybind11::module_& m)
     tensorrt_llm::pybind::executor::Executor::initBindings(m);
 }
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace pybind::executor
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/workspace.h"
 
@@ -37,7 +38,8 @@
 #include <string>
 #include <unordered_map>
 
-namespace tensorrt_llm::common::op
+TRTLLM_NAMESPACE_BEGIN
+namespace common::op
 {
 
 // Write values into buffer
@@ -178,7 +180,7 @@ struct hash
 
 // for testing only
 void const* getCommSessionHandle();
-} // namespace tensorrt_llm::common::op
+} // namespace common::op
 
 inline bool isBuilding()
 {
@@ -219,6 +221,8 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 //! Get cublas and cublasLt handle for current cuda context
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
+
+TRTLLM_NAMESPACE_END
 
 #ifndef DEBUG
 

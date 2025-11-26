@@ -21,6 +21,7 @@
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -172,6 +173,7 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -187,5 +189,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mamba_conv1d", &torch_ext::mamba_conv1d);
+    m.impl("mamba_conv1d", &tensorrt_llm::torch_ext::mamba_conv1d);
 }

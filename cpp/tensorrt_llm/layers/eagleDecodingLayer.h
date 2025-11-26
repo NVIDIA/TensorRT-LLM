@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -23,7 +24,8 @@
 
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 //! \brief Decoding layer for EAGLE speculative decoding technique.
@@ -83,4 +85,5 @@ private:
     TensorPtr mEagleNetGenPastKeyValueLengths;
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

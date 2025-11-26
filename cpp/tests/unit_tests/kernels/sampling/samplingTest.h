@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
@@ -29,7 +30,8 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-namespace tensorrt_llm::tests::kernels::sampling
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::kernels::sampling
 {
 
 typedef testing::Types<float, half> FloatAndHalfTypes;
@@ -350,4 +352,6 @@ protected:
     float mMaxTopP;
 };
 
-} // namespace tensorrt_llm::tests::kernels::sampling
+} // namespace tests::kernels::sampling
+TRTLLM_NAMESPACE_END
+

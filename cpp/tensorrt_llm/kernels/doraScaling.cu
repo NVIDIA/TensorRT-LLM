@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 // TODO(oargov): literally zero performance optimization work was put into these kernels and their launch parameters,
 // since they should hopefully be fused to some gemm eventually.
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 template <typename T>
 __global__ void tokenPerChannelScaleKernel(size_t const numModules, size_t const numTokens,
@@ -89,4 +91,5 @@ template void tokenPerChannelScale<nv_bfloat16>(int64_t const numel, size_t cons
     nv_bfloat16 const* const* __restrict__ scale_ptrs, nv_bfloat16* __restrict__ result, cudaStream_t stream);
 #endif
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

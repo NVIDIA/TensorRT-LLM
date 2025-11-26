@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/loraCache.h"
@@ -24,7 +25,8 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <unordered_map>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 /**
@@ -91,4 +93,5 @@ private:
     std::unordered_map<SizeType32, LoraModule> mModuleIdToModule;
     std::unordered_map<SizeType32, SizeType32> mModuleOffset;
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

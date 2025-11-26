@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -24,7 +25,8 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 #pragma once
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 // The TransferManager accelerates transfers to/from the GPU by overlapping HtoD and DtoH transfers, and tracks ongoing
@@ -82,4 +84,5 @@ private:
     int mDeviceId;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

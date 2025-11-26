@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/responseImpl.h"
 #include "tensorrt_llm/executor/types.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 Response::Response(IdType requestId, std::string errorMsg, std::optional<IdType> clientId)
@@ -77,4 +79,5 @@ Result const& Response::getResult() const
     return mImpl->getResult();
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

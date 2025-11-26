@@ -19,13 +19,15 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <nlohmann/json.hpp>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 class Model
@@ -128,4 +130,5 @@ public:
     [[nodiscard]] virtual SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const = 0;
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

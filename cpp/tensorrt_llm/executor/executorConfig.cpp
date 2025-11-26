@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <utility>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedulerConfig, KvCacheConfig kvCacheConfig,
@@ -382,4 +384,5 @@ void ExecutorConfig::setFailFastOnAttentionWindowTooLarge(bool failFastOnAttenti
     mFailFastOnAttentionWindowTooLarge = failFastOnAttentionWindowTooLarge;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

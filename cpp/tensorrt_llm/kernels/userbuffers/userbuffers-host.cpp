@@ -15,6 +15,7 @@
  */
 
 #include "ipcsocket.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "userbuffers.h"
@@ -26,7 +27,8 @@
 #include <cuda_runtime_api.h>
 #include <unistd.h>
 
-namespace tensorrt_llm::runtime::ub
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::ub
 {
 #define UB_ONESHOT_DEFAULT_VALUE 1
 #define UB_FORCE_ENABLE_ONESHOT_TOKEN_NUM_THRESHOLD 8
@@ -433,4 +435,5 @@ error:
 
     return comm->free_region++;
 }
-} // namespace tensorrt_llm::runtime::ub
+} // namespace runtime::ub
+TRTLLM_NAMESPACE_END

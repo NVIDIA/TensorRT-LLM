@@ -16,6 +16,7 @@
  */
 
 #include "modelSpecBinding.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/testing/modelSpec.h"
 
@@ -27,7 +28,8 @@ using tensorrt_llm::testing::KVCacheType;
 using tensorrt_llm::testing::QuantMethod;
 using tensorrt_llm::testing::OutputContentType;
 
-namespace tensorrt_llm::nanobind::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::testing
 {
 
 void initBindings(nb::module_& m)
@@ -84,4 +86,5 @@ void initBindings(nb::module_& m)
         .def("__copy__", [](ModelSpec const& self) { return ModelSpec(self); });
 }
 
-} // namespace tensorrt_llm::nanobind::testing
+} // namespace nanobind::testing
+TRTLLM_NAMESPACE_END

@@ -15,11 +15,12 @@
  */
 
 #include "beamSearchLayer.h"
-#include "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernelsTemplate.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
+#include "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernelsTemplate.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 
@@ -28,7 +29,8 @@
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 #define GET_INFO_STAGE1(paddedBeamWidth)                                                                               \
@@ -418,4 +420,5 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
 template class BeamSearchLayer<float>;
 template class BeamSearchLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

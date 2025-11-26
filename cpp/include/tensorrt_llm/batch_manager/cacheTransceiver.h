@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -37,7 +38,8 @@
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 class ContextProgress;
@@ -277,4 +279,5 @@ private:
     void* mWrapperLibHandle{nullptr};
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

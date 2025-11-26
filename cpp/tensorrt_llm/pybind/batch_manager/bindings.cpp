@@ -16,8 +16,8 @@
  */
 
 #include "bindings.h"
-
 #include "tensorrt_llm/batch_manager/common.h"
+
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -47,7 +48,8 @@ namespace tr = tensorrt_llm::runtime;
 
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::pybind::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::batch_manager
 {
 
 void initBindings(pybind11::module_& m)
@@ -497,4 +499,5 @@ void initBindings(pybind11::module_& m)
         py::arg("num_context_logits_prefix_sum"), py::arg("buffer_manager"), "Make decoding batch input.");
 }
 
-} // namespace tensorrt_llm::pybind::batch_manager
+} // namespace pybind::batch_manager
+TRTLLM_NAMESPACE_END

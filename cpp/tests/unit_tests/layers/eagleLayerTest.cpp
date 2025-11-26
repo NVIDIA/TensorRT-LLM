@@ -15,6 +15,7 @@
  */
 
 #include "eagleLayerTest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"

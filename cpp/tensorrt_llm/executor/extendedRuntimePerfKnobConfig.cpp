@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 
@@ -32,7 +33,8 @@ void validateCudaGraphCacheSize(bool cudaGraphMode, tensorrt_llm::executor::Size
 
 } // namespace
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 ExtendedRuntimePerfKnobConfig::ExtendedRuntimePerfKnobConfig(
@@ -86,4 +88,5 @@ void ExtendedRuntimePerfKnobConfig::setCudaGraphCacheSize(SizeType32 cudaGraphCa
     validateCudaGraphCacheSize(mCudaGraphMode, mCudaGraphCacheSize);
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

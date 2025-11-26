@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -24,7 +25,8 @@
 #include <memory>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 //! \brief A class that manages multicast device memory for efficient communication between GPUs.
@@ -119,4 +121,5 @@ private:
 
 constexpr size_t kSIGNAL_PAD_SIZE = 2048;
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

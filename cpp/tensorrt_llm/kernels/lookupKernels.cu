@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/kernels/lookupKernels.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 /* When running with multiple GPUs, we split the embedding lookup table across multiple GPUs to save the memory
@@ -92,4 +92,4 @@ INSTANTIATE_LOOK_UP(__nv_bfloat16, int8_t, int);
 #endif
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

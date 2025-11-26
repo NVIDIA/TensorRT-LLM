@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <limits>
@@ -23,8 +24,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace layers
 {
 
@@ -140,4 +140,4 @@ public:
     }
 };
 } // namespace layers
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -20,11 +20,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm::kernels::causal_conv1d
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::causal_conv1d
 {
 
 #define TLLM_CUDA_KERNEL_LAUNCH_CHECK() TLLM_CUDA_CHECK(cudaGetLastError())
@@ -214,4 +216,5 @@ void causal_conv1d_fwd_cuda(ConvParamsBase& params, cudaStream_t stream);
 template <typename input_t, typename weight_t>
 void causal_conv1d_update_cuda(ConvParamsBase& params, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::causal_conv1d
+} // namespace kernels::causal_conv1d
+TRTLLM_NAMESPACE_END

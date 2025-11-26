@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <ATen/ATen.h>
 #include <ATen/ops/tensor.h>
@@ -27,7 +28,8 @@
 
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::batch_manager
 {
 
 namespace tb = tensorrt_llm::batch_manager;
@@ -160,4 +162,5 @@ public:
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest> toTrtLlm() const;
 };
 
-} // namespace tensorrt_llm::nanobind::batch_manager
+} // namespace nanobind::batch_manager
+TRTLLM_NAMESPACE_END

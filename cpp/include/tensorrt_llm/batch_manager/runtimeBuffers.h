@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
@@ -32,7 +33,8 @@
 #include <optional>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime;
 
@@ -40,9 +42,9 @@ namespace decoder
 {
 class DecoderState;
 } // namespace decoder
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 
 namespace kv_cache_manager
@@ -318,4 +320,5 @@ private:
     void fillIOMaps(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

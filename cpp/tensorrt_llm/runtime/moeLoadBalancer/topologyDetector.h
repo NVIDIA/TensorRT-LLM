@@ -23,6 +23,7 @@
 #ifdef __linux__
 #include <numa.h> // For libnuma
 #endif
+#include "tensorrt_llm/common/config.h"
 
 // Forward declaration for struct bitmask to avoid including numaif.h if numa.h already covers it,
 // or if only numa.h is intended to be the public include for this header's users.
@@ -30,7 +31,8 @@
 struct bitmask;
 #endif
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class TopologyDetector
@@ -106,4 +108,5 @@ private:
 #endif
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

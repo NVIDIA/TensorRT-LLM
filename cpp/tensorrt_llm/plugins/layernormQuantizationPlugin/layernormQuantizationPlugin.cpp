@@ -16,6 +16,7 @@
  */
 #include "layernormQuantizationPlugin.h"
 #include "pluginUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/layernormKernels.h"
 
 using namespace nvinfer1;

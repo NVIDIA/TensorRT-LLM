@@ -19,9 +19,11 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 namespace batch_scheduler
@@ -85,4 +87,5 @@ private:
     LlmRequestState mNoScheduleAfterState;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

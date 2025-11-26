@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/utils.h"
@@ -49,7 +50,8 @@ using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::executor::disagg_executor;
 namespace su = tensorrt_llm::executor::serialize_utils;
 
-namespace tensorrt_llm::testing::disaggexecutor
+TRTLLM_NAMESPACE_BEGIN
+namespace testing::disaggexecutor
 {
 
 constexpr int32_t kM_INSTANCE_ID_TAG{12024};
@@ -837,4 +839,6 @@ private:
         }
     }
 };
-} // namespace tensorrt_llm::testing::disaggexecutor
+} // namespace testing::disaggexecutor
+TRTLLM_NAMESPACE_END
+

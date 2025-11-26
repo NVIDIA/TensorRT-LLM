@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
@@ -26,7 +27,8 @@
 #include <NvInferRuntime.h>
 #include <array>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class ModelConfig
@@ -953,4 +955,6 @@ private:
     std::optional<SizeType32> mNumLanguages;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

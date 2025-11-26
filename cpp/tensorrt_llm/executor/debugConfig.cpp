@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <utility>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 DebugConfig::DebugConfig(
@@ -78,4 +80,5 @@ void DebugConfig::setDebugTensorsMaxIterations(SizeType32 debugTensorsMaxIterati
     mDebugTensorsMaxIterations = debugTensorsMaxIterations;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

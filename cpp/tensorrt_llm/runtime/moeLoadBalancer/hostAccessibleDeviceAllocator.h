@@ -20,11 +20,13 @@
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
+#include "tensorrt_llm/common/config.h"
 
 #include "gdrwrap.h"
 #include "topologyDetector.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class MoeLoadBalancer;
@@ -175,4 +177,5 @@ private:
     static bool mAllowManagedFallback;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

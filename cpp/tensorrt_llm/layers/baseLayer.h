@@ -17,13 +17,15 @@
 #pragma once
 
 #include <utility>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 class BaseLayer
@@ -106,4 +108,5 @@ protected:
     DecoderDomain mDecoderDomain;
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

@@ -15,6 +15,7 @@
  */
 
 #include <cuda_runtime_api.h>
+#include "tensorrt_llm/common/config.h"
 
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/pipeline>
@@ -36,8 +37,7 @@
 #include "chunkstate.h"
 #include "statepassing.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -628,4 +628,4 @@ INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE(__nv_bfloat16, float);
 #undef INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -17,14 +17,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/pybind/common/customCasters.h"
 #include <pybind11/pybind11.h>
 
 namespace py = pybind11;
 
-namespace tensorrt_llm::pybind::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::testing
 {
 
 void initBindings(py::module_& m);
 
-} // namespace tensorrt_llm::pybind::testing
+} // namespace pybind::testing
+TRTLLM_NAMESPACE_END

@@ -17,13 +17,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <nanobind/nanobind.h>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::batch_manager::algorithms
+namespace nanobind::batch_manager::algorithms
 {
 
 void initBindings(nb::module_& m);
 
-}
+} // namespace nanobind::batch_manager::algorithms
+TRTLLM_NAMESPACE_END
+

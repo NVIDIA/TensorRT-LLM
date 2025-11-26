@@ -17,6 +17,7 @@
 #pragma once
 
 #include "checkMacrosPlugin.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -33,7 +34,8 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 // batch_size = num_ctx_requests + num_gen_requests * beam_width
 // num_ctx_requests = number of context requests (single sequence per request).
@@ -257,4 +259,5 @@ public:
         char const* name, void const* serialData, size_t serialLength) noexcept override;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

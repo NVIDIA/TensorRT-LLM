@@ -18,13 +18,15 @@
 
 #include "compileEngine.h"
 #include "serializationUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 
 #include <functional>
 #include <mutex>
 #include <unordered_map>
 
-namespace tensorrt_llm::kernels::jit
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::jit
 {
 
 // A thread-safe collection of CubinObjs, with caching functionality.
@@ -173,4 +175,5 @@ using CubinObjKey = XQAKernelFullHashKey;
 using CubinObjHasher = XQAKernelFullHasher;
 using CubinObjRegistry = CubinObjRegistryTemplate<CubinObjKey, CubinObjHasher>;
 
-} // namespace tensorrt_llm::kernels::jit
+} // namespace kernels::jit
+TRTLLM_NAMESPACE_END

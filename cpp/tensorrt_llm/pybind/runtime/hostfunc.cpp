@@ -16,6 +16,7 @@
  */
 
 #include "hostfunc.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/logger.h"
 
@@ -27,7 +28,8 @@
 
 namespace py = pybind11;
 
-namespace tensorrt_llm::pybind::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::runtime
 {
 
 struct HostFuncUserData
@@ -112,4 +114,5 @@ void initHostFuncBindings(pybind11::module_& m)
         py::call_guard<py::gil_scoped_release>());
     m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
 }
-} // namespace tensorrt_llm::pybind::runtime
+} // namespace pybind::runtime
+TRTLLM_NAMESPACE_END

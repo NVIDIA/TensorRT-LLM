@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <mutex>
 
+#include "tensorrt_llm/common/config.h"
+
 // Forward declarations
 namespace nvinfer1
 {
@@ -34,7 +36,8 @@ class IPluginCreatorInterface;
 
 } // namespace nvinfer1
 
-namespace tensorrt_llm::plugins::api
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins::api
 {
 
 auto constexpr kDefaultNamespace = "tensorrt_llm";
@@ -58,7 +61,8 @@ private:
     nvinfer1::ILoggerFinder* mLoggerFinder{nullptr};
     std::mutex mMutex;
 };
-} // namespace tensorrt_llm::plugins::api
+} // namespace plugins::api
+TRTLLM_NAMESPACE_END
 
 extern "C"
 {

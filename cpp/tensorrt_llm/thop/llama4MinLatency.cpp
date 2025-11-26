@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <unordered_set>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -210,10 +211,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("llama4_bf16_bf16_gemm", &torch_ext::llama4_bf16_bf16_gemm);
-    m.impl("llama4_fp8_bf16_gemm", &torch_ext::llama4_fp8_bf16_gemm);
-    m.impl("llama4_fp8_fp8_gemm_swiglu", &torch_ext::llama4_fp8_fp8_gemm_swiglu);
-    m.impl("llama4_moe_tp8ep1_min_latency", &torch_ext::llama4_moe_tp8ep1_min_latency);
+    m.impl("llama4_bf16_bf16_gemm", &tensorrt_llm::torch_ext::llama4_bf16_bf16_gemm);
+    m.impl("llama4_fp8_bf16_gemm", &tensorrt_llm::torch_ext::llama4_fp8_bf16_gemm);
+    m.impl("llama4_fp8_fp8_gemm_swiglu", &tensorrt_llm::torch_ext::llama4_fp8_fp8_gemm_swiglu);
+    m.impl("llama4_moe_tp8ep1_min_latency", &tensorrt_llm::torch_ext::llama4_moe_tp8ep1_min_latency);
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END

@@ -17,9 +17,9 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
-#include "tensorrt_llm/executor/dataTransceiverState.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h" //TODO: remove when progressing to standalone UCX stack
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 #include "ucxx/api.h"
 #include "ucxx/utils/sockaddr.h"
 #include "ucxx/utils/ucx.h"
@@ -29,7 +29,8 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #endif
-#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
+#include "tensorrt_llm/executor/dataTransceiverState.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h" //TODO: remove when progressing to standalone UCX stack
 
 #include <future>
 #include <map>
@@ -38,7 +39,8 @@
 #include <vector>
 #include <zmq.hpp>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 class UcxConnectionManager : public ConnectionManager, public std::enable_shared_from_this<UcxConnectionManager>
@@ -101,4 +103,5 @@ extern "C"
 #pragma clang diagnostic pop
 #endif
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

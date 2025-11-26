@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 class DoraImpl
 {
@@ -40,4 +42,5 @@ private:
     std::vector<int64_t> mHostBuf;
     nvinfer1::DataType mType;
 };
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

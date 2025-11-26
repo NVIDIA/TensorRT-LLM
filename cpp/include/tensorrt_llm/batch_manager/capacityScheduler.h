@@ -19,20 +19,22 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <variant>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 namespace kv_cache_manager
 {
 class BaseKVCacheManager;
 }
 class BasePeftCacheManager;
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 
 using tensorrt_llm::runtime::SizeType32;
@@ -173,4 +175,5 @@ private:
         mScheduler;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

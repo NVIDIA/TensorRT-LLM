@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <list>
@@ -24,12 +25,14 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 class RequestWithId;
 }
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 class LlmRequest;
 
@@ -115,4 +118,5 @@ struct BatchStateHash
     }
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

@@ -18,18 +18,21 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime;
 class MulticastTensor;
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::batch_manager
+
+namespace batch_manager
 {
 
 namespace kv_cache_manager
@@ -142,4 +145,5 @@ private:
     SizeType32 maxNumTokens;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

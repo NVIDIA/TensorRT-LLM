@@ -17,12 +17,14 @@
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/common/config.h"
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
     && ((TORCH_VERSION_MAJOR > 1) || ((TORCH_VERSION_MAJOR == 1) && (TORCH_VERSION_MINOR >= 9)))
 #define TORCH_IS_AT_LEAST_v190
 #endif
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 using torch::Tensor;
@@ -399,36 +401,37 @@ Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_si
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 // Utility methods that may be useful for preprocessing weights in torch.
 static auto symmetric_quantize_last_axis_of_batched_matrix
     = torch::RegisterOperators("trtllm::symmetric_quantize_last_axis_of_batched_matrix",
-        &torch_ext::symmetric_quantize_last_axis_of_batched_matrix);
+        &tensorrt_llm::torch_ext::symmetric_quantize_last_axis_of_batched_matrix);
 
 static auto preprocess_weights_for_mixed_gemm = torch::RegisterOperators(
-    "trtllm::preprocess_weights_for_mixed_gemm", &torch_ext::preprocess_weights_for_mixed_gemm);
+    "trtllm::preprocess_weights_for_mixed_gemm", &tensorrt_llm::torch_ext::preprocess_weights_for_mixed_gemm);
 
 static auto unpack_int4_packed_tensor_to_int8 = torch::RegisterOperators(
-    "trtllm::unpack_int4_packed_tensor_to_int8", &torch_ext::unpack_int4_packed_tensor_to_int8);
+    "trtllm::unpack_int4_packed_tensor_to_int8", &tensorrt_llm::torch_ext::unpack_int4_packed_tensor_to_int8);
 
 static auto pack_int8_tensor_to_packed_int4
-    = torch::RegisterOperators("trtllm::pack_int8_tensor_to_packed_int4", &torch_ext::pack_int8_tensor_to_packed_int4);
+    = torch::RegisterOperators("trtllm::pack_int8_tensor_to_packed_int4", &tensorrt_llm::torch_ext::pack_int8_tensor_to_packed_int4);
 
 // Utility methods exposed purely for unit tests in torch.
 static auto _symmetric_quantize_last_axis_of_batched_matrix
     = torch::RegisterOperators("trtllm::_symmetric_quantize_last_axis_of_batched_matrix",
-        &torch_ext::_symmetric_quantize_last_axis_of_batched_matrix);
+        &tensorrt_llm::torch_ext::_symmetric_quantize_last_axis_of_batched_matrix);
 
 static auto add_bias_and_interleave_int4s
-    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int4s", &torch_ext::add_bias_and_interleave_int4s);
+    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int4s", &tensorrt_llm::torch_ext::add_bias_and_interleave_int4s);
 
 static auto add_bias_and_interleave_int8s
-    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int8s", &torch_ext::add_bias_and_interleave_int8s);
+    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int8s", &tensorrt_llm::torch_ext::add_bias_and_interleave_int8s);
 
 static auto permute_B_rows_for_mixed_gemm
-    = torch::RegisterOperators("trtllm::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
+    = torch::RegisterOperators("trtllm::_permute_B_rows_for_mixed_gemm", &tensorrt_llm::torch_ext::permute_B_rows_for_mixed_gemm);
 
-static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_transpose", &torch_ext::subbyte_transpose);
+static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_transpose", &tensorrt_llm::torch_ext::subbyte_transpose);
 
 static auto mxfp4_dequantize_unswizzled
-    = torch::RegisterOperators("trtllm::mxfp4_dequantize_unswizzled", &torch_ext::mxfp4_dequantize_unswizzled);
+    = torch::RegisterOperators("trtllm::mxfp4_dequantize_unswizzled", &tensorrt_llm::torch_ext::mxfp4_dequantize_unswizzled);

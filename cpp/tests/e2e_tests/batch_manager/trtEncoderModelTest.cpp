@@ -20,6 +20,7 @@
 #endif
 
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -51,7 +52,8 @@ auto const T5_TP1_PP1_ENCODER_RMPAD_DIR = "t5-small/1-gpu/float16/tp1/encoder";
 auto const ENC_DEC_DATA_BASE = TEST_RESOURCE_PATH / "data/enc_dec";
 } // namespace
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 class EncoderModelTestSingleGPU : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -216,4 +218,5 @@ TEST_F(TrtEncoderModelTestMultiGPU, Forward)
     runEncoderTest(mManager, mModelConfig, mWorldConfig, mEngineBuffer, mLogger);
 }
 
-} // namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_END
+} // namespace batch_manager

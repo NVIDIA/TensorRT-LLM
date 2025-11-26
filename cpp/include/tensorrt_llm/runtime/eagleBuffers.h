@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/eagleModule.h"
@@ -26,12 +27,14 @@
 
 #include <cstddef>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 class LlmRequest;
 }
 
-namespace tensorrt_llm::runtime
+namespace runtime
 {
 
 class EagleBuffers
@@ -179,4 +182,6 @@ private:
     TensorPtr posteriorThresholdHost;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

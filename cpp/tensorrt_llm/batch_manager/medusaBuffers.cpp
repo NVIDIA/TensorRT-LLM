@@ -16,11 +16,13 @@
  */
 
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 MedusaBuffers::MedusaBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
@@ -142,4 +144,5 @@ void MedusaBuffers::insertInputTensors(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -54,7 +55,8 @@ std::tuple<std::unordered_set<int32_t>, std::unordered_set<int32_t>> populateIte
 
 } // namespace
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 std::pair<std::unordered_set<int32_t>, std::unordered_set<int32_t>> populateIterationIndexes(
@@ -81,4 +83,5 @@ std::pair<std::unordered_set<int32_t>, std::unordered_set<int32_t>> populateIter
     return std::make_pair(profileIterIdxs, stopIterIdxs);
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END

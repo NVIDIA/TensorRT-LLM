@@ -18,13 +18,17 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+
+#include "tensorrt_llm/common/config.h"
 namespace nb = nanobind;
 
-namespace tensorrt_llm::kernels::userbuffers
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::userbuffers
 {
 class UserBufferBindings
 {
 public:
     static void initBindings(nb::module_& m);
 };
-} // namespace tensorrt_llm::kernels::userbuffers
+} // namespace kernels::userbuffers
+TRTLLM_NAMESPACE_END

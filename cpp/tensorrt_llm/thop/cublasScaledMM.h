@@ -17,8 +17,11 @@
 #include <optional>
 #include <torch/extension.h>
 
+#include "tensorrt_llm/common/config.h"
+
 namespace th = torch;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 th::Tensor& cublas_mm_out(
@@ -34,3 +37,4 @@ th::Tensor cublas_scaled_mm(th::Tensor const& mat_a, th::Tensor const& mat_b, th
 th::Tensor cublas_scaled_mm_out(th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const& scale_a,
     th::Tensor const& scale_b, std::optional<at::Tensor> const& bias, th::Tensor& out);
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END

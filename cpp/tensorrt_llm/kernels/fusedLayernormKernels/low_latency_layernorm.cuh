@@ -24,10 +24,12 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.cuh"
+#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 template <uint32_t N_THREADS, typename T, size_t N>
@@ -333,4 +335,5 @@ struct LowLatencyLayerNorm
     }
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

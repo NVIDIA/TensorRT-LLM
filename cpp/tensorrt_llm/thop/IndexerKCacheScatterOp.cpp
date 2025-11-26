@@ -23,6 +23,7 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -92,6 +93,7 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8_bytes, th::Tensor const&
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -102,5 +104,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("indexer_k_cache_scatter_op", &torch_ext::indexer_k_cache_scatter_op);
+    m.impl("indexer_k_cache_scatter_op", &tensorrt_llm::torch_ext::indexer_k_cache_scatter_op);
 }

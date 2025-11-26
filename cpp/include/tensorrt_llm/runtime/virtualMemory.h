@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -30,7 +31,8 @@
 
 class VirtualMemoryManagerTest;
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 /**
@@ -527,9 +529,9 @@ private:
     std::shared_ptr<Configuration> mConfig;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::runtime
+namespace runtime
 {
 CudaVirtualMemoryManager& getVirtualMemoryManager();
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator();
@@ -537,4 +539,6 @@ void setVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
 void clearVirtualMemoryAllocator();
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

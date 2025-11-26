@@ -17,6 +17,7 @@
 
 #include "executor.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/tensor.h"
 
@@ -75,7 +76,8 @@ tle::Tensor numpyToTensor(py::array const& array)
 }
 } // namespace
 
-namespace tensorrt_llm::pybind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::executor
 {
 
 Executor::Executor(
@@ -188,4 +190,5 @@ void Executor::initBindings(py::module_& m)
         .def("get_kv_cache_event_manager", &Executor::getKVCacheEventManager);
 }
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace pybind::executor
+TRTLLM_NAMESPACE_END

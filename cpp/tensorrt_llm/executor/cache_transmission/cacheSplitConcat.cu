@@ -17,6 +17,7 @@
 
 #include "cacheSplitConcat.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -35,7 +36,8 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 namespace
@@ -1792,4 +1794,5 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     }
 }
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

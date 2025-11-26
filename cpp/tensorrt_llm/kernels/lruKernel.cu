@@ -27,12 +27,12 @@
 #endif
 
 #include "lruKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -437,4 +437,4 @@ INSTANTIATE_RGLRU_UPDATE_DATA_TYPE(__nv_bfloat16);
 #undef INSTANTIATE_RGLRU_UPDATE_DATA_TYPE
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

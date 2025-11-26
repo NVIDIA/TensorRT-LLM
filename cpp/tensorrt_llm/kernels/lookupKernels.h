@@ -16,13 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 template <typename Tout, typename Tin, typename Idx>
@@ -30,4 +30,4 @@ void invokeLookUp(Tout* out, Idx const* input, Tin const* weight, int64_t const 
     Idx const size, Idx const n_embed, Tout const* perTokenScales, cudaStream_t stream = 0);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

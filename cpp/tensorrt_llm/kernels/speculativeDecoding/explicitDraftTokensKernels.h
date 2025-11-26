@@ -17,12 +17,14 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::speculative_decoding
 {
 
 template <typename T>
@@ -374,4 +376,5 @@ void invokeConvertMaskToPackedMask(runtime::SizeType32 batchSize,
     runtime::SizeType32 const* __restrict__ batchSlots, runtime::SizeType32 maxDraftTokens,
     runtime::SizeType32 maxGenerationLength, runtime::SizeType32* __restrict__ packedMask, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+TRTLLM_NAMESPACE_END

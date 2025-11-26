@@ -15,9 +15,9 @@
  */
 
 #include "beamSearchKernelsTemplate.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -28,4 +28,4 @@ INSTANTIATE_BEAM_SEARCH(half, 32, true);
 #endif // FAST_BUILD
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

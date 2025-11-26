@@ -35,6 +35,7 @@ using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassLowLatencyFp8GemmR
 using tensorrt_llm::kernels::internal_cutlass_kernels::LowLatencyCutlassGemmConfig;
 using tensorrt_llm::kernels::internal_cutlass_kernels::KernelScheduleType;
 #endif
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -170,6 +171,7 @@ Tensor cutlass_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const&
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -180,5 +182,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("cutlass_scaled_mm", &torch_ext::cutlass_scaled_mm);
+    m.impl("cutlass_scaled_mm", &tensorrt_llm::torch_ext::cutlass_scaled_mm);
 }

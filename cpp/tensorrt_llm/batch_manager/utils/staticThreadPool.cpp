@@ -16,8 +16,10 @@
  */
 
 #include "staticThreadPool.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::batch_manager::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::utils
 {
 
 StaticThreadPool::StaticThreadPool(std::size_t numThreads)
@@ -75,4 +77,5 @@ void StaticThreadPool::workerThread()
     }
 }
 
-} // namespace tensorrt_llm::batch_manager::utils
+} // namespace batch_manager::utils
+TRTLLM_NAMESPACE_END

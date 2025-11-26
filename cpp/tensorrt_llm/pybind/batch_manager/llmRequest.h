@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/pybind/common/customCasters.h"
 
 #include <ATen/ATen.h>
@@ -26,7 +27,8 @@
 #include <optional>
 #include <pybind11/pybind11.h>
 
-namespace tensorrt_llm::pybind::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::batch_manager
 {
 
 namespace tb = tensorrt_llm::batch_manager;
@@ -160,4 +162,5 @@ public:
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest> toTrtLlm() const;
 };
 
-} // namespace tensorrt_llm::pybind::batch_manager
+} // namespace pybind::batch_manager
+TRTLLM_NAMESPACE_END

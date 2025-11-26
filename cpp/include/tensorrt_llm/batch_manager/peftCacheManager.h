@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -34,7 +35,8 @@
 #include <unordered_set>
 #include <vector>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 using runtime::SizeType32;
@@ -194,4 +196,5 @@ private:
         return false;
     }
 };
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

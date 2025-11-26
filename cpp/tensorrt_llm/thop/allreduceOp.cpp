@@ -61,6 +61,7 @@ using tensorrt_llm::pg_utils::get_world_pg;
 using tensorrt_llm::pg_utils::get_local_pg;
 using tensorrt_llm::pg_utils::PgHelper;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -1274,6 +1275,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -1338,11 +1340,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mnnvl_fusion_allreduce", &torch_ext::mnnvlFusionAllReduce);
-    m.impl("allreduce", &torch_ext::allreduce_raw);
-    m.impl("allreduce_pg", &torch_ext::allreduce_pg);
-    m.impl("moe_allreduce", &torch_ext::moe_allreduce);
-    m.impl("moe_finalize_allreduce", &torch_ext::moe_finalize_allreduce);
+    m.impl("mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::mnnvlFusionAllReduce);
+    m.impl("allreduce", &tensorrt_llm::torch_ext::allreduce_raw);
+    m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
+    m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
+    m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

@@ -16,8 +16,9 @@
  */
 
 #include "doraPlugin.h"
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/iBuffer.h"

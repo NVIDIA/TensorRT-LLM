@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/ipcSocket.h"
@@ -54,7 +55,8 @@
 // if n is already a multiple of "multiple", n is returned unchanged, otherwise round up to next multiple.
 #define ROUND_UP(n, multiple) (((n + multiple - 1) / multiple) * multiple)
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 using namespace tensorrt_llm::mpi;
 
@@ -537,4 +539,5 @@ void ipcNvlsFree(IpcNvlsHandle* handle)
 #endif
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

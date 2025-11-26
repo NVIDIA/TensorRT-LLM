@@ -16,13 +16,15 @@
  */
 
 #include "connection.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <string>
 #include <unistd.h>
 #include <utility>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 std::string genUniqueAgentName()
@@ -589,4 +591,5 @@ AgentConnectionManager::~AgentConnectionManager()
 {
     m_Agent->deregisterMemory(mRegMemDescs);
 }
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

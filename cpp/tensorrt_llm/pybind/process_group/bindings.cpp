@@ -16,11 +16,13 @@
  */
 
 #include "bindings.h"
-
 #include "tensorrt_llm/common/bindingUtils.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
-namespace tensorrt_llm::pybind::process_group
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::process_group
 {
 
 void initBindings(py::module_& m)
@@ -37,4 +39,5 @@ void initBindings(py::module_& m)
         });
 }
 
-} // namespace tensorrt_llm::pybind::process_group
+} // namespace pybind::process_group
+TRTLLM_NAMESPACE_END

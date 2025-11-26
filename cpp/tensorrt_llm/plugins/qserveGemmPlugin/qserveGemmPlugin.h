@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -23,7 +24,8 @@
 #include <string>
 #include <tensorrt_llm/kernels/qserveGemm.h>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 using QServeGemmRunnerPtr = std::shared_ptr<tensorrt_llm::kernels::qserve::QServeGemmRunner>;
@@ -109,4 +111,5 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -26,7 +27,9 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 class SamplingConfig;
 
@@ -35,9 +38,9 @@ namespace decoder
 class DecoderState;
 } // namespace decoder
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 class MedusaBuffers;
 class DecoderInputBuffers;
@@ -83,4 +86,5 @@ private:
     bool mIsNormalizeLogProbs;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

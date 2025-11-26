@@ -14,12 +14,17 @@
  * limitations under the License.
  */
 
+#pragma once
+
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_set>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 /// @brief Populate the start and end profiling iteration indexes from the provided environment variables
@@ -28,4 +33,5 @@ namespace tensorrt_llm::common
 std::pair<std::unordered_set<int32_t>, std::unordered_set<int32_t>> populateIterationIndexes(
     std::string const& envVarName, std::optional<std::string> const& legacyEnvVarName = std::nullopt);
 
-} // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END

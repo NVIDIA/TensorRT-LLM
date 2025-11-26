@@ -15,9 +15,9 @@
  */
 
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace cutlass_kernels
@@ -25,4 +25,4 @@ namespace cutlass_kernels
 template class CutlassFpAIntBGemmRunner<half, cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>;
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

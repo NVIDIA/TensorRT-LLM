@@ -16,14 +16,17 @@
 #pragma once
 
 #if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #else
 #include "allreduce_gemm_runner.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #endif
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 /*
  * Used for tuning to find best GEMM configs for different problem shapes.
@@ -65,4 +68,5 @@ private:
     static std::string getCacheFileName(GemmIdCore gemmId);
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

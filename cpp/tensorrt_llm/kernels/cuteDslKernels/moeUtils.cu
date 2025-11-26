@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
@@ -25,7 +26,8 @@
 #include <cuda_fp4.h>
 #include <cute/numeric/numeric_types.hpp>
 
-namespace tensorrt_llm::kernels::cute_dsl
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cute_dsl
 {
 namespace
 {
@@ -457,4 +459,5 @@ INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_fp4_e2m1, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_ACTIVATION
 
-} // namespace tensorrt_llm::kernels::cute_dsl
+} // namespace kernels::cute_dsl
+TRTLLM_NAMESPACE_END

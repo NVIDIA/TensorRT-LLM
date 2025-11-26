@@ -17,6 +17,7 @@
 
 // Rest of includes
 #include "mcastDeviceMemory.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -25,7 +26,8 @@
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 namespace
@@ -222,4 +224,6 @@ void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
     mUcHandles = mNvlsHandle->ipc_uc_handles;
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

@@ -17,13 +17,15 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tle = tensorrt_llm::executor;
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional<SizeType32> attentionDpRank,
@@ -268,4 +270,5 @@ void KVCacheEventManager::worker()
     }
 }
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

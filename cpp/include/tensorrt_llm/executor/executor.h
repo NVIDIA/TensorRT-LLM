@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -34,17 +35,19 @@
 #include <variant>
 #include <vector>
 
-namespace tensorrt_llm::mpi
+TRTLLM_NAMESPACE_BEGIN
+
+namespace mpi
 {
 class MpiComm;
-} // namespace tensorrt_llm::mpi
+} // namespace mpi
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+namespace batch_manager::kv_cache_manager
 {
 class BaseKVCacheManager;
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
 
-namespace tensorrt_llm::executor
+namespace executor
 {
 
 /// @brief Version of TRT-LLM
@@ -1925,4 +1928,5 @@ public:
     [[nodiscard]] static std::string toJsonStr(RequestStats const& requestStats);
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <NvInferRuntime.h>
@@ -24,7 +25,8 @@
 #include <cuda_fp16.h>
 #include <vector>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 constexpr int LP_ALLREDUCE_MAX_BLOCKS = 8;
@@ -119,4 +121,5 @@ void customLowPrecisionAllReduce(
     kernels::LowPrecisionAllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream);
 
 int32_t max_workspace_size_lowprecision(int32_t tp_size);
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

@@ -19,12 +19,14 @@
 #include "../include/moe_gemm_kernels.h"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass_extensions/epilogue_helpers.h"
+#include "tensorrt_llm/common/config.h"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 
 // Blackwell arch
@@ -103,4 +105,5 @@ constexpr bool isValidAmpereMOESpecialisation()
 #endif
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

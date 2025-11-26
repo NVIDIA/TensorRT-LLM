@@ -16,17 +16,20 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 class KVCacheIndex;
-} // namespace tensorrt_llm::kernels
-
-namespace tensorrt_llm::runtime::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::kernels
 {
 
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -59,4 +62,5 @@ void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftT
     SizeType32 const* rewindDraftTokenSeparateAdjustments, ITensor const& batchSlots, SizeType32 maxKVCacheLen,
     SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock, bool canUseOneMoreBlock, cudaStream_t stream);
 
-} // namespace tensorrt_llm::runtime::kernels
+} // namespace runtime::kernels
+TRTLLM_NAMESPACE_END

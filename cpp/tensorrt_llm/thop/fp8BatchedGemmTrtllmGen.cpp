@@ -173,6 +173,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
 }
 } // namespace
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -267,11 +268,12 @@ private:
 };
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP8BatchedGemmRunner>("FP8BatchedGemmRunner")
+    m.class_<tensorrt_llm::torch_ext::FP8BatchedGemmRunner>("FP8BatchedGemmRunner")
         .def(torch::init<at::ScalarType, bool, bool, int64_t, int64_t>())
-        .def("get_valid_configs", &torch_ext::FP8BatchedGemmRunner::getValidConfigs)
-        .def("run_batched_gemm", &torch_ext::FP8BatchedGemmRunner::runBatchedGemm);
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8BatchedGemmRunner::getValidConfigs)
+        .def("run_batched_gemm", &tensorrt_llm::torch_ext::FP8BatchedGemmRunner::runBatchedGemm);
 }

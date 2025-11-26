@@ -16,10 +16,12 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 template <typename TTensor, typename TStream>
@@ -373,4 +375,5 @@ void LlmRequest::removeLoraTensors()
     mLoraConfig.reset();
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

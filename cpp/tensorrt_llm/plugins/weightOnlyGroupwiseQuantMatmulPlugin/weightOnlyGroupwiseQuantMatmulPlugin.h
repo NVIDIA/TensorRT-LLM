@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
@@ -37,7 +38,8 @@
 // breaking dependencies
 #include "cutlass/integer_subbyte.h"
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
@@ -183,4 +185,5 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
+#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 
@@ -23,7 +24,8 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 // Blocks are assigned priority levels, with blocks at a lower priority evicted before blocks at a higher priority.
 // New priority values always override the previous value.
 
-namespace tensorrt_llm::batch_manager::eviction_policy
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::eviction_policy
 {
 
 auto const kMinPriority = executor::KvCacheRetentionConfig::kMinRetentionPriority;
@@ -218,4 +220,5 @@ void LRUEvictionPolicy::refresh()
     }
 }
 
-} // namespace tensorrt_llm::batch_manager::eviction_policy
+} // namespace batch_manager::eviction_policy
+TRTLLM_NAMESPACE_END

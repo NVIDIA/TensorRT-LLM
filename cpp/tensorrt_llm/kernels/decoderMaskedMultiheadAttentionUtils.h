@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include <stdint.h>
@@ -31,8 +32,7 @@ using tensorrt_llm::common::float22bf162;
 using tensorrt_llm::common::hsub2;
 #endif
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -4256,4 +4256,4 @@ __device__ __host__ constexpr inline T const& const_max(T const& a, T const& b)
 
 } // namespace mmha
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include <cassert>
 #include <cmath>
@@ -25,8 +26,7 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace smooth_quant
@@ -60,4 +60,4 @@ template <typename>
 void int8_sq_launcher(Params& params, cudaStream_t s);
 } // namespace smooth_quant
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <cstdio>
@@ -24,7 +25,8 @@
 #include <optional>
 #include <vector>
 
-namespace tensorrt_llm::executor::disagg_executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::disagg_executor
 {
 
 namespace texec = tensorrt_llm::executor;
@@ -155,4 +157,5 @@ private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
 };
-} // namespace tensorrt_llm::executor::disagg_executor
+} // namespace executor::disagg_executor
+TRTLLM_NAMESPACE_END

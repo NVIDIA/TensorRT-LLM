@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/workerPool.h"
 
 #include <gtest/gtest.h>
 #include <random>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 TEST(WorkerPool, basic)
@@ -111,4 +113,6 @@ INSTANTIATE_TEST_SUITE_P(WorkerPoolTests, WorkerPoolTest,
         ::testing::Values(1, 2, 4, 8, 16, 32, 64, 128)                 // Range for number of workers
         ));
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

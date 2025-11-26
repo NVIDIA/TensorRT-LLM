@@ -18,16 +18,20 @@
 #include "NvInferPlugin.h"
 
 #if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #else
 #include "allreduce_gemm_runner.h"
-#endif
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
+#endif
 #include "tensorrt_llm/plugins/common/plugin.h"
 
 using namespace nvinfer1;
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 #if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
@@ -79,4 +83,5 @@ public:
     std::shared_ptr<cutlass_kernels::PersistentWorkspaceInterface> mWorkspace;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

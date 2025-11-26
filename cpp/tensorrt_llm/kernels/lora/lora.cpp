@@ -15,18 +15,20 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/lora/lora.h"
-
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
+#include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <algorithm>
 #include <utility>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 // TODO should reuse the function in gemmPlugin
@@ -339,4 +341,5 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
     return impl->run(numTokens, numReqs, input, loraRanks, loraWeightsPtr, weightIndex, outputs, workspace, stream);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

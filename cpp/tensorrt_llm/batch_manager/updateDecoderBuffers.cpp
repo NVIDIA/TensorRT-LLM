@@ -15,13 +15,15 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 using BufferManager = tensorrt_llm::runtime::BufferManager;
@@ -75,4 +77,5 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
     return copyEvent;
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

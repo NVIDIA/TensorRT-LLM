@@ -50,6 +50,7 @@
 #pragma GCC diagnostic pop
 #endif
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
@@ -65,7 +66,8 @@
 #include <mutex>
 #include <sstream>
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels_oss
 {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
@@ -382,7 +384,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
 #undef SHAPE_CASE
     default: TLLM_THROW("Unsupported cluster shape config %d for MoE gemm.", (int) gemm_config.cluster_shape);
     }
-} // namespace tensorrt_llm
+}
 
 template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION>
 void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmInput hopper_input, int num_experts,
@@ -511,4 +513,5 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
     return count;
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+} // namespace kernels::cutlass_kernels_oss
+TRTLLM_NAMESPACE_END

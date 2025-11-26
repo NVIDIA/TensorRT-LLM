@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/iTensor.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tensorView.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 

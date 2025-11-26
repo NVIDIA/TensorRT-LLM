@@ -13,9 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tests/unit_tests/kernels/routing/routingTest.h"
 
-namespace tensorrt_llm::tests::kernels::routing
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::kernels::routing
 {
 
 template <typename T>
@@ -386,4 +388,6 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
 template class RoutingKernelTest<float>;
 template class RoutingKernelTest<__nv_bfloat16>;
 
-} // namespace tensorrt_llm::tests::kernels::routing
+} // namespace tests::kernels::routing
+TRTLLM_NAMESPACE_END
+

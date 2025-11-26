@@ -18,22 +18,27 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+
+#include "tensorrt_llm/common/config.h"
 namespace nb = nanobind;
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 class KVCacheManagerBindings
 {
 public:
     static void initBindings(nb::module_& m);
 };
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
-
-namespace tensorrt_llm::batch_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class BasePeftCacheManagerBindings
 {
 public:
     static void initBindings(nb::module_& m);
 };
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

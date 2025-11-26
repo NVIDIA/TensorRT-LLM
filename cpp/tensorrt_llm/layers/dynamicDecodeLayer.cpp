@@ -15,6 +15,7 @@
  */
 
 #include "dynamicDecodeLayer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/layers/layerUtils.h"
@@ -29,7 +30,8 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 template <typename T>
@@ -309,4 +311,5 @@ void DynamicDecodeLayer<T>::prepareOutputData(std::shared_ptr<BaseDecodingOutput
 template class DynamicDecodeLayer<float>;
 template class DynamicDecodeLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

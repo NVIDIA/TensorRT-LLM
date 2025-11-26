@@ -13,11 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include <cub/cub.cuh>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 template <int THREADS_PER_BLOCK, int MAX_NUM_PAGES>
@@ -199,4 +199,4 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, int32_t* output_
         kv_page_offsets, seq_lengths, sparse_params, batch_size, tokens_per_page, max_num_pages_per_seq);
 }
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

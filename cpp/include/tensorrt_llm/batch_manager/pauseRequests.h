@@ -22,10 +22,12 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 class BasePeftCacheManager;
@@ -37,9 +39,9 @@ namespace kv_cache_manager
 class BaseKVCacheManager;
 
 }
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 
 namespace tle = tensorrt_llm::executor;
@@ -71,4 +73,5 @@ private:
     SizeType32 mMaxInputLen;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

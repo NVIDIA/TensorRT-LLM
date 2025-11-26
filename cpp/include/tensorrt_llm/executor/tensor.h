@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/executor/types.h"
-
 #include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/executor/types.h"
 
 #include <cstdint>
 #include <initializer_list>
@@ -28,13 +29,15 @@
 #include <type_traits>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class ITensor;
 class CudaStream;
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::executor
+
+namespace executor
 {
 
 class Tensor;
@@ -272,4 +275,5 @@ private:
     friend class Serialization;
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

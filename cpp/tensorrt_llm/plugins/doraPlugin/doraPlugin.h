@@ -14,10 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/lora/dora.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 class DoraPlugin : public BasePluginV3
@@ -111,4 +113,6 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-}; // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END
+

@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <utility>
@@ -28,7 +29,8 @@ using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;
 
 /// See tensorrt_llm/_torch/pyexecutor/connector.py for details on the Connector API.
 
-namespace tensorrt_llm::batch_manager::kv_connector
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_connector
 {
 
 /// @brief The KV connector manager. This is passed into the C++ KV Cache Manager when adding sequences.
@@ -43,4 +45,5 @@ public:
     virtual SizeType32 getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) = 0;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_connector
+} // namespace batch_manager::kv_connector
+TRTLLM_NAMESPACE_END

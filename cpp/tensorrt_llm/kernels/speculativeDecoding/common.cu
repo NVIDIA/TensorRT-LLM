@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -35,7 +36,8 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::speculative_decoding
 {
 template <int32_t BLOCK_SIZE>
 __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
@@ -485,4 +487,5 @@ template size_t getTypicalAcceptanceWorkspaceSize<float>(
 template size_t getTypicalAcceptanceWorkspaceSize<half>(
     SizeType32 batchSize, SizeType32 maxDecodingTokens, SizeType32 vocabSizePadded);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+TRTLLM_NAMESPACE_END

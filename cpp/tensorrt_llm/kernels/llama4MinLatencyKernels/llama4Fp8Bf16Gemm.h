@@ -20,11 +20,14 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
 
 void llama4_fp8_bf16_gemm_op(void const* A, void const* B, void* C, void const* scaling_factor, void const* pos_ids,
     bool pos_ids_int64, int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+} // namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+TRTLLM_NAMESPACE_END

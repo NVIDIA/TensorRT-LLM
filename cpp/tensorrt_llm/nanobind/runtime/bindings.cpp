@@ -18,6 +18,7 @@
 #include "bindings.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -97,7 +98,8 @@ public:
     }
 };
 
-namespace tensorrt_llm::nanobind::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::runtime
 {
 
 void initBindings(nb::module_& m)
@@ -410,4 +412,5 @@ void initBindingsEarly(nb::module_& m)
         .def_prop_ro("has_draft_logits", &tr::SpeculativeDecodingMode::hasDraftLogits)
         .def_prop_ro("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
-} // namespace tensorrt_llm::nanobind::runtime
+} // namespace nanobind::runtime
+TRTLLM_NAMESPACE_END

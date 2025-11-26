@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
 #include "bufferManager.h"
 
 #include <forward_list>
 #include <shared_mutex>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 namespace
@@ -387,9 +389,10 @@ void CudaVirtualMemoryAllocator::deallocate(Pointer ptr, std::size_t n) const
     TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
 }
 
-} // namespace tensorrt_llm::runtime
-
-namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 CudaVirtualMemoryManager& getVirtualMemoryManager()
@@ -430,4 +433,5 @@ void clearVirtualMemoryAllocator()
     currentConf = bgConf;
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

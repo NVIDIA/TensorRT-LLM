@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 MropeConfig::MropeConfig(Tensor mropeRotaryCosSin, SizeType32 mropePositionDeltas)
     : mMRopeRotaryCosSin(std::move(mropeRotaryCosSin))
@@ -36,4 +38,5 @@ SizeType32 MropeConfig::getMRopePositionDeltas() const
     return mMRopePositionDeltas;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

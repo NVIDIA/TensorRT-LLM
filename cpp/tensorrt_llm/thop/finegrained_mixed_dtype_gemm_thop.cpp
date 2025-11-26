@@ -41,6 +41,7 @@
 #include <tuple>
 #include <vector>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -270,11 +271,12 @@ int64_t finegrainedMixedDtypeGemmRunner::getNumConfigs() const
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::finegrainedMixedDtypeGemmRunner>("finegrainedMixedDtypeGemmRunner")
+    m.class_<tensorrt_llm::torch_ext::finegrainedMixedDtypeGemmRunner>("finegrainedMixedDtypeGemmRunner")
         .def(torch::init<at::ScalarType, at::ScalarType, int64_t>())
-        .def("run_gemm", &torch_ext::finegrainedMixedDtypeGemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::finegrainedMixedDtypeGemmRunner::getNumConfigs);
+        .def("run_gemm", &tensorrt_llm::torch_ext::finegrainedMixedDtypeGemmRunner::runGemm)
+        .def("get_num_configs", &tensorrt_llm::torch_ext::finegrainedMixedDtypeGemmRunner::getNumConfigs);
 }

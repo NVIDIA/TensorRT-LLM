@@ -18,6 +18,7 @@
 #pragma once
 #include "decoderXQAConstants.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -30,8 +31,7 @@
 #include <cstdint>
 #include <utility>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -482,4 +482,4 @@ inline int computeMultiBlockCountSpecDecGMMA(
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

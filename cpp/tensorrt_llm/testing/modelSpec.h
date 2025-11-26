@@ -18,6 +18,7 @@
 #pragma once
 
 #include "NvInfer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
@@ -25,7 +26,8 @@
 #include <filesystem>
 #include <vector>
 
-namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace testing
 {
 
 using tensorrt_llm::runtime::SizeType32;
@@ -339,4 +341,5 @@ public:
     std::shared_ptr<ModelSpec> mOtherModelSpecToCompare{nullptr};
 };
 
-}; // namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_END
+}; // namespace testing

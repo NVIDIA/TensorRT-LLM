@@ -15,11 +15,14 @@
  */
 
 #include "tests/unit_tests/layers/dynamicDecodeLayerTest.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <algorithm>
 
-namespace tensorrt_llm::tests::layers::sampling
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers::sampling
 {
 
 // TODO:
@@ -2193,4 +2196,6 @@ TYPED_TEST(DynamicDecodeLayerTest, MedusaStopWordsTest)
     this->runTest(expectedOutputIds, params);
 }
 
-} // namespace tensorrt_llm::tests::layers::sampling
+} // namespace tests::layers::sampling
+TRTLLM_NAMESPACE_END
+

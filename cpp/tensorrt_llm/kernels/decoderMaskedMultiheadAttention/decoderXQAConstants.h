@@ -18,9 +18,9 @@
 #pragma once
 #include <cstdint>
 #include <optional>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 inline constexpr int kMinHistoryTokensPerBlock = 128;
@@ -40,4 +40,4 @@ inline constexpr int getXqaMaxNumSubSeq(bool isMLA)
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -16,21 +16,25 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
+
 #include <optional>
 #include <utility>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class LookaheadDecodingBuffers;
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
 
-namespace tensorrt_llm::runtime
+
+namespace runtime
 {
 class DecodingOutput
 {
@@ -124,4 +128,6 @@ public:
     std::optional<EagleBuffers::Inputs> eagleBuffers;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

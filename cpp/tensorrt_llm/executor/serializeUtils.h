@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
@@ -32,7 +33,8 @@
 #include <variant>
 #include <vector>
 
-namespace tensorrt_llm::executor::serialize_utils
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::serialize_utils
 {
 
 template <typename CharT, typename TraitsT = std::char_traits<CharT>>
@@ -729,4 +731,5 @@ auto deserializeWithGetterType(std::istream& is)
     return deserialize<method_return_type_t<ObjectMethodT>>(is);
 }
 
-} // namespace tensorrt_llm::executor::serialize_utils
+} // namespace executor::serialize_utils
+TRTLLM_NAMESPACE_END

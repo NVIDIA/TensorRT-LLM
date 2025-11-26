@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::speculative_decoding
 {
 
 using IndexType = int;
@@ -205,4 +207,5 @@ void updateKVBlockArrayDraftTokenLocation(runtime::SizeType32 const* seqAccepted
     runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
     bool canUseOneMoreBlock, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+TRTLLM_NAMESPACE_END

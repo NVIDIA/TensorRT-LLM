@@ -16,9 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class TllmLogger : public nvinfer1::ILogger
@@ -31,4 +34,6 @@ public:
     void setLevel(Severity level);
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

@@ -17,14 +17,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/pybind/common/customCasters.h"
 #include <pybind11/pybind11.h>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class CacheTransceiverBindings
 {
 public:
     static void initBindings(pybind11::module_& m);
 };
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

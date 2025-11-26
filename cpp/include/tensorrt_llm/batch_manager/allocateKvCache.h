@@ -20,10 +20,12 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 class AllocateKvCache : Algorithm
@@ -45,4 +47,5 @@ public:
         OptionalRef<BaseKVCacheManager> crossKvCacheManager = std::nullopt) const;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

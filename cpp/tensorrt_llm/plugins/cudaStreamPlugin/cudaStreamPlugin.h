@@ -17,6 +17,7 @@
 #pragma once
 
 #include "NvInferPlugin.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/runtime/cudaMemPool.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
@@ -190,7 +191,8 @@ private:
 } // namespace pluginInternal
 } // namespace nvinfer1
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 class CudaStreamPlugin : public BasePlugin
@@ -262,4 +264,5 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

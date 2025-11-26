@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include <nanobind/nanobind.h>
@@ -24,7 +25,8 @@
 namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
 
-namespace tensorrt_llm::nanobind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::executor
 {
 
 class Executor
@@ -126,4 +128,5 @@ private:
     std::unique_ptr<tle::Executor> mExecutor;
 };
 
-} // namespace tensorrt_llm::nanobind::executor
+} // namespace nanobind::executor
+TRTLLM_NAMESPACE_END

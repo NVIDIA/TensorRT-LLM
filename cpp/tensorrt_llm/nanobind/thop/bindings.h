@@ -16,12 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include <nanobind/nanobind.h>
 
-namespace tensorrt_llm::nanobind::thop
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::thop
 {
 
 void initBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::nanobind::thop
+} // namespace nanobind::thop
+TRTLLM_NAMESPACE_END

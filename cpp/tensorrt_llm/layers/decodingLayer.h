@@ -17,13 +17,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 //! \brief Layer performs token decoding using sampling (beamWidth=1), beam search (beamWidth>1) or Medusa.
@@ -65,4 +67,5 @@ private:
     std::unique_ptr<BaseLayer> mDecodingLayer;
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

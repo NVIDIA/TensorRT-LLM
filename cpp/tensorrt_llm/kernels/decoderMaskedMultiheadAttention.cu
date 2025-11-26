@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include <assert.h>
 #include <float.h>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace mmha
@@ -176,4 +176,4 @@ INSTANTIATE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16, false)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

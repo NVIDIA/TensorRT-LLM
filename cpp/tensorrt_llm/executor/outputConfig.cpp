@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 OutputConfig::OutputConfig(bool inReturnLogProbs, bool inReturnContextLogits, bool inReturnGenerationLogits,
@@ -44,4 +46,5 @@ bool AdditionalModelOutput::operator==(AdditionalModelOutput const& other) const
     return name == other.name && gatherContext == other.gatherContext;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

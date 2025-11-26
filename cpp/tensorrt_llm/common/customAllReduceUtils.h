@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -25,7 +26,8 @@
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 
-namespace tensorrt_llm::utils::customAllReduceUtils
+TRTLLM_NAMESPACE_BEGIN
+namespace utils::customAllReduceUtils
 {
 
 constexpr size_t NUM_POINTERS_PER_RANK = 7;
@@ -293,4 +295,5 @@ inline const std::unordered_map<int, AllReduceBestStrategyTableType> AllReduceBe
     {90, AllReduceBestStrategyTableSM90},
     {100, AllReduceBestStrategyTableSM100},
 };
-} // namespace tensorrt_llm::utils::customAllReduceUtils
+} // namespace utils::customAllReduceUtils
+TRTLLM_NAMESPACE_END

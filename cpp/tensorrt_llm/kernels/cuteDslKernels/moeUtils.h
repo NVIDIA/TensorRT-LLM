@@ -15,11 +15,13 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels::cute_dsl
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cute_dsl
 {
 template <typename InputType, typename SFType>
 void moePermute(InputType const* input, InputType* permuted_output, SFType const* input_sf, SFType* permuted_sf,
@@ -38,4 +40,5 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     cutlass_kernels::ActivationParams activation_params, int32_t const max_num_permuted_tokens,
     int32_t const interm_size, int32_t const tile_size, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::cute_dsl
+} // namespace kernels::cute_dsl
+TRTLLM_NAMESPACE_END

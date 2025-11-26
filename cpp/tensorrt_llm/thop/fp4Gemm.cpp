@@ -47,6 +47,7 @@ using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunner;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface;
 #endif
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -309,13 +310,14 @@ private:
     FP4GemmType mfp4GemmType;
 };
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP4GemmRunner>("FP4GemmRunner")
+    m.class_<tensorrt_llm::torch_ext::FP4GemmRunner>("FP4GemmRunner")
         .def(torch::init<at::ScalarType, int64_t>())
-        .def("run_gemm", &torch_ext::FP4GemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::FP4GemmRunner::getNumConfigs);
+        .def("run_gemm", &tensorrt_llm::torch_ext::FP4GemmRunner::runGemm)
+        .def("get_num_configs", &tensorrt_llm::torch_ext::FP4GemmRunner::getNumConfigs);
 
     m.def(
         "fp4_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, int fp4GemmType, "
@@ -327,6 +329,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp4_bmm", &torch_ext::fp4_bmm);
-    m.impl("fp4_gemm", &torch_ext::fp4_bmm);
+    m.impl("fp4_bmm", &tensorrt_llm::torch_ext::fp4_bmm);
+    m.impl("fp4_gemm", &tensorrt_llm::torch_ext::fp4_bmm);
 }

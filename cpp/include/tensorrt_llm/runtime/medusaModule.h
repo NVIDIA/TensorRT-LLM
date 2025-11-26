@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class MedusaModule : public SpeculativeDecodingModule
@@ -56,4 +58,6 @@ private:
         {7, 0}, {0, 1, 2}, {2, 0, 0}, {3, 1}, {2, 2}, {8, 0}, {0, 5, 0}, {1, 5}, {1, 0, 1}, {0, 2, 1}, {9, 0},
         {0, 6, 0}, {0, 0, 0, 1}, {1, 6}, {0, 7, 0}};
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

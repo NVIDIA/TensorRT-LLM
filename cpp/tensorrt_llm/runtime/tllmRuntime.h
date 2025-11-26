@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -30,7 +31,8 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime
 {
@@ -240,4 +242,5 @@ private:
     // For Variable-Beam-Width-Search
     std::vector<SizeType32> mCurrentBeamWidths;
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

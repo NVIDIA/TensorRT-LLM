@@ -21,6 +21,7 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -67,6 +68,7 @@ void buildRelativeAttentionBias(
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 static auto relative_attention_bias
-    = torch::RegisterOperators("tensorrt_llm::relative_attention_bias", &torch_ext::buildRelativeAttentionBias);
+    = torch::RegisterOperators("tensorrt_llm::relative_attention_bias", &tensorrt_llm::torch_ext::buildRelativeAttentionBias);

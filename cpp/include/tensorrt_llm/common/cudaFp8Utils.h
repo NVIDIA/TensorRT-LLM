@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -29,8 +31,7 @@
 #define USE_QGMMA
 #endif
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
@@ -320,5 +321,5 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
     const int64_t lda, QuantizeMode quantize_mode, cudaStream_t stream);
 
 } // namespace common
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 #endif // ENABLE_FP8

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -24,8 +25,7 @@
 #include <limits>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 #ifdef ENABLE_FP8
@@ -466,4 +466,4 @@ DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_bfloat16, float, __nv_fp8_e4m3);
 
 #endif // ENABLE_FP8
 } // namespace common
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -16,13 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cassert>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
@@ -293,4 +293,4 @@ AlignedPointersUnpacker inline calcAlignedPointers(
 }
 
 } // namespace common
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

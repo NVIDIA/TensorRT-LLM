@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferView.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <stdexcept>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TensorView : virtual public ITensor, public BufferView
 {
@@ -83,4 +85,5 @@ private:
 
     nvinfer1::Dims mDims{};
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

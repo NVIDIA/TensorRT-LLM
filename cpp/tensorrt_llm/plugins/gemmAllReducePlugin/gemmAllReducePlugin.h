@@ -16,9 +16,11 @@
 #pragma once
 
 #if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #else
 #include "allreduce_gemm_runner.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #endif
 
 #include "gemmAllReducePluginProfiler.h"
@@ -37,7 +39,8 @@ namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;
 
 using LaunchConfig = typename cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig;
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 struct GemmAllReducePluginOptions
 {
@@ -186,4 +189,5 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

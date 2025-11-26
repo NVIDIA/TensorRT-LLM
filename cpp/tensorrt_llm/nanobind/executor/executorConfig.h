@@ -18,13 +18,16 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include "tensorrt_llm/common/config.h"
 
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::executor
 {
 
 // Register bindings for executor API.
 void initConfigBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::nanobind::executor
+} // namespace nanobind::executor
+TRTLLM_NAMESPACE_END

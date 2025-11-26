@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/arrayView.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/dynamicBatchTuner.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/intervalSet.h"
@@ -42,7 +43,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 class RequestWithIdAsyncSend;
@@ -368,4 +370,5 @@ private:
     std::shared_ptr<DynamicBatchTuner> mDynamicBatchTuner;
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

@@ -15,13 +15,12 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
-
+TRTLLM_NAMESPACE_BEGIN
 enum class QuantizationSFLayout
 {
     // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
@@ -93,4 +92,4 @@ void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* 
     float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

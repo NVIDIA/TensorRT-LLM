@@ -17,12 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
 #include <deque>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 /// @brief A class that maintains runtime input and output length statistics and computes runtime dynamic batch size.
@@ -84,4 +86,5 @@ private:
     static SizeType32 const kMaxNumTokensThresholdGenHeavy = 2048;
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

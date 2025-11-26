@@ -29,6 +29,7 @@
 
 using torch::Tensor;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -376,6 +377,7 @@ Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Ten
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -387,6 +389,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("cublas_scaled_mm", &torch_ext::cublas_scaled_mm);
-    m.impl("cublas_mm", &torch_ext::cublas_mm);
+    m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
+    m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
 }

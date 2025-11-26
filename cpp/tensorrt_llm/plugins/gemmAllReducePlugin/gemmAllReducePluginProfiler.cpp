@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 #include "gemmAllReducePlugin.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/plugins/common/pluginUtils.h"
 
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 void GemmAllReducePluginProfiler::serializeToOwnFile(GemmIdCore gemmId)
 {
@@ -137,4 +139,5 @@ std::vector<cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig> GemmAllRe
     TLLM_CHECK(mRunner != nullptr);
     return mRunner->getSupportedLaunchConfigs();
 }
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

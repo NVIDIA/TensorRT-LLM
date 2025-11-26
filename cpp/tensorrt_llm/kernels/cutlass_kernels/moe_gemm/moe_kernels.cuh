@@ -16,10 +16,12 @@
 
 #pragma once
 #include <limits>
+#include "tensorrt_llm/common/config.h"
 
 #include "cutlass/epilogue/thread/activation.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 // ============================== Activation Adaptors =================================
 
@@ -72,4 +74,5 @@ struct SwigluBiasAdaptor
     }
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

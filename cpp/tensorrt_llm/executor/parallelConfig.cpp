@@ -16,13 +16,15 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include <filesystem>
 
 #include <utility>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 ParallelConfig::ParallelConfig(CommunicationType commType, CommunicationMode commMode,
     std::optional<std::vector<SizeType32>> deviceIds, std::optional<std::vector<SizeType32>> participantIds,
@@ -101,4 +103,5 @@ void ParallelConfig::setNumNodes(SizeType32 numNodes)
     mNumNodes = numNodes;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
  */
 
 #include "cacheTransBuffer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
@@ -23,7 +24,8 @@
 #include <NvInferRuntimeBase.h>
 #include <mutex>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 class FabricMemory::Impl
@@ -527,4 +529,5 @@ size_t CacheTransBufferManager::getSendBufferCount()
     return mSendBufferCount;
 }
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

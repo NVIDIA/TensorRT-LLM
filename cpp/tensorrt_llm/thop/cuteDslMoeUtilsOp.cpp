@@ -20,6 +20,7 @@
 
 #include <cuda_fp4.h>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 // Sort
@@ -407,6 +408,7 @@ torch::Tensor moe_gelu(torch::Tensor const& input, torch::Tensor const& tile_idx
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -434,11 +436,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_topk_sort", &torch_ext::moe_topk_sort);
-    m.impl("moe_sort", &torch_ext::moe_sort);
-    m.impl("moe_permute", &torch_ext::moe_permute);
-    m.impl("moe_unpermute", &torch_ext::moe_unpermute);
-    m.impl("moe_swiglu", &torch_ext::moe_swiglu);
-    m.impl("moe_swiglu_nvfp4_quantize", &torch_ext::moe_swiglu_nvfp4_quantize);
-    m.impl("moe_gelu", &torch_ext::moe_gelu);
+    m.impl("moe_topk_sort", &tensorrt_llm::torch_ext::moe_topk_sort);
+    m.impl("moe_sort", &tensorrt_llm::torch_ext::moe_sort);
+    m.impl("moe_permute", &tensorrt_llm::torch_ext::moe_permute);
+    m.impl("moe_unpermute", &tensorrt_llm::torch_ext::moe_unpermute);
+    m.impl("moe_swiglu", &tensorrt_llm::torch_ext::moe_swiglu);
+    m.impl("moe_swiglu_nvfp4_quantize", &tensorrt_llm::torch_ext::moe_swiglu_nvfp4_quantize);
+    m.impl("moe_gelu", &tensorrt_llm::torch_ext::moe_gelu);
 }

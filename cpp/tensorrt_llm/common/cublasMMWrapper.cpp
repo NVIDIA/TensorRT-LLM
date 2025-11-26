@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cublasVersionCheck.h"
 #include <algorithm>
 #include <unordered_map>
@@ -24,8 +25,7 @@
 #error CUDART_VERSION Undefined!
 #endif
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
@@ -660,5 +660,4 @@ void CublasMMWrapper::BlockScaleGemm(cublasOperation_t transa, cublasOperation_t
 #endif
 
 } // namespace common
-
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 #include "eagleSampleAndAcceptDraftTokensPlugin.h"
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/memoryUtils.h"

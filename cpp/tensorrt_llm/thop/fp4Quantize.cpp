@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <optional>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 // self: [M, K], fp16/bf16/fp8_quantized
@@ -231,6 +232,7 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
     return globalScale;
 }
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -242,6 +244,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp4_quantize", TORCH_FN(torch_ext::fp4_quantize));
-    m.impl("calculate_nvfp4_global_scale", TORCH_FN(torch_ext::calculate_nvfp4_global_scale));
+    m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
+    m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
 }

@@ -17,9 +17,11 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 #if defined(__clang__)
@@ -36,4 +38,5 @@ extern "C"
 #pragma clang diagnostic pop
 #endif
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

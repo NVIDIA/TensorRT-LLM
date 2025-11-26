@@ -22,6 +22,7 @@
 #include <cuda_pipeline.h>
 #include <tuple>
 #include <type_traits>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -31,7 +32,8 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 
-namespace tensorrt_llm::kernels::mnnvl
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::mnnvl
 {
 
 using tensorrt_llm::common::isNegZero;
@@ -1029,4 +1031,5 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     }
 }
 
-} // namespace tensorrt_llm::kernels::mnnvl
+} // namespace kernels::mnnvl
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 
 #include "executor.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -110,7 +111,8 @@ tle::Tensor numpyToTensor(nb::object const& object)
 
 } // namespace
 
-namespace tensorrt_llm::nanobind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::executor
 {
 
 Executor::Executor(
@@ -222,4 +224,5 @@ void Executor::initBindings(nb::module_& m)
         .def("get_kv_cache_event_manager", &Executor::getKVCacheEventManager);
 }
 
-} // namespace tensorrt_llm::nanobind::executor
+} // namespace nanobind::executor
+TRTLLM_NAMESPACE_END

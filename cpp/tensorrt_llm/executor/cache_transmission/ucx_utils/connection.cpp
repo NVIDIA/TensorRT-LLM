@@ -16,14 +16,17 @@
  */
 
 #include "ucxCacheCommunicator.h"
+
 #if ENABLE_UCX
 
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 // Using declarations to shorten the code
@@ -187,6 +190,6 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
         mConnectionIdInPeer, mFromRequester);
 }
 
-} // namespace tensorrt_llm::executor::kv_cache
-
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END
 #endif

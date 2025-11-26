@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 
-namespace tensorrt_llm::pg_utils
+TRTLLM_NAMESPACE_BEGIN
+namespace pg_utils
 {
 
 c10::intrusive_ptr<c10d::ProcessGroup> pg_world;
@@ -41,4 +43,5 @@ void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
     pg_local = process_group_local;
 }
 
-} // namespace tensorrt_llm::pg_utils
+} // namespace pg_utils
+TRTLLM_NAMESPACE_END

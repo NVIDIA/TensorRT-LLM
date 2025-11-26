@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 
 #include <cmath>
@@ -24,7 +25,8 @@
 #include <cuda_runtime.h>
 #include <limits>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 // Internal for K and V cache indexing
@@ -322,4 +324,5 @@ struct KVLinearBuffer
     }
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

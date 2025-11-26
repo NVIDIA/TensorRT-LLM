@@ -19,9 +19,9 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass_extensions/interleaved_numeric_conversion.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace weight_only
@@ -79,4 +79,4 @@ struct I2FConverter<AType, WElemBits, false>
 
 } // namespace weight_only
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

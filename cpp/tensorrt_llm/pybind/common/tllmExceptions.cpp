@@ -15,11 +15,13 @@
  */
 
 #include "tllmExceptions.h"
+#include "tensorrt_llm/common/config.h"
 
 namespace py = pybind11;
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::pybind::common
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::common
 {
 
 void initExceptionsBindings(py::module_& m)
@@ -64,4 +66,5 @@ void initExceptionsBindings(py::module_& m)
         });
 }
 
-} // namespace tensorrt_llm::pybind::common
+} // namespace pybind::common
+TRTLLM_NAMESPACE_END

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/topkLastDim.h" // Air TopK
@@ -22,8 +23,7 @@
 
 #define BEAM_SEARCH_DEBUG 0
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 static size_t constexpr kMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
@@ -219,4 +219,4 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
 #endif
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

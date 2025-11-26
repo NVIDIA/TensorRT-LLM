@@ -18,8 +18,10 @@
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 template <typename T>
@@ -41,4 +43,5 @@ struct GeneralFP4AddBiasResidualPreLayerNormParam
     cudaStream_t stream;
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

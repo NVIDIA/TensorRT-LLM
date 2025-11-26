@@ -18,6 +18,7 @@
 #include "common.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -32,7 +33,8 @@
 #include <algorithm>
 #include <vector>
 
-namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace testing
 {
 namespace fs = std::filesystem;
 namespace tr = tensorrt_llm::runtime;
@@ -681,4 +683,6 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
     }
 }
 
-} // namespace tensorrt_llm::testing
+} // namespace testing
+TRTLLM_NAMESPACE_END
+

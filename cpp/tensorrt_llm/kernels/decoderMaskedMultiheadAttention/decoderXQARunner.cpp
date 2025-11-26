@@ -22,6 +22,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -31,8 +32,7 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -180,5 +180,4 @@ void DecoderXQARunnerResource::serialize(void* buffer, size_t buffer_size) const
 }
 
 } // namespace kernels
-
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

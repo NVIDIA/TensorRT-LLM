@@ -16,8 +16,9 @@
  */
 
 #include "buffers.h"
-
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/torch.h"
 
 #include <ATen/ATen.h>
@@ -33,7 +34,8 @@ namespace tr = tensorrt_llm::runtime;
 
 using tr::SizeType32;
 
-namespace tensorrt_llm::pybind::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::batch_manager
 {
 
 void Buffers::initBindings(pybind11::module_& m)
@@ -72,4 +74,5 @@ void Buffers::initBindings(pybind11::module_& m)
         .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
 }
-} // namespace tensorrt_llm::pybind::batch_manager
+} // namespace pybind::batch_manager
+TRTLLM_NAMESPACE_END

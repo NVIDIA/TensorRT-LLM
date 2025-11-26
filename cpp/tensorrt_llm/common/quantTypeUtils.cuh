@@ -21,9 +21,9 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <float.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
@@ -52,4 +52,4 @@ struct QuantTypeStaticVals<__nv_fp8_e4m3>
 #endif // ENABLE_FP8
 
 } // namespace common
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/promptTuningParams.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, SizeType32 const batchSize,
@@ -89,4 +91,5 @@ void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, SizeType32 const b
     }
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

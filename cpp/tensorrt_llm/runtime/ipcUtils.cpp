@@ -14,16 +14,18 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/ipcUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 bool canAccessPeer(WorldConfig const& worldConfig)
@@ -218,4 +220,5 @@ void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t
 #endif
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

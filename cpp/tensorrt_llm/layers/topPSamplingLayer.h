@@ -17,10 +17,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 //! \brief Layer to randomly sample tokens from TopP logits.
@@ -69,4 +71,5 @@ private:
     void allocateBuffer(runtime::SizeType32 batchSize);
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

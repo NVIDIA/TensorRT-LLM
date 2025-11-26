@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
+
 #include "tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.h"
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::dsv3MinLatencyKernels
 {
 
 // Custom FMA implementation using PTX assembly instructions
@@ -238,4 +241,5 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-} // namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+} // namespace kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_END

@@ -18,8 +18,10 @@
 #pragma once
 
 #include "cacheFormatter.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
@@ -60,4 +62,5 @@ private:
     std::vector<CacheTransBufferManager*> mCacheTransBufferManagers;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

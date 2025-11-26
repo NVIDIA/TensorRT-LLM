@@ -16,6 +16,7 @@
  */
 #include "rmsnormQuantizationPlugin.h"
 #include "pluginUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 
 using namespace nvinfer1;

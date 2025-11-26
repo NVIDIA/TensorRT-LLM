@@ -16,6 +16,7 @@
  */
 
 #include "banWordsLayer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/banBadWords.h"
 #include "tensorrt_llm/kernels/banRepeatNgram.h"
@@ -25,7 +26,8 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 template <typename T>
@@ -162,4 +164,5 @@ void BanWordsLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
 template class BanWordsLayer<float>;
 template class BanWordsLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

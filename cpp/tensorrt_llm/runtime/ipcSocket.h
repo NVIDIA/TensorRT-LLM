@@ -16,11 +16,13 @@
 #pragma once
 
 #if ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/common/config.h"
 
 #include <cstdint>
 #include <memory>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 ////////////////////////////////////////////////////////////////
 // Functions for sharing file descriptors between processes
@@ -35,6 +37,6 @@ int ncclIpcSocketRecvFd(std::shared_ptr<NcclIpcSocket> handle);
 
 void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int fd, int rank);
 
-} // namespace tensorrt_llm::runtime
-
+} // namespace runtime
+TRTLLM_NAMESPACE_END
 #endif // ENABLE_MULTI_DEVICE

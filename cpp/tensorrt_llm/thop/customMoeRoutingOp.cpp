@@ -22,6 +22,7 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 template <bool DoSoftmaxBeforeTopK>
@@ -120,6 +121,7 @@ std::tuple<at::Tensor, at::Tensor> default_moe_routing_op(
     return custom_moe_routing_op<true>(router_logits, topk, output_dtype);
 }
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -130,7 +132,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("renorm_moe_routing_op", &torch_ext::renorm_moe_routing_op);
+    m.impl("renorm_moe_routing_op", &tensorrt_llm::torch_ext::renorm_moe_routing_op);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -142,5 +144,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("default_moe_routing_op", &torch_ext::default_moe_routing_op);
+    m.impl("default_moe_routing_op", &tensorrt_llm::torch_ext::default_moe_routing_op);
 }

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -23,7 +24,8 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::speculative_decoding
 {
 
 //! \brief Accepts or rejects draft tokens based on their probability distributions or the equality of draft and target
@@ -95,4 +97,5 @@ void invokeForwardAcceptedTokens(runtime::SizeType32 batchSize, runtime::SizeTyp
     runtime::TokenIdType** idsPtrs, runtime::SizeType32 step, runtime::SizeType32 maxDraftTokens,
     runtime::TokenIdType const* endIds, FinishedState* finishedOutput, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+TRTLLM_NAMESPACE_END

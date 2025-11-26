@@ -13,13 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::ar_fusion
 {
 template <int NRanks>
 struct SyncComm
@@ -818,4 +820,7 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     DISPATCH_RANKS(16);
     TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
-}; // namespace tensorrt_llm::kernels::ar_fusion
+}; // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END
+

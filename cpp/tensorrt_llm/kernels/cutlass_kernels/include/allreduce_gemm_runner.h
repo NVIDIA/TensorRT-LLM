@@ -20,12 +20,14 @@
 #include <map>
 #include <memory>
 #include <set>
+#include "tensorrt_llm/common/config.h"
 
 #include "cutlass/layout/layout.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
-namespace tensorrt_llm::kernels::opened_cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::opened_cutlass_kernels
 {
 using namespace cute;
 using namespace tensorrt_llm::cutlass_extensions;
@@ -248,4 +250,5 @@ private:
     std::map<KeyType, ValueType> mGemmRegistry;
 };
 
-} // namespace tensorrt_llm::kernels::opened_cutlass_kernels
+} // namespace kernels::opened_cutlass_kernels
+TRTLLM_NAMESPACE_END

@@ -18,11 +18,13 @@
 #ifndef TRT_TOPK_LAST_DIM_PLUGIN_H
 #define TRT_TOPK_LAST_DIM_PLUGIN_H
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/topkLastDim.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 class TopkLastDimPlugin : public BasePlugin
 {
@@ -94,6 +96,6 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
-
+} // namespace plugins
+TRTLLM_NAMESPACE_END
 #endif

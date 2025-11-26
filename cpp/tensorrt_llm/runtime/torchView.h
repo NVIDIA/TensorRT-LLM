@@ -17,13 +17,15 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/ATen.h>
 #include <torch/types.h>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TorchView : virtual public ITensor
 {
@@ -108,4 +110,5 @@ private:
     Shape mDims;
     std::size_t mCapacity;
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

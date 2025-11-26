@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-namespace tensorrt_llm::batch_manager::rnn_state_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::rnn_state_manager
 {
 
 class RnnStateManager
@@ -57,4 +59,5 @@ private:
     SizeType32 mBeamSlotsPerSequence = 0;
 };
 
-} // namespace tensorrt_llm::batch_manager::rnn_state_manager
+} // namespace batch_manager::rnn_state_manager
+TRTLLM_NAMESPACE_END

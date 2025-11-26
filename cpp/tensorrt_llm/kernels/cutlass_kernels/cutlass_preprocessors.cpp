@@ -18,13 +18,13 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace cutlass_kernels
@@ -803,4 +803,4 @@ template void symmetric_quantize<__nv_bfloat16, float>(
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

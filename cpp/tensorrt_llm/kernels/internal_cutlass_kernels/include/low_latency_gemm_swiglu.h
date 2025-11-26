@@ -17,13 +17,13 @@
 
 #pragma once
 #include "low_latency_gemm.h"
+#include "tensorrt_llm/common/config.h"
 
 // namespace tk = tensorrt_llm::common;
 
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace internal_cutlass_kernels
@@ -73,4 +73,5 @@ private:
 
 }; // namespace internal_cutlass_kernels
 }; // namespace kernels
-}; // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
+

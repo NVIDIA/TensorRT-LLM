@@ -20,11 +20,13 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 constexpr size_t WARP_SIZE = 32;
@@ -192,4 +194,5 @@ namespace reduce_fusion
 bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

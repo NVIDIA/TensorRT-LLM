@@ -16,11 +16,15 @@
 
 #pragma once
 #include <nanobind/nanobind.h>
+
+#include "tensorrt_llm/common/config.h"
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::common
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::common
 {
 
 void initExceptionsBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::nanobind::common
+} // namespace nanobind::common
+TRTLLM_NAMESPACE_END

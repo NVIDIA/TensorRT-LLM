@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/executor/executorImpl.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/executorImpl.h"
 #include "tensorrt_llm/executor/orchestratorUtils.h"
 #include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/serialization.h"
@@ -46,7 +47,8 @@
 #include <optional>
 #include <utility>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 namespace
@@ -2770,4 +2772,5 @@ void Executor::Impl::checkParallelApiUsage(std::string const& methodName) const
     }
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

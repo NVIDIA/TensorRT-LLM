@@ -16,6 +16,7 @@
 
 #include "lookaheadDecodingLayer.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -34,7 +35,8 @@
 #include <memory>
 #include <tuple>
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 using namespace tensorrt_llm::common;
@@ -461,4 +463,5 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 template class LookaheadDecodingLayer<float>;
 template class LookaheadDecodingLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

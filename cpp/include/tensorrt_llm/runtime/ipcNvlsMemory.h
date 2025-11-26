@@ -15,12 +15,15 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <set>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 struct IpcNvlsHandle
 {
@@ -104,4 +107,6 @@ private:
     size_t _capacity = 0;
     IpcNvlsHandle* _handle;
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

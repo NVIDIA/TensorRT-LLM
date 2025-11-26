@@ -18,6 +18,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
 #define dllOpen(name) LoadLibrary("nv" name ".dll")
 #define dllClose(handle) FreeLibrary(static_cast<HMODULE>(handle))
 #define dllGetSym(handle, name) static_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name))
@@ -29,6 +30,7 @@
 #endif // defined(_WIN32)
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cuda.h>
@@ -36,7 +38,8 @@
 #include <cstdio>
 #include <mutex>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
@@ -295,4 +298,5 @@ CUresult CUDADriverWrapper::cuOccupancyMaxActiveClusters(
     return (*_cuOccupancyMaxActiveClusters)(maxActiveClusters, f, config);
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END

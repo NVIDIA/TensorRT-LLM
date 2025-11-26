@@ -26,6 +26,7 @@
 #include <memory>
 #include <unordered_map>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -394,11 +395,12 @@ private:
 };
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP8BlockScaleMoeRunner>("FP8BlockScaleMoERunner")
+    m.class_<tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner>("FP8BlockScaleMoERunner")
         .def(torch::init<>())
-        .def("get_valid_configs", &torch_ext::FP8BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::FP8BlockScaleMoeRunner::run);
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::FP8BlockScaleMoeRunner::run);
 }

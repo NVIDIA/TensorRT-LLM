@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -48,7 +49,8 @@
                // this undef.
 #endif         // WIN32
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 // workspace for cublas gemm : 32MB
@@ -1401,7 +1403,8 @@ DEFINE_MEMBER_CHECKER(deq)
 DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 
-} // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END
 
 /*
  * Macros compliant with TensorRT coding conventions
@@ -1409,7 +1412,7 @@ DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 #define TLLM_CUDA_CHECK(stat)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                                \
+        tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                  \
     } while (0)
 
 // We use singleton memory pool and the order of destructors depends on the compiler implementation. We find that the
@@ -1419,5 +1422,6 @@ DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 #define TLLM_CUDA_CHECK_FREE_RESOURCE(stat)                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
+        tensorrt_llm::common::checkEx(                                                                   \
+            (stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);                               \
     } while (0)

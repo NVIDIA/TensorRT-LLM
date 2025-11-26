@@ -28,6 +28,7 @@
 #include <torch/extension.h>
 #include <vector>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -279,11 +280,12 @@ void groupRMSNormHeuristic(torch::TensorList const& inputs, torch::TensorList co
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("group_rms_norm_base", &torch_ext::groupRMSNormBase);
-    m.impl("group_rms_norm_large_batch", &torch_ext::groupRMSNormLargeBatch);
+    m.impl("group_rms_norm_base", &tensorrt_llm::torch_ext::groupRMSNormBase);
+    m.impl("group_rms_norm_large_batch", &tensorrt_llm::torch_ext::groupRMSNormLargeBatch);
     // Use groupRMSNormHeuristic which automatically selects between regular and large batch kernels
-    m.impl("group_rms_norm_heuristic", &torch_ext::groupRMSNormHeuristic);
+    m.impl("group_rms_norm_heuristic", &tensorrt_llm::torch_ext::groupRMSNormHeuristic);
 }

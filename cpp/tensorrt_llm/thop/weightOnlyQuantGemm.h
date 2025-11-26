@@ -23,12 +23,14 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <torch/extension.h>
 
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 using namespace tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 using WeightOnlyQuantGemmRunnerPtr = std::shared_ptr<CutlassFpAIntBGemmRunnerInterface>;
@@ -51,3 +53,4 @@ private:
 };
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END

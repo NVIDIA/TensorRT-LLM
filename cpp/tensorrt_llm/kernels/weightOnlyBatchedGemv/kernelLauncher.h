@@ -15,12 +15,12 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/details.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace weight_only
@@ -112,4 +112,4 @@ inline bool is_supported(int arch, KernelType kernel_type)
 }
 } // namespace weight_only
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

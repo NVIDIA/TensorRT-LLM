@@ -15,13 +15,16 @@
  */
 #include "./allreduce_gemm_impl_sm100.h"
 #include "./allreduce_gemm_impl_sm90.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
 #include "cutlass/half.h"
 
-namespace tensorrt_llm::kernels::opened_cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::opened_cutlass_kernels
 {
 /////////////////////////////////////////////////
 // GemmAllReduce implementation specializations
@@ -292,4 +295,5 @@ template class GemmAllReduceImplRunner<GemmTypes<cutlass::float_e2m1_t, cutlass:
     cutlass::bfloat16_t, cutlass::float_ue4m3_t, cutlass::float_ue4m3_t, cutlass::layout::RowMajor,
     cutlass::layout::ColumnMajor, cutlass::layout::RowMajor, cutlass::layout::RowMajor>>;
 
-} // namespace tensorrt_llm::kernels::opened_cutlass_kernels
+} // namespace kernels::opened_cutlass_kernels
+TRTLLM_NAMESPACE_END

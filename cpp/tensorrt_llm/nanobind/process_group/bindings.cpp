@@ -17,13 +17,15 @@
 
 #include "bindings.h"
 #include <nanobind/stl/string.h>
-
 #include "tensorrt_llm/common/bindingUtils.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::process_group
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::process_group
 {
 
 void initBindings(nb::module_& m)
@@ -40,4 +42,5 @@ void initBindings(nb::module_& m)
         });
 }
 
-} // namespace tensorrt_llm::nanobind::process_group
+} // namespace nanobind::process_group
+TRTLLM_NAMESPACE_END

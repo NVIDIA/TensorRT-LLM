@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/kernels/recoverFromRingAtten.h"
 
@@ -23,8 +24,7 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -138,4 +138,4 @@ INSTANTIATE_RECOVER_RA(half);
 INSTANTIATE_RECOVER_RA(__nv_bfloat16);
 #endif
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

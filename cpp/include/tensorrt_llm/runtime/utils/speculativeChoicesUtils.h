@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <vector>
 
-namespace tensorrt_llm::runtime::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::utils
 {
 struct TreeNode
 {
@@ -38,4 +40,6 @@ SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDe
     ITensor::SharedPtr paths, ITensor::SharedPtr packedMask,
     std::optional<SizeType32> maxNonLeafNodesPerLayer = std::nullopt);
 
-} // namespace tensorrt_llm::runtime::utils
+} // namespace runtime::utils
+TRTLLM_NAMESPACE_END
+

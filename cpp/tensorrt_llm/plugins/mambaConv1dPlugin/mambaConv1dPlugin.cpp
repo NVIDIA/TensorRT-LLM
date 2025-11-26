@@ -17,6 +17,7 @@
 
 #include "mambaConv1dPlugin.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <algorithm>
 
 using namespace nvinfer1;

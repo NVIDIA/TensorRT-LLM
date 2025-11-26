@@ -15,9 +15,9 @@
  */
 
 #include "../decoderMaskedMultiheadAttentionLaunch.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -36,4 +36,4 @@ INSTANTIATE_MMHA_LAUNCHERS(uint16_t, kSizePerHead)
 } // namespace mmha
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

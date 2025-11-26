@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tests/utils/common.h"
@@ -26,7 +27,8 @@
 
 #include <memory>
 
-namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace testing
 {
 
 class GptExecutorTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -55,4 +57,5 @@ protected:
     SizeType32 mTrigWarnMs = 10000;
 };
 
-} // namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_END
+} // namespace testing

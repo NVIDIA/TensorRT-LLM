@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -25,13 +26,15 @@
 #include <memory>
 #include <vector>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class DecoderInputBuffers;
 class LlmRequest;
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
 
-namespace tensorrt_llm::runtime
+
+namespace runtime
 {
 class SamplingConfig;
 
@@ -77,4 +80,6 @@ protected:
     virtual ~IGptDecoderBatched() = default;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

@@ -16,8 +16,10 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 // CuBLAS >= 12.9.1 requires 256-byte alignment.
@@ -85,4 +87,6 @@ inline size_t calculateTotalWorkspaceSize(
     return total;
 }
 
-}; // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END
+

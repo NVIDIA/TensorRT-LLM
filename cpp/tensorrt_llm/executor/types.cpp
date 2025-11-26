@@ -16,10 +16,12 @@
  */
 
 #include <iostream>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/executor/types.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy)
 {
@@ -41,4 +43,5 @@ std::ostream& operator<<(std::ostream& os, ContextChunkingPolicy policy)
     }
     return os;
 }
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

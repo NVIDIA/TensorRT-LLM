@@ -15,6 +15,7 @@
  */
 #include "gemmAllReducePlugin.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/plugins/common/pluginUtils.h"
 
@@ -25,7 +26,8 @@ static char const* GEMM_ALLREDUCE_PLUGIN_NAME = "GemmAllReduce";
 template <nvinfer1::DataType T>
 using CutlassType = ::tensorrt_llm::kernels::cutlass_kernels::CutlassType<T>;
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 template <typename K, typename V, DataType ElementA, DataType ElementB, DataType ElementD>
 static std::pair<K, V> makeEntry()
@@ -718,4 +720,5 @@ IPluginV2* GemmAllReducePluginCreator::deserializePlugin(
     return nullptr;
 }
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

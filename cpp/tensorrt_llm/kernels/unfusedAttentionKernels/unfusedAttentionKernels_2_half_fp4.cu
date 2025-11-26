@@ -16,9 +16,9 @@
  */
 
 #include "unfusedAttentionKernels_2_template.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -28,4 +28,4 @@ INSTANTIATE_ATTENTION_INPUT_PROCESSING(half, __nv_fp4_e2m1, KVLinearBuffer);
 #endif
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

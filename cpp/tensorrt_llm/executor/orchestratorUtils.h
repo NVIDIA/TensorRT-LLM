@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestWithId.h"
 #include "tensorrt_llm/executor/types.h"
@@ -24,7 +25,8 @@
 #include <variant>
 #include <vector>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 enum class MpiId : uint64_t
@@ -77,4 +79,5 @@ struct MpiMessage
     MpiMessageData data;
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

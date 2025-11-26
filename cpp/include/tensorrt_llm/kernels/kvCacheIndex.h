@@ -17,11 +17,13 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 class KVCacheIndex
@@ -53,4 +55,5 @@ private:
     UnderlyingType value;
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

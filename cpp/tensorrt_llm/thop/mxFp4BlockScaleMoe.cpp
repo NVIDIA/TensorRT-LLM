@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 namespace btg = batchedGemm::trtllm::gen;
@@ -663,17 +664,18 @@ private:
 };
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 // Accepts CUDA tensor only
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::Bf16MxE2m1BlockScaleMoeRunner>("Bf16MxE2m1BlockScaleMoERunner")
+    m.class_<tensorrt_llm::torch_ext::Bf16MxE2m1BlockScaleMoeRunner>("Bf16MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t>())
-        .def("get_valid_configs", &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::run);
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::Bf16MxE2m1BlockScaleMoeRunner::run);
 
-    m.class_<torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner>("MxE4m3MxE2m1BlockScaleMoERunner")
+    m.class_<tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner>("MxE4m3MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, bool>())
-        .def("get_valid_configs", &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run);
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run);
 }

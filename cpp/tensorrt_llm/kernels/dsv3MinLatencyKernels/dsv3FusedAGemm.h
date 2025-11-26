@@ -19,13 +19,16 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::dsv3MinLatencyKernels
 {
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream);
 
-} // namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+} // namespace kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_END

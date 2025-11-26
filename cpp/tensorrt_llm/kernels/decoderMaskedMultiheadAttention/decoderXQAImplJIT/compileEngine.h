@@ -15,12 +15,12 @@
  */
 #pragma once
 #include "cubinObj.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace jit
@@ -43,4 +43,4 @@ private:
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

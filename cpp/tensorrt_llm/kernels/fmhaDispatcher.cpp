@@ -15,9 +15,11 @@
  */
 
 #include "fmhaDispatcher.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -246,4 +248,5 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

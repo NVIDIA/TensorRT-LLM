@@ -16,6 +16,7 @@
  */
 
 #include "qserveGemmPlugin.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/qserveGemm.h"
 #include <cassert>
 #include <numeric>
@@ -34,7 +35,8 @@ static char const* QSERVE_GEMM_PLUGIN_NAME{"QServeGemm"};
 PluginFieldCollection QServeGemmPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> QServeGemmPluginCreator::mPluginAttributes;
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 QServeGemmPlugin::QServeGemmPlugin(
@@ -413,4 +415,5 @@ IPluginV2* QServeGemmPluginCreator::deserializePlugin(
     }
     return nullptr;
 }
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

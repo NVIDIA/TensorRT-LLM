@@ -17,18 +17,21 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime;
-} // namespace tensorrt_llm::runtime
-
-namespace tensorrt_llm::batch_manager::utils
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::utils
 {
 
 /// @brief Dump tensor to an npy file.
@@ -66,4 +69,5 @@ runtime::ITensor::TensorMap storeIOTensors(executor::DebugConfig const& debugCon
 template <typename T>
 void writeBinArray(std::string const& filename, T const* tensor, const int64_t size, cudaStream_t stream);
 
-} // namespace tensorrt_llm::batch_manager::utils
+} // namespace batch_manager::utils
+TRTLLM_NAMESPACE_END

@@ -15,6 +15,7 @@
  */
 #include "weightOnlyQuantGemm.h"
 #include "cutlass/numeric_types.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <ATen/cuda/EmptyTensor.h>
 #include <optional>
@@ -22,6 +23,7 @@
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 using namespace tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -155,11 +157,12 @@ int64_t WeightOnlyQuantGemmRunner::getNumConfigs() const
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::WeightOnlyQuantGemmRunner>("WeightOnlyQuantGemmRunner")
+    m.class_<tensorrt_llm::torch_ext::WeightOnlyQuantGemmRunner>("WeightOnlyQuantGemmRunner")
         .def(torch::init<at::ScalarType, at::ScalarType>())
-        .def("run_gemm", &torch_ext::WeightOnlyQuantGemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::WeightOnlyQuantGemmRunner::getNumConfigs);
+        .def("run_gemm", &tensorrt_llm::torch_ext::WeightOnlyQuantGemmRunner::runGemm)
+        .def("get_num_configs", &tensorrt_llm::torch_ext::WeightOnlyQuantGemmRunner::getNumConfigs);
 }

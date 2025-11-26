@@ -18,8 +18,10 @@
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::kernels::moe_comm
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::moe_comm
 {
 
 // Configuration constants
@@ -177,4 +179,5 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
     int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::moe_comm
+} // namespace kernels::moe_comm
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/kvCacheUpdateKernels.h"
@@ -27,7 +28,8 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::runtime::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::kernels
 {
 
 namespace
@@ -482,4 +484,5 @@ void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftT
         bufferCast<SizeType32>(batchSlots), maxKVCacheLen, maxBlocksPerSeq, tokensPerBlock, canUseOneMoreBlock, stream);
 }
 
-} // namespace tensorrt_llm::runtime::kernels
+} // namespace runtime::kernels
+TRTLLM_NAMESPACE_END

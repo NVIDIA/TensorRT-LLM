@@ -16,6 +16,7 @@
  */
 
 #include <cstdio>
+#include "tensorrt_llm/common/config.h"
 
 #include "cpSplitPlugin.h"
 

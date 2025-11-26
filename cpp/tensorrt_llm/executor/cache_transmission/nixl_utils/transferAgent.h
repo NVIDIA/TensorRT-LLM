@@ -18,11 +18,13 @@
 #pragma once
 
 #include "nixl.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
 #include <thread>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 struct NixlHelper
@@ -142,4 +144,5 @@ extern "C"
 #pragma clang diagnostic pop
 #endif
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

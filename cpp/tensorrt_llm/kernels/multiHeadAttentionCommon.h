@@ -17,11 +17,11 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <limits.h>
 #include <stdint.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -122,4 +122,4 @@ static constexpr int kIdxScaleSoftmaxPtr = 0;
 static constexpr int kIdxScaleSoftmaxLog2Ptr = 1;
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

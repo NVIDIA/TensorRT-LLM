@@ -16,6 +16,7 @@
  */
 
 #include "decodingLayer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/eagleDecodingLayer.h"
@@ -30,7 +31,8 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 template <typename T>
@@ -263,4 +265,5 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
 template class DecodingLayer<float>;
 template class DecodingLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

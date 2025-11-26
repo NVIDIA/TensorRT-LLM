@@ -15,17 +15,19 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
-
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+
+#include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 namespace tr = tensorrt_llm::runtime;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -85,4 +87,5 @@ bool LogitsPostProcessor::operator()(DecoderInputBuffers& inputBuffers, bool rep
     return logitsPostProcessorIsApplied;
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

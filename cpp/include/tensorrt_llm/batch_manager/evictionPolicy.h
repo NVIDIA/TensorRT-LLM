@@ -17,13 +17,15 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <chrono>
 #include <vector>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 
-namespace tensorrt_llm::batch_manager::eviction_policy
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::eviction_policy
 {
 
 class BaseEvictionPolicy
@@ -104,4 +106,5 @@ private:
     std::set<BlockPtr, ExpiringBlockComparator> mExpiringBlockHeap;
 };
 
-} // namespace tensorrt_llm::batch_manager::eviction_policy
+} // namespace batch_manager::eviction_policy
+TRTLLM_NAMESPACE_END

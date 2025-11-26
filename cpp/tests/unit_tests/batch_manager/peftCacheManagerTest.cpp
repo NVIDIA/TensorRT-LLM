@@ -19,9 +19,10 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -64,7 +65,8 @@ auto const TEST_KEYS_LORA_TP2_PAGES_RANK1 = TEST_RESOURCE_PATH / "lora-test-weig
 auto const TEST_PREFETCH = TEST_RESOURCE_PATH / "lora_prefetch";
 } // namespace
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 using namespace tensorrt_llm::runtime;
@@ -628,4 +630,6 @@ TEST_F(PeftCacheManagerPrefetchTest, prefetch)
     EXPECT_TRUE(mPeftManager->isTaskCached(5));
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END
+

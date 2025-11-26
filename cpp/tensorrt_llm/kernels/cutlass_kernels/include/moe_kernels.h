@@ -32,8 +32,10 @@
 #include <optional>
 #include <random>
 #include <utility>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 // Change to following declarations must sync with lora.h in public repo
 class LoraImpl;
@@ -1016,4 +1018,5 @@ private:
 void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 } // namespace cutlass_kernels
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

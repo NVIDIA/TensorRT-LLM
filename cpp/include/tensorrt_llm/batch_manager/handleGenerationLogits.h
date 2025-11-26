@@ -19,15 +19,18 @@
 
 #include "common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class BufferManager;
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::batch_manager
+
+namespace batch_manager
 {
 
 class DecoderInputBuffers;
@@ -50,4 +53,5 @@ public:
         OptionalRef<RuntimeBuffers> genRuntimeBuffers, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

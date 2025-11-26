@@ -16,6 +16,7 @@
  */
 
 #include "moeBindings.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 #include <pybind11/functional.h>
@@ -29,7 +30,8 @@ namespace py = pybind11;
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 
-namespace tensorrt_llm::pybind::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::runtime
 {
 
 void pyDoReplication(tk::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<float>& expertLoadFactor,
@@ -133,4 +135,5 @@ void initMoeBindings(pybind11::module_& m)
         "Do placement");
 }
 
-} // namespace tensorrt_llm::pybind::runtime
+} // namespace pybind::runtime
+TRTLLM_NAMESPACE_END

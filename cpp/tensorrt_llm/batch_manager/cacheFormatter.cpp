@@ -17,12 +17,13 @@
 
 #include "cacheFormatter.h"
 #include "mlaCacheFormatter.h"
-
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -39,7 +40,8 @@
 #include <future>
 #include <numeric>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
@@ -983,4 +985,5 @@ std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
     return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManagers[0]);
 }
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

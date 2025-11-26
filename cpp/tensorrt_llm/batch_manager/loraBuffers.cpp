@@ -16,11 +16,13 @@
  */
 
 #include "loraBuffers.h"
-
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 LoraBuffers::LoraBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::TllmRuntime const& tllmRuntime,
@@ -106,4 +108,5 @@ void LoraBuffers::reshape(SizeType32 numSequences)
     mLoraAdapterSizesHost->reshape(adapterSizesShape);
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

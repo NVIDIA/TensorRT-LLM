@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
-#include "tensorrt_llm/plugins/common/plugin.h"
-#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
+
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+#include "tensorrt_llm/plugins/common/plugin.h"
 #else
 #include "fp4_gemm.h"
 #endif
@@ -29,7 +31,8 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 #if defined(USING_OSS_CUTLASS_FP4_GEMM)
@@ -159,4 +162,5 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

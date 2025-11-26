@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -35,7 +36,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class LoraExpectedException : public std::runtime_error
@@ -455,4 +457,6 @@ std::string to_string(LoraCache::TaskLayerModuleConfig const& v);
 
 std::ostream& operator<<(std::ostream& os, LoraCache::TaskLayerModuleConfig const& v);
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

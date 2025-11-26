@@ -17,10 +17,12 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/timestampUtils.h"
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 std::string getCurrentTimestamp()
@@ -39,4 +41,5 @@ std::string getCurrentTimestamp()
     return stream.str();
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END

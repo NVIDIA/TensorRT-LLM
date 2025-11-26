@@ -18,9 +18,13 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+
+#include "tensorrt_llm/common/config.h"
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::process_group
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::process_group
 {
 void initBindings(nb::module_& m);
-} // namespace tensorrt_llm::nanobind::process_group
+} // namespace nanobind::process_group
+TRTLLM_NAMESPACE_END

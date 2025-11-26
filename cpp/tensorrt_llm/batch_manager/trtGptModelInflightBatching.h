@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -29,7 +30,8 @@
 
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime;
 class GptDecoderBatched;
@@ -48,19 +50,19 @@ class Input;
 class Output;
 } // namespace decoder_batch
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::mpi
+namespace mpi
 {
 class MpiWaitThread;
-} // namespace tensorrt_llm::mpi
+} // namespace mpi
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 class BaseCacheTransceiver;
 }
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 
 namespace kv_cache_manager
@@ -618,4 +620,6 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::UpdateDecoderBuffers const> mUpdateDecoderBuffers;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END
+

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/tensor.h"
 
 #include <NvInferRuntime.h>
@@ -24,7 +25,8 @@
 #include <map>
 #include <optional>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class RawEngine
@@ -120,4 +122,6 @@ private:
     std::optional<std::map<std::string, tensorrt_llm::executor::Tensor>> mManagedWeightsMap;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

@@ -16,6 +16,7 @@
  */
 
 #include "requestWithId.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 
 #include <istream>

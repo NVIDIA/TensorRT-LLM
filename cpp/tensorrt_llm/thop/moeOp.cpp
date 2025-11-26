@@ -23,6 +23,7 @@
 // Always include the public header for moe_gemm_kernels.h
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
@@ -42,6 +43,7 @@
         C10_THROW_ERROR(ErrorType, oss.str());                                                                         \
     } while (0)
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -234,6 +236,7 @@ public:
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+        cuInit(0);
     }
 
     ~FusedMoeRunner()
@@ -1188,13 +1191,14 @@ private:
 };
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY(trtllm, m)
 {
-    m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
+    m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
-        .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
-        .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
-        .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
-        .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
+        .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
+        .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
+        .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
+        .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency);
 }

@@ -14,20 +14,22 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, BufferManager const& manager,
@@ -592,4 +594,5 @@ void EagleBuffers::insertInputTensors(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

@@ -15,6 +15,7 @@
  */
 #include "tllmLogger.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
 using namespace tensorrt_llm::runtime;

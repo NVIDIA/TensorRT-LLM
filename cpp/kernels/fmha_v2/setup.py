@@ -185,8 +185,8 @@ generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
                                     'False').lower() == 'true'
 
 ns_open = r"""
-namespace tensorrt_llm
-{
+\#include "tensorrt_llm/common/config.h"
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 // clang-format off
@@ -195,7 +195,7 @@ namespace kernels
 ns_close = r"""
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 """ if generate_cu_trtllm else ""
 
 copyright = '''\

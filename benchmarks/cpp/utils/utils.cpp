@@ -17,13 +17,15 @@
  */
 
 #include "utils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include <random>
 
 #include <filesystem>
 #include <fstream>
 
-namespace tensorrt_llm::benchmark
+TRTLLM_NAMESPACE_BEGIN
+namespace benchmark
 {
 
 std::vector<std::vector<SizeType32>> parseVectorOfVectors(std::string const& input)
@@ -160,4 +162,6 @@ std::ostream& operator<<(std::ostream& os, RecordBwMetric const& metric)
     return os;
 }
 
-} // namespace tensorrt_llm::benchmark
+} // namespace benchmark
+TRTLLM_NAMESPACE_END
+

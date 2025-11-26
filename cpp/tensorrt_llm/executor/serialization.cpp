@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
 #include "tensorrt_llm/executor/responseImpl.h"
+#include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -31,7 +32,8 @@
 
 namespace su = tensorrt_llm::executor::serialize_utils;
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 // TimePoint
@@ -2500,4 +2502,5 @@ tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deseriali
     return key;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

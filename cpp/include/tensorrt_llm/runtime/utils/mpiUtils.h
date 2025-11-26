@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
@@ -66,13 +67,15 @@ typedef struct MPI_Status
 
 #define MPICHECK(cmd) TLLM_MPI_CHECK(cmd)
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 class IBuffer;
 }
 
 // A wrapper module of the MPI library.
-namespace tensorrt_llm::mpi
+namespace mpi
 {
 
 // A wrapper of MPI data type. MpiType::{data_type}
@@ -492,7 +495,8 @@ private:
     std::atomic<bool> mShouldExit{false};
 };
 
-} // namespace tensorrt_llm::mpi
+} // namespace mpi
+TRTLLM_NAMESPACE_END
 
 #define COMM_SESSION tensorrt_llm::mpi::MpiComm::session()
 #define LOCAL_COMM_SESSION tensorrt_llm::mpi::MpiComm::localSession()

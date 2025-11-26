@@ -15,9 +15,9 @@
  */
 
 #include "../decoderMaskedMultiheadAttentionLaunch.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -36,4 +36,4 @@ INSTANTIATE_MMHA_LAUNCHERS_WITH_ATTN_LOGIT_SOFTCAPPING_SCALE(__nv_bfloat16, kSiz
 } // namespace mmha
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

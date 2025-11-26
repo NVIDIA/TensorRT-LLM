@@ -13,13 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include <list>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace jit
@@ -205,4 +205,4 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

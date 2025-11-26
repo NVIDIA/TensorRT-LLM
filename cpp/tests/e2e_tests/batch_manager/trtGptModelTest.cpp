@@ -19,9 +19,10 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
@@ -51,7 +52,8 @@ auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
 auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 } // namespace
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 class TrtGptModelTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -1267,4 +1269,6 @@ TEST_F(TrtGptModelTest, ClampSeqLenToAttentionWindow)
     EXPECT_EQ(trtGptModel->getMaxSequenceLen(), trtGptModel->getMaxAttentionWindow());
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END
+

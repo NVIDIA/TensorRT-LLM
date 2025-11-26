@@ -16,9 +16,11 @@
  */
 
 #include "inflightBatchingUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
-namespace tensorrt_llm::batch_manager::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::utils
 {
 using ITensor = runtime::ITensor;
 
@@ -396,4 +398,5 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
     }
 }
 
-} // namespace tensorrt_llm::batch_manager::utils
+} // namespace batch_manager::utils
+TRTLLM_NAMESPACE_END

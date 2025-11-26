@@ -16,11 +16,12 @@
  */
 
 #include "logitsThread.h"
-
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
@@ -28,7 +29,8 @@
 
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::batch_manager::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::utils
 {
 
 enum class FastLogitsMpiId : uint64_t
@@ -164,4 +166,5 @@ void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
 #endif // ENABLE_MULTI_DEVICE
 }
 
-} // namespace tensorrt_llm::batch_manager::utils
+} // namespace batch_manager::utils
+TRTLLM_NAMESPACE_END

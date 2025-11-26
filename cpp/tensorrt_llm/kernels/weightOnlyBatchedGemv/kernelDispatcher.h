@@ -16,11 +16,11 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernel.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace weight_only
@@ -171,4 +171,4 @@ void select_gs(Params& params, cudaStream_t s)
         KernelDetails<A, B, Layout, ConverterInterleave, KTile>>(Params & params, cudaStream_t s);
 } // namespace weight_only
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

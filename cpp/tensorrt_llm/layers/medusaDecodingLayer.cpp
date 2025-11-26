@@ -15,6 +15,7 @@
  */
 
 #include "medusaDecodingLayer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
@@ -29,7 +30,8 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::kernels::speculative_decoding;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 template <typename T>
@@ -479,4 +481,5 @@ void MedusaDecodingLayer<T>::packAcceptedPaths(SpeculativeDecodingOutputs const&
 template class MedusaDecodingLayer<float>;
 template class MedusaDecodingLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

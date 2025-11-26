@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
@@ -35,12 +36,13 @@
 #include <vector>
 
 // Forward declare TransferSession in the correct global namespace scope
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class TransferSession;
 }
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+namespace batch_manager::kv_cache_manager
 {
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false);
@@ -136,4 +138,5 @@ private:
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
     std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

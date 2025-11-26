@@ -20,14 +20,17 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 class CudaStream;
 }
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 class DecoderInputBuffers;
 
@@ -50,4 +53,5 @@ public:
         std::optional<LogitsPostProcessorBatched> const& logitsPostProcessorBatched = std::nullopt) const;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

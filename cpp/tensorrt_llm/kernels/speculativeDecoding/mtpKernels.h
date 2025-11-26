@@ -19,13 +19,13 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 // namespace tensorrt_llm::kernels
 namespace kernels
 {
@@ -114,5 +114,4 @@ template <typename T>
 void invokeMTPRelaxedAcceptance(MTPRelaxedAcceptanceParam& params, cudaStream_t const stream = 0);
 
 } // namespace kernels
-
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

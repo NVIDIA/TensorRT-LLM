@@ -22,10 +22,12 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.h"
+#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 struct DummyFusedOperator
@@ -838,4 +840,5 @@ __global__ void __launch_bounds__(TARGET_THREADS, 1) warpSpecializedInvoker(type
     T::run(param);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

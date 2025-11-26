@@ -15,13 +15,17 @@
  */
 
 #pragma once
+
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <vector>
 
 // non-persistent-cooperative GEMM
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::fp8_blockscale_gemm
 {
 
 class CutlassFp8BlockScaleGemmRunnerInterface
@@ -146,4 +150,5 @@ private:
     int64_t expected_m_ = 0;
 };
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+} // namespace kernels::fp8_blockscale_gemm
+TRTLLM_NAMESPACE_END

@@ -25,13 +25,15 @@
 #include <cuda_runtime.h>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 // Using a local lambda in beam search layers to fill buffers causes an internal compiler error on nvcc windows.
@@ -180,4 +182,5 @@ size_t expandMatchElements(size_t expandSize, std::vector<T>&... vector)
     return expandSize;
 }
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

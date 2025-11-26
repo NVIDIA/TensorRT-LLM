@@ -21,6 +21,7 @@
 #include "cuda.h"
 #include "cuda_bf16.h"
 #include "cuda_runtime.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3FusedAGemm.h"
 
@@ -29,7 +30,8 @@ using bf16_t = __nv_bfloat16;
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::dsv3MinLatencyKernels
 {
 
 __device__ void hmma_16_8_16_f32acc_bf16ab(
@@ -681,4 +683,5 @@ template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
-} // namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+} // namespace kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_END

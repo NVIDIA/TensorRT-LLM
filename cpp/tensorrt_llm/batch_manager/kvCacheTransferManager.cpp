@@ -16,11 +16,12 @@
  */
 
 #include <cstdint>
+#include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
+
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
-
-#include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
-#include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
@@ -32,7 +33,8 @@ namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 static bool gpuToFilePosix(tr::ITensor::SharedPtr const& srcPtr, std::string const& filename)
@@ -250,4 +252,5 @@ void KVCacheTransferManager::syncTransfers()
     mPendingOffloads.clear();
 }
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

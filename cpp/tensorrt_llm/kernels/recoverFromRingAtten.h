@@ -16,13 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -31,4 +31,4 @@ void invokeRecoverFromRA(Tout* accu_output, float* accu_softmax_stats, Tout* out
     int h, int d, int* cu_seqlens, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

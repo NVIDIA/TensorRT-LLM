@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -38,7 +39,8 @@ namespace nvinfer1
 class IExecutionContext;
 }
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class ITensor : virtual public IBuffer
@@ -489,4 +491,6 @@ T const* bufferCastOrNull(std::optional<ITensor::SharedConstPtr> const& optional
     return bufferCastOrNull<T>(static_cast<std::optional<IBuffer::SharedConstPtr>>(optionalTensorPtr));
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

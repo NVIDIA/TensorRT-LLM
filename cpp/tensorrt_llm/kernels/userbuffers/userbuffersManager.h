@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <memory>
 #include <mutex>
 #include <vector>
 
-namespace tensorrt_llm::runtime::ub
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::ub
 {
 
 class UserBufferDeleter
@@ -79,4 +81,5 @@ private:
 void initialize_userbuffers_manager(int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank,
     int64_t gpus_per_node, int64_t buffer_size, bool use_nccl_symmetric);
 
-} // namespace tensorrt_llm::runtime::ub
+} // namespace runtime::ub
+TRTLLM_NAMESPACE_END

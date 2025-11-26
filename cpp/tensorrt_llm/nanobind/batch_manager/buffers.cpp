@@ -16,8 +16,9 @@
  */
 
 #include "buffers.h"
-
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -33,7 +34,8 @@ namespace tr = tensorrt_llm::runtime;
 
 using tr::SizeType32;
 
-namespace tensorrt_llm::nanobind::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::batch_manager
 {
 
 void Buffers::initBindings(nb::module_& m)
@@ -71,4 +73,5 @@ void Buffers::initBindings(nb::module_& m)
         .def_rw("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_rw("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
 }
-} // namespace tensorrt_llm::nanobind::batch_manager
+} // namespace nanobind::batch_manager
+TRTLLM_NAMESPACE_END

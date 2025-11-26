@@ -35,6 +35,7 @@
 
 #include "cutlass_extensions/epilogue/fusion/sm90_visitor_scatter.hpp"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -55,8 +56,7 @@
 #include <math.h>
 #include <sstream>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -709,4 +709,4 @@ using namespace cutlass::epilogue;
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

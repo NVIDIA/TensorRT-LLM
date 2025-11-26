@@ -16,13 +16,14 @@
 
 #include <numeric>
 #include <unordered_set>
-
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -38,7 +39,8 @@
 // in the future, we trigger a compilation error here if SizeType32 isn't int32_t.
 static_assert(std::is_same<tensorrt_llm::runtime::SizeType32, std::int32_t>::value);
 
-namespace tensorrt_llm::mpi
+TRTLLM_NAMESPACE_BEGIN
+namespace mpi
 {
 
 MPI_Datatype getMpiDtype(MpiType dtype)
@@ -654,4 +656,5 @@ void MpiWaitThread::notifyStop()
     TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
-} // namespace tensorrt_llm::mpi
+} // namespace mpi
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/arrayView.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
@@ -40,7 +41,8 @@
 #include <typeinfo>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 enum class MemoryType : std::int32_t
@@ -697,4 +699,6 @@ public:
 //! \brief Utility function to print a buffer.
 std::ostream& operator<<(std::ostream& output, IBuffer const& buffer);
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

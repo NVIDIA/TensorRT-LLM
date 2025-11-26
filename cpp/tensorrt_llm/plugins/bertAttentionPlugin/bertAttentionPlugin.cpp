@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "bertAttentionPlugin.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/recoverFromRingAtten.h"
 #include "tensorrt_llm/kernels/sageAttentionKernels.h"

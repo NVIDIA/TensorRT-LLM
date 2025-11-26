@@ -17,13 +17,17 @@
 
 #pragma once
 #include <nanobind/nanobind.h>
+
+#include "tensorrt_llm/common/config.h"
 namespace nb = nanobind;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class CacheTransceiverBindings
 {
 public:
     static void initBindings(nb::module_& m);
 };
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

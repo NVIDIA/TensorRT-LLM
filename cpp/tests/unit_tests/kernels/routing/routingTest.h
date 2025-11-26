@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -29,7 +30,8 @@
 #include <memory> //@todo check the usage of this
 #include <random> //@todo check the usage of this
 
-namespace tensorrt_llm::tests::kernels::routing
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::kernels::routing
 {
 
 typedef testing::Types<float, __nv_bfloat16> FloatAndBf16Types;
@@ -521,4 +523,6 @@ protected:
     TensorPtr mPtrNumNonExitingCtasDevice;
 };
 
-} // namespace tensorrt_llm::tests::kernels::routing
+} // namespace tests::kernels::routing
+TRTLLM_NAMESPACE_END
+

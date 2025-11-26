@@ -19,6 +19,7 @@
 #include "executor.h"
 #include "executorConfig.h"
 #include "request.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -34,7 +35,8 @@ namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
 using SizeType32 = tle::SizeType32;
 
-namespace tensorrt_llm::nanobind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::executor
 {
 
 template <typename T>
@@ -261,4 +263,5 @@ void initBindings(nb::module_& m)
     tensorrt_llm::nanobind::executor::Executor::initBindings(m);
 }
 
-} // namespace tensorrt_llm::nanobind::executor
+} // namespace nanobind::executor
+TRTLLM_NAMESPACE_END

@@ -15,9 +15,11 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/userbuffers/userbuffersManager.h"
 #include <torch/extension.h>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -25,3 +27,4 @@ std::pair<torch::Tensor, tensorrt_llm::runtime::ub::UBBuffer> create_userbuffers
     at::IntArrayRef shape, torch::ScalarType dtype);
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END

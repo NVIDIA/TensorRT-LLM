@@ -29,6 +29,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
@@ -41,8 +42,7 @@
 using namespace cute;
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace cutlass_kernels
@@ -291,4 +291,4 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

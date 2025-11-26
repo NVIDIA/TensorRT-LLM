@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
@@ -22,7 +23,8 @@
 #include <optional>
 #include <utility>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 // Constructor for ExternalDraftTokensConfig
@@ -304,4 +306,5 @@ void DecodingConfig::setEagleConfig(EagleConfig const& eagleConfig)
     mDecodingMode = DecodingMode::Eagle();
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

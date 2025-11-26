@@ -16,11 +16,12 @@
  */
 
 #include "dataTransceiver.h"
-
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -34,7 +35,8 @@
 #include <memory>
 #include <unordered_map>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 using BlockRange = tensorrt_llm::batch_manager::kv_cache_manager::BlockRange;
@@ -1212,4 +1214,5 @@ bool CacheReceiver::receiveReadySignal(TransferSession& session)
     return mImpl->receiveReadySignal(session);
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

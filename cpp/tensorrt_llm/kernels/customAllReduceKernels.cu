@@ -15,6 +15,7 @@
  */
 
 #include "customAllReduceKernels.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,7 +27,8 @@
 #include <tuple>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 using tensorrt_llm::common::divUp;
@@ -2014,4 +2016,5 @@ void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, c
     sync_check_cuda_error(stream);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

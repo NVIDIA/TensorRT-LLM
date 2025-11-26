@@ -22,6 +22,7 @@
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/gemm/device/gemm_universal_base_compat.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
@@ -44,8 +45,7 @@
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace cutlass_kernels
@@ -584,4 +584,4 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -16,11 +16,13 @@
  */
 
 #include "modelSpec.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
 
 #include <numeric>
 
-namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace testing
 {
 
 std::string ModelSpec::getQuantMethodString() const
@@ -300,4 +302,6 @@ std::string ModelSpec::getDtypeString() const
     return tensorrt_llm::common::getDtypeString(mDataType);
 }
 
-} // namespace tensorrt_llm::testing
+} // namespace testing
+TRTLLM_NAMESPACE_END
+

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -46,12 +47,14 @@
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
-namespace tensorrt_llm::batch_manager::eviction_policy
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::eviction_policy
 {
 class BaseEvictionPolicy;
-} // namespace tensorrt_llm::batch_manager::eviction_policy
+} // namespace batch_manager::eviction_policy
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+
+namespace batch_manager::kv_cache_manager
 {
 
 static constexpr SizeType32 kPrimaryLevel = 0;
@@ -2030,4 +2033,5 @@ private:
     std::size_t mAllocatedBytes{0};
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

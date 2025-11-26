@@ -21,11 +21,11 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 #include <float.h>
+#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -867,4 +867,4 @@ quantize_with_block_size(
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

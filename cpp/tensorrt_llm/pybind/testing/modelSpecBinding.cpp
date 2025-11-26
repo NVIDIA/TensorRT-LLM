@@ -16,6 +16,7 @@
  */
 
 #include "modelSpecBinding.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/testing/modelSpec.h"
 
 #include <pybind11/pybind11.h>
@@ -27,7 +28,8 @@ using tensorrt_llm::testing::KVCacheType;
 using tensorrt_llm::testing::QuantMethod;
 using tensorrt_llm::testing::OutputContentType;
 
-namespace tensorrt_llm::pybind::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::testing
 {
 
 void initBindings(py::module_& m)
@@ -82,4 +84,5 @@ void initBindings(py::module_& m)
         .def("__copy__", [](ModelSpec const& self) { return ModelSpec(self); });
 }
 
-} // namespace tensorrt_llm::pybind::testing
+} // namespace pybind::testing
+TRTLLM_NAMESPACE_END

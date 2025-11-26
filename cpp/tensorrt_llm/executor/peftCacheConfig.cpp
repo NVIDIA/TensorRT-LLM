@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 PeftCacheConfig::PeftCacheConfig(SizeType32 numHostModuleLayer, SizeType32 numDeviceModuleLayer,
     SizeType32 optimalAdapterSize, SizeType32 maxAdapterSize, SizeType32 numPutWorkers, SizeType32 numEnsureWorkers,
@@ -109,4 +111,5 @@ std::optional<std::string> PeftCacheConfig::getLoraPrefetchDir() const
     return mLoraPrefetchDir;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

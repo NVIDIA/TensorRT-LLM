@@ -17,6 +17,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -31,7 +32,8 @@
 #include <optional>
 #include <stdexcept>
 
-namespace tensorrt_llm::runtime::lora
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::lora
 {
 using TensorPtr = ITensor::SharedPtr;
 
@@ -120,4 +122,6 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
         testing::Throws<std::runtime_error>());
 }
 
-} // namespace tensorrt_llm::runtime::lora
+} // namespace runtime::lora
+TRTLLM_NAMESPACE_END
+

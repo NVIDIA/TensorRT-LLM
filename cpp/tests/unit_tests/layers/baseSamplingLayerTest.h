@@ -19,26 +19,28 @@
 
 #include <memory>
 
-#include "tensorrt_llm/layers/beamSearchLayer.h"
-#include "tensorrt_llm/layers/externalDraftTokensLayer.h"
-#include "tensorrt_llm/layers/samplingLayer.h"
-#include "tensorrt_llm/layers/topKSamplingLayer.h"
-#include "tensorrt_llm/layers/topPSamplingLayer.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
-
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
+#include "tensorrt_llm/layers/beamSearchLayer.h"
+#include "tensorrt_llm/layers/externalDraftTokensLayer.h"
+
+#include "tensorrt_llm/layers/samplingLayer.h"
+#include "tensorrt_llm/layers/topKSamplingLayer.h"
+#include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include "tensorrt_llm/common/tllmException.h"
-
-namespace tensorrt_llm::tests::layers::sampling
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers::sampling
 {
 
 constexpr float EPSILON = 1e-20f;
@@ -189,4 +191,6 @@ public:
 
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
-} // namespace tensorrt_llm::tests::layers::sampling
+} // namespace tests::layers::sampling
+TRTLLM_NAMESPACE_END
+

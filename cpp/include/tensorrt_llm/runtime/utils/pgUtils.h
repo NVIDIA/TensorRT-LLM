@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
 
@@ -75,7 +76,8 @@ inline bool useMPI()
     return useMPI;
 }
 
-namespace tensorrt_llm::pg_utils
+TRTLLM_NAMESPACE_BEGIN
+namespace pg_utils
 {
 
 // ProcessGroup management functions
@@ -281,4 +283,6 @@ struct PgHelper
     }
 };
 
-} // namespace tensorrt_llm::pg_utils
+} // namespace pg_utils
+TRTLLM_NAMESPACE_END
+

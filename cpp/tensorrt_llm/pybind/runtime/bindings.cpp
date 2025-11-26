@@ -19,6 +19,7 @@
 #include "hostfunc.h"
 #include "moeBindings.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -196,7 +197,8 @@ public:
     }
 };
 
-namespace tensorrt_llm::pybind::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::runtime
 {
 
 void initBindings(pybind11::module_& m)
@@ -507,4 +509,5 @@ void initBindingsEarly(py::module_& m)
         .def_property_readonly("has_draft_logits", &tr::SpeculativeDecodingMode::hasDraftLogits)
         .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
-} // namespace tensorrt_llm::pybind::runtime
+} // namespace pybind::runtime
+TRTLLM_NAMESPACE_END

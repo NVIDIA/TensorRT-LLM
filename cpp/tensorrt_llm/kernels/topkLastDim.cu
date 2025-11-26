@@ -21,6 +21,7 @@
  * Another variant can be found in TopP sampling: cpp/tensorrt_llm/kernels/samplingAirTopPKernels.cu .
  */
 #include <cuda_runtime_api.h>
+#include "tensorrt_llm/common/config.h"
 
 #include "moeTopKFuncs.cuh"
 #include "topkLastDim.h"
@@ -34,8 +35,7 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -1696,4 +1696,4 @@ INSTANTIATE_TOPK_LastDim_DATA_TYPE(__nv_bfloat16);
 #undef INSTANTIATE_TOPK_LastDim_DATA_TYPE
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

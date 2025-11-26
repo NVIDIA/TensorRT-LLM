@@ -13,12 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 __global__ void delayStreamKernel(long long delay_micro_secs)
 {
@@ -34,4 +36,5 @@ void invokeDelayStreamKernel(long long delay_micro_secs, cudaStream_t stream)
     delayStreamKernel<<<1, 1, 0, stream>>>(delay_micro_secs);
     check_cuda_error(cudaGetLastError());
 }
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

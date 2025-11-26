@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/attentionOp.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -26,12 +27,13 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 class DecoderXQARunnerResource;
 }
 
-namespace tensorrt_llm::plugins
+namespace plugins
 {
 
 class GPTAttentionPluginCommon : public BasePlugin, public tensorrt_llm::common::op::AttentionOp
@@ -109,4 +111,5 @@ protected:
     nvinfer1::PluginFieldCollection mFC{};
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+TRTLLM_NAMESPACE_END

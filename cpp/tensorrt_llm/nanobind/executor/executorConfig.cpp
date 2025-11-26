@@ -16,6 +16,7 @@
  */
 
 #include "executorConfig.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -41,7 +42,8 @@ namespace tle = tensorrt_llm::executor;
 using SizeType32 = tle::SizeType32;
 using RuntimeDefaults = tensorrt_llm::runtime::RuntimeDefaults;
 
-namespace tensorrt_llm::nanobind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::executor
 {
 
 void initConfigBindings(nb::module_& m)
@@ -657,4 +659,5 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", executorConfigSetState);
 }
 
-} // namespace tensorrt_llm::nanobind::executor
+} // namespace nanobind::executor
+TRTLLM_NAMESPACE_END

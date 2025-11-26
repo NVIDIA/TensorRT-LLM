@@ -18,9 +18,11 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/config.h"
 #include <deque>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 /// @brief Inserts a request into a request list sorted by priority / arrival time
@@ -30,4 +32,5 @@ void insertRequestInOrder(tensorrt_llm::batch_manager::RequestList& reqList,
 /// @brief Inserts a requestWithId into a request deque sorted by priority / arrival time
 void insertRequestInOrder(std::deque<RequestWithId>& reqWithIdDeque, RequestWithId&& reqWithId);
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

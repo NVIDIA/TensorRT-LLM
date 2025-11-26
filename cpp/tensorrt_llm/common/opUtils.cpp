@@ -28,6 +28,7 @@
 #include <mutex>
 #include <thread>
 
+TRTLLM_NAMESPACE_BEGIN
 #if ENABLE_MULTI_DEVICE
 
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
@@ -273,3 +274,5 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         });
     return creator();
 }
+TRTLLM_NAMESPACE_END
+

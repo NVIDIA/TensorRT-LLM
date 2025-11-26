@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 MpiConnection::MpiConnection(mpi::MpiComm const* comm, int rank)
@@ -77,4 +79,5 @@ CommState const& MpiConnectionManager::getCommState() const
     return mCommState;
 }
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

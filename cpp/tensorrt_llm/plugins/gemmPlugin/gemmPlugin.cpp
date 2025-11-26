@@ -20,6 +20,7 @@
 #include "gemmPluginProfiler.h"
 #include "plugin.h"
 #include "pluginUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemm.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 

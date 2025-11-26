@@ -15,15 +15,17 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <string>
 
-namespace tensorrt_llm::runtime::lora
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::lora
 {
 
 LoraModuleConfig::LoraModuleConfig(LoraModuleConfig::TensorPtr loraConfigTensor)
@@ -113,4 +115,5 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
         }
     }
 }
-} // namespace tensorrt_llm::runtime::lora
+} // namespace runtime::lora
+TRTLLM_NAMESPACE_END

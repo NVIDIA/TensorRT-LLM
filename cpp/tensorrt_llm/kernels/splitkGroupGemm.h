@@ -18,8 +18,10 @@
 #include "cutlass/gemm_coord.h"
 #include <NvInferRuntime.h>
 #include <vector>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 int64_t getSplitkGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
@@ -29,4 +31,5 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problem_size
     void* gemmParamsWorkspace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
     bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

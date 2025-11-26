@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -35,7 +36,8 @@
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::mpi;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -612,4 +614,5 @@ bool TrtEncoderModel::getReplicateLogitsPostProcessor() const
 
 TrtEncoderModel::~TrtEncoderModel() = default;
 
-} //  namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cooperative_groups.h>
 #include <cub/cub.cuh>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -24,8 +25,7 @@
 
 namespace cg = cooperative_groups;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -665,4 +665,4 @@ void moeSetSignalForGpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, int64_
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

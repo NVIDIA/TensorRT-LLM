@@ -15,9 +15,11 @@
  *
  * Common utils to be shared between Precompiled and JIT implementation.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 uint32_t getKernelMTileSize(
@@ -59,4 +61,5 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
         isXqaJit ? std::optional(xqaParams.position_embedding_type) : std::nullopt};
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

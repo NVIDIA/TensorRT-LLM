@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 template class MoeGemmRunner<half, __nv_fp4_e2m1, half>;
 }
+TRTLLM_NAMESPACE_END

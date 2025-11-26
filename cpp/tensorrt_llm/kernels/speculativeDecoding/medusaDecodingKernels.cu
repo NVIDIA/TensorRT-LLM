@@ -15,10 +15,12 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+
 #include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
@@ -31,7 +33,8 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::speculative_decoding
 {
 namespace
 {
@@ -62,4 +65,5 @@ void scatterMedusaDraftTokens(TokenIdType* treeDraftIds, TokenIdType const* sour
     scatterMedusaDraftTokens<<<batchSize, BLOCK_SIZE, 0, stream>>>(
         treeDraftIds, sourceDraftIds, treeIds, tokensPerStep, batchSlots, maxDecodingTokens);
 }
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+TRTLLM_NAMESPACE_END

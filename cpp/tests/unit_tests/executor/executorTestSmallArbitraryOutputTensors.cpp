@@ -1,5 +1,6 @@
 #include "include/tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -27,7 +28,8 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_BEGIN
+namespace testing
 {
 
 struct TrivialConstantDecoderWithTopKLogitsTestParameters
@@ -488,4 +490,6 @@ TEST_P(DecoderTopKContextLogitsFloatTest, TestSizeAndValues)
 
 INSTANTIATE_TEST_SUITE_P(Float, DecoderTopKContextLogitsFloatTest, paramGeneratorGatherContext, nameSuffixGenerator);
 
-} // namespace tensorrt_llm::testing
+} // namespace testing
+TRTLLM_NAMESPACE_END
+

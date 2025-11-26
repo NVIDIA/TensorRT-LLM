@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "smoothQuantGemmPlugin.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/int8SQ.h"
 #include <numeric>
 

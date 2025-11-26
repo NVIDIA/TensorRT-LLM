@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
@@ -24,7 +25,8 @@
 
 namespace su = tensorrt_llm::executor::serialize_utils;
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 ContextPhaseParams::ContextPhaseParams(
@@ -143,4 +145,5 @@ bool ContextPhaseParams::operator==(ContextPhaseParams const& other) const noexc
         == *static_cast<DataTransceiverState const*>(other.mState.get());
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

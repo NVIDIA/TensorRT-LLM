@@ -17,6 +17,7 @@
 
 #include "request.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
@@ -44,7 +45,8 @@ using VecTokens = tle::VecTokens;
 using IdType = tle::IdType;
 using VecTokenExtraIds = tle::VecTokenExtraIds;
 
-namespace tensorrt_llm::pybind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::executor
 {
 
 void initRequestBindings(pybind11::module_& m)
@@ -904,4 +906,5 @@ void initRequestBindings(pybind11::module_& m)
         .def(py::pickle(responseGetstate, responseSetstate));
 }
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace pybind::executor
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -35,8 +36,7 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace cuda_core_gemm_nvfp4
@@ -78,4 +78,4 @@ struct Params
 bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream);
 } // namespace cuda_core_gemm_nvfp4
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

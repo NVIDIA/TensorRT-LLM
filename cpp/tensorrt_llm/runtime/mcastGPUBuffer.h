@@ -15,10 +15,12 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 //! \brief Wrapper class for McastDeviceMemory to facilitate PyTorch tensor creation.
@@ -95,4 +97,5 @@ private:
     at::Device mLocalDevice; //!< The local CUDA device.
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

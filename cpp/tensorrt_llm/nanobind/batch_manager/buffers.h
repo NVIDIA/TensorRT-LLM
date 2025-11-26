@@ -18,13 +18,17 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+
+#include "tensorrt_llm/common/config.h"
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::batch_manager
 {
 class Buffers
 {
 public:
     static void initBindings(nb::module_& m);
 };
-} // namespace tensorrt_llm::nanobind::batch_manager
+} // namespace nanobind::batch_manager
+TRTLLM_NAMESPACE_END

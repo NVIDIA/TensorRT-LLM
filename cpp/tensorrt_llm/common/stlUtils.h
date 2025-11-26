@@ -20,8 +20,10 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::common::stl_utils
+TRTLLM_NAMESPACE_BEGIN
+namespace common::stl_utils
 {
 
 template <typename TInputIt, typename TOutputIt, typename TBinOp>
@@ -120,4 +122,5 @@ std::string toString(std::optional<T> const& t, typename std::enable_if_t<HasOpe
     return oss.str();
 }
 
-} // namespace tensorrt_llm::common::stl_utils
+} // namespace common::stl_utils
+TRTLLM_NAMESPACE_END

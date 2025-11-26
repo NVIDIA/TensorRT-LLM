@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
@@ -28,7 +29,8 @@
 
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 void LoraManager::create(ModelConfig const& modelConfig)
@@ -156,4 +158,5 @@ void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsP
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

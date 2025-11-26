@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
@@ -31,7 +32,8 @@
 #include <string>
 #include <unordered_map>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 using namespace tensorrt_llm::common::op;
@@ -107,8 +109,8 @@ protected:
     std::string mNamespace{api::kDefaultNamespace};
 };
 
-} // namespace tensorrt_llm::plugins
-
+} // namespace plugins
+TRTLLM_NAMESPACE_END
 // Init with O(n) and retrieve with O(1)
 class PluginFieldParser
 {

@@ -16,17 +16,20 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <pybind11/pybind11.h>
 
 namespace py = pybind11;
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::pybind::common
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::common
 {
 
 /// @brief Bind RequestSpecificException and related types to Python
 /// @param m The pybind11 module to bind to
 void initExceptionsBindings(py::module_& m);
 
-} // namespace tensorrt_llm::pybind::common
+} // namespace pybind::common
+TRTLLM_NAMESPACE_END

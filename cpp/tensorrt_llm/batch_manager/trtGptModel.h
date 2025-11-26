@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/model.h"
@@ -30,7 +31,8 @@
 
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 enum class TrtGptModelType
 {
@@ -348,4 +350,5 @@ private:
     bool mCudaGraphMode;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

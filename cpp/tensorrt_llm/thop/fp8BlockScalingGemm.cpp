@@ -16,6 +16,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -26,6 +27,7 @@
 using namespace tensorrt_llm::kernels::fp8_blockscale_gemm;
 using namespace tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -381,6 +383,7 @@ torch::Tensor fp8_block_scaling_bmm(torch::Tensor const& mat1, torch::Tensor con
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -398,8 +401,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_block_scaling_gemm", &torch_ext::fp8_block_scaling_gemm);
-    m.impl("fp8_block_scaling_bmm", &torch_ext::fp8_block_scaling_bmm);
-    m.impl("fp8_block_scaling_bmm_out", &torch_ext::fp8_block_scaling_bmm_out);
-    m.impl("fp8_block_scaling_moe_gemm", &torch_ext::fp8_block_scaling_moe_gemm);
+    m.impl("fp8_block_scaling_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm);
+    m.impl("fp8_block_scaling_bmm", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm);
+    m.impl("fp8_block_scaling_bmm_out", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm_out);
+    m.impl("fp8_block_scaling_moe_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_moe_gemm);
 }

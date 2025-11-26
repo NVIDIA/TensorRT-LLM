@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
-#include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include <cstdint>
 #include <limits>
 #include <sstream>
+
+#include "tensorrt_llm/batch_manager/contextProgress.h"
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
 #if defined(_WIN32)
 #include <windows.h>
@@ -33,19 +35,19 @@
 #define dllGetSym(handle, name) dlsym(handle, name)
 #endif // defined(_WIN32)
 
-#include "tensorrt_llm/batch_manager/cacheFormatter.h"
-#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
-#include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
@@ -53,7 +55,8 @@
 #include <numeric>
 #include <unordered_set>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 std::mutex CacheTransceiver::mDllMutex;
@@ -695,4 +698,5 @@ bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
     return false;
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

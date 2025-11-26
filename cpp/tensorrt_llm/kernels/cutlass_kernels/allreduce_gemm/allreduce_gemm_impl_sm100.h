@@ -29,12 +29,14 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels::opened_cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::opened_cutlass_kernels
 {
 //////////////////////////////////////////////
 // Sm100 Two-shot fusion
@@ -374,4 +376,5 @@ private:
     cutlass::KernelHardwareInfo _hw_info;
 };
 
-} // namespace tensorrt_llm::kernels::opened_cutlass_kernels
+} // namespace kernels::opened_cutlass_kernels
+TRTLLM_NAMESPACE_END

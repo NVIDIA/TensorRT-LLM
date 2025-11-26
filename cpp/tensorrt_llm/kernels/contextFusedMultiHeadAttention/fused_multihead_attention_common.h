@@ -16,16 +16,15 @@
 
 #pragma once
 
-#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tmaDescriptor.h"
 #include <limits.h>
 #include <stdint.h>
-
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -518,4 +517,4 @@ struct Launch_params
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

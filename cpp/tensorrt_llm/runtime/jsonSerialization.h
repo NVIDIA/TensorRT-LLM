@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/jsonSerializeOptional.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
 #include <nlohmann/json.hpp>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 // RuntimeDefaults
@@ -39,4 +41,5 @@ void from_json(nlohmann::json const& json, RuntimeDefaults& runtimeDefaults)
 
 // End RuntimeDefaults
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

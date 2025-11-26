@@ -19,17 +19,20 @@
 
 #include "common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
-namespace tensorrt_llm::runtime::decoder
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::decoder
 {
 class DecoderState;
-} // namespace tensorrt_llm::runtime::decoder
+} // namespace runtime::decoder
 
-namespace tensorrt_llm::batch_manager
+
+namespace batch_manager
 {
 class DecoderInputBuffers;
 class RuntimeBuffers;
@@ -53,4 +56,5 @@ public:
         runtime::decoder::DecoderState const& decoderState);
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

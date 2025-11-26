@@ -18,13 +18,13 @@
 
 #include "gdrwrap.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace runtime
 {
 namespace gdrcopy
@@ -264,6 +264,5 @@ void gdrCudaFree(GdrMemDesc* memDesc, gdr_t handle)
 
 } // namespace gdrcopy
 } // namespace runtime
-} // namespace tensorrt_llm
-
+TRTLLM_NAMESPACE_END
 #endif // _WIN32

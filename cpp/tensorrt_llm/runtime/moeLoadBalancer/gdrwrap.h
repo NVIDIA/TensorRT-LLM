@@ -17,9 +17,8 @@
 #pragma once
 
 #ifdef _WIN32
-
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cstdlib>
 
@@ -37,8 +36,7 @@ struct gdr_info
 };
 typedef struct gdr_info gdr_info_t;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace runtime
 {
 namespace gdrcopy
@@ -140,17 +138,16 @@ inline void gdrCudaFree(GdrMemDesc* /*memDesc*/, gdr_t /*handle*/)
 
 } // namespace gdrcopy
 } // namespace runtime
-} // namespace tensorrt_llm
-
+TRTLLM_NAMESPACE_END
 #else // NOT _WIN32
 
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 
 // These definitions are from gdrapi.h to avoid a direct dependency on the header.
 #define GPU_PAGE_SHIFT 16
@@ -178,8 +175,7 @@ struct gdr_info
 };
 typedef struct gdr_info gdr_info_t;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace runtime
 {
 namespace gdrcopy
@@ -261,6 +257,5 @@ void gdrCudaFree(GdrMemDesc* memDesc, gdr_t handle);
 
 } // namespace gdrcopy
 } // namespace runtime
-} // namespace tensorrt_llm
-
+TRTLLM_NAMESPACE_END
 #endif // _WIN32

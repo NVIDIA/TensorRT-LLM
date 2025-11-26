@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -41,7 +42,8 @@ namespace tc = tensorrt_llm::common;
 namespace te = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 using SizeType32 = CreateNewDecoderRequests::SizeType32;
@@ -749,4 +751,5 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     return {std::move(lookaheadPrompt), std::move(lookaheadAlgoConfigs)};
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

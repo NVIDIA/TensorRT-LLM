@@ -17,9 +17,9 @@
 
 #include "cutlass/gemm_coord.h"
 #include <NvInferRuntime.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -31,5 +31,4 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
     bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream);
 
 } // namespace kernels
-
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

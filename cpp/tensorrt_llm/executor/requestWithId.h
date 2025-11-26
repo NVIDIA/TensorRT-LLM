@@ -17,12 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
 #include <vector>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 class RequestWithId
@@ -37,4 +39,5 @@ public:
     static std::vector<RequestWithId> deserializeReqWithIds(std::vector<char>& buffer);
 };
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

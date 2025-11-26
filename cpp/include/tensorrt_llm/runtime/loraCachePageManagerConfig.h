@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -26,7 +27,8 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 /**
  * Configuration for LoraCachePageManager
@@ -167,4 +169,6 @@ inline std::string to_string(LoraCachePageManagerConfig const& c)
     sstream << c;
     return sstream.str();
 }
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

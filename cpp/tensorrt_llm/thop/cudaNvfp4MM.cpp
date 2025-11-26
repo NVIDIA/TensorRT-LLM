@@ -24,6 +24,7 @@
 
 using torch::Tensor;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
@@ -130,6 +131,7 @@ Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor con
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -140,5 +142,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("cuda_core_nvfp4_gemm", &torch_ext::cuda_core_nvfp4_gemm);
+    m.impl("cuda_core_nvfp4_gemm", &tensorrt_llm::torch_ext::cuda_core_nvfp4_gemm);
 }

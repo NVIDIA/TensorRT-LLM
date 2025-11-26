@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/utils/numpyUtils.h"
-
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include <NvInferRuntime.h>
 
 #include <sstream>
@@ -31,7 +32,8 @@
 
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::runtime::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::utils
 {
 
 std::string getNumpyTypeDesc(nvinfer1::DataType type)
@@ -262,4 +264,5 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
     fclose(f_ptr);
 }
 
-} // namespace tensorrt_llm::runtime::utils
+} // namespace runtime::utils
+TRTLLM_NAMESPACE_END

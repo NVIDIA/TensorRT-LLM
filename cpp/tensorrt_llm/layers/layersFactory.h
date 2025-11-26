@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/banWordsLayer.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingLayer.h"
@@ -24,7 +25,8 @@
 #include <memory>
 #include <vector>
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 enum DecodingLayers_t
 {
@@ -92,4 +94,5 @@ static std::vector<std::unique_ptr<BaseLayer>> createLayers(executor::DecodingMo
     }
     return layers;
 }
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

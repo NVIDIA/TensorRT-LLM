@@ -21,10 +21,12 @@
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
+#include "tensorrt_llm/common/config.h"
 
 namespace py = pybind11;
 
-namespace tensorrt_llm::pybind::thop
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::thop
 {
 
 void initBindings(pybind11::module_& m)
@@ -71,4 +73,5 @@ void initBindings(pybind11::module_& m)
         py::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
         py::call_guard<py::gil_scoped_release>());
 }
-} // namespace tensorrt_llm::pybind::thop
+} // namespace pybind::thop
+TRTLLM_NAMESPACE_END

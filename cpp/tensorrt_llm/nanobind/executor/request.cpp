@@ -17,6 +17,7 @@
 
 #include "request.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
@@ -48,7 +49,8 @@ using VecTokens = tle::VecTokens;
 using IdType = tle::IdType;
 using VecTokenExtraIds = tle::VecTokenExtraIds;
 
-namespace tensorrt_llm::nanobind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::executor
 {
 
 void initRequestBindings(nb::module_& m)
@@ -965,4 +967,5 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", responseSetstate);
 }
 
-} // namespace tensorrt_llm::nanobind::executor
+} // namespace nanobind::executor
+TRTLLM_NAMESPACE_END

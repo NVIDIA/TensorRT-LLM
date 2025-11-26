@@ -16,11 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class LoraModule
@@ -291,4 +293,6 @@ inline std::ostream& operator<<(std::ostream& output, LoraModule const& module)
                   << "inTpSplitDim=" << module.inTpSplitDim() << ", "
                   << "outTpSplitDim=" << module.outTpSplitDim() << ")";
 }
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+

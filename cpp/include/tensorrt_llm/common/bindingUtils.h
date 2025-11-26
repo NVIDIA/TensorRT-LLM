@@ -16,10 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "c10/util/intrusive_ptr.h"
+
 #include <Python.h>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+namespace common
 {
 
 // Adapted from pybind11's example implementation:
@@ -69,4 +72,5 @@ c10::intrusive_ptr<T> get_intrusive_ptr(PyObject* py_obj, std::string pybind11_a
     return c10::intrusive_ptr<T>::reclaim_copy(p);
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+TRTLLM_NAMESPACE_END

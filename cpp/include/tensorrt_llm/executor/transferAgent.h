@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
@@ -28,7 +29,8 @@
 #include <unordered_map>
 #include <vector>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+namespace executor::kv_cache
 {
 
 enum class MemoryType : uint8_t
@@ -408,4 +410,5 @@ template <typename... Args>
     TLLM_THROW("Unknown backend name.");
 }
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+TRTLLM_NAMESPACE_END

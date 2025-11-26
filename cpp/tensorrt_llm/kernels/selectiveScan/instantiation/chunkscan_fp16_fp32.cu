@@ -15,15 +15,14 @@
  */
 
 #include "../chunkscan.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
 GetChunkScanKernelFunc getChunkScanKernel_fp16_fp32 = getChunkScanKernel<fp16_t, fp32_t>;
 
 } // namespace kernels
-} // namespace tensorrt_llm
-
+TRTLLM_NAMESPACE_END
 // vim: ts=2 sw=2 sts=2 et sta

@@ -17,11 +17,13 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <string>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class BufferView : virtual public IBuffer
 {
@@ -98,4 +100,5 @@ private:
     std::size_t mOffset, mSize;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/gptDecoder.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
+
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 
 #include <NvInferRuntime.h>
 
@@ -760,8 +761,10 @@ void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& inp
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 template class GptDecoder<float>;
 template class GptDecoder<half>;
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

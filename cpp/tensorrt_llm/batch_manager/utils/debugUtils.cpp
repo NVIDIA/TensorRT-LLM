@@ -16,6 +16,7 @@
  */
 
 #include "debugUtils.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
@@ -25,7 +26,8 @@
 
 namespace fs = std::filesystem;
 
-namespace tensorrt_llm::batch_manager::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::utils
 {
 using executor::IterationType;
 using runtime::ITensor;
@@ -192,4 +194,5 @@ template void writeBinArray(
     std::string const& filename, __nv_bfloat16 const* tensor, const int64_t size, cudaStream_t stream);
 #endif
 
-} // namespace tensorrt_llm::batch_manager::utils
+} // namespace batch_manager::utils
+TRTLLM_NAMESPACE_END

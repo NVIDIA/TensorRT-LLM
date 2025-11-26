@@ -27,11 +27,11 @@
 #include <curand_kernel.h>
 #include <float.h>
 #include <type_traits>
+#include "tensorrt_llm/common/config.h"
 
 namespace cg = cooperative_groups;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
@@ -423,4 +423,4 @@ __device__ __forceinline__ half clamp_inf_for_half(float const input)
 }
 
 } // namespace common
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

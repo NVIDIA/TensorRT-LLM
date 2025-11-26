@@ -15,6 +15,7 @@
  */
 
 #include "moeTopKFuncs.cuh"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
@@ -29,7 +30,8 @@
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
 {
 
 static constexpr int BLOCK_SIZE = 1024;
@@ -275,4 +277,5 @@ INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+TRTLLM_NAMESPACE_END

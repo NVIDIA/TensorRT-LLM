@@ -16,6 +16,7 @@
  */
 
 #include <utility>
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -23,7 +24,8 @@
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, SamplingConfig const& samplingConfig,
     OutputConfig const& outputConfig, std::optional<SizeType32> const& endId, std::optional<SizeType32> const& padId,
@@ -422,4 +424,5 @@ void Request::setCacheSaltID(CacheSaltIDType cacheSaltID)
 {
     return mImpl->setCacheSaltID(cacheSaltID);
 }
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

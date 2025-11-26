@@ -15,6 +15,7 @@
  */
 
 #include "kvCacheUpdateKernels.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -22,7 +23,8 @@
 #include <array>
 #include <vector>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::speculative_decoding
 {
 
 using namespace tensorrt_llm::runtime;
@@ -334,4 +336,5 @@ void updateKVBlockArrayDraftTokenLocationSeparateRewind(SizeType32 const* seqAcc
         canUseOneMoreBlock, stream);
 }
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+TRTLLM_NAMESPACE_END

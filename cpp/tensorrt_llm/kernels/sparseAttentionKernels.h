@@ -20,9 +20,9 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -82,4 +82,4 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, // [num_head_kv,
     int32_t const tokens_per_page, int32_t const max_num_pages_per_seq, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

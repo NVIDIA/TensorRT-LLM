@@ -16,9 +16,11 @@
  */
 
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 SequenceSlotManager::SequenceSlotManager(SlotIdType maxNumSlots, uint64_t maxSequenceIdleMicroseconds)
@@ -107,4 +109,5 @@ void SequenceSlotManager::freeIdleSequenceSlots()
     }
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16Gemm.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16GemmAttnScalingPerBlockTemplate.cuh"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Fp8Bf16GemmPerBlockTemplate.cuh"
@@ -21,7 +22,8 @@
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 #include <stdexcept>
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
 
 DEFINE_GET_PER_BLOCK_FUNC_PTR(/*HIDDEN_IN=*/5120, /*ALIGNED=*/true);
@@ -186,4 +188,5 @@ void llama4_fp8_bf16_gemm_op(void const* A, void const* B, void* C, void const* 
     }
 }
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+} // namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+TRTLLM_NAMESPACE_END

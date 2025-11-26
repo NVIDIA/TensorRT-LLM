@@ -17,6 +17,7 @@
 #ifndef TRT_GEMM_PLUGIN_H
 #define TRT_GEMM_PLUGIN_H
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -24,7 +25,8 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 
 using CublasGemmWrapper = tensorrt_llm::common::CublasMMWrapper;
@@ -164,6 +166,6 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
-
+} // namespace plugins
+TRTLLM_NAMESPACE_END
 #endif // TRT_GEMM_PLUGIN_H

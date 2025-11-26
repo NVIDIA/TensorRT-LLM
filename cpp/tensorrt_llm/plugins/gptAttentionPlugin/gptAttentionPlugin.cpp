@@ -16,8 +16,9 @@
  */
 
 #include "gptAttentionPlugin.h"
-
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"

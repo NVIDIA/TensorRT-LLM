@@ -19,17 +19,19 @@
 
 #include <memory>
 
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 
-namespace tensorrt_llm::tests::layers::sampling
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers::sampling
 {
 
 struct TestSamplingParams
@@ -178,4 +180,6 @@ public:
 
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
-} // namespace tensorrt_llm::tests::layers::sampling
+} // namespace tests::layers::sampling
+TRTLLM_NAMESPACE_END
+

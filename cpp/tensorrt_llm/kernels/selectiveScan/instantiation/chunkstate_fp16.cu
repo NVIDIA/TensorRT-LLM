@@ -15,15 +15,14 @@
  */
 
 #include "../chunkstate.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
 GetChunkStateKernelFunc getChunkStateKernel_fp16 = getChunkStateKernel<fp16_t>;
 
 } // namespace kernels
-} // namespace tensorrt_llm
-
+TRTLLM_NAMESPACE_END
 // vim: ts=2 sw=2 sts=2 et sta

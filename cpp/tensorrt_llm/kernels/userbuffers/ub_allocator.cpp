@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include <set>
 #include <stdexcept>
 
-namespace tensorrt_llm::runtime::ub
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::ub
 {
 UserBufferAllocator& UserBufferAllocator::Instance()
 {
@@ -246,4 +248,6 @@ bool NCCLHelper::isLoaded() const
 
 bool UserBufferAllocator::use_nccl_symmetric = false;
 
-}; // namespace tensorrt_llm::runtime::ub
+}; // namespace runtime::ub
+TRTLLM_NAMESPACE_END
+

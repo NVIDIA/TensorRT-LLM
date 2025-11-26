@@ -17,19 +17,22 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "trtGptModel.h"
 
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime;
 class NcclCommunicator;
-} // namespace tensorrt_llm::runtime
-
-namespace tensorrt_llm::batch_manager
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 class CapacityScheduler;
 class MicroBatchScheduler;
@@ -202,4 +205,5 @@ private:
     executor::IterationType mIterCounter{0};
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.h"
-
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.h"
 
 #include <algorithm> // For std::for_each, std::sort, std::unique
 #include <filesystem>
@@ -39,7 +40,8 @@
 #include <sched.h>
 #endif
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 TopologyDetector::TopologyDetector()
@@ -459,4 +461,5 @@ std::string TopologyDetector::getCpuArchitecture()
     return mCpuArchitecture;
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

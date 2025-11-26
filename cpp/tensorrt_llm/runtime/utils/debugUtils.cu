@@ -18,14 +18,16 @@
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
+
 #else
 #include "3rdparty/cub/cub.cuh"
 #endif
 
-#include "tensorrt_llm/runtime/utils/debugUtils.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include <cfloat>
 #include <string>
 
@@ -77,7 +79,8 @@ __global__ void stallStreamKernel(int const microSeconds)
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm::runtime::utils
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::utils
 {
 
 template <typename T>
@@ -233,4 +236,5 @@ int stallStream(char const* name, std::optional<cudaStream_t> stream, std::optio
     return delay_val;
 }
 
-} // namespace tensorrt_llm::runtime::utils
+} // namespace runtime::utils
+TRTLLM_NAMESPACE_END

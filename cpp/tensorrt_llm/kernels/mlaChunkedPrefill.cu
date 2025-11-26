@@ -16,6 +16,7 @@
 
 #include "mlaChunkedPrefill.cuh"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/mathUtils.h"
 #include <cuda_fp8.h>
@@ -290,8 +291,7 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
 
 } // namespace
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -351,4 +351,4 @@ INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(half);
 INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(float);
 INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(__nv_bfloat16);
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -26,11 +26,13 @@
 #include "hostAccessibleDeviceAllocator.h"
 #include "topologyDetector.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 class NumaHugePagePoolAllocator
@@ -416,4 +418,5 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
     }
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

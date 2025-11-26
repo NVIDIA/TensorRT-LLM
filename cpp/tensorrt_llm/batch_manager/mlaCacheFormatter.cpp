@@ -17,6 +17,7 @@
 
 #include "mlaCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -34,7 +35,8 @@
 #include <cstdint>
 #include <future>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 // some context rank in connection
@@ -669,4 +671,5 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
 
     return true;
 }
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

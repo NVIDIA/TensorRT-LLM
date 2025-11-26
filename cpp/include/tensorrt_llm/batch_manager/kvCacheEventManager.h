@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <atomic>
@@ -26,7 +27,8 @@
 #include <thread>
 #include <vector>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager::kv_cache_manager
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -111,4 +113,5 @@ private:
     std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiComm;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_END

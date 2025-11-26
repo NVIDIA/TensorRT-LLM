@@ -18,14 +18,16 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#include "tensorrt_llm/common/config.h"
+
+#include "tensorrt_llm/common/cudaUtils.h"
 #if defined(USING_OSS_CUTLASS_MOE_GEMM)
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/common/quantization.h"
 #else
 #include "moe_kernels.h"
 #endif
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -37,7 +39,8 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using MoeMinLatencyParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MoeMinLatencyParams;
@@ -632,6 +635,6 @@ private:
     std::string mNamespace;
 };
 
-} // namespace tensorrt_llm::plugins
-
+} // namespace plugins
+TRTLLM_NAMESPACE_END
 #endif // TRT_MIXTURE_OF_EXPERTS_PLUGIN_H

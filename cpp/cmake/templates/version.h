@@ -18,7 +18,12 @@
 
 // THIS FILE IS AUTO GENERATED FROM cmake/templates/version.h. DO NOT EDIT.
 
-namespace tensorrt_llm::executor
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 static auto constexpr kTensorRtLlmVersion = "@TRTLLM_VERSION@";
 }
+TRTLLM_NAMESPACE_END
+

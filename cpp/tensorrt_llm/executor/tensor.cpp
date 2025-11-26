@@ -15,9 +15,10 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/executor/tensor.h"
-
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+
+#include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -27,7 +28,8 @@
 
 namespace tr = tensorrt_llm::runtime;
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace executor
 {
 
 Tensor::Tensor(std::shared_ptr<runtime::ITensor> tensor)
@@ -277,4 +279,5 @@ void Tensor::setFrom(Tensor const& other, Tensor::CudaStreamPtr stream)
     }
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+TRTLLM_NAMESPACE_END

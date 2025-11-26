@@ -16,8 +16,14 @@
 
 #pragma once
 
-namespace tensorrt_llm
-{
+
+#include "tensorrt_llm/common/config.h"
+
+#include <cstdint>
+#include <cstring>
+#include <cuda_runtime_api.h>
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -500,4 +506,4 @@ private:
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

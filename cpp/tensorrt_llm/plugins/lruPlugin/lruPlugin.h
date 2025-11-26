@@ -17,11 +17,13 @@
 
 #ifndef TRT_LRU_PLUGIN_H
 #define TRT_LRU_PLUGIN_H
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/lruKernel.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+namespace plugins
 {
 // batch_size = num_ctx_requests or num_gen_requests
 // num_ctx_requests = number of context requests (single sequence per request).
@@ -234,6 +236,6 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
-
+} // namespace plugins
+TRTLLM_NAMESPACE_END
 #endif // TRT_LRU_PLUGIN_H

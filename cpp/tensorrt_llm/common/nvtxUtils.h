@@ -25,10 +25,12 @@
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+#include "tensorrt_llm/common/config.h"
 
 #include <array>
 
-namespace tensorrt_llm::common::nvtx
+TRTLLM_NAMESPACE_BEGIN
+namespace common::nvtx
 {
 inline nvtx3::color nextColor()
 {
@@ -46,8 +48,8 @@ inline nvtx3::color nextColor()
 #endif
 }
 
-} // namespace tensorrt_llm::common::nvtx
-
+} // namespace common::nvtx
+TRTLLM_NAMESPACE_END
 #define NVTX3_SCOPED_RANGE_WITH_NAME(range, name)                                                                      \
     ::nvtx3::scoped_range range(::tensorrt_llm::common::nvtx::nextColor(), name)
 #define NVTX3_SCOPED_RANGE(range) NVTX3_SCOPED_RANGE_WITH_NAME(range##_range, #range)

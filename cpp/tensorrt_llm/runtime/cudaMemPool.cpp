@@ -14,16 +14,18 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/cudaMemPool.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/cudaMemPool.h"
 #include <array>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 CudaMemPool::CudaMemPool(cudaMemPool_t pool)
@@ -162,4 +164,5 @@ std::shared_ptr<CudaMemPool> CudaMemPool::getPrimaryPoolForDevice(int deviceId)
     }
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -25,12 +26,14 @@
 
 #include <vector>
 
-namespace tensorrt_llm::runtime::decoder
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::decoder
 {
 class DecoderState;
 }
 
-namespace tensorrt_llm::batch_manager
+namespace batch_manager
 {
 
 class DecoderInputBuffers
@@ -183,4 +186,5 @@ private:
     std::unique_ptr<mpi::MpiRequest> mRequest4;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

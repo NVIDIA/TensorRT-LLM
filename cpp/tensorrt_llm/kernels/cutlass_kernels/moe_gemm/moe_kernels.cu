@@ -25,6 +25,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include "tensorrt_llm/common/config.h"
 
 // Ignore CUTLASS warnings about type punning
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
@@ -71,7 +72,8 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 /**
  * Takes the input maps and prepares the expanded maps for min latency
@@ -4742,4 +4744,5 @@ template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>;
 #endif
 #endif
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

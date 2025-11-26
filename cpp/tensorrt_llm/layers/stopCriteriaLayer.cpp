@@ -16,6 +16,7 @@
  */
 
 #include "stopCriteriaLayer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
 #include "tensorrt_llm/layers/layerUtils.h"
@@ -24,7 +25,8 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace layers
 {
 
 template <typename T>
@@ -176,4 +178,5 @@ void StopCriteriaLayer<T>::checkEosToken(std::shared_ptr<BaseDecodingOutputs>& o
 template class StopCriteriaLayer<float>;
 template class StopCriteriaLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+TRTLLM_NAMESPACE_END

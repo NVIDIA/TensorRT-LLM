@@ -18,14 +18,17 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 class TllmRuntime;
-} // namespace tensorrt_llm::runtime
-
-namespace tensorrt_llm::batch_manager
+} // namespace runtime
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+namespace batch_manager
 {
 
 namespace rnn_state_manager
@@ -55,4 +58,5 @@ public:
     void getBuffers(TensorMap& inputBuffers) const;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+TRTLLM_NAMESPACE_END

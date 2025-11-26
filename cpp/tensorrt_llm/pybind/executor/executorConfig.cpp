@@ -16,6 +16,7 @@
  */
 
 #include "executorConfig.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -34,7 +35,8 @@ namespace tle = tensorrt_llm::executor;
 using SizeType32 = tle::SizeType32;
 using RuntimeDefaults = tensorrt_llm::runtime::RuntimeDefaults;
 
-namespace tensorrt_llm::pybind::executor
+TRTLLM_NAMESPACE_BEGIN
+namespace pybind::executor
 {
 
 void initConfigBindings(pybind11::module_& m)
@@ -636,4 +638,5 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 
-} // namespace tensorrt_llm::pybind::executor
+} // namespace pybind::executor
+TRTLLM_NAMESPACE_END

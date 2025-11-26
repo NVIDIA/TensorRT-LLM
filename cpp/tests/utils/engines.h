@@ -2,6 +2,7 @@
 #define CA1B91B5_DF64_4CF8_948F_5AFF243A2555
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -16,7 +17,8 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::testing::utils::engines
+TRTLLM_NAMESPACE_BEGIN
+namespace testing::utils::engines
 {
 
 namespace details
@@ -351,6 +353,7 @@ std::unique_ptr<nvinfer1::IHostMemory> createConstantTrivialDecoderWithTopKLogit
     auto* engine = buildState.builder->buildSerializedNetwork(*buildState.networkDefinition, *buildState.builderConfig);
     return std::unique_ptr<nvinfer1::IHostMemory>(engine);
 }
-} // namespace tensorrt_llm::testing::utils::engines
+} // namespace testing::utils::engines
+TRTLLM_NAMESPACE_END
 
 #endif /* CA1B91B5_DF64_4CF8_948F_5AFF243A2555 */

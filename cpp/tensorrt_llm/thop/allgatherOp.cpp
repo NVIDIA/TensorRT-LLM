@@ -35,6 +35,7 @@
 
 using tensorrt_llm::pg_utils::PgHelper;
 
+TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 #if ENABLE_MULTI_DEVICE
@@ -285,6 +286,7 @@ std::vector<torch::Tensor> allgather_list_pg(torch::TensorList input_list, torch
 }
 
 } // namespace torch_ext
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -300,8 +302,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("allgather", &torch_ext::allgather);
-    m.impl("allgather_pg", &torch_ext::allgather_pg);
-    m.impl("allgather_list", &torch_ext::allgather_list);
-    m.impl("allgather_list_pg", &torch_ext::allgather_list_pg);
+    m.impl("allgather", &tensorrt_llm::torch_ext::allgather);
+    m.impl("allgather_pg", &tensorrt_llm::torch_ext::allgather_pg);
+    m.impl("allgather_list", &tensorrt_llm::torch_ext::allgather_list);
+    m.impl("allgather_list_pg", &tensorrt_llm::torch_ext::allgather_list_pg);
 }

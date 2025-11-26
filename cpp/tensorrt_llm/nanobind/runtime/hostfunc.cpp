@@ -16,6 +16,7 @@
  */
 
 #include "hostfunc.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/logger.h"
 
@@ -27,7 +28,8 @@
 
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace nanobind::runtime
 {
 
 struct HostFuncUserData
@@ -112,4 +114,5 @@ void initHostFuncBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
     m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
 }
-} // namespace tensorrt_llm::nanobind::runtime
+} // namespace nanobind::runtime
+TRTLLM_NAMESPACE_END

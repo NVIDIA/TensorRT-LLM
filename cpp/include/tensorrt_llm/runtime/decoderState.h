@@ -18,11 +18,13 @@
 
 #include "decodingInput.h"
 #include "decodingOutput.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 
-namespace tensorrt_llm::runtime::decoder
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::decoder
 {
 
 class BeamSearchBuffers
@@ -240,4 +242,6 @@ private:
     SpeculativeDecodingMode mSpeculativeDecodingMode{SpeculativeDecodingMode::None()};
 };
 
-} // namespace tensorrt_llm::runtime::decoder
+} // namespace runtime::decoder
+TRTLLM_NAMESPACE_END
+
