@@ -1,3 +1,4 @@
+import asyncio
 import json
 import multiprocessing
 import time
@@ -35,11 +36,13 @@ mcp = FastMCP("test_mcp_server")
 
 @mcp.tool()
 async def add_numbers(a: int, b: int) -> int:
+    await asyncio.sleep(1)
     return a + b
 
 
 @mcp.tool()
 async def echo_message(message: str) -> str:
+    await asyncio.sleep(1)
     return f"Echo: {message}"
 
 
@@ -247,7 +250,7 @@ async def test_mcp_worker_add_numbers(mcp_server):
 
     finally:
         # 6. Clean up worker resources
-        await worker.async_shutdown()
+        worker.shutdown()
 
 
 @pytest.mark.asyncio
@@ -276,7 +279,7 @@ async def test_mcp_worker_echo_message(mcp_server):
         print(f"✓ Test passed: echo_message returned '{task.result_str}'")
 
     finally:
-        await worker.async_shutdown()
+        worker.shutdown()
 
 
 @pytest.mark.asyncio
@@ -328,7 +331,37 @@ async def test_mcp_worker_multiple_calls(mcp_server):
         print(f"  - Call 3: echo_message returned '{task3.result_str}'")
 
     finally:
-        await worker.async_shutdown()
+        worker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_multiple_calls_to_same_tool(mcp_server):
+    sse_url = mcp_server.get_sse_url()
+    worker = MCPWorker(urls=[sse_url])
+    await worker.init_in_asyncio_event_loop()
+
+    task1 = MCPCallTask()
+    task1.tool_name = "add_numbers"
+    task1.args = json.dumps({"a": 10, "b": 20})
+
+    task2 = MCPCallTask()
+    task2.tool_name = "add_numbers"
+    task2.args = json.dumps({"a": 100, "b": 200})
+
+    status1 = await worker.run_task(task1)
+    status2 = await worker.run_task(task2)
+    assert status1 == TaskStatus.SUCCESS
+    assert status2 == TaskStatus.SUCCESS
+    result1 = int(task1.result_str)
+    result2 = int(task2.result_str)
+    assert result1 == 30, f"Expected 30, but got {result1}"
+    assert result2 == 300, f"Expected 300, but got {result2}"
+
+    print("✓ Test passed: Multiple calls to same tool successful")
+    print(f"  - Call 1: add_numbers(10, 20) = {result1}")
+    print(f"  - Call 2: add_numbers(100, 200) = {result2}")
+
+    worker.shutdown()
 
 
 @pytest.mark.asyncio
@@ -400,7 +433,7 @@ async def test_scaffolding_with_chat_mcp_controller(mcp_server):
 
     finally:
         # Clean up
-        await mcp_worker.async_shutdown()
+        mcp_worker.shutdown()
         scaffolding_llm.shutdown(shutdown_workers=False)  # Don't shutdown workers again
 
 

@@ -50,7 +50,7 @@ async def main():
 
     llm.shutdown()
     generation_worker.shutdown()
-    await mcp_worker.async_shutdown()
+    mcp_worker.shutdown()
     return
 
 
