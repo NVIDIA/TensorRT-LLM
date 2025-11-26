@@ -2422,8 +2422,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                                             free_gpu_memory_fraction=0.6,
                                             tokens_per_block=64)
         else:
-            if moe_backend != "_DEFAULT":
-                pytest.skip("Not supported MoE backend!")
+            moe_backend = "_DEFAULT"
             moe_config = MoeConfig()
             # TODO: Support block reuse for DeepSeek-V3.2
             kv_cache_config = KvCacheConfig(enable_block_reuse=False,
