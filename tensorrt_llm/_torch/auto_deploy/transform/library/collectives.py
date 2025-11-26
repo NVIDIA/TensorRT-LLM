@@ -5,6 +5,7 @@ when TRT-LLM is available (MPI mode) since it provides optimized fused kernels.
 The torch backend (demollm mode) does not benefit from fusion.
 """
 
+from functools import partial
 from typing import Tuple
 
 import torch
@@ -28,11 +29,14 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # ============================================================================
 
 
-def _make_allreduce_residual_rmsnorm_pattern(add_order: str = "residual_first"):
+def _make_allreduce_residual_rmsnorm_pattern(
+    add_order: str = "residual_first", strategy: str = "AUTO"
+):
     """Factory function to create pattern functions for allreduce+residual+rmsnorm fusion.
 
     Args:
         add_order: Either "residual_first" (residual + x) or "x_first" (x + residual)
+        strategy: AllReduce strategy to use in the pattern
 
     Returns:
         A pattern function that can be used with register_ad_pattern
@@ -50,7 +54,7 @@ def _make_allreduce_residual_rmsnorm_pattern(add_order: str = "residual_first"):
         Returns (normed, z)
         """
         input_dtype = x.dtype
-        hidden_states = torch.ops.auto_deploy.trtllm_dist_all_reduce(x)
+        hidden_states = torch.ops.auto_deploy.trtllm_dist_all_reduce(x, strategy)
 
         # Handle addition order
         if add_order == "residual_first":
@@ -70,10 +74,12 @@ def _make_allreduce_residual_rmsnorm_pattern(add_order: str = "residual_first"):
 
 
 def _allreduce_residual_rmsnorm_replacement(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, strategy: str
 ):
     """Replacement using TRT-LLM fused kernel."""
-    return torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm(x, residual, weight, eps)
+    return torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm(
+        x, residual, weight, eps, strategy
+    )
 
 
 # ============================================================================
@@ -115,19 +121,22 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
+        # Get the allreduce strategy from shared_config
+        strategy = shared_config.sharding_config.allreduce_strategy.name
+
         # TRT-LLM backend (MPI mode) - two patterns for different addition orders
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(
-            add_order="residual_first"
+            add_order="residual_first", strategy=strategy
         )
         _allreduce_residual_rmsnorm_pattern2_trtllm = _make_allreduce_residual_rmsnorm_pattern(
-            add_order="x_first"
+            add_order="x_first", strategy=strategy
         )
 
         # Register TRT-LLM backend patterns only (no torch backend fusion)
         # Pattern 1: residual + allreduce(x)
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern_trtllm,
-            replace_fn=_allreduce_residual_rmsnorm_replacement,
+            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,
@@ -137,7 +146,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Pattern 2: allreduce(x) + residual
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern2_trtllm,
-            replace_fn=_allreduce_residual_rmsnorm_replacement,
+            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,

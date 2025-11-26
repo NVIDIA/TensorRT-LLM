@@ -61,6 +61,8 @@ def validate_allreduce_strategy(v):
     if isinstance(v, int):
         return AllReduceStrategy(v)
     return v  # Let Pydantic handle other types
+
+
 def _get_dist_ops(backend: str):
     """Get the appropriate distributed ops based on backend availability.
 
@@ -588,7 +590,7 @@ def _shard_parameter_node(
 
     # add reduction node
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(fn_dist, args=dist_args)
+        dist_node = gm.graph.call_function(fn_dist, args=(node,) + tuple(dist_args))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -1235,7 +1237,9 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, [])
+        _insert_sharded_moe(
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, []
+        )
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1249,7 +1253,9 @@ class MXFP4EPShardingInfo(EPShardingInfo):
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend)
+        _insert_sharded_mxfp4_mlp_ep(
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend
+        )
 
 
 class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -1266,7 +1272,13 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, self.scale_names()
+            gm,
+            node,
+            self.rank,
+            self.world_size,
+            self.allreduce_strategy,
+            self.dist_backend,
+            self.scale_names(),
         )
 
 
@@ -1284,7 +1296,13 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_moe(
-            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, self.scale_names()
+            gm,
+            node,
+            self.rank,
+            self.world_size,
+            self.allreduce_strategy,
+            self.dist_backend,
+            self.scale_names(),
         )
 
 
