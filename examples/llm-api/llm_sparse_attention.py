@@ -55,7 +55,7 @@ def parse_arguments():
                         default='TRTLLM',
                         choices=['VANILLA', 'TRTLLM'])
 
-    # RocketKV configuration
+    # RocketKV config
     parser.add_argument('--window_size',
                         type=int,
                         default=32,
