@@ -42,6 +42,13 @@ class AllGatherReduceScatter(Communication):
         # Initialize dispatch state
         self._dispatch_state = {}
 
+    @staticmethod
+    def is_platform_supported() -> bool:
+        """
+        AllGather + ReduceScatter is always supported as the fallback strategy
+        """
+        return True
+
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
         Check if AllGather is feasible for the given workload at runtime.
