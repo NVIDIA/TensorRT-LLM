@@ -35,38 +35,43 @@ class SpecTreeManager:
     # shape: [num_trees, max_total_draft_tokens + 1], device tensor.
     spec_dec_position_offsets: torch.Tensor = None
 
-    # TODO: Optimized together with the subsequent dynamic tree.
-    # Auxiliary buffers for the static tree.
+    ############################ Auxiliary buffers for the static tree. ############################
     # Considering that the static tree does not modify the tree structure during inference, we can calculate some buffers in advance.
     # NOTE: Most of these buffers are introduced due to limitations of XQA:
     #       With tree attention, XQA cannot simply take the tokens to be processed in the next round as input. Instead, it needs to take ALL of their parent nodes as input.
     #       This incurs additional computation, but it is unavoidable.
 
     # NOTE: The reason why most of these auxiliary buffers are with `len == max_draft_len - 1` is that: we do not need to prepare specific input data for the first draft layer.
-
     # The top k value for each draft layer. Device tensor.
     top_k_list_cuda: list[torch.Tensor] = None
 
     # The max top k value for all draft layers. Which is used for torch.topk and cuda graph.
     max_top_k = -1
 
-    # Gather the required draft tokens from all currently generated draft tokens as the input of the next draft layer.
+    # Gather the required draft tokens among the 'max_total_draft_tokens + 1' tokens.
     # Only the nodes has child(s) this layer and all their parents nodes will be gathered.
-    # Device tensor. len(tokens_gather_idx) == max_draft_len - 1. Each element is a tensor with shape [num_tokens_for_next_layer].
     tokens_gather_idx_for_drafter_model: list[torch.Tensor] = None
 
     # Gather the required logits from all currently generated logits.
-    # Device tensor. len(tokens_gather_idx) == max_draft_len - 1.
     logits_gather_idx: list[torch.Tensor] = None
 
     # The packed mask for the drafter model's attention (i.e., xqa).
+    # shape: [1, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)], device tensor.
     spec_dec_packed_mask_for_drafter_model: torch.Tensor = None
 
     # The read indices offset for the drafter model.
+    # shape: [max_total_draft_tokens + 1], device tensor.
     hidden_states_read_indices_offset_for_drafter_model: torch.Tensor = None
 
     # The write back start indices for the drafter tokens between different draft layers.
+    # shape: [max_draft_len + 1], device tensor.
     draft_tokens_indices_cumsum: torch.Tensor = None
+
+    ############################ Auxiliary buffers for the dynamic tree. ############################
+    # For the dynamic tree, before reconstructing the tree, 
+    # the draft token offsets of each draft layer are fixed, which we can set in advance.
+    # shape: [1, max_total_draft_tokens + 1], device tensor.
+    spec_dec_position_offsets_for_drafter_model: torch.Tensor = None
 
     def __init__(self, max_num_requests: int, use_dynamic_tree: bool,
                  max_total_draft_tokens: int, max_draft_len: int,
@@ -113,17 +118,24 @@ class SpecTreeManager:
         else:
             self.init_tree_info_for_static_tree()
 
-        # self.dump_tree_info()
+        self.dump_tree_info()
+        import pdb; pdb.set_trace()
 
     def init_tree_info_for_dynamic_tree(self):
         # For the dynamic tree
         # To the internal layer, the number of nodes is the same as the dynamic_tree_max_topK.
-        self.top_k_list = [
-            torch.ones(self.dynamic_tree_max_topK,
-                       dtype=torch.int32,
-                       device='cpu',
-                       pin_memory=True) * self.dynamic_tree_max_topK
-        ]
+        self.spec_dec_position_offsets_for_drafter_model = torch.zeros(
+            (1, self.max_total_draft_tokens + 1),
+            dtype=torch.int32,
+            device='cuda',
+        )
+        tmp_position_offsets = []
+        for i in range(self.max_draft_len):
+            tmp_position_offsets.extend([i] * self.dynamic_tree_max_topK)
+        self.spec_dec_position_offsets_for_drafter_model[0, :len(tmp_position_offsets)].copy_(
+            torch.tensor(tmp_position_offsets, dtype=torch.int32, device='cuda'),
+            non_blocking=True,
+        )
 
     # For the static tree
     def init_tree_info_for_static_tree(self):
@@ -174,9 +186,7 @@ class SpecTreeManager:
                              pin_memory=True))
 
         # 6) Compute the spec decoding according to the eagle_paths for the target model
-        for i, path in enumerate(self.eagle_paths[0]):
-            indices = path[path > -1]
-            self.spec_dec_mask_matrix[0][i, indices] = 1
+        self.compute_spec_dec_mask_matrix(0)
         self.compute_spec_dec_packed_mask(self.spec_dec_mask_matrix,
                                           self.spec_dec_packed_mask)
 
@@ -255,21 +265,18 @@ class SpecTreeManager:
 
     # Get the eagle_paths
     def get_eagle_paths(self, tree_idx=0):
-        if self.use_dynamic_tree:
-            self.eagle_paths[tree_idx].fill_(-1)
-            # If dynamic tree, return the eagle_paths according to the mask.
-            for i in range(self.max_total_draft_tokens + 1):
-                self.eagle_paths[tree_idx][:, i, :] = self.spec_dec_mask_matrix[
-                    tree_idx][i, :].nonzero()
-            return self.eagle_paths[tree_idx]
-        else:
-            # If static tree, return the prepared eagle_paths. These paths are immutable.
-            return self.eagle_paths[0]
+        return self.eagle_paths[tree_idx]
 
     # Get the topK list for the specific draft layer
     def get_top_k_list(self, draft_layer_id):
         assert draft_layer_id >= 0
         return self.top_k_list[draft_layer_id]
+
+    # Compute the spec decoding mask matrix according to the eagle_paths
+    def compute_spec_dec_mask_matrix(self, tree_idx=0):
+        for i, path in enumerate(self.eagle_paths[tree_idx]):
+            indices = path[path > -1]
+            self.spec_dec_mask_matrix[tree_idx][i, indices] = 1
 
     # Compute the packed mask according to the mask matrix
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
@@ -315,9 +322,12 @@ class SpecTreeManager:
     # Print the tree info
     def dump_tree_info(self):
         print(f"TopK list: {self.top_k_list}")
-        if not self.use_dynamic_tree:
+        if self.use_dynamic_tree:
+            print(f"Dynamic max top k: {self.dynamic_tree_max_topK}")
+            print(f"Spec dec position offsets for drafter model: {self.spec_dec_position_offsets_for_drafter_model}")
+        else:
             print(f"Max top k list cuda: {self.max_top_k}")
-            print(f"Static tree: {self.eagle_paths}")
+            print(f"Eagle paths: {self.eagle_paths}")
             print(f"Index mapping set: {self.index_mapping_set}")
             print(f"Nodes list per layer: {self.nodes_list_per_layer}")
             print(

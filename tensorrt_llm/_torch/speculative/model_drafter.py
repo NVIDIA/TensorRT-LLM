@@ -19,6 +19,7 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from .drafter import Drafter
+from ...llmapi.llm_args import EagleDecodingConfig
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DecodingBaseConfig
@@ -616,6 +617,17 @@ class ModelDrafter(Drafter):
             draft_logits = outputs[0]
             draft_tokens_host = outputs[1].host.new_tokens
             outputs[1].sampler_event.synchronize()
+        
+        # Get the dynamic tree buffers
+        topk_score_indices, history_draft_tokens_parent_buffer = None, None
+        spec_tree_manager = None
+        if isinstance(self.spec_config, EagleDecodingConfig) and self.spec_config.use_dynamic_tree:
+            dynamic_tree_buffers = outputs["dynamic_tree_buffers"]
+            topk_score_indices = dynamic_tree_buffers["topk_score_indices"].cpu() # [batch_size, self.max_total_draft_tokens]
+            history_draft_tokens_parent_buffer = dynamic_tree_buffers["history_draft_tokens_parent_buffer"].cpu() # [batch_size, dynamic_tree_max_topK + dynamic_tree_max_topK * dynamic_tree_max_topK * (max_draft_len - 1)]
+            
+            spec_tree_manager = self.spec_resource_manager.spec_tree_manager
+            assert spec_tree_manager is not None
 
         for req_idx, req in enumerate(draft_batch.all_requests()):
             target_model_req = self.req_id_to_old_request[req.py_request_id]
@@ -632,6 +644,95 @@ class ModelDrafter(Drafter):
             # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
             if self.disable_overlap_scheduler:
                 target_model_req.py_draft_logits = torch.stack(py_draft_logits)
+
+            if topk_score_indices is not None and history_draft_tokens_parent_buffer is not None:
+                self.reconstruct_dynamic_tree(req_idx, topk_score_indices[req_idx], history_draft_tokens_parent_buffer[req_idx], spec_tree_manager)
+
+            
+    def reconstruct_dynamic_tree(self, req_idx: int, 
+                                 cur_topk_score_indices: torch.Tensor, 
+                                 cur_history_draft_tokens_parent_buffer: torch.Tensor, 
+                                 spec_tree_manager: "SpecTreeManager") -> None:
+        '''
+        Reconstruct the dynamic tree based on the current topk score indices and draft tokens parents.
+        Update the spec_tree_manager buffers:
+            - spec_tree_manager.eagle_paths
+            - spec_tree_manager.spec_dec_mask_matrix
+            - spec_tree_manager.spec_dec_packed_mask
+            - spec_tree_manager.spec_dec_position_offsets
+            All these buffers will be used to update the attn_metadata for the target model's tree attention.
+            And the verfication after forward the target model.
+        Args:
+            req_idx: The index of the request.
+            cur_topk_score_indices: The topk score indices for the final output draft tokens. 
+                                    The indices will take all history draft tokens into account. 
+                                    shape: [self.max_total_draft_tokens]
+            cur_history_draft_tokens_parent_buffer: The draft tokens' parent indices. 
+                                     The indices will also take all history draft tokens into account.
+                                     shape: [dynamic_tree_max_topK + dynamic_tree_max_topK * dynamic_tree_max_topK * (max_draft_len - 1)]
+            spec_tree_manager: The spec tree manager.
+        '''
+
+    
+        topk_score_indices_list = cur_topk_score_indices.tolist()
+        cur_history_draft_tokens_parent_buffer = cur_history_draft_tokens_parent_buffer.tolist()
+        print(f"======= topk_score_indices_list: {topk_score_indices_list}")
+        print(f"======= cur_history_draft_tokens_parent_buffer: {cur_history_draft_tokens_parent_buffer}")
+
+        # 1) Generate the mapping
+        # Because these indices will take all history draft tokens into account,
+        # We need to generate a mapping between the current node index and the index of the final output tree.
+        idx_mapping = {}
+        idx_mapping[-1] = 0 # root node
+        for i in range(len(cur_topk_score_indices)):
+            idx_mapping[topk_score_indices_list[i]] = i + 1 # shift by 1 for the root node
+        print(f"======= idx_mapping: {idx_mapping}")
+
+        # 2) Update the eagle_paths
+        spec_tree_manager.eagle_paths[req_idx].fill_(-1)
+        # root node
+        spec_tree_manager.eagle_paths[req_idx][0][0] = 0
+        for path_idx, cur_node_idx in enumerate(topk_score_indices_list):
+            tmp_path = [cur_node_idx]
+            parent_idx = cur_history_draft_tokens_parent_buffer[cur_node_idx]
+            tmp_path = [parent_idx] + tmp_path
+            while parent_idx != -1:
+                parent_idx = cur_history_draft_tokens_parent_buffer[parent_idx]
+                tmp_path = [parent_idx] + tmp_path
+
+            print(f"======= path_idx: {path_idx}, cur_node_idx: {cur_node_idx}, tmp_path: {tmp_path}")
+            
+            assert len(tmp_path) >= 2 and len(tmp_path) <= self.max_draft_len + 1
+            # Map the indices
+            tmp_map_path = [idx_mapping[idx] for idx in tmp_path]
+            print(f"======= tmp_map_path1111: {tmp_map_path}, tmp_path: {tmp_path}")
+            tmp_map_path += [-1] * (self.max_draft_len + 1 - len(tmp_map_path)) # pad with -1
+            print(f"======= tmp_map_path2222: {tmp_map_path}")
+            spec_tree_manager.eagle_paths[req_idx, path_idx + 1, :] = torch.tensor(tmp_map_path, dtype=torch.int32)
+            print(f"======= spec_tree_manager.eagle_paths[req_idx, path_idx + 1, :]: {spec_tree_manager.eagle_paths[req_idx, path_idx + 1, :]}")
+
+        print(f"============================ after update eagle_paths: {spec_tree_manager.eagle_paths[req_idx]} ============================")
+        # 3) Update the spec_dec_mask_matrix
+        spec_tree_manager.compute_spec_dec_mask_matrix(req_idx)
+        print(f"======= spec_tree_manager.spec_dec_mask_matrix[req_idx]: {spec_tree_manager.spec_dec_mask_matrix[req_idx]}")
+
+        # 4）Update the spec_dec_packed_mask
+        spec_tree_manager.compute_spec_dec_packed_mask(spec_tree_manager.spec_dec_mask_matrix, spec_tree_manager.spec_dec_packed_mask)
+        print(f"======= spec_tree_manager.spec_dec_packed_mask[req_idx]: {spec_tree_manager.spec_dec_packed_mask[req_idx]}")
+
+        # 5) Update the spec_dec_position_offsets
+        spec_tree_manager.spec_dec_position_offsets[req_idx, :] = 0
+        start_idx = 0
+        for i in range(self.max_draft_len + 1):
+            tmp_set = set(spec_tree_manager.eagle_paths[req_idx, :, i].tolist())
+            tmp_set.discard(-1)
+            num_nodes_this_layer = len(tmp_set)
+            print(f"======= i: {i}, num_nodes_this_layer: {num_nodes_this_layer}")
+            spec_tree_manager.spec_dec_position_offsets[req_idx, start_idx:start_idx + num_nodes_this_layer] = i
+            start_idx += num_nodes_this_layer
+
+        print(f"======= spec_tree_manager.spec_dec_position_offsets[req_idx]: {spec_tree_manager.spec_dec_position_offsets[req_idx]}")
+
 
     def process_dynamic_draft_outputs(
             self,
@@ -900,7 +1001,7 @@ class ModelDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
-        resource_manager: Optional[ResourceManager] = None,
+        resource_manager: ResourceManager
     ) -> None:
         """
         Prepare draft tokens for the scheduled requests.
