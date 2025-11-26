@@ -159,6 +159,10 @@ if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
 endif()
 
+if(MOONCAKE_ROOT)
+  set(MOONCAKE_WRAPPER_TARGET tensorrt_llm_mooncake_wrapper)
+endif()
+
 add_subdirectory(executor)
 
 find_package(Threads REQUIRED)
@@ -270,6 +274,11 @@ endif()
 if(TARGET ${NIXL_WRAPPER_TARGET})
   target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
+endif()
+
+if(TARGET ${MOONCAKE_WRAPPER_TARGET})
+  target_link_libraries(${MOONCAKE_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 
 if(NOT WIN32)
