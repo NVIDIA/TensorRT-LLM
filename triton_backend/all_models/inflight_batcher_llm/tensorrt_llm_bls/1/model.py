@@ -176,34 +176,36 @@ class TritonPythonModel:
     def execute(self, requests):
 
         responses = []
-        try:
-            # Check if draft model is configured as
+        if self.draft_llm_model_name is not None:
+            # When draft model is specified,
+            # check if draft model is configured as
             # `exclude_input_in_output: true` or not.
-            self.decoder.load_model_configs(
-                triton_host_and_port=self.triton_host_and_port,
-                target_model_name=self.llm_model_name,
-                draft_model_name=self.draft_llm_model_name)
-        except Exception:
-            # Stop main executions immediately.
-            self.logger.log_error(traceback.format_exc())
-            # If encountering an error, send a response with err msg
-            error_response = pb_utils.InferenceResponse(
-                output_tensors=[],
-                error=pb_utils.TritonError(traceback.format_exc()))
+            try:
+                self.decoder.load_model_configs_for_spec_decoding(
+                    triton_host_and_port=self.triton_host_and_port,
+                    target_model_name=self.llm_model_name,
+                    draft_model_name=self.draft_llm_model_name)
+            except Exception:
+                # Stop main executions immediately.
+                self.logger.log_error(traceback.format_exc())
+                # If encountering an error, send a response with err msg
+                error_response = pb_utils.InferenceResponse(
+                    output_tensors=[],
+                    error=pb_utils.TritonError(traceback.format_exc()))
 
-            for request in requests:
+                for request in requests:
+                    if self.decoupled:
+                        response_sender = request.get_response_sender()
+                        response_sender.send(error_response)
+                        response_sender.send(
+                            flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+                    else:
+                        responses.append(error_response)
                 if self.decoupled:
-                    response_sender = request.get_response_sender()
-                    response_sender.send(error_response)
-                    response_sender.send(
-                        flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+                    return None
                 else:
-                    responses.append(error_response)
-            if self.decoupled:
-                return None
-            else:
-                assert len(responses) == len(requests)
-                return responses
+                    assert len(responses) == len(requests)
+                    return responses
 
         for request in requests:
             if self.decoupled:

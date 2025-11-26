@@ -496,11 +496,12 @@ class Decoder:
     def reset_decoder(self):
         self._accumulated_tokens = []
 
-    def load_model_configs(self,
-                           target_model_config_api_url: Optional[str] = None,
-                           draft_model_config_api_url: Optional[str] = None,
-                           n_retries: Optional[int] = 5,
-                           retry_interval_sec: Optional[int] = 3):
+    def load_model_configs_for_spec_decoding(
+            self,
+            target_model_config_api_url: Optional[str] = None,
+            draft_model_config_api_url: Optional[str] = None,
+            n_retries: Optional[int] = 5,
+            retry_interval_sec: Optional[int] = 3):
         raise NotImplementedError()
 
     def is_input_excluded_from_output_for_target(self,
