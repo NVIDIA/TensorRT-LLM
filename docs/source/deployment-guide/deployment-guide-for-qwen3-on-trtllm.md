@@ -26,7 +26,7 @@ This is a functional quick-start guide for running the Qwen3 model on TensorRT L
 
 Build and run the docker container. See the [Docker guide](../../../docker/README.md) for details.
 
-```
+```shell
 cd TensorRT-LLM
 
 make -C docker release_build IMAGE_TAG=qwen3-local
@@ -201,7 +201,7 @@ Here is an example response:
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<'EOF' > bench.sh
