@@ -5,6 +5,7 @@ slurm:
   account: "<account>"
   job_time: "02:00:00"
   job_name: "<job_name>"
+  extra_args: ""
   numa_bind: true # Only enable for GB200 NVL72
 
 # Benchmark Mode
