@@ -575,12 +575,14 @@ def _shard_parameter_node(
         return
 
     # figure out the right dist op
-    dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
-    }
-
-    fn_dist, *dist_args = dist_lookup[dim]
+    if dim == 0:
+        # Column split -> all_gather
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
+        dist_args = (node, -1)
+    else:
+        # Row split -> all_reduce with strategy
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce.default
+        dist_args = (node, allreduce_strategy.name)
 
     # add reduction node
     with gm.graph.inserting_after(node):
@@ -720,6 +722,7 @@ class WeightShardingInfo(ShardingTransformInfo):
             min_local_shape=self.min_local_shape,
             fused_weight_dims=self.fused_weight_dims,
             quantization_cb=self.quantization_cb,
+            allreduce_strategy=self.allreduce_strategy,
         )
 
 
