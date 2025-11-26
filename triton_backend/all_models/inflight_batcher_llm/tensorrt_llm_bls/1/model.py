@@ -88,7 +88,7 @@ class TritonPythonModel:
         # NOTE: this is a temporal solution related to
         # the implementation of `decoder.load_model_configs()`.
         # Assuming the gRPC endpoint is running with 8001 port.
-        self.model_config_api_baseurl = "localhost:8001/v2/models/"
+        self.triton_host_and_port = "localhost:8001"
 
     def get_batch_index(self, response):
         if hasattr(
@@ -180,7 +180,7 @@ class TritonPythonModel:
             # Check if draft model is configured as
             # `exclude_input_in_output: true` or not.
             self.decoder.load_model_configs(
-                model_config_api_baseurl=self.model_config_api_baseurl,
+                triton_host_and_port=self.triton_host_and_port,
                 target_model_name=self.llm_model_name,
                 draft_model_name=self.draft_llm_model_name)
         except Exception:
