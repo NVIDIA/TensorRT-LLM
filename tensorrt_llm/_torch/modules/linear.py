@@ -1117,7 +1117,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
-        
+
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         # NOTE: pre_quant_scale is the same for gate and up since modelopt checks which layer shared the same input
         if "pre_quant_scale" in weights[0]:
