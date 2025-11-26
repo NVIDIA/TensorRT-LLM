@@ -206,6 +206,28 @@ async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
 
 
 @pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("prompts", [["Hello, my name is", "What is the AI?"]])
+async def test_batch_completions_with_option_n_streaming(
+        async_client: openai.AsyncOpenAI, model_name, prompts):
+    # test beam search with streaming
+    batch = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts,
+        n=3,  # number of completions to generate for each prompt.
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+    )
+    texts = [""] * 6  # 2 prompts × 3 generations per prompt = 6 choices
+    async for chunk in batch:
+        assert len(chunk.choices) == 1
+        choice = chunk.choices[0]
+        texts[choice.index] += choice.text
+
+    assert [""] not in texts  # Assert all the generations are not empty
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
                                          model_name: str):
     prompt = "Hello, my name is"
