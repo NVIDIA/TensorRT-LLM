@@ -580,12 +580,12 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
             ):
-                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm_cutlass(
+                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
                     True)
                 return nvfp4_gemm_output
 
-            # No extra check needed as the output dtype of nvfp4_gemm_cutlass has been verified when
+            # No extra check needed as the output dtype of nvfp4_gemm has been verified when
             # ub_copy is inserted.
             register_replacement(
                 empty_nvfp4_gemm_prologue_pattern,

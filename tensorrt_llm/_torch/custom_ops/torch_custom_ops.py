@@ -857,7 +857,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                         self.to_userbuffers)
         elif tactic == "cutedsl":
             return torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                act_fp4, weight, act_sf, weight_scale, alpha, self.output_dtype)
+                act_fp4, weight, act_sf, weight_scale, alpha, self.output_dtype,
+                self.to_userbuffers)
         elif tactic == -1:
             return torch.ops.trtllm.nvfp4_gemm_cutlass(act_fp4, weight, act_sf,
                                                        weight_scale, alpha,

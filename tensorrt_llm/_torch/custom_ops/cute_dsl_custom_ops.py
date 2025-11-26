@@ -45,7 +45,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_cold_l2_cache=True,
         )
 
-        def __init__(self, output_dtype: torch.dtype):
+        def __init__(self,
+                     output_dtype: torch.dtype,
+                     to_userbuffers: bool = False):
             super().__init__()
 
 
@@ -55,10 +57,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
                 )
             self.output_dtype = output_dtype
+            self.to_userbuffers = to_userbuffers
 
         # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
         def unique_id(self):
-            return (self.output_dtype, )
+            return (self.output_dtype, self.to_userbuffers)
+
+        def __hash__(self):
+            return hash((self.output_dtype, self.to_userbuffers))
+
+        def __eq__(self, other):
+            if not isinstance(other, self.__class__):
+                return False
+            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers
 
         def get_valid_tactics(
             self,
@@ -228,9 +239,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
-            c_tensor = torch.empty(*(m, n),
-                                   dtype=self.output_dtype,
-                                   device="cuda")
+
+            # Allocate output tensor from UserBuffers or regular CUDA memory
+            if self.to_userbuffers:
+                from tensorrt_llm.bindings import torch_ext
+                c_tensor, _ = torch_ext.create_userbuffers_tensor(
+                    [m, n], self.output_dtype)
+            else:
+                c_tensor = torch.empty(*(m, n),
+                                       dtype=self.output_dtype,
+                                       device="cuda")
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
@@ -367,8 +385,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
+        to_userbuffers: bool = False,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
+
+        Args:
+            input: Activation tensor [m, k] in FP4 format (packed in uint8)
+            weight: Weight tensor [n, k] in FP4 format (packed in uint8)
+            input_scale: Activation scale factors
+            weight_scale: Weight scale factors
+            alpha: Scaling factor
+            output_dtype: Output data type (must be bfloat16)
+            to_userbuffers: Whether to allocate output from UserBuffers pool
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
@@ -385,7 +413,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellLinear(output_dtype)
+        runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
@@ -405,6 +433,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
+        to_userbuffers: bool = False,
     ):
         # [m, k]
         shape = list(mat_a.shape)
