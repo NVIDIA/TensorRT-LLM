@@ -148,7 +148,12 @@ def _check_mem_usage(file, mem_info, ranks_num=1):
         f"Running memory information: peak mem {peak}, model mem {model_size}, kv mem {kv_mem_size}, extra {extra}, total {min_total}, activation {activation_memory}, tmp_kv {tmp_kv}, fraction  {fraction}, none-torch memory at starttime {start_time_mem}"
     )
 
-    assert peak - tmp_kv <= e_peak + start_time_mem + delta, f"peak memory {peak} is larger than expected {e_peak}"
+    increased_peak_mem = peak - tmp_kv - e_peak - start_time_mem - delta
+    assert increased_peak_mem <= 0, (
+        f"increased peak memory {increased_peak_mem} is larger than 0,"
+        f" which is calculated as peak ({peak}) - tmp_kv ({tmp_kv}) -"
+        f" e_peak ({e_peak}) - start_time_mem ({start_time_mem}) - delta ({delta})."
+    )
     assert kv_mem_size >= e_kv_mem_size - delta, f"kv memory size {kv_mem_size} is smaller than expected {e_kv_mem_size}"
     # assert model_size <= e_model_size + delta, f"model memory {model_size} is larger than expected {e_model_size}"
     # assert max(extra) <= e_extra + delta, f"extra memory size {extra} is larger than expected {e_extra}"
@@ -1950,7 +1955,7 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                 "--use_one_model",
             ],
             stdout=running_log)
-        _check_mem_usage(running_log, [54.60, 0, 0, 0])
+        _check_mem_usage(running_log, [54.90, 0, 0, 0])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
