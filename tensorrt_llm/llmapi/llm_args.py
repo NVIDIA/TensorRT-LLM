@@ -3023,8 +3023,11 @@ def update_llm_args_with_extra_dict(
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
-        llm_args_dict['kv_cache_config'] = llm_args[
-            'kv_cache_config'] | llm_args_dict['kv_cache_config']
+        # Convert KvCacheConfig object to dict if necessary
+        base_kv_config = llm_args['kv_cache_config']
+        if isinstance(base_kv_config, KvCacheConfig):
+            base_kv_config = base_kv_config.model_dump(exclude_unset=True)
+        llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict['kv_cache_config']
 
     field_mapping = {
         "quant_config": QuantConfig,
