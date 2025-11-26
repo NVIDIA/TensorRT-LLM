@@ -1128,10 +1128,3 @@ LLM.__doc__ = \
 
     Parameters:
 """ + TORCH_LLM_DOCSTRING
-
-class AsyncLLM(LLM):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    async def async_init_phase(self):
-        await self._executor.init_workers_async()

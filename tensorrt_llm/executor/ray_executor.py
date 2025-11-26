@@ -209,6 +209,20 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                                         **kwargs))
         return refs if non_block else ray.get(refs)
 
+    @unwrap_ray_errors()
+    async def collective_rpc_async(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            unique_reply_rank: Optional[int] = None) -> list[Any]:
+        refs = self.collective_rpc(method,
+                                   args,
+                                   kwargs,
+                                   non_block=True,
+                                   unique_reply_rank=unique_reply_rank)
+        return await asyncio.gather(*refs)
+
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
         Low-level API to the executor. Return a "future" GenerationResult
