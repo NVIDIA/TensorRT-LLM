@@ -40,7 +40,7 @@ from typing import (
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from .....functional import AllReduceStrategy
@@ -189,12 +189,6 @@ class ShardingTransformConfig(TransformConfig):
                 # invalidate the config
                 config.clear()
                 continue
-
-    def get_factory_config(self) -> Dict[str, Any]:
-        return self.factory_config
-
-    def get_manual_config(self) -> Dict[str, Any]:
-        return self.manual_config
 
 
 def validate_allreduce_strategy(v):
@@ -707,8 +701,6 @@ def _update_node_args(node: Node, args: tuple) -> None:
 class ShardingTransformInfo(BaseModel, ABC):
     """Abstract base class for transformation configurations."""
 
-    model_config = ConfigDict(frozen=True)  # Makes the model immutable and hashable
-
     target_node: str
     config: ShardingTransformConfig
 
@@ -737,6 +729,25 @@ class ShardingTransformInfo(BaseModel, ABC):
             return False
         self.apply(gm, node)
         return True
+
+    def __hash__(self) -> int:
+        """Make the transform info hashable by excluding the config field.
+
+        The config field is excluded because:
+        1. It may not be hashable (ShardingTransformConfig is mutable)
+        2. Tests set config=None before comparison anyway
+        """
+        # Get all fields except 'config' for hashing
+        field_values = []
+        for field_name, field_info in self.model_fields.items():
+            if field_name != "config":
+                value = getattr(self, field_name)
+                # Handle enums
+                if isinstance(value, (Enum, IntEnum)):
+                    field_values.append(value.value)
+                else:
+                    field_values.append(value)
+        return hash(tuple(field_values))
 
 
 class LayerType(Enum):
