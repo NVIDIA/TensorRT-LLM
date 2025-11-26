@@ -28,7 +28,7 @@ def _allreduce_residual_rmsnorm_pattern(
     """
 
     input_dtype = x.dtype
-    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x, "AUTO")
     add = residual + hidden_states
 
     hidden_states = add.to(torch.float32)
@@ -52,7 +52,7 @@ def _allreduce_residual_rmsnorm_pattern2(
     """
 
     input_dtype = x.dtype
-    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x, "AUTO")
     add = hidden_states + residual
 
     hidden_states = add.to(torch.float32)

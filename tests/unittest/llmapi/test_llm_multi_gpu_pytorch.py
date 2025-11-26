@@ -11,6 +11,7 @@ from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_phi3_lora_fused_modules_output_tp2_identical_to_tp1)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
+                       llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness,
                        tinyllama_logits_processor_test_harness)
 from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
@@ -125,3 +126,45 @@ def test_llm_return_logprobs_streaming_tp2(prompt_logprobs, logprobs,
                                      streaming=True,
                                      backend="pytorch",
                                      tp_size=2)
+
+
+@skip_ray
+@pytest.mark.gpu2
+@pytest.mark.parametrize(
+    "return_context_logits, enable_chunked_prefill, enable_iter_req_stats",
+    [
+        (False, False, True),
+        (False, True, True),
+    ],
+)
+def test_llm_get_stats_pp2(return_context_logits, enable_chunked_prefill,
+                           enable_iter_req_stats):
+    llm_get_stats_test_harness(
+        tp_size=1,
+        pp_size=2,
+        return_context_logits=return_context_logits,
+        pytorch_backend=True,
+        enable_chunked_prefill=enable_chunked_prefill,
+        enable_iter_req_stats=enable_iter_req_stats,
+    )
+
+
+@skip_ray
+@pytest.mark.gpu4
+@pytest.mark.parametrize(
+    "return_context_logits, enable_chunked_prefill, enable_iter_req_stats",
+    [
+        (False, False, True),
+        (False, True, True),
+    ],
+)
+def test_llm_get_stats_pp4(return_context_logits, enable_chunked_prefill,
+                           enable_iter_req_stats):
+    llm_get_stats_test_harness(
+        tp_size=1,
+        pp_size=4,
+        return_context_logits=return_context_logits,
+        pytorch_backend=True,
+        enable_chunked_prefill=enable_chunked_prefill,
+        enable_iter_req_stats=enable_iter_req_stats,
+    )

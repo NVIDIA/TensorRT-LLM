@@ -700,8 +700,10 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
+    max_num_sequences = max_batch_size * mapping.pp_size
+
     logger.info(
-        f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
+        f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
     for key, value in llm_args.extra_resource_managers.items():
@@ -785,8 +787,6 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
-
-    max_num_sequences = max_batch_size * mapping.pp_size
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)

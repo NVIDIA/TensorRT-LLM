@@ -400,7 +400,6 @@ examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
 unittest/_torch/speculative/test_draft_len_schedule.py::test_correctness_across_batch_sizes[model_drafter-schedule1] SKIP (https://nvbugs/5680911)
 full:RTXPro6000D/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2] SKIP (https://nvbugs/5684703)
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-False-Qwen3-8B-FP8] SKIP (https://nvbugs/5685143)
 test_e2e.py::test_openai_responses SKIP (https://nvbugs/5635153)
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype SKIP (https://nvbugs/5612438)
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5688388)
