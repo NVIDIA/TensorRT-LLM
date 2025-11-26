@@ -43,9 +43,6 @@ class Worker(ABC):
     def shutdown(self):
         pass
 
-    async def async_shutdown(self):
-        pass
-
     def __enter__(self):
         return self
 
@@ -343,11 +340,24 @@ from mcp.client.sse import sse_client
 
 class MCPWorker(Worker):
 
+    class ToolCall:
+
+        def __init__(self, tool_name: str, args: dict):
+            self.tool_name = tool_name
+            self.args = args
+            self.ready = asyncio.Event()
+            self.result = None
+
+        def set_result(self, result: Optional[str]):
+            self.result = result
+            self.ready.set()
+
     def __init__(
         self,
         urls: List[str],
     ):
         self.urls = urls
+        self.queues = [asyncio.Queue() for _ in urls]
 
     @classmethod
     def init_with_urls(cls, urls: List[str]):
@@ -360,43 +370,41 @@ class MCPWorker(Worker):
                 await session.initialize()
                 response = await session.list_tools()
                 tools = response.tools
-                try:
-                    tool_name, args = yield None
-                    while True:
-                        if tool_name in [tool.name for tool in tools]:
-                            response = await session.call_tool(tool_name, args)
-                            tool_name, args = yield response.content[0].text
-                        else:
-                            tool_name, args = yield None
-                except GeneratorExit:
-                    pass
+                while True:
+                    obj = await self.queues[index].get()
+                    if obj is None:
+                        break
+                    # tool_call is a ToolCall object
+                    tool_call = obj
+                    tool_name = tool_call.tool_name
+                    args = tool_call.args
+                    if tool_name in [tool.name for tool in tools]:
+                        response = await session.call_tool(tool_name, args)
+                        tool_call.set_result(response.content[0].text)
+                    else:
+                        tool_call.set_result(None)
 
     async def init_in_asyncio_event_loop(self):
-        self.session_iterators = [
-            self._main_loop_async_client_iter(url, index)
-            for index, url in enumerate(self.urls)
-        ]
-        for iterator in self.session_iterators:
-            await iterator.asend(None)
+        for index in range(len(self.urls)):
+            asyncio.create_task(
+                self._main_loop_async_client_iter(self.urls[index], index))
 
     async def call_handler(self, task: MCPCallTask) -> TaskStatus:
         tool_name = task.tool_name
         tool_args = json.loads(task.args)
         for index in range(len(self.urls)):
-            result = await self.session_iterators[index].asend(
-                (tool_name, tool_args))
+            tool_call = self.ToolCall(tool_name, tool_args)
+            self.queues[index].put_nowait(tool_call)
+            await tool_call.ready.wait()
+            result = tool_call.result
             if result is not None:
                 task.result_str = result
                 break
 
         return TaskStatus.SUCCESS
 
-    # must shutdown in asyncio event loop
-    async def async_shutdown(self):
-        for iterator in self.session_iterators:
-            try:
-                await iterator.aclose()
-            except GeneratorExit:
-                pass
+    def shutdown(self):
+        for queue in self.queues:
+            queue.put_nowait(None)
 
     task_handlers = {MCPCallTask: call_handler}
