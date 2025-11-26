@@ -106,6 +106,7 @@ class BatchState:
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
     scheduled_ctx_reqs: list[LlmRequest] = None
+    finished_ctx_reqs: list[LlmRequest] = None
 
 
 class AsyncTransferManager:
@@ -270,6 +271,8 @@ class PyExecutor:
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
 
+        # Set of request IDs that are currently in flight across all micro batches.
+        # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
 
         # During warmup, we don't enable the profiler
@@ -732,7 +735,7 @@ class PyExecutor:
         return req_stats
 
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
-                           scheduled_batch) -> IterationStats:
+                           scheduled_batch, micro_batch_id) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
         stats.num_queued_requests = self.executor_request_queue.get_request_queue_size(
@@ -773,7 +776,7 @@ class PyExecutor:
         stats.inflight_batching_stats.num_paused_requests = len(
             scheduled_batch.paused_requests)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
-        stats.inflight_batching_stats.micro_batch_id = 0
+        stats.inflight_batching_stats.micro_batch_id = micro_batch_id
         if stats.specdec_stats is not None:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
@@ -786,9 +789,13 @@ class PyExecutor:
         with self.stats_lock:
             self.stats.append((stats, req_stats))
 
-    def _process_iter_stats(self, finished_requests: list[LlmRequest],
-                            active_requests: List[LlmRequest],
-                            batch_state: BatchState):
+    def _process_iter_stats(
+        self,
+        finished_requests: list[LlmRequest],
+        active_requests: List[LlmRequest],
+        batch_state: BatchState,
+        micro_batch_id: int = 0,
+    ):
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -801,9 +808,10 @@ class PyExecutor:
                 and self.enable_iter_perf_stats) else None
 
         self._append_iter_stats(
-            self._update_iter_stats(
-                batch_state.iter_stats, iter_latency_ms, len(finished_requests),
-                batch_state.sample_state.scheduled_requests), req_stats)
+            self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
+                                    len(finished_requests),
+                                    batch_state.sample_state.scheduled_requests,
+                                    micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
 
@@ -863,6 +871,7 @@ class PyExecutor:
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
+                    f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
@@ -871,9 +880,13 @@ class PyExecutor:
                 can_queue = self._can_queue(scheduled_batch)
 
                 if not can_queue:
+                    logger.debug(
+                        f"microbatch {microbatch_id} cannot be queued, skipping"
+                    )
                     self.micro_batches[microbatch_id] = None
                 else:
-                    self._add_inflight_ids(scheduled_batch)
+                    logger.debug(f"microbatch {microbatch_id} can be queued")
+                    finished_ctx_reqs = self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -933,6 +946,7 @@ class PyExecutor:
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
                         scheduled_ctx_reqs=scheduled_batch.context_requests,
+                        finished_ctx_reqs=finished_ctx_reqs,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -983,6 +997,8 @@ class PyExecutor:
                 finished_requests = []
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
+                        sample_state = previous_batch.sample_state
+                        sample_state.scheduled_requests.context_requests = previous_batch.finished_ctx_reqs
                         self._update_requests(previous_batch.sample_state)
 
                         if self.kv_cache_transceiver:
@@ -1002,7 +1018,8 @@ class PyExecutor:
                         self.resource_manager.update_resources(
                             previous_scheduled_batch, attn_metadata,
                             kv_cache_dtype_byte_size)
-                        self._remove_inflight_ids(previous_scheduled_batch)
+
+                        self._remove_inflight_ids(previous_batch)
 
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
@@ -1020,9 +1037,11 @@ class PyExecutor:
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
 
                 if self.enable_iter_perf_stats and previous_batch is not None:
+                    sample_state = previous_batch.sample_state
+                    sample_state.scheduled_requests.context_requests = previous_batch.scheduled_ctx_reqs
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
-                                             previous_batch)
+                                             previous_batch, microbatch_id)
 
                 self.iter_counter += 1
 
@@ -2468,13 +2487,43 @@ class PyExecutor:
             self._terminate_request(req)
 
     def _add_inflight_ids(self, scheduled_requests):
-        """Add reqids of current requests to self.inflight_req_ids."""
-        for req in scheduled_requests.all_requests():
-            self.inflight_req_ids.insert(req.request_id)
+        """Add request IDs of current requests to self.inflight_req_ids.
 
-    def _remove_inflight_ids(self, scheduled_requests):
-        """Remove reqids of current requests from self.inflight_req_ids."""
-        for req in scheduled_requests.all_requests():
+        Non‑final context chunks are not added to the inflight set, so the scheduler can keep scheduling further
+        context chunks while earlier ones are in the PP pipeline. Only context requests that finish context phase
+        are inserted into the inflight set and collected into finished_ctx_reqs.
+        All generation requests are still inserted into the inflight set.
+        """
+        finished_ctx_reqs = []
+        for req in scheduled_requests.context_requests:
+            if req.is_last_context_chunk:
+                logger.debug(
+                    f"Context request with ID {req.request_id} added to DECODER model inflight set"
+                )
+                self.inflight_req_ids.insert(req.request_id)
+                finished_ctx_reqs.append(req)
+        for req in scheduled_requests.generation_requests:
+            logger.debug(
+                f"Generation request with ID {req.request_id} added to DECODER model inflight set"
+            )
+            self.inflight_req_ids.insert(req.request_id)
+        return finished_ctx_reqs
+
+    def _remove_inflight_ids(self, batch_state: BatchStatePP):
+        """Remove request IDs of current requests from self.inflight_req_ids.
+
+        Context IDs are erased from the inflight set using batch_state.finished_ctx_reqs.
+        Generation IDs are erased using batch_state.sample_state.scheduled_requests.generation_requests.
+        """
+        for req in batch_state.finished_ctx_reqs:
+            logger.debug(
+                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
+            )
+            self.inflight_req_ids.erase(req.request_id)
+        for req in batch_state.sample_state.scheduled_requests.generation_requests:
+            logger.debug(
+                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
+            )
             self.inflight_req_ids.erase(req.request_id)
 
     def _handle_speculative_decoding(self, scheduled_batch, previous_tensors,
