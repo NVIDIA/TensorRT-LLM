@@ -80,7 +80,7 @@ def check_port_available(port: int) -> int:
         return sock.getsockname()[1]
 
 
-def revise_disaggregated_server_config_urls(
+def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: Dict[str, Any]) -> Dict[str, Any]:
     disaggregated_server_config['port'] = check_port_available(
         disaggregated_server_config['port'])
@@ -122,7 +122,7 @@ def launch_disaggregated_llm(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
 
-    disaggregated_server_config = check_disagg_server_config(
+    disaggregated_server_config = revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config)
 
     with open(disaggregated_serving_config_path, "w") as f:
