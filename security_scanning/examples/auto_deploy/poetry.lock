@@ -45,13 +45,13 @@ testing = ["bitsandbytes", "datasets", "diffusers", "evaluate", "parameterized",
 
 [[package]]
 name = "ai-edge-model-explorer"
-version = "0.1.30"
+version = "0.1.31"
 description = "A modern model graph visualizer and debugger"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "ai_edge_model_explorer-0.1.30-py3-none-any.whl", hash = "sha256:0b4a6629661a133b6a076edfad57501446946ff0ffc878271fd1a687fee7a633"},
-    {file = "ai_edge_model_explorer-0.1.30.tar.gz", hash = "sha256:a7306d00a5b4d8c892bf48ef6346f6d62ef11b0e66d1815622ee3cfe563a6f7c"},
+    {file = "ai_edge_model_explorer-0.1.31-py3-none-any.whl", hash = "sha256:746ada4952a43927302158fb2cc11f160cc24e6181ab111b95c236a3066291b6"},
+    {file = "ai_edge_model_explorer-0.1.31.tar.gz", hash = "sha256:8d2e91c16f331fe77eb8059f9fdb004d2e412e82e84706580ebdcddfcb4d145f"},
 ]
 
 [package.dependencies]
@@ -3491,13 +3491,13 @@ test = ["argcomplete (>=3.0.3)", "mypy (>=1.7.0)", "pre-commit", "pytest (>=7.0,
 
 [[package]]
 name = "transformers"
-version = "4.57.2"
+version = "4.57.3"
 description = "State-of-the-art Machine Learning for JAX, PyTorch and TensorFlow"
 optional = false
 python-versions = ">=3.9.0"
 files = [
-    {file = "transformers-4.57.2-py3-none-any.whl", hash = "sha256:0918df354853c9931a637792cec519e137aceb150effd4c7924d6b8d36918fab"},
-    {file = "transformers-4.57.2.tar.gz", hash = "sha256:172a455ad5a570ecad89bea510a6c924c45fa90e46e859225fac07305d7946fc"},
+    {file = "transformers-4.57.3-py3-none-any.whl", hash = "sha256:c77d353a4851b1880191603d36acb313411d3577f6e2897814f333841f7003f4"},
+    {file = "transformers-4.57.3.tar.gz", hash = "sha256:df4945029aaddd7c09eec5cad851f30662f8bd1746721b34cc031d70c65afebc"},
 ]
 
 [package.dependencies]
