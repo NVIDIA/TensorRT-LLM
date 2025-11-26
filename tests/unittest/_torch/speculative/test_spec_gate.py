@@ -20,7 +20,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # It is set with acceptance window and acceptance threshold in spec_config.
 # This test set the max_concurrency to a large value to prevent spec decode turned off due to number of effective requests > max_concurrency,
 # So that we can only focus on the turning off effect from the SpeculationGate.
-@skip_blackwell  # TODO: Remove after fixing TRTLLM-GEN FMHA segfault on Blackwell
+@skip_blackwell  # TODO: Remove after fixing TRTLLM-GEN FMHA segfault on Blackwell. NVBugs: https://nvbugspro.nvidia.com/bug/5698292
 @pytest.mark.high_cuda_memory
 def test_spec_gate_e2e():
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
