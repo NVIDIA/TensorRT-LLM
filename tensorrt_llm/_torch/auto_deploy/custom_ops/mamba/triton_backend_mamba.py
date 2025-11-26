@@ -185,12 +185,12 @@ def _triton_cached_ssm(
     C_flat = C.reshape(bs, *C.shape[2:])  # [bs, G, N]
     dt_flat = dt.reshape(bs, dt.shape[2])  # [bs, H]
 
-    y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
-    y_flat = y.view(bs, *y.shape[2:])
-
     ssm_state_size = B.shape[3]
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_tensor.tolist()
+
+    y_prefill = None
+    y_dec = None
 
     # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
@@ -232,7 +232,6 @@ def _triton_cached_ssm(
             mamba_ssm_cache_dtype=ssm_state_cache.dtype,
         )
 
-        y_flat[:num_prefill_tokens] = y_prefill[0].to(y_flat.dtype)
         ssm_state_cache.index_copy_(
             0, slot_idx[:num_prefill], varlen_states.to(ssm_state_cache.dtype)
         )
@@ -265,9 +264,19 @@ def _triton_cached_ssm(
             state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
-        y_flat[num_prefill_tokens : num_prefill_tokens + num_decode].copy_(y_dec.to(y_flat.dtype))
-
-    return y
+    # Dispatch return logic
+    if num_prefill > 0 and num_decode > 0:
+        y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+        y_flat = y.view(bs, *y.shape[2:])
+        y_flat[:num_prefill_tokens].copy_(y_prefill[0])
+        y_flat[num_prefill_tokens : num_prefill_tokens + num_decode].copy_(y_dec)
+        return y
+    elif num_prefill > 0:
+        return y_prefill[0].view(b, s, num_heads, head_dim).to(hidden_states.dtype)
+    elif num_decode > 0:
+        return y_dec.view(b, s, num_heads, head_dim).to(hidden_states.dtype)
+    else:
+        return torch.empty_like(hidden_states)
 
 
 @_triton_cached_ssm.register_fake

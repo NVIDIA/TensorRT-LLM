@@ -94,7 +94,7 @@ def cuda_causal_conv_prepare_metadata_fake(
     )
 
 
-@torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={})
+@torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={"input"})
 def _cuda_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
@@ -114,13 +114,15 @@ def _cuda_cached_causal_conv1d(
     groups: int,
     padding_mode: str,
     activation: Optional[str],
-) -> torch.Tensor:
+) -> None:
     """Flattened cached causal conv that respects slot-indexed state caches (CUDA backend).
 
     Supports two layouts from the attention interface:
     - Generate-only: input is [b, 1, c_in]. We'll gather caches using slot_idx[:b].
     - Flattened context/mixed: input is [1, total_s, c_in] and seq_len/seq_start
       describe per-sequence segments. We'll process each segment and scatter final states to caches.
+
+    NOTE: This op modifies `input` in-place.
     """
     b, s = input.shape[:2]
     num_seq = seq_len.shape[0]
@@ -137,8 +139,6 @@ def _cuda_cached_causal_conv1d(
     # Flatten tokens
     bs = b * s
     inp_flat = input.reshape(bs, *input.shape[2:])  # [total_s, C_in]
-    y = torch.empty(b, s, weight.shape[0], device=input.device, dtype=input.dtype)
-    y_flat = y.view(bs, *y.shape[2:])
 
     # Prepare weight as [dim, width] (depthwise)
     if weight.ndim == 3:
@@ -155,6 +155,7 @@ def _cuda_cached_causal_conv1d(
         total_prefill_tokens = int(seq_len_prefill.sum().item())
 
         # x_varlen: (dim, cu_seq_len)
+        # We must clone to make it contiguous for the kernel
         x_varlen = inp_flat[:total_prefill_tokens].transpose(0, 1).contiguous()
 
         # Metadata
@@ -181,9 +182,8 @@ def _cuda_cached_causal_conv1d(
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
 
-        # Scatter outputs back to y
-        y_prefill = y_varlen.transpose(0, 1)  # [total_prefill_tokens, C_out]
-        y_flat[:total_prefill_tokens].copy_(y_prefill)
+        # Scatter outputs back to input buffer
+        inp_flat[:total_prefill_tokens] = y_varlen.transpose(0, 1)
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
@@ -191,7 +191,8 @@ def _cuda_cached_causal_conv1d(
             total_prefill_tokens : total_prefill_tokens + num_decode
         ]  # [num_decode, C_in]
 
-        y_dec = causal_conv1d_update(
+        # causal_conv1d_update modifies x_decode in-place
+        causal_conv1d_update(
             x_decode,  # [batch, dim]
             conv_state_cache,
             w2d,
@@ -201,13 +202,9 @@ def _cuda_cached_causal_conv1d(
             conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
         )
+        # No copy needed!
 
-        if y_dec.dim() == 3:
-            y_dec = y_dec.squeeze(-1)
-        y_flat[total_prefill_tokens : total_prefill_tokens + num_decode].copy_(y_dec)
-
-    # Custom op must not return an alias of any input; return a fresh tensor
-    return y
+    return
 
 
 @_cuda_cached_causal_conv1d.register_fake
@@ -231,9 +228,12 @@ def _cuda_cached_causal_conv1d_fake(
     padding_mode: str,
     activation: Optional[str],
 ):
-    return torch.empty(
-        input.shape[0], input.shape[1], weight.shape[0], device=input.device, dtype=input.dtype
-    )
+    return
+
+
+def cuda_cached_causal_conv1d_wrapper(input, *args, **kwargs):
+    torch.ops.auto_deploy.cuda_cached_causal_conv1d(input, *args, **kwargs)
+    return input
 
 
 @AttentionRegistry.register("cuda_causal_conv")
@@ -259,7 +259,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.cuda_cached_causal_conv1d
+        return cuda_cached_causal_conv1d_wrapper
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
