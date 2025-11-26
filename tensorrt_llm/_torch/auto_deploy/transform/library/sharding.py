@@ -168,6 +168,7 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+
     dist_backend: DistBackend = Field(default=DistBackend.AUTO)
 
 
