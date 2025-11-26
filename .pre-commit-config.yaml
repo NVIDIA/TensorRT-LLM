@@ -65,8 +65,10 @@ repos:
     -   id: codespell
         additional_dependencies:
         - tomli
+        # Use regex to exclude the whole directory recursively
+        exclude: ^security_scanning/
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
