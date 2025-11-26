@@ -930,7 +930,8 @@ class Indexer(nn.Module):
                     start_idx=0,
                 )
 
-                if len(chunk_groups) > 1:
+                if len(chunk_groups
+                       ) > 1 or metadata.enable_context_mla_with_cached_kv:
                     metadata.indexer_prefill_chunks = [
                         Indexer.prepare_one_prefill_chunk(
                             metadata,
@@ -938,13 +939,14 @@ class Indexer(nn.Module):
                         ) for chunk_specs in chunk_groups
                     ]
                 else:
-                    # Single chunk - use non-chunked fallback path
                     metadata.indexer_prefill_chunks = None
 
-            host_cu_seqlen_ks, _ = compute_cu_seqlen_kv_bounds_with_cache(
+            host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
                 host_seq_lens, num_contexts, num_ctx_tokens, host_cached_tokens)
 
             metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
+                                                         non_blocking=True)
+            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
                                                          non_blocking=True)
 
         # Prepare for decode phase if there are generation requests
@@ -1016,9 +1018,9 @@ class Indexer(nn.Module):
         metadata.slot_mapping_scale[:total_tokens].copy_(
             metadata.host_slot_mapping_scale[:total_tokens], non_blocking=True)
 
-        # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
+        # When chunked prefill or KVCache reuse is enabled, we need to gather the full KV for indexer's logit computation.
         # Indexer's own chunking does not need full KV gathering, instead it gathers only the current chunk with loop-based gathering.
-        _need_full_kv_gathering = num_contexts > 0 and has_mla_chunked_prefill
+        _need_full_kv_gathering = num_contexts > 0 and metadata.enable_context_mla_with_cached_kv
         if _need_full_kv_gathering:
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
             total_kv_per_request = seq_lens[:
