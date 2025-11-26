@@ -424,8 +424,8 @@ class Attention(nn.Module):
             out_scale = self.o_proj.inv_input_scale
         if has_awq_pre_quant_scale and enable_attn_nvfp4_output:
             logger.warning_once(
-                "Disable attn nvfp4 output because o_proj has pre_quant_scale for AWQ."
-            )
+                "Disable attn nvfp4 output because o_proj has pre_quant_scale for AWQ.",
+                key="disable_attn_nvfp4_output_for_awq")
             enable_attn_nvfp4_output = False
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output and not self.attn_output_gate:
             out_scale_sf = self.o_proj.input_scale
