@@ -419,12 +419,177 @@ def get_all_weights_in_subgraph(
     return weight_nodes
 
 
+def _insert_sharded_mamba(
+    gm: GraphModule,
+    entry_node: Node,
+    dim: int,
+    config: ShardingTransformConfig,
+    min_local_shape: int = 1,
+    weights_to_shard: Optional[list[str]] = None,
+    weight_shard_dims: Optional[Dict[str, int]] = None,
+    fused_weight_dims: Optional[Dict[str, list]] = None,
+    quantization_cb: Optional[
+        Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
+    ] = None,
+) -> bool:
+    """
+    To shard Mamba layer, first column-shard the first linear layer: entry_node,
+    then shard all remaining weight tensors found in the subgraph defined between
+    entry_node and the next successor linear node.
+    First, validate if this is indeed a mamba module: within the subgraph,
+    there should be an torch_ssm node and conv1d node.
+
+    Args:
+        gm: GraphModule
+        entry_node: The first linear node of the Mamba layer
+        dim: Default shard dimension
+        allreduce_strategy: AllReduceStrategy
+        min_local_shape: Minimum local shape constraint
+        weights_to_shard: Optional list of regex patterns to match weight names
+        weight_shard_dims: Optional dict mapping weight keys to their shard dimensions
+        fused_weight_dims: Optional dict mapping weight keys to their fused dimension lists
+        quantization_cb: Optional quantization callback
+    """
+    # Find next linear node to define subgraph boundary
+    try:
+        next_lin_node, depth = bfs(entry_node, is_any_lin_op, include_root=False)
+    except RuntimeError:
+        ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
+        return False
+
+    rank, world_size = config.rank, config.world_size
+    # Get subgraph between entry_node and next linear node
+    subgraph_nodes = subgraph([entry_node], [next_lin_node])
+
+    ##############################################################
+    ########## validate if this is a valid Mamba module ##########
+    ##############################################################
+    # has_ssm = any(is_op(n, torch.ops.auto_deploy.mamba.torch_ssm_transform) for n in subgraph_nodes)
+    has_ssm = True
+    conv1d_nodes = [
+        n
+        for n in subgraph_nodes
+        if is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
+    ]
+    if len(conv1d_nodes) != 1 or not has_ssm:
+        ad_logger.warning(
+            f"Subgraph does not contain exactly one conv1d node and torch_ssm_transform. "
+            f"Skipping Mamba sharding. conv1d_nodes={conv1d_nodes}, has_ssm={has_ssm}"
+        )
+        return False
+
+    ##############################################################
+    ########## infer split sizes for in_proj and conv1d ##########
+    ##############################################################
+    # in_proj and conv1d are most likely fused, followed up by split nodes. Infer split sizes:
+    if fused_weight_dims is None:
+        split_nodes = [
+            n
+            for n in subgraph_nodes
+            if is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes])
+        ]
+        if len(split_nodes) != 2:
+            ad_logger.warning(
+                f"Subgraph does not contain exactly two split nodes. "
+                f"Skipping Mamba sharding. split_nodes={split_nodes}"
+            )
+            return False
+        split_sizes_1 = split_nodes[0].args[1]
+        split_sizes_2 = split_nodes[1].args[1]
+        if split_sizes_1[1] != sum(split_sizes_2):
+            ad_logger.warning(
+                f"Split nodes have different sizes. "
+                f"Skipping Mamba sharding. split_sizes_1={split_sizes_1}, split_sizes_2={split_sizes_2}"
+            )
+            return False
+        fused_weight_dims = {
+            "in_proj": split_sizes_1[0:1] + split_sizes_2 + split_sizes_1[2:],
+            "conv1d": split_sizes_2,
+        }
+
+    conv1d_node = conv1d_nodes[0]
+    # conv1d_node last argument is the number of output channels.
+    # This one is also sharded, so we need to update this parameter
+    conv_args = list(conv1d_node.args)
+    conv_args[-1] = conv1d_node.args[-1] // world_size
+    conv1d_node.args = tuple(conv_args)
+
+    # First, shard the entry_node (the first linear layer)
+    # Extract entry node's fused_weight_dims by matching weight name against patterns
+    entry_fused_dims = None
+    if fused_weight_dims:
+        entry_weight_key, _ = extract_param_names_from_node(entry_node)
+        for pattern, dims in fused_weight_dims.items():
+            if re.search(pattern, entry_weight_key):
+                entry_fused_dims = dims
+                break
+
+    _shard_parameter_node(
+        gm=gm,
+        node=entry_node,
+        dim=SplitDimension.COLUMN,
+        config=config,
+        min_local_shape=min_local_shape,
+        fused_weight_dims=entry_fused_dims,
+        quantization_cb=quantization_cb,
+    )
+
+    # Get all weight nodes in the subgraph except for out_proj
+    weight_nodes = [
+        n
+        for n in get_all_weights_in_subgraph([entry_node], [next_lin_node])
+        if "out_proj" not in str(n)
+    ]
+
+    # Shard remaining weights, such as conv1d or RMSNorm
+    for weight_node in weight_nodes:
+        weight_key = weight_node.target
+
+        # Filter by regex patterns if provided
+        if weights_to_shard is not None:
+            if not any(pattern in weight_key for pattern in weights_to_shard):
+                continue
+
+        # Determine shard dimension for this weight
+        shard_dim = weight_shard_dims.get(weight_key, dim) if weight_shard_dims else dim
+
+        # Get the weight parameter
+        try:
+            weight_param = gm.get_parameter(weight_key)
+        except AttributeError:
+            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
+            continue
+
+        # Get fused dims for this weight if specified
+        fused_dims = None
+        for k, v in fused_weight_dims.items():
+            if k in weight_key:
+                fused_dims = v
+                break
+
+        # Shard the weight tensor (also updates the parameter in the module)
+        _, sharded_shape = shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_param,
+            param_key=weight_key,
+            dim=shard_dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+            fused_weight_dims=fused_dims,
+        )
+
+        ad_logger.debug(
+            f"Sharded weight {weight_key} on dim {shard_dim}: "
+            f"{weight_param.shape} -> {sharded_shape}"
+        )
+
+
 def _shard_parameter_node(
     gm: GraphModule,
     node: Node,
     dim: int,
-    rank: int,
-    world_size: int,
+    config: ShardingTransformConfig,
     add_dist: bool = False,
     min_local_shape: int = 1,
     fused_weight_dims: Optional[list] = None,
@@ -439,6 +604,8 @@ def _shard_parameter_node(
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
 
+    rank, world_size = config.rank, config.world_size
+    allreduce_strategy = config.allreduce_strategy.name
     num_users = num_users_of_weight_node(node)
     if num_users > 1 or num_users == 0:
         ad_logger.warning(
@@ -510,15 +677,18 @@ def _shard_parameter_node(
         return
 
     # figure out the right dist op
-    dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
-    }
-    fn_dist, *dist_args = dist_lookup[dim]
+    if dim == 0:
+        # Column split -> all_gather
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
+        dist_args = (node, -1)
+    else:
+        # Row split -> all_reduce with strategy
+        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce.default
+        dist_args = (node, allreduce_strategy)
 
     # add reduction node
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(fn_dist, args=(node, *dist_args))
+        dist_node = gm.graph.call_function(fn_dist, args=dist_args)
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -627,17 +797,27 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        _shard_parameter_node(
-            gm=gm,
-            node=node,
-            dim=self.split_dim.value,
-            rank=self.config.rank,
-            world_size=self.config.world_size,
-            add_dist=self.dist_op is not None,
-            min_local_shape=self.min_local_shape,
-            fused_weight_dims=self.fused_weight_dims,
-            quantization_cb=self.quantization_cb,
-        )
+        if self.layer_type == LayerType.MAMBA:
+            _insert_sharded_mamba(
+                gm=gm,
+                entry_node=node,
+                dim=self.split_dim.value,
+                config=self.config,
+                min_local_shape=self.min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
+                quantization_cb=self.quantization_cb,
+            )
+        else:
+            _shard_parameter_node(
+                gm=gm,
+                node=node,
+                dim=self.split_dim.value,
+                config=self.config,
+                add_dist=self.dist_op is not None,
+                min_local_shape=self.min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
+                quantization_cb=self.quantization_cb,
+            )
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
@@ -942,6 +1122,7 @@ def _insert_sharded_moe(
     ep_size = config.process_grid[ShardingDim.EP]["w"]
     tp_rank = config.process_grid[ShardingDim.TP]["p"]
     tp_size = config.process_grid[ShardingDim.TP]["w"]
+    allreduce_strategy = config.allreduce_strategy.name
     num_experts = len(node.args[3])
     args = list(node.args)
 
@@ -1035,7 +1216,7 @@ def _insert_sharded_moe(
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
         dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
+            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node, allreduce_strategy)
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
