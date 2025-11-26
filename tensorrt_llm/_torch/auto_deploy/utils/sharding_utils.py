@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from ....functional import AllReduceStrategy
@@ -1317,13 +1317,17 @@ class ShardingTransformContainer(BaseModel):
             ParameterUpdateInfo: self.parameter_update_transforms,
         }
 
-    def init_params(self, other: "ShardingTransformConfig") -> None:
+    def init_params(
+        self, other: "ShardingTransformConfig", rank: int = None, world_size: int = None
+    ) -> None:
         """
         Copy parameters from ShardingTransformConfig. The class is not
         imported here to avoid circular imports.
         """
-        self.rank = other.rank
-        self.world_size = other.world_size
+        if rank is not None:
+            self.rank = rank
+        if world_size is not None:
+            self.world_size = world_size
         self.factory_config = other.factory_config
         self.manual_config = other.manual_config
         self.simple_shard_only = other.simple_shard_only
