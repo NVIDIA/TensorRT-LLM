@@ -73,15 +73,14 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
-  # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['heuristic']
+    sharding_source: ['factory','heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
+    allreduce_strategy: 'AUTO'
     requires_shape_prop: true
-  # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
@@ -116,9 +115,11 @@ transforms:
   fuse_moe:
     stage: post_load_fusion
     enabled: true
+    backend: trtllm
   fuse_fp8_moe:
     stage: post_load_fusion
     enabled: true
+    backend: trtllm
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
@@ -163,6 +164,9 @@ transforms:
   ############################################################################################
   fuse_causal_conv_activation:
     stage: compile
+  multi_stream_moe:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     run_per_gm: false

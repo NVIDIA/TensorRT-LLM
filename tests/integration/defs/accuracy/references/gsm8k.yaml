@@ -161,6 +161,11 @@ nvidia/Nemotron-H-56B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 89.27
+nvidia/Nemotron-MOE:
+  - accuracy: 88.249
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 86.884
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 37.15
   - quant_algo: FP8
@@ -263,4 +268,11 @@ ByteDance-Seed/Seed-OSS-36B-Instruct:
 zai-org/GLM-4.6:
   - accuracy: 81.3
   - quant_algo: NVFP4
-    accuracy: 91.0
+    spec_dec_algo: MTP
+    accuracy: 88.0
+bigcode/starcoder2-3b:
+  - accuracy: 20.2
+bigcode/starcoder2-7b:
+  - accuracy: 26.5
+bigcode/starcoder2-15b:
+  - accuracy: 54.5

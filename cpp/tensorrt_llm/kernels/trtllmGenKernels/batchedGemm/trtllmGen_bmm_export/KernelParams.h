@@ -16,13 +16,13 @@
  */
 #pragma once
 
-#include <stdexcept>
-#include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/CommonUtils.h"
+#include "trtllm/gen/SfLayoutDecl.h"
+#include <stdexcept>
 
-#include "TmaDescriptor.h"
-#include "Enums.h"
 #include "BatchedGemmEnums.h"
+#include "Enums.h"
+#include "TmaDescriptor.h"
 
 // NOTE: keep this code dependency free. It has to be included by the device code and has to be
 // compilable with NVRTC.
@@ -445,9 +445,21 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         }
 
         if (options.mDtypeA == tg::Dtype::E2m1 || options.mDtypeA == tg::Dtype::MxE4m3
-            || options.mDtypeA == tg::Dtype::MxE2m1)
+            || options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::MxInt4)
         {
-            tg::Dtype const dTypeSf = (options.mDtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
+            tg::Dtype dTypeSfA{};
+            if (options.mDtypeA == tg::Dtype::E2m1)
+            {
+                dTypeSfA = tg::Dtype::E4m3;
+            }
+            else if (options.mDtypeA == tg::Dtype::MxInt4)
+            {
+                dTypeSfA = tg::Dtype::Bfloat16;
+            }
+            else
+            {
+                dTypeSfA = tg::Dtype::UE8m0;
+            }
 
             // Build TMA descriptor for gmem A block scaling factors.
             auto [shapeSfA, strideSfA, tileShapesSfA]
@@ -455,7 +467,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                     options.mTileM, options.mTileN, options.mTileK, tg::SfLayout::R128c4, options.mSfReshapeFactor,
                     options.mSfBlockSizeA.value_or(tg::dtypeNumEltsPerSf(options.mDtypeA)));
             params.tmaSfA[0]
-                = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
+                = gemm::buildSfTmaDescriptor(dTypeSfA, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
         }
 
         if (options.mDtypeB == tg::Dtype::E2m1 || options.mDtypeB == tg::Dtype::MxE4m3

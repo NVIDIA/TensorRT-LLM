@@ -88,6 +88,34 @@ def _nemotron_h_block_forward(
         return hidden_states
 
 
+def _nemotron_h_topk_router_forward(self, hidden_states):
+    """
+    Forward pass for NemotronHTopkRouter using the optimized noaux_tc_op kernel.
+
+    This replaces the original forward method which used pure PyTorch operations
+    with a fused CUDA kernel that performs:
+    1. Sigmoid activation of logits
+    2. Group-based expert selection
+    3. Top-k selection within selected groups
+    4. Normalized weight computation
+    """
+    hidden_states = hidden_states.view(-1, self.config.hidden_size)
+    router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+
+    # Use the fused noaux_tc_op kernel which applies sigmoid internally
+    # and performs group-based top-k selection with normalization
+    topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+        router_logits,
+        self.e_score_correction_bias,
+        self.n_group,
+        self.topk_group,
+        self.top_k,
+        self.routed_scaling_factor,
+    )
+
+    return topk_indices, topk_weights
+
+
 # Note: we assume experts have no bias for now
 def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     """
@@ -100,6 +128,10 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     topk_indices, topk_weights = self.gate(hidden_states)
     x_flat = hidden_states.view(-1, hidden_states.shape[-1])
 
+    # NOTE: So far we've seen that the dispatch order in eager code is the same as the node order in the exported graph.
+    # We dispatch shared expert first so that we can easily fork the execution of the routed experts
+    # (using the custom op below) to an auxiliary stream.
+    shared_out = self.shared_experts(residuals)
     # Check if this is a latent MOE (has fc1_latent_proj and fc2_latent_proj)
     has_latent_proj = hasattr(self, "fc1_latent_proj") and hasattr(self, "fc2_latent_proj")
 
@@ -123,8 +155,8 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
         # Latent MOE: project back from latent space
         out_flat = self.fc2_latent_proj(out_flat)
 
-    out = out_flat.view(*orig_shape)
-    out = out + self.shared_experts(residuals)
+    routed_out = out_flat.view(*orig_shape)
+    out = shared_out + routed_out
     return out
 
 
@@ -138,6 +170,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
     ],
     "NemotronHBlock": [("forward", _nemotron_h_block_forward)],
     "NemotronHMOE": [("forward", _nemotron_h_moe_forward)],
+    "NemotronHTopkRouter": [("forward", _nemotron_h_topk_router_forward)],
 }
 
 
@@ -158,15 +191,23 @@ AutoModelForCausalLM.from_config = get_model_from_config_patched
 
 _config_from_pretrained_original = AutoConfig.from_pretrained
 _nemotron_h_base_model_tp_plan = {
+    # mamba SSM layer
     "in_proj": "mamba",
     "out_proj": "rowwise",
+    # attention layer
     "q_proj": "colwise",
     "k_proj": "colwise",
     "v_proj": "colwise",
     "o_proj": "rowwise",
+    # NOTE: consider not sharding shared experts and/or
+    # latent projections at all, keeping them replicated.
+    # To do so, comment out the corresponding entries.
+    # moe layer: SHARED experts
     "up_proj": "colwise",
     "down_proj": "rowwise",
-    # "*": "gather",
+    # MoLE: latent projections: simple shard
+    "fc1_latent_proj": "gather",
+    "fc2_latent_proj": "gather",
 }
 
 
