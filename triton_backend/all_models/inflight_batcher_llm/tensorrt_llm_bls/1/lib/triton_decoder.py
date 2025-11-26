@@ -656,12 +656,13 @@ class TritonDecoder(Decoder):
             ]
 
     @override
-    def load_model_configs(self,
-                           triton_host_and_port: Optional[str] = None,
-                           target_model_name: Optional[str] = None,
-                           draft_model_name: Optional[str] = None,
-                           n_retries: Optional[int] = 5,
-                           retry_interval_sec: Optional[int] = 3):
+    def load_model_configs_for_spec_decoding(
+            self,
+            triton_host_and_port: Optional[str] = None,
+            target_model_name: Optional[str] = None,
+            draft_model_name: Optional[str] = None,
+            n_retries: Optional[int] = 5,
+            retry_interval_sec: Optional[int] = 3):
         if self._exclude_input_in_output_for_target is not None and self._exclude_input_in_output_for_draft is not None:
             # Already loaded. Skip.
             return
