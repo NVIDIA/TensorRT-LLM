@@ -3997,6 +3997,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["tp2", "ep2", "dp2"])
     def test_w4_2gpus_nvfp4(self, tp_size, pp_size, ep_size, attention_dp,
                             cuda_graph, overlap_scheduler, mocker):
+        pytest.skip("Models not uploaded to CI")
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
