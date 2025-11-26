@@ -1988,9 +1988,12 @@ class TRTLLMSampler(Sampler):
         if beam_width > 1:
             self._update_cache_indirection_buffer(scheduled_requests)
 
+        decoder_input_buffers = self.store["decoder_input_buffers"][self.micro_batch_idx]
+        decoder_state = self.store["decoder_state"]
+
         make_decoding_batch_input(
-            self.store["decoder_input_buffers"][self.micro_batch_idx],
-            self.store["decoder_state"],
+            decoder_input_buffers,
+            decoder_state,
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
             model_outputs["logits"],
@@ -2000,35 +2003,40 @@ class TRTLLMSampler(Sampler):
         )
 
         self.algs.decoder.forward_async(
-            self.store["decoder_state"],
-            self.store["decoder_input_buffers"][self.micro_batch_idx],
+            decoder_state,
+            decoder_input_buffers,
         )
+
+        finished_context_requests = [
+            req for req in scheduled_requests.context_requests if req.is_last_context_chunk
+        ]
+        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
 
         finalize_events = {}
         gathered_ids = None
         if beam_width > 1:
-            finished_sum_device = self.store["decoder_state"].finished_sum
+            finished_sum_device = decoder_state.finished_sum
 
-            for request in scheduled_requests.all_requests():
+            for request in sampling_requests:
                 if request.is_context_init_state:
                     continue
                 if finished_sum_device[request.seq_slot] == beam_width:
                     finalize_events[request.request_id] = self._finalize_request(request, False)
                 elif request.streaming:
                     finalize_events[request.request_id] = self._finalize_request(request, True)
-            gathered_ids = self.store["decoder_state"].gathered_ids.to("cpu", non_blocking=True)
-        new_output_tokens = self.store["decoder_state"].all_new_tokens.to("cpu", non_blocking=True)
-        finished_sum = self.store["decoder_state"].finished_sum.to("cpu", non_blocking=True)
-        finish_reasons = self.store["decoder_state"].finish_reasons.to("cpu", non_blocking=True)
-        sequence_lengths = self.store["decoder_state"].sequence_lengths.to("cpu", non_blocking=True)
+            gathered_ids = decoder_state.gathered_ids.to("cpu", non_blocking=True)
+        new_output_tokens = decoder_state.all_new_tokens.to("cpu", non_blocking=True)
+        finished_sum = decoder_state.finished_sum.to("cpu", non_blocking=True)
+        finish_reasons = decoder_state.finish_reasons.to("cpu", non_blocking=True)
+        sequence_lengths = decoder_state.sequence_lengths.to("cpu", non_blocking=True)
 
         log_probs = None
         cum_log_probs = None
-        if any(request.py_return_log_probs for request in scheduled_requests.all_requests()):
-            log_probs = self.store["decoder_state"].log_probs.to("cpu", non_blocking=True)
-            cum_log_probs = self.store["decoder_state"].cum_log_probs.to("cpu", non_blocking=True)
+        if any(request.py_return_log_probs for request in sampling_requests):
+            log_probs = decoder_state.log_probs.to("cpu", non_blocking=True)
+            cum_log_probs = decoder_state.cum_log_probs.to("cpu", non_blocking=True)
 
-        device = SampleStateTensors(new_tokens=self.store["decoder_state"].all_new_tokens)
+        device = SampleStateTensors(new_tokens=decoder_state.all_new_tokens)
 
         host = SampleStateTensorsHostTRTLLM(
             new_tokens=new_output_tokens,
@@ -2046,7 +2054,7 @@ class TRTLLMSampler(Sampler):
         self.micro_batch_idx = (self.micro_batch_idx + 1) % self.num_micro_batches
 
         return SampleStateTRTLLM(
-            scheduled_requests=scheduled_requests,
+            requests=sampling_requests,
             device=device,
             host=host,
             sampler_event=sampler_event,
@@ -2062,13 +2070,13 @@ class TRTLLMSampler(Sampler):
     ):
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
-        if state.scheduled_requests.batch_size == 0:
+        if len(state.requests) == 0:
             return
 
         if state.sampler_event:
             state.sampler_event.synchronize()
 
-        beam_width = self.beam_width(state.scheduled_requests.all_requests())
+        beam_width = self.beam_width(state.requests)
 
         if beam_width == 1 and self.MAX_DECODING_TOKENS == 1:
             self.update_requests_single_beam_single_step(state)
@@ -2087,13 +2095,7 @@ class TRTLLMSampler(Sampler):
             state.host.cum_log_probs.tolist() if state.host.cum_log_probs is not None else None
         )
 
-        reqs = [
-            r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
-        ] + [
-            r
-            for r in state.scheduled_requests.generation_requests
-            if not r.is_generation_complete_state
-        ]
+        reqs = [r for r in state.requests if not r.is_generation_complete_state]
 
         reqs_with_new_tokens = [
             r for r in reqs if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
@@ -2148,13 +2150,7 @@ class TRTLLMSampler(Sampler):
         log_probs_host = state.host.log_probs.tolist() if state.host.log_probs is not None else None
         finalize_events = state.finalize_events
 
-        reqs = [
-            r for r in state.scheduled_requests.context_requests if not r.is_context_init_state
-        ] + [
-            r
-            for r in state.scheduled_requests.generation_requests
-            if not r.is_generation_complete_state
-        ]
+        reqs = [r for r in state.requests if not r.is_generation_complete_state]
 
         for request in reqs:
             seq_slot = request.py_seq_slot
