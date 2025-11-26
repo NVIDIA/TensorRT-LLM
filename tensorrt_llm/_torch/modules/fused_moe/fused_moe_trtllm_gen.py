@@ -283,6 +283,9 @@ class TRTLLMGenFusedMoE(MoE):
                 x_col = x.shape[1] * 2
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                if pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, pad_size))
                 x_row = x.shape[0]
                 x_col = x.shape[1]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
