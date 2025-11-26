@@ -236,6 +236,9 @@ class OpenAIServer:
             status_code=HTTPStatus.NOT_FOUND,
         )
 
+    def _check_health(self) -> bool:
+        return self.llm._check_health()
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
@@ -296,7 +299,10 @@ class OpenAIServer:
                                methods=["POST"])
 
     async def health(self) -> Response:
-        return Response(status_code=200)
+        if self._check_health():
+            return Response(status_code=200)
+        else:
+            return Response(status_code=503, content="LLM is unavailable. Please check the server logs for more details.")
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
