@@ -17,6 +17,8 @@ This is a functional quick-start guide for running the Qwen3 model on TensorRT L
 * [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B)
 * [Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B)
 * [Qwen3-235B-A22B-FP8](https://huggingface.co/Qwen/Qwen3-235B-A22B-FP8)
+* [Qwen3-30B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3-30B-A3B-NVFP4)
+* [Qwen3-235B-A22B-NVFP4](https://huggingface.co/nvidia/Qwen3-235B-A22B-NVFP4)
 
 ## Deployment Steps
 
