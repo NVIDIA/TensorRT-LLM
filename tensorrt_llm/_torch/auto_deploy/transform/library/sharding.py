@@ -220,7 +220,6 @@ class Sharding(BaseTransform):
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
         self.config.factory_config = factory.get_sharding_config() if factory else {}
         transform_container = shared_config.sharding_transform_container
-        print(f"\nsharding.apply. Config: \n{self.config}\n")
         transform_container.init_params(self.config, local_rank, world_size)
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
