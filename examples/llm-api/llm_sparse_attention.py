@@ -44,6 +44,7 @@ def parse_arguments():
         type=str,
         default="tests/unittest/_torch/multi_gpu/test_star_attention_input.jsonl"
     )
+
     # Build config
     parser.add_argument('--algo',
                         type=str,
@@ -53,6 +54,8 @@ def parse_arguments():
                         type=str,
                         default='TRTLLM',
                         choices=['VANILLA', 'TRTLLM'])
+
+    # RocketKV configuration
     parser.add_argument('--window_size',
                         type=int,
                         default=32,
@@ -114,7 +117,7 @@ def parse_arguments():
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
     parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
-    parser.add_argument('--tokens_per_block', type=int, default=64)
+    parser.add_argument('--tokens_per_block', type=int, default=32)
     parser.add_argument('--num_samples', type=int, default=10)
 
     # Runtime

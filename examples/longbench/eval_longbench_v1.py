@@ -435,6 +435,14 @@ def evaluate_single_dataset(
         formatted_prompt = format_prompt_style(sample, prompt_format,
                                                chat_template, dataset,
                                                tokenizer)
+        # Truncate prompt if it's too long
+        token_ids = tokenizer.encode(formatted_prompt, truncation=False)
+        if len(token_ids) > args.max_seq_len:
+            half = (args.max_seq_len - max_new_tokens) // 2
+            formatted_prompt = tokenizer.decode(
+                token_ids[:half], skip_special_tokens=True) + tokenizer.decode(
+                    token_ids[-half:], skip_special_tokens=True)
+
         prompts.append(formatted_prompt)
 
     if len(prompts) == 0:

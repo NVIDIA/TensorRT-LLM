@@ -872,6 +872,8 @@ def triton_rocket_update_kt_cache_gen(
 
     grid = (num_gen_tokens, num_kv_heads, 1)
 
+    DIM_BLOCK_SIZE = triton.next_power_of_2(head_dim)
+
     rocket_update_kt_cache_gen_kernel[grid](k,
                                             kt_cache_tensor,
                                             kt_cache_block_offsets,
@@ -884,7 +886,7 @@ def triton_rocket_update_kt_cache_gen(
                                             max_kt_blocks_per_seq,
                                             k.stride(0),
                                             k.stride(1),
-                                            DIM_BLOCK_SIZE=128)
+                                            DIM_BLOCK_SIZE=DIM_BLOCK_SIZE)
 
 
 @triton.jit
@@ -1027,7 +1029,7 @@ def triton_rocket_update_kt_cache_ctx(
     total_kt_tokens = (prompt_budget + kt_page_size - 1) // kt_page_size
 
     BLOCK_SIZE_KT = 8
-    BLOCK_SIZE_DIM = head_dim
+    BLOCK_SIZE_DIM = triton.next_power_of_2(head_dim)
 
     grid = (batch_size, num_kv_heads,
             (total_kt_tokens + BLOCK_SIZE_KT - 1) // BLOCK_SIZE_KT)
@@ -1207,12 +1209,7 @@ def triton_rocket_paged_kt_cache_bmm(
 
     Q_BLOCK_SIZE = num_heads_per_kv
     KT_BLOCK_SIZE = 64
-    if head_dim <= 128:
-        DIM_BLOCK_SIZE = 128
-    elif head_dim <= 256:
-        DIM_BLOCK_SIZE = 256
-    else:
-        assert False, f"Unsupported head_dim: {head_dim}"
+    DIM_BLOCK_SIZE = triton.next_power_of_2(head_dim)
 
     rocket_paged_kt_cache_bmm_kernel[grid](
         q,
