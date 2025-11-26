@@ -370,15 +370,20 @@ class Decoder:
                 draft_request = DraftRequest()
             target_response = self._generate_non_streaming(
                 cur_preproc, request, draft_request)
-            last_input_ids = input_ids
             if self._is_exclude_input_in_output(
                     request,
                     self.is_input_excluded_from_output_for_target(
                         assume_loaded=True)):
-                # Input is excluded from target output
-                # when `exclude_input_in_output` is specified.
-                input_ids = np.concatenate(
-                    (last_input_ids, target_response.output_ids[0][0]))
+
+                if last_input_ids is None:
+                    last_input_ids = input_ids
+                    input_ids = target_response.output_ids[0][0]
+                else:
+                    last_input_ids = input_ids
+                    # Input is excluded from target output
+                    # when `exclude_input_in_output` is specified.
+                    input_ids = np.concatenate(
+                        (last_input_ids, target_response.output_ids[0][0]))
 
                 # Replace values with merged information.
                 # This is required for the output of this function.
@@ -387,6 +392,7 @@ class Decoder:
                 target_response.sequence_length[0][0] = len(
                     target_response.output_ids[0][0])
             else:
+                last_input_ids = input_ids
                 input_ids = target_response.output_ids[0][0]
             cur_preproc = PreprocResponse.with_new_inputs(
                 cur_preproc, np.expand_dims(input_ids, 0),
