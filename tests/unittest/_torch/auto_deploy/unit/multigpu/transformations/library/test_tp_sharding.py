@@ -15,6 +15,7 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8TPShardingInfo,
+    ShardingTransformConfig,
     SplitDimension,
     WeightShardingInfo,
 )
@@ -253,6 +254,11 @@ def _run_pattern_detection_job(
     x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
 
     # Test pattern detection - create expected transformations for validation
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        allreduce_strategy=AllReduceStrategy.AUTO,
+    )
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     expected_transformations = []
     # if world_size == 1, no sharding transformations should be detected
@@ -275,8 +281,7 @@ def _run_pattern_detection_job(
                         WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
                             allreduce_strategy=AllReduceStrategy.AUTO,
@@ -299,8 +304,7 @@ def _run_pattern_detection_job(
                         WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
                             allreduce_strategy=AllReduceStrategy.AUTO,
@@ -315,8 +319,7 @@ def _run_pattern_detection_job(
                         WeightShardingInfo(
                             target_node=node.name,
                             split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op="all_gather",
                             min_local_shape=1,
                             allreduce_strategy=AllReduceStrategy.AUTO,
@@ -338,8 +341,7 @@ def _run_pattern_detection_job(
                         FP8TPShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
                             allreduce_strategy=AllReduceStrategy.AUTO,
