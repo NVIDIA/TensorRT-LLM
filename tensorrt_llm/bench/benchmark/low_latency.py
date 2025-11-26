@@ -250,6 +250,7 @@ def latency_command(
             param_hint="backend")
 
     exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Update configuration with runtime options

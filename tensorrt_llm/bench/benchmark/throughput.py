@@ -376,6 +376,7 @@ def throughput_command(
             param_hint="backend")
 
     exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
