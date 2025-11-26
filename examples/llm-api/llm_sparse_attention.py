@@ -153,7 +153,6 @@ def run_llm(args, sparse_attention_config):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         tokens_per_block=args.tokens_per_block,
         dtype=args.kv_cache_dtype,
-        tokens_per_block=64,
     )
 
     cuda_graph_config = CudaGraphConfig(
