@@ -169,17 +169,6 @@ elif [ -d "${trtllm_repo}" ]; then
     echo "TensorRT-LLM installation completed successfully"
 fi
 
-# Get enable_pdl from gen config
-enable_pdl=$(python3 -c "import yaml; import sys;
-try:
-    with open('${gen_config_path}') as f:
-        c = yaml.safe_load(f)
-        print(str(not c.get('enable_attention_dp', True)).lower())
-except Exception as e:
-    print(f'Error reading config: {e}', file=sys.stderr)
-    sys.exit(1)
-")
-
 # Get node lists
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
@@ -211,7 +200,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_config_path}" "${worker_env_var}" \
+        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
@@ -226,7 +215,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" "${worker_env_var}" \
+        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 

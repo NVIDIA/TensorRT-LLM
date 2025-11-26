@@ -9,15 +9,13 @@ model_path=${3}
 port=${4}
 benchmark_mode=${5}
 concurrency=${6}
-enable_pdl=${7}
-numa_bind=${8}
-log_dir=${9}
-enable_nsys=${10}
-config_file=${11}
-worker_env_var=${12}
+numa_bind=${7}
+log_dir=${8}
+enable_nsys=${9}
+config_file=${10}
+worker_env_var=${11}
 
 unset UCX_TLS
-echo "enable_pdl: ${enable_pdl}, log_dir: ${log_dir}"
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 
 # Export worker environment variables from config
@@ -25,10 +23,6 @@ for env_var in ${worker_env_var}; do
     export "${env_var}"
     echo "Exported: ${env_var}"
 done
-
-if [ "${enable_pdl}" = "true" ]; then
-    export TRTLLM_ENABLE_PDL=1
-fi
 
 if [ "${numa_bind}" = "true" ]; then
     numa_bind_cmd="numactl -m 0,1"
