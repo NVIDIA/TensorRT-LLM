@@ -64,7 +64,8 @@ class Cohere2Config(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return Cohere2Config(
-            runtime_defaults=dict(max_attention_window=[4096, 4096, 4096, 131072]),
+            # can't be set without adding serialization of RuntimeDefaults
+            #runtime_defaults=RuntimeDefaults(max_attention_window=[4096, 4096, 4096, 131072]),
             architecture=hf_config.architectures[0],
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
