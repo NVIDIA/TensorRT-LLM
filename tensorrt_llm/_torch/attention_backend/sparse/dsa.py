@@ -980,11 +980,9 @@ class Indexer(nn.Module):
 
         batch_size = len(request_ids)
 
-        # Create request indices repeated by seq_lens (which request each token belongs to)
         req_indices = torch.repeat_interleave(
             torch.arange(batch_size, dtype=torch.int64, device='cpu'), seq_lens)
 
-        # Create within-sequence token offsets (0, 1, 2, ... for each sequence)
         token_offsets = torch.cat([
             torch.arange(seq_lens[i].item(), dtype=torch.int64, device='cpu')
             for i in range(batch_size)
@@ -993,7 +991,7 @@ class Indexer(nn.Module):
         # Compute global positions for all tokens in the batch
         global_positions = start_positions[req_indices] + token_offsets
 
-        # Compute block indices and positions in blocks
+        # Block indices/pos for all tokens in the batch
         block_indices_in_seq = global_positions // tokens_per_block
         pos_in_blocks = global_positions % tokens_per_block
 
@@ -1035,12 +1033,10 @@ class Indexer(nn.Module):
                                                          dtype=torch.int64,
                                                          pin_memory=True)
 
-            # Create request indices repeated by total_kv_per_request for each request
             req_indices = torch.repeat_interleave(
                 torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
                 total_kv_per_request)
 
-            # Create within-sequence KV position offsets (0, 1, 2, ... for each request)
             kv_positions = torch.cat([
                 torch.arange(total_kv_per_request[i].item(),
                              dtype=torch.int64,
@@ -1050,12 +1046,11 @@ class Indexer(nn.Module):
             block_indices_in_seq = kv_positions // tokens_per_block
             pos_in_blocks = kv_positions % tokens_per_block
 
-            # Assertions
             max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
             assert (block_indices_in_seq < max_blocks).all(), \
                 f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
 
-            # Gather block IDs using advanced indexing (vectorized)
+            # Gather block IDs
             block_ids = metadata.host_indexer_k_cache_block_offsets[
                 req_indices, block_indices_in_seq]
 
@@ -1066,10 +1061,8 @@ class Indexer(nn.Module):
             fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
             scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
 
-            metadata.host_slot_mapping_fp8_fullkv[:
-                                                  total_kv_len] = fp8_flat_indices
-            metadata.host_slot_mapping_scale_fullkv[:
-                                                    total_kv_len] = scale_flat_indices
+            host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
+            host_slot_mapping_scale_fullkv[:total_kv_len] = scale_flat_indices
 
             assert len(fp8_flat_indices) == total_kv_len, \
                 f"host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv length mismatch: {len(fp8_flat_indices)} != total_kv_len={total_kv_len}"
