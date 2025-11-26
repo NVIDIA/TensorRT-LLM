@@ -15,3 +15,18 @@ l0_gb10:
       backend: tensorrt
   tests:
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*gb10*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - unittest/utils/test_util.py

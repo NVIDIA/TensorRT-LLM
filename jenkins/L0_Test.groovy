@@ -1354,10 +1354,21 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
-            selectors = """
+            if (type == "gb10x_blossom")
+            {
+                targetCould = "nvks-sparks-cloud"
+                selectors = """
+                    kubernetes.io/arch: ${arch}
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu.machine: NVIDIA_DGX_Spark
+                    nvidia.com/tenant: blossom_trt"""
+            }
+            else {
+                selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
+            }
         } else if (perfMode && !hasMultipleGPUs) {
         // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
         // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
@@ -2780,6 +2791,7 @@ def launchTestJobs(pipeline, testFilter)
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
+        "GB10-PyTorch-1": ["gb10x_blossom", "l0_gb10", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
 
