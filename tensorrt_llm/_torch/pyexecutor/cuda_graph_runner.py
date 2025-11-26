@@ -62,7 +62,6 @@ class CUDAGraphRunnerConfig:
     max_num_tokens: int
     spec_config: Optional[DecodingBaseConfig]
     cuda_graph_mem_pool: Any
-    dynamic_draft_len_mapping: Optional[Dict[int, int]]
     use_mrope: bool
     original_max_draft_len: int
     original_max_total_draft_tokens: int
@@ -72,6 +71,7 @@ class CUDAGraphRunnerConfig:
     mapping: Optional[Mapping]
     dist: Optional[MPIDist]
     kv_cache_manager_key: Any
+    dynamic_draft_len_mapping: Optional[Dict[int, int]]
 
 
 class CUDAGraphRunner:
@@ -452,7 +452,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-        self.padding_dummy_requests = None
+        self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()

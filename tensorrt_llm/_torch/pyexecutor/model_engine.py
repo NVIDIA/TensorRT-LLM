@@ -562,8 +562,8 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         # The lifetime of model engine and kv cache manager can be different.
-        # Reset the global cuda graph dummy request to None in warmup.
-        self.cuda_graph_runner.padding_dummy_request = None
+        # Reset the global cuda graph dummy requests in warmup.
+        self.cuda_graph_runner.padding_dummy_requests = {}
 
         # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)

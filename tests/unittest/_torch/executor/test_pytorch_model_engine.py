@@ -172,7 +172,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch.context_requests = []
             batch.generation_requests = requests
             pages_before = kv_cache_manager.get_num_free_blocks()
-            new_dummy_block = 1 if model_engine.cuda_graph_runner.padding_dummy_request is None else 0
+            new_dummy_block = 1 if not model_engine.cuda_graph_runner.padding_dummy_requests else 0
             with model_engine.cuda_graph_runner.pad_batch(
                     batch, resource_manager) as padded_batch:
                 if batch_size < 8 and max_seq_len < 25:
