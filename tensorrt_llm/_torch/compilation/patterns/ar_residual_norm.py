@@ -555,10 +555,10 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
 
         def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
             trtllm_nvfp4_gemm_default = CallFunction(
-                torch.ops.trtllm.nvfp4_gemm_cutlass.default,
-                KeywordArg('act_fp4'), KeywordArg('weight'),
-                KeywordArg('act_sf'), KeywordArg('weight_scale'),
-                KeywordArg('alpha'), KeywordArg('output_dtype'))
+                torch.ops.trtllm.nvfp4_gemm.default, KeywordArg('act_fp4'),
+                KeywordArg('weight'), KeywordArg('act_sf'),
+                KeywordArg('weight_scale'), KeywordArg('alpha'),
+                KeywordArg('output_dtype'))
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
 
