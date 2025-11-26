@@ -7,8 +7,6 @@ import torch
 from flashinfer import bmm_fp8
 from torch import nn
 
-from tensorrt_llm._torch.autotuner import autotune
-
 from ..distributed import common as dist
 from ..distributed import trtllm as trtllm_dist
 from .torch_libs.float8_python_api import addmm_float8_unwrapped
@@ -336,10 +334,9 @@ def nvfp4_linear(
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
-    with autotune():
-        output = torch.ops.trtllm.nvfp4_gemm(
-            x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
-        )
+    output = torch.ops.trtllm.nvfp4_gemm(
+        x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
+    )
 
     if bias is not None:
         output = output + bias
