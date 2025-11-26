@@ -120,6 +120,8 @@ def response(request) -> MockTritonResponse:
         "acceptance_rate",
         "total_accepted_draft_tokens",
         "total_draft_tokens",
+        "num_input_tokens",
+        "num_output_tokens",
     ]
     response = Response()
     for output_name in output_names:
@@ -182,7 +184,9 @@ mock_reponse = {
     "last_token_time_ns": [[3]],
     "acceptance_rate": [[0.0]],
     "total_accepted_draft_tokens": [[0]],
-    "total_draft_tokens": [[0]]
+    "total_draft_tokens": [[0]],
+    "num_input_tokens": None,
+    "num_output_tokens": None
 }
 
 mock_request = {"text_input": [["Hello world"]], "max_tokens": [[24]]}
