@@ -1,5 +1,5 @@
 import copy
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -135,31 +135,35 @@ def test_recursive_update_config(mock_factory):
 
 
 def test_register_custom_model_cls():
-    model_type = "foo"
+    config_cls_name = "FooConfig"
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
     AutoModelForCausalLMFactory.register_custom_model_cls(
-        model_type=model_type, custom_model_cls=custom_model_cls
+        config_cls_name=config_cls_name, custom_model_cls=custom_model_cls
     )
 
-    assert AutoModelForCausalLMFactory._custom_model_mapping[model_type] == custom_model_cls
+    assert AutoModelForCausalLMFactory._custom_model_mapping[config_cls_name] == custom_model_cls
 
 
 class MyError(Exception):
     pass
 
 
+# Needed for `type(config)` calls.
+class FooConfig:
+    pass
+
+
 def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock_factory):
-    model_type = "foo"
-    custom_model_cls = MagicMock(spec=AutoModelForCausalLM, __name__="Foo")
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM, __name__="FooModel")
     AutoModelForCausalLMFactory.register_custom_model_cls(
-        model_type=model_type, custom_model_cls=custom_model_cls
+        config_cls_name=FooConfig.__name__, custom_model_cls=custom_model_cls
     )
 
     with (
         patch.object(
             AutoModelForCausalLMFactory,
             "_get_model_config",
-            return_value=(Mock(model_type=model_type), {}),
+            return_value=(FooConfig(), {}),
         ),
         pytest.raises(ValueError, match=r"from_config"),
     ):
@@ -167,19 +171,44 @@ def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock
 
 
 def test_build_model_uses_custom_model_cls_from_config(mock_factory):
-    model_type = "foo"
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
     custom_model_cls.configure_mock(_from_config=MagicMock(side_effect=MyError))
     AutoModelForCausalLMFactory.register_custom_model_cls(
-        model_type=model_type, custom_model_cls=custom_model_cls
+        config_cls_name=FooConfig.__name__, custom_model_cls=custom_model_cls
     )
 
     with (
         patch.object(
             AutoModelForCausalLMFactory,
             "_get_model_config",
-            return_value=(Mock(model_type=model_type), {}),
+            return_value=(FooConfig(), {}),
         ),
         pytest.raises(MyError),
     ):
         mock_factory.build_model(device="meta")
+
+
+def test_custom_model_mapping_in_parent_does_not_affect_children():
+    class Child(AutoModelForCausalLMFactory):
+        pass
+
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
+    custom_model_cls.configure_mock(_from_config=MagicMock(side_effect=MyError))
+    AutoModelForCausalLMFactory.register_custom_model_cls(
+        config_cls_name=FooConfig.__name__, custom_model_cls=custom_model_cls
+    )
+
+    assert Child._custom_model_mapping == {}
+
+
+def test_custom_model_mapping_in_parent_does_not_affect_parent():
+    class Child(AutoModelForCausalLMFactory):
+        pass
+
+    custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
+    custom_model_cls.configure_mock(_from_config=MagicMock(side_effect=MyError))
+    Child.register_custom_model_cls(
+        config_cls_name=FooConfig.__name__, custom_model_cls=custom_model_cls
+    )
+
+    assert AutoModelForCausalLMFactory._custom_model_mapping == {}

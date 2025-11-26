@@ -13,6 +13,7 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE
+from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (
@@ -767,12 +768,23 @@ class CutlassFusedMoE(MoE):
             **kwargs,
         )
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
+            self.quant_method.load_weights(self, weights,
+                                           self.weight_loading_mode)
+        else:
+            self.quant_method.load_weights(
+                self,
+                weights,
+                self.weight_loading_mode,
+                allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)

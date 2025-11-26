@@ -19,6 +19,7 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen"
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  - unittest/_torch/modeling -k "modeling_starcoder2"
   - unittest/_torch/auto_deploy/unit/singlegpu
   - unittest/_torch/sampler/test_beam_search.py
   - unittest/_torch/sampler/test_return_logits.py

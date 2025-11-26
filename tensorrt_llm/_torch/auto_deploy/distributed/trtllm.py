@@ -18,17 +18,26 @@ try:
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
         return allgather(tensor, p_config, dim=dim, sizes=sizes)
 
-    def trtllm_allreduce(tensor, op, all_reduce_params=None):
+    def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
 
-        # Cache key includes rank, world_size, and dtype to handle different configurations
-        cache_key = (rank, world_size, tensor.dtype)
+        # Convert string strategy to enum
+        try:
+            strategy_enum = getattr(AllReduceStrategy, strategy)
+        except AttributeError:
+            raise ValueError(
+                f"Invalid allreduce strategy: {strategy}. "
+                f"Valid options: AUTO, NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
+                f"LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC"
+            )
+
+        # Cache key includes rank, world_size, dtype, and strategy to handle different configurations
+        cache_key = (rank, world_size, tensor.dtype, strategy_enum)
         if cache_key not in _allreduce_cache:
             p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-            # Use Strategy.AUTO for optimal performance
             _allreduce_cache[cache_key] = AllReduce(
-                mapping=p_config, strategy=AllReduceStrategy.NCCL, dtype=tensor.dtype
+                mapping=p_config, strategy=strategy_enum, dtype=tensor.dtype
             )
 
         torch_op = _allreduce_cache[cache_key]
@@ -38,7 +47,11 @@ try:
         "dist::fused_allreduce_residual_rmsnorm", mutates_args=(), device_types="cuda"
     )
     def fused_allreduce_residual_rmsnorm(
-        tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        strategy: str = "AUTO",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fusing allreduce, residual (add), and hf_rms_norm together.
 
@@ -54,7 +67,9 @@ try:
                 norm_weight=norm_weight,
                 eps=eps,
             )
-            return trtllm_allreduce(tensor, ReduceOp.SUM, all_reduce_params=all_reduce_params)
+            return trtllm_allreduce(
+                tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+            )
         else:
             # Fallback: unfused implementation using torch distributed
             # This is used in demollm mode without MPI
@@ -79,7 +94,11 @@ try:
 
     @fused_allreduce_residual_rmsnorm.register_fake
     def fused_allreduce_residual_rmsnorm_fake(
-        tensor: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        strategy: str = "AUTO",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.empty_like(tensor), torch.empty_like(tensor)
 
@@ -89,7 +108,7 @@ except ImportError:
     def trtllm_allgather(tensor, dim, sizes=None):
         raise ImportError("TRT-LLM is not available.")
 
-    def trtllm_allreduce(tensor, op):
+    def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
         raise ImportError("TRT-LLM is not available.")
 
     TRTLLM_OP_AVAILABLE = False

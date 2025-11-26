@@ -1,6 +1,6 @@
 from tensorrt_llm.functional import AllReduceFusionOp
 
-from .communicator import Distributed, MPIDist, PPComm, TorchDist
+from .communicator import Distributed, MPIDist, TorchDist
 from .moe_alltoall import MoeAlltoAll
 from .ops import (AllReduce, AllReduceParams, AllReduceStrategy, MoEAllReduce,
                   MoEAllReduceParams, allgather, alltoall_helix, cp_allgather,
@@ -20,7 +20,6 @@ __all__ = [
     "MoEAllReduceParams",
     "MoeAlltoAll",
     "TorchDist",
-    "PPComm",
     "MPIDist",
     "Distributed",
 ]

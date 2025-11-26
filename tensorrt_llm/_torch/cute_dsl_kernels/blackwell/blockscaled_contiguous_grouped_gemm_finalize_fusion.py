@@ -1552,6 +1552,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
 
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.out_dtype)
+
             copy_atom_r2s = sm100_utils.get_smem_store_op(
                 self.gemm_output_layout, self.out_dtype, self.acc_dtype, tiled_copy_t2r
             )
@@ -1641,8 +1643,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     layout = cute.make_layout(shape=(cute.size(tTR_rAcc),), stride=(1,))
                     loop_size = cute.size(tTR_rAcc)
 
-                rOut_epi = cute.make_rmem_tensor(layout, self.out_dtype)
-
                 for subtile_idx in cutlass.range(subtile_cnt):
                     #
                     # Load accumulator from tensor memory buffer to register
@@ -1657,7 +1657,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     # Apply router scale to the entire row (broadcast scalar to vector)
                     acc_vec_finalized = token_scale * acc_vec_scaled
 
-                    rOut_epi.store(acc_vec_finalized.to(self.out_dtype))
+                    tTR_rC.store(acc_vec_finalized.to(self.out_dtype))
+                    rOut_epi = cute.make_tensor(tTR_rC.iterator, layout)
 
                     if permuted_row < tile_mn_limit:
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[

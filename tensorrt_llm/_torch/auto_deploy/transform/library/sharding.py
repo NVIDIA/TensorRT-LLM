@@ -22,9 +22,10 @@ from collections import defaultdict
 from typing import DefaultDict, Dict, List, Set, Tuple, Type
 
 import torch
-from pydantic import Field
+from pydantic import Field, field_validator
 from torch.fx import GraphModule, Node
 
+from .....functional import AllReduceStrategy
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -49,6 +50,7 @@ from ...utils.sharding_utils import (
     SplitDimension,
     WeightShardingInfo,
     get_all_weights_in_subgraph,
+    validate_allreduce_strategy,
 )
 from ..interface import (
     BaseTransform,
@@ -152,6 +154,18 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.AUTO,
+        description="AllReduce strategy for distributed operations. "
+        "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
+        "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
+    )
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        return validate_allreduce_strategy(v)
 
 
 @TransformRegistry.register("detect_sharding")
@@ -199,6 +213,8 @@ class Sharding(BaseTransform):
         sharding_config = shared_config.sharding_config
         sharding_config.rank = local_rank
         sharding_config.world_size = world_size
+        sharding_config.allreduce_strategy = self.config.allreduce_strategy
+        ad_logger.info(f"Using allreduce strategy: {sharding_config.allreduce_strategy.name}")
         sharding_config.predefined_config = factory.get_sharding_config() if factory else {}
         sharding_config.factory_source = (
             sharding_config.predefined_config.get("source", ShardingConfigSource.UNKNOWN)
@@ -573,7 +589,7 @@ def detect_sharding_from_factory_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
                 if config == "colwise":
-                    sharding_config.weight_sharding_transforms.append(
+                    if sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -582,10 +598,10 @@ def detect_sharding_from_factory_config(
                             dist_op=None,
                             min_local_shape=min_local_shape,
                         )
-                    )
-                    num_row_col_shards += 1
+                    ):
+                        num_row_col_shards += 1
                 elif config == "rowwise":
-                    sharding_config.weight_sharding_transforms.append(
+                    if sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.ROW,
@@ -594,10 +610,10 @@ def detect_sharding_from_factory_config(
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
                         )
-                    )
-                    num_row_col_shards += 1
+                    ):
+                        num_row_col_shards += 1
                 elif config == "mamba":
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -618,7 +634,7 @@ def detect_sharding_from_factory_config(
                     if "shared" in module_name:
                         col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
-                            sharding_config.weight_sharding_transforms.append(
+                            sharding_config.add(
                                 WeightShardingInfo(
                                     target_node=lin_node.name,
                                     split_dim=SplitDimension.COLUMN,
@@ -629,7 +645,7 @@ def detect_sharding_from_factory_config(
                                 )
                             )
                         elif col_row_action == "rowwise":
-                            sharding_config.weight_sharding_transforms.append(
+                            if sharding_config.add(
                                 WeightShardingInfo(
                                     target_node=lin_node.name,
                                     split_dim=SplitDimension.ROW,
@@ -638,8 +654,8 @@ def detect_sharding_from_factory_config(
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
                                 )
-                            )
-                            num_row_col_shards += 1
+                            ):
+                                num_row_col_shards += 1
                         else:
                             ad_logger.warning(f"Unsupported sharding action {config}. Skipping.")
                     else:
@@ -648,7 +664,7 @@ def detect_sharding_from_factory_config(
 
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
-                    sharding_config.weight_sharding_transforms.append(
+                    if sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -657,13 +673,13 @@ def detect_sharding_from_factory_config(
                             dist_op="all_gather",
                             min_local_shape=1,
                         )
-                    )
-                    num_simple_shards += 1
+                    ):
+                        num_simple_shards += 1
                 else:
                     ad_logger.warning(
                         f"Unsupported sharding action {config}. Fallback to simple shard"
                     )
-                    sharding_config.weight_sharding_transforms.append(
+                    sharding_config.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -943,7 +959,7 @@ def detect_column_row_shard(
         )
 
         # shard single row node
-        sharding_config.weight_sharding_transforms.append(
+        if sharding_config.add(
             WeightShardingInfo.from_node(
                 nodes_to_row_shard[0],
                 split_dim=SplitDimension.ROW,
@@ -952,9 +968,8 @@ def detect_column_row_shard(
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
             )
-        )
-
-        num_row_col_shards += 1
+        ):
+            num_row_col_shards += 1
 
     ad_logger.info(
         f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_row_col_shards})"
@@ -1020,7 +1035,7 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
             start_idx = remainder + rank * base_size
             end_idx = start_idx + base_size
 
-        sharding_config.bmm_transforms.append(
+        sharding_config.add(
             BMMShardingInfo(
                 target_node=node.name,
                 rank=rank,
@@ -1064,14 +1079,14 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
             ),
         ):
             continue
-        sharding_config.ep_transforms.append(
+        if sharding_config.add(
             EPShardingInfo.from_node(
                 node,
                 rank=rank,
                 world_size=world_size,
             )
-        )
-        num_moe_patterns += 1
+        ):
+            num_moe_patterns += 1
 
     ad_logger.info(f"Found {num_moe_patterns} MoE patterns")
 

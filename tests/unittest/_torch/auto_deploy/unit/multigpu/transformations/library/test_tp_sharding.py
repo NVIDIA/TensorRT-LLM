@@ -20,6 +20,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
+from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
     "q_proj": "colwise",
@@ -279,6 +280,7 @@ def _run_pattern_detection_job(
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == MLP:
@@ -300,6 +302,7 @@ def _run_pattern_detection_job(
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == nn.Linear:
@@ -314,6 +317,7 @@ def _run_pattern_detection_job(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == FP8MLP:
@@ -335,6 +339,7 @@ def _run_pattern_detection_job(
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
 

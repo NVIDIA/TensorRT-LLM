@@ -570,7 +570,15 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
         }
         else
         {
-            outIndices[i] = smemOutput[i] - rowStart;
+            if (stride1 == 1)
+            {
+                // stride1 == 1 will use vectorized_process, which indexes already skip the rowStart.
+                outIndices[i] = smemOutput[i];
+            }
+            else
+            {
+                outIndices[i] = smemOutput[i] - rowStart;
+            }
         }
     }
 }

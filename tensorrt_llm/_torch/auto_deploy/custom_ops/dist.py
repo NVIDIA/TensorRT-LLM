@@ -26,19 +26,23 @@ def all_gather_fake(tensor, dim=0):
 
 
 @torch.library.custom_op("auto_deploy::torch_dist_all_reduce", mutates_args=(), device_types="cuda")
-def all_reduce(t: torch.Tensor) -> torch.Tensor:
-    """All_reduce across the ranks. Reduction op is SUM.
+def all_reduce(t: torch.Tensor, strategy: str) -> torch.Tensor:
+    """All_reduce across the ranks. Reduction op is SUM. Strategy is MANDATORY.
+
+    Args:
+        t: Tensor to reduce across ranks
+        strategy: AllReduce strategy - "AUTO", "NCCL", "ONESHOT", "TWOSHOT", "MIN_LATENCY", etc.
 
     NOTE: this op requires an extra memory copy and should ONLY be used for debugging + testing. For
     efficient all_reduce ops one should write/replace it with a fused op.
     """
     if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(t, op=dist.ReduceOp.SUM)
+        return trtllm_dist.trtllm_allreduce(t, op=dist.ReduceOp.SUM, strategy=strategy)
     t_res = t.clone()
     dist.all_reduce(t_res, op=dist.ReduceOp.SUM)
     return t_res
 
 
 @all_reduce.register_fake
-def all_reduce_fake(tensor):
+def all_reduce_fake(tensor, strategy):
     return torch.empty_like(tensor)
