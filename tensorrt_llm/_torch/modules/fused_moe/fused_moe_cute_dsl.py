@@ -143,10 +143,9 @@ def cute_dsl_nvfp4_grouped_gemm_ref(
         a_sliced = a[start * tile_size:end * tile_size]
         a_sf_sliced = a_sf[start * tile_size * k // scaling_vector_size:end *
                            tile_size * k // scaling_vector_size]
-        ref[start * tile_size:end *
-            tile_size] = torch.ops.trtllm.nvfp4_gemm_cutlass(
-                a_sliced.view(torch.uint8), b[i].view(torch.uint8), a_sf_sliced,
-                b_sf[i], alpha[i], output_dtype)
+        ref[start * tile_size:end * tile_size] = torch.ops.trtllm.nvfp4_gemm(
+            a_sliced.view(torch.uint8), b[i].view(torch.uint8), a_sf_sliced,
+            b_sf[i], alpha[i], output_dtype)
 
     return ref
 
