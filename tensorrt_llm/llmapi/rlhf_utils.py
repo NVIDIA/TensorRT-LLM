@@ -3,6 +3,8 @@ import torch
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.logger import logger
+import pickle
+import base64
 
 
 class WorkerExtension:
@@ -52,7 +54,7 @@ class WorkerExtension:
                 raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
 
             weights = {}
-            all_handles = ipc_handles[device_uuid]
+            all_handles = pickle.loads(base64.b64decode(ipc_handles[device_uuid]))
 
             for param_name, tensor_handle in all_handles:
                 func, args = tensor_handle
