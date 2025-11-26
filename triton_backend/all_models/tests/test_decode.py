@@ -37,7 +37,9 @@ class MockDecoder(Decoder):
     def __init__(self,
                  streaming=False,
                  accumulate=False,
-                 data_dict: Optional[Dict] = None):
+                 data_dict: Optional[Dict] = None,
+                 exclude_input_in_output_for_target: Optional[bool] = False,
+                 exclude_input_in_output_for_draft: Optional[bool] = False):
         super().__init__(streaming=streaming, accumulate=accumulate)
         self.data_dict = data_dict
         self.draft_step = -1
@@ -45,6 +47,8 @@ class MockDecoder(Decoder):
 
         self.draft_num_calls = 0
         self.target_num_calls = 0
+        self._exclude_input_in_output_for_target = exclude_input_in_output_for_target
+        self._exclude_input_in_output_for_draft = exclude_input_in_output_for_draft
 
     def preprocess(self, request: Request) -> PreprocResponse:
         return PreprocResponse(
@@ -115,6 +119,26 @@ class MockDecoder(Decoder):
         return GenerationResponse(output_ids=np.array(
             [[target_output["output_ids"]]]),
                                   sequence_length=np.array([[output_len]]))
+
+    def load_model_configs_for_spec_decoding(
+            self,
+            triton_host_and_port: Optional[str] = None,
+            target_model_name: Optional[str] = None,
+            draft_model_name: Optional[str] = None,
+            n_retries: Optional[int] = 5,
+            retry_interval_sec: Optional[int] = 3):
+        # NoOp
+        pass
+
+    def is_input_excluded_from_output_for_target(self,
+                                                 assume_loaded: bool = False
+                                                 ) -> bool:
+        return self._exclude_input_in_output_for_target
+
+    def is_input_excluded_from_output_for_draft(self,
+                                                assume_loaded: bool = False
+                                                ) -> bool:
+        return self._exclude_input_in_output_for_draft
 
 
 decode_testcases = [
@@ -202,6 +226,36 @@ decode_testcases = [
             "generation_logits": np.random.rand(1, 1, 7, 1024),
         }]
     },
+    {
+        "text_input":
+        "Deep learning is",
+        "max_tokens":
+        10,
+        "use_speculative":
+        True,
+        "num_draft_tokens":
+        3,
+        "use_draft_logits":
+        False,
+        "exclude_input_in_output":
+        True,
+        "input_ids": [1, 10, 11, 23],
+        "target_output": [{
+            "output_ids": [1, 10, 11, 23, 7, 9, 21],
+            "output_text": "Deep learning is a subset of"
+        }, {
+            "output_ids": [1, 10, 11, 23, 7, 9, 21, 22, 11],
+            "output_text":
+            "Deep learning is a subset of Machine learning"
+        }],
+        "draft_output": [{
+            "output_ids": [7, 9, 21],
+            "sequence_length": 3,
+        }, {
+            "output_ids": [22, 11],
+            "sequence_length": 2,
+        }]
+    },
 ]
 
 
@@ -217,7 +271,10 @@ def test_decode(test_case):
         use_draft_logits=(np.array([[test_case["use_draft_logits"]]],
                                    dtype=bool)
                           if "use_draft_logits" in test_case else None),
-        stop_words=np.array([[[]]]))
+        stop_words=np.array([[[]]]),
+        exclude_input_in_output=(np.array(
+            [[test_case["exclude_input_in_output"]]],
+            dtype=bool) if "exclude_input_in_output" in test_case else None))
     # Last index is the expected response
     expected_res = Response(text_output=np.array(
         [test_case["target_output"][-1]["output_text"]], dtype=object))
