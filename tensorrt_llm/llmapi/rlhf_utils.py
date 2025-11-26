@@ -1,6 +1,9 @@
+from typing import Optional
+
 import torch
 
 from tensorrt_llm._ray_utils import control_action_decorator
+from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.logger import logger
 
@@ -28,7 +31,7 @@ class WorkerExtension:
     """
 
     @control_action_decorator
-    def update_weights(self, ipc_handles: dict):
+    def update_weights(self, ipc_handles: Optional[dict] = None):
         """Update model weights from IPC (Inter-Process Communication) handles.
 
         This method receives shared memory handles from another process (typically FSDP training),
@@ -45,25 +48,41 @@ class WorkerExtension:
             Exception: Re-raises any exception encountered during weight update.
         """
         try:
-            logger.info("Update weights from IPC handles")
-            device_uuid = get_device_uuid(self.device_id)
+            if ipc_handles is not None:
+                logger.info("Update weights from IPC handles")
+                device_uuid = get_device_uuid(self.device_id)
 
-            if device_uuid not in ipc_handles:
-                raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
+                if device_uuid not in ipc_handles:
+                    raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
 
-            weights = {}
-            all_handles = ipc_handles[device_uuid]
+                weights = {}
+                all_handles = ipc_handles[device_uuid]
 
-            for param_name, tensor_handle in all_handles:
-                func, args = tensor_handle
-                list_args = list(args)
-                list_args[6] = self.device_id  # Set target device
-                tensor = func(*list_args)
-                weights[param_name] = tensor
+                for param_name, tensor_handle in all_handles:
+                    func, args = tensor_handle
+                    list_args = list(args)
+                    list_args[6] = self.device_id  # Set target device
+                    tensor = func(*list_args)
+                    weights[param_name] = tensor
 
-            self.engine.model_engine.model.load_weights(weights)
-            torch.cuda.synchronize()
-            self.engine.reset_prefix_cache()
+                logger.info(f"weights key size: {len(weights.keys())}")
+                self.engine.model_engine.model_loader.reload(
+                    self.engine.model_engine.model, weights, allow_partial_loading=True
+                )
+            else:
+                logger.info("Finalize update weights")
+                for module in self.engine.model_engine.model.modules():
+                    if hasattr(module, "post_load_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.post_load_weights()
+                moe_load_balancer = getattr(self.engine.model_engine, "moe_load_balancer", None)
+                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                    moe_load_balancer.register_weight_slots_after_to_cuda()
+                    logger.info("moe_load_balancer finalizing model...")
+                    moe_load_balancer.finalize_model()
+                    logger.info("moe_load_balancer finalize model done")
+                self.engine.reset_prefix_cache()
 
         except Exception as e:
             logger.error("Encountered an error in update_weights")

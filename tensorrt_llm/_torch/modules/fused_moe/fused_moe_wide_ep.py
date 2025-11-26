@@ -248,9 +248,9 @@ class WideEPMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "mnnvllatency" (default) or "mnnvlthroughput"
+        # "NVLINK_TWO_SIDED" (default) or "NVLINK_ONE_SIDED"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "mnnvllatency").strip().lower()
+                              "NVLINK_TWO_SIDED").strip().upper()
 
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         num_rows = sum(all_rank_num_tokens)
@@ -400,7 +400,6 @@ class WideEPMoE(MoE):
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
@@ -437,7 +436,7 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "mnnvllatency"
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
             self._load_balancer_update_statistic(token_selected_experts,
                                                  is_first_call, is_last_call,
                                                  ignore_allreduce)
@@ -941,12 +940,23 @@ class WideEPMoE(MoE):
         """WideEPMoE supports load balancer."""
         return True
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            assert not allow_partial_loading, "Partial loading is not supported for quantized MoE now"
+            self.quant_method.load_weights(self, weights,
+                                           self.weight_loading_mode)
+        else:
+            self.quant_method.load_weights(
+                self,
+                weights,
+                self.weight_loading_mode,
+                allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)

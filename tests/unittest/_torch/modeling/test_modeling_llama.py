@@ -512,7 +512,7 @@ class TestLlama(unittest.TestCase):
         use_spec_decoding = True
         is_spec_dec_tree = True
         is_spec_dec_dynamic_tree = True
-        max_draft_tokens = gen_input_ids_0.size(-1) - 1
+        max_total_draft_tokens = gen_input_ids_0.size(-1) - 1
 
         attn_metadata_gen_phase_0 = metadata_cls(
             seq_lens=torch.tensor([gen_input_ids_0.size(-1)], dtype=torch.int),
@@ -538,10 +538,13 @@ class TestLlama(unittest.TestCase):
 
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
+            batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             is_spec_dec_tree=is_spec_dec_tree,
-            max_draft_tokens=max_draft_tokens,
+            max_draft_len=max_total_draft_tokens,
+            max_total_draft_tokens=max_total_draft_tokens,
+            model_is_wrapped=False,
             spec_decoding_tensor=spec_decoding_tensor,
         )
 
@@ -583,13 +586,20 @@ class TestLlama(unittest.TestCase):
         attn_metadata_gen_phase_0.seq_lens = torch.tensor(
             [gen_input_ids_1.size(-1)], dtype=torch.int)
         attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
+
+        attn_metadata_gen_phase_0.spec_decoding_position_offsets = None
+        attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
+        attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
+            batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_tree=is_spec_dec_tree
             if get_sm_version() < 100 else False,
             is_spec_dec_dynamic_tree=False,
-            max_draft_tokens=gen_input_ids_1.size(-1) - 1)
+            max_draft_len=gen_input_ids_1.size(-1) - 1,
+            max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
+            model_is_wrapped=False)
 
         gen_position_ids_1 = [
             torch.full(
@@ -631,14 +641,20 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=False,
             num_heads_per_kv=num_heads_per_kv,
         )
+
+        attn_metadata_ref.spec_decoding_position_offsets = None
+        attn_metadata_ref.spec_decoding_packed_mask = None
+        attn_metadata_ref.spec_decoding_generation_lengths = None
         attn_metadata_ref.prepare()
         attn_metadata_ref.update_spec_dec_param(
+            batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
             is_spec_dec_tree=is_spec_dec_tree
             if get_sm_version() < 100 else False,
             is_spec_dec_dynamic_tree=False,
-            max_draft_tokens=gen_input_ids_ref.size(-1) - 1,
-        )
+            max_draft_len=gen_input_ids_ref.size(-1) - 1,
+            max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
+            model_is_wrapped=False)
 
         gen_position_ids_ref = [
             torch.full((gen_input_ids_ref.size(-1), ),

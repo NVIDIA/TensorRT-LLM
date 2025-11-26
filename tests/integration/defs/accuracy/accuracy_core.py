@@ -433,6 +433,29 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_OUTPUT_LEN = 50
 
 
+class LongBenchV2(AccuracyTask):
+    DATASET = "longbench_v2"
+    DATASET_DIR = f"{llm_models_root()}/zai-org/LongBench-v2"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 215
+
+    MAX_BATCH_SIZE = 32
+    MAX_INPUT_LEN = 1280000
+    MAX_OUTPUT_LEN = 32000
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.LongBenchV2
+    EVALUATOR_KWARGS = dict(
+        dataset_path=DATASET_DIR,
+        length="medium",
+        max_len=120000,
+        apply_chat_template=True,
+        random_seed=0,
+    )
+
+
 class CliFlowAccuracyTestHarness:
     # Model
     MODEL_NAME = None

@@ -61,6 +61,10 @@ struct EpilogueOpDefaultReLU
 {
 };
 
+struct EpilogueOpDefaultRelu2
+{
+};
+
 struct EpilogueOpDefaultFtGelu
 {
 };
@@ -120,6 +124,14 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
 {
     using Op = cutlass::epilogue::thread::LinearCombinationRelu<ElementType, ElementsPerVectorAccess,
         ElementAccumulator, ElementAccumulator, DefaultScaleMode>;
+};
+
+template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
+struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpDefaultRelu2>
+{
+    using Op = cutlass::epilogue::thread::LinearCombinationGeneric<cutlass::epilogue::thread::Relu2, ElementType,
+        ElementsPerVectorAccess, ElementAccumulator, ElementAccumulator, DefaultScaleMode,
+        cutlass::FloatRoundStyle::round_to_nearest, true>;
 };
 
 template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>

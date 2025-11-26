@@ -186,6 +186,14 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
+        (
+            "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024",
+            {
+                "transforms": {
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                },
+            },
+        ),
     ],
 )
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):

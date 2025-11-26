@@ -8,22 +8,14 @@ endif()
 # =============
 
 # Use FlashMLA submodule
-set(FLASH_MLA_SOURCE_DIR
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/flash-mla)
+set(FLASH_MLA_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/flashmla-src)
 get_filename_component(FLASH_MLA_SOURCE_DIR ${FLASH_MLA_SOURCE_DIR} ABSOLUTE)
-
-if(NOT EXISTS ${FLASH_MLA_SOURCE_DIR})
-  message(
-    FATAL_ERROR
-      "FlashMLA submodule not found at ${FLASH_MLA_SOURCE_DIR}. Please run: git submodule update --init --recursive"
-  )
-endif()
 
 # Check if submodules are initialized
 if(NOT EXISTS ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/include)
   message(
     FATAL_ERROR
-      "FlashMLA submodules not initialized. Please run: cd ${FLASH_MLA_SOURCE_DIR} && git submodule update --init --recursive"
+      "FlashMLA submodules not initialized. Something went wrong with FetchContent"
   )
 endif()
 

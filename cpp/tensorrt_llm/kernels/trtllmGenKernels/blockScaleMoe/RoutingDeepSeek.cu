@@ -63,7 +63,7 @@ __global__ void routingMainKernel(KernelParams params)
     // note that for invalid scores, we simply use a negative value:
     // they work well even with the compacted format used in topK, and
     // sigmoid / bias activated scores cannot be negative
-    static constexpr float invalidScoreFloat = -1.F;
+    static constexpr float invalidScoreFloat = float{-INFINITY};
     const OutputT invalidScore = OutputT{invalidScoreFloat};
 
     // load bias already; each warp represents one expert group
@@ -527,6 +527,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesCoo
         {
             params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
         }
+        if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert)
+        {
+            params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+        }
         if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert)
         {
             params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
@@ -593,7 +597,8 @@ void run(Data& data, void* stream)
         TLLM_CHECK_WITH_INFO(data.mPtrTopKWeights != nullptr,
             "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for DeepSeek routing.");
     }
-    if (data.mPtrExpandedIdxToPermutedIdx != nullptr || data.mPtrPermutedIdxToTokenIdx != nullptr)
+    if (data.mPtrExpandedIdxToPermutedIdx != nullptr || data.mPtrPermutedIdxToExpandedIdx != nullptr
+        || data.mPtrPermutedIdxToTokenIdx != nullptr)
         TLLM_CHECK_WITH_INFO(
             (data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr) && data.mPtrPermutedIdxSize,
             "If permuted index is required, `mPtrTopKPacked` or `mPtrTopKIds` is also required");
@@ -642,8 +647,7 @@ void run(Data& data, void* stream)
     //
     // The upper bound is a strict requirement. The number of blocks should be determined by querying
     // the device properties, or conservatively low.
-    // /!\ The following number is not portable!! (but works on H100 and B200)
-    int const numBlocksCoop = 128;
+    static int const numBlocksCoop = tensorrt_llm::common::getMultiProcessorCount();
 
     // Maximum number of tokens supported by the kernel using a cooperative launch.
     int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;

@@ -189,6 +189,7 @@ set(TRTLLM_LINK_LIBS
     fb_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
+    cute_dsl_src
     layers_src
     runtime_src
     testing_src

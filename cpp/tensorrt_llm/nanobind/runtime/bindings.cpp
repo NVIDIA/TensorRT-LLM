@@ -124,11 +124,6 @@ void initBindings(nb::module_& m)
         .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"),
             nb::call_guard<nb::gil_scoped_release>());
 
-    nb::class_<tr::BufferManager>(m, "BufferManager")
-        .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("stream", &tr::BufferManager::getStream);
-
     nb::class_<tr::TllmRuntime>(m, "TllmRuntime")
         .def(
             "__init__",
@@ -169,15 +164,6 @@ void initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
-    nb::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(nb::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), nb::arg("logits"),
-            nb::arg("max_decoding_engine_tokens"), nb::call_guard<nb::gil_scoped_release>())
-        .def(nb::init<std::vector<tr::ITensor::SharedConstPtr>>(), nb::arg("logits"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_rw("logits", &tr::decoder_batch::Input::logits)
-        .def_rw("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
-        .def_rw("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     nb::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), nb::arg("max_num_sequences"),
@@ -397,6 +383,11 @@ void initBindings(nb::module_& m)
 
 void initBindingsEarly(nb::module_& m)
 {
+    nb::class_<tr::BufferManager>(m, "BufferManager")
+        .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("stream", &tr::BufferManager::getStream);
+
     nb::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
         .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"))
         .def_static("NoneType", &tr::SpeculativeDecodingMode::None)

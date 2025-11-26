@@ -38,6 +38,7 @@ class DecoderInputBuffers
 public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
 
     explicit DecoderInputBuffers(
         SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
@@ -60,13 +61,22 @@ public:
     //! Requests for considered in decoder forward
     RequestVector decoderRequests;
 
+    //! Logits of decoder requests
+    std::vector<TensorPtr> decoderLogits;
+
+    //! Maximum number of decoding steps of decoder requests.
+    //! This is only more than 1 for external draft tokens speculative decoding.
+    SizeType32 maxDecoderSteps{1};
+
     //! Batch slots for all decoder steps, [maxDecoderSteps][maxBatchSize]
     std::vector<TensorPtr> forwardBatchSlots;
 
-    //! Logits of decoder requests
-    std::vector<TensorPtr> logits;
+    //! Logits for requests in forwardBatchSlots (in the same order).
+    //! [maxDecoderSteps][batchSize][1, beamWidth, vocabSizePadded], on gpu
+    std::vector<std::vector<TensorConstPtr>> batchLogits;
 
-    //! Logits for speculative decoding (Medusa)
+    //! Logits for speculative decoding (Medusa).
+    //! The vector is sparse, only slots in forwardBatchSlots are used.
     //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
     std::vector<std::vector<runtime::ITensor::SharedPtr>> predictedDraftLogits;
 };

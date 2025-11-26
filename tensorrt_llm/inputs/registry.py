@@ -3,7 +3,7 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
-                    TypeVar)
+                    TypeVar, Union)
 
 import torch
 from PIL import Image
@@ -118,7 +118,7 @@ class DefaultInputProcessor(InputProcessor):
         return token_ids, None
 
 
-class BaseMultimodalInputProcessor(InputProcessor, ABC):
+class BaseMultimodalInputProcessor(ABC):
     """
     Base class for multimodal input processors with default implementations
     of get_num_tokens_per_image and get_num_tokens_per_video methods.
@@ -127,8 +127,16 @@ class BaseMultimodalInputProcessor(InputProcessor, ABC):
     models. Specific processors can override these methods if they need custom logic.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self,
+                 model_path,
+                 config,
+                 tokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
+        self._config = config
+        self._model_path = model_path
+        self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._multimodal_hashing_supported: Optional[bool] = None
 
@@ -142,13 +150,13 @@ class BaseMultimodalInputProcessor(InputProcessor, ABC):
     @abstractmethod
     def tokenizer(self) -> PreTrainedTokenizerBase:
         """The HF tokenizer for this model."""
-        ...
+        return self._tokenizer
 
     @property
     @abstractmethod
     def config(self) -> PretrainedConfig:
         """The HF pretrained config for this model."""
-        ...
+        return self._config
 
     @property
     @abstractmethod
@@ -306,22 +314,23 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         super().__init__(**kwargs)
         self.image_max_dim = kwargs.get('image_max_dim',
                                         self.DEFAULT_IMAGE_MAX_DIM)
-        self.img_min_dim = kwargs.get('img_min_dim', self.DEFAULT_IMAGE_MIN_DIM)
+        self.image_min_dim = kwargs.get('image_min_dim',
+                                        self.DEFAULT_IMAGE_MIN_DIM)
 
     @property
     @abstractmethod
     def tokenizer(self) -> PreTrainedTokenizerBase:
-        pass
+        ...
 
     @property
     @abstractmethod
     def config(self) -> PretrainedConfig:
-        pass
+        ...
 
     @property
     @abstractmethod
     def model_path(self) -> str:
-        pass
+        ...
 
     def get_dummy_image(self, max_width: int, max_height: int) -> Image.Image:
         image = Image.new("RGB", (max_width, max_height),
@@ -331,7 +340,7 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     def get_dummy_prompt(self, input_seq_len: int):
         # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
         # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
-        while self.image_max_dim >= self.img_min_dim:
+        while self.image_max_dim >= self.image_min_dim:
             image = self.get_dummy_image(max_width=self.image_max_dim,
                                          max_height=self.image_max_dim)
 
@@ -549,7 +558,7 @@ def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
     checkpoint_format: Optional[str] = "HF",
-) -> InputProcessor:
+) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
 
     Args:

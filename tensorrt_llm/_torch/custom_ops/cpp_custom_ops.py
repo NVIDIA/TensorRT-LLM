@@ -1,10 +1,11 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..._utils import get_sm_version
+from .cute_dsl_custom_ops import GroupedGemmInputsHelper
 
 
 def _register_fake():
@@ -183,12 +184,12 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
-    @torch.library.register_fake("trtllm::indexer_topk_prefill_op")
+    @torch.library.register_fake("trtllm::indexer_topk_prefill")
     def _(logits, row_starts, row_ends, indices, index_topk):
         # In-place operation, no return value (void function)
         pass
 
-    @torch.library.register_fake("trtllm::indexer_topk_decode_op")
+    @torch.library.register_fake("trtllm::indexer_topk_decode")
     def _(logits, seq_lens, indices, next_n, index_topk):
         # In-place operation, no return value (void function)
         pass
@@ -484,6 +485,183 @@ def _register_fake():
         unpadded_hidden_size_val = int(unpadded_hidden_size)
         return gemm2_output.new_empty((num_rows_val, unpadded_hidden_size_val),
                                       dtype=gemm2_output.dtype)
+
+    @torch.library.register_fake("trtllm::moe_topk_sort")
+    def _(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        tile_tokens_dim: int,
+        routing_method_type: int,
+    ) -> List[torch.Tensor]:
+        helper = GroupedGemmInputsHelper(
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_tokens_dim,
+        )
+        num_tokens = routing_logits.size(0)
+        device = routing_logits.device
+        routing_bias_dtype = torch.bfloat16 if routing_bias is None else routing_bias.dtype
+        max_num_tiles = helper.get_max_num_tiles(num_tokens)
+        max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+        tile_idx_to_expert_idx = torch.empty((max_num_tiles, ),
+                                             dtype=torch.int32,
+                                             device=device)
+        tile_idx_to_mn_limit = torch.empty((max_num_tiles, ),
+                                           dtype=torch.int32,
+                                           device=device)
+        expanded_idx_to_permuted_idx = torch.empty((num_tokens, top_k),
+                                                   dtype=torch.int32,
+                                                   device=device)
+        permuted_idx_to_expanded_idx = torch.empty((max_num_permuted_tokens, ),
+                                                   dtype=torch.int32,
+                                                   device=device)
+        total_num_padded_tokens = torch.empty((1, ),
+                                              dtype=torch.int32,
+                                              device=device)
+        num_non_exiting_tiles = torch.empty((1, ),
+                                            dtype=torch.int32,
+                                            device=device)
+        new_token_final_scales = torch.empty((num_tokens, top_k),
+                                             dtype=routing_bias_dtype,
+                                             device=device)
+        return [
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+            total_num_padded_tokens, num_non_exiting_tiles,
+            new_token_final_scales
+        ]
+
+    @torch.library.register_fake("trtllm::moe_sort")
+    def _(
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        tile_tokens_dim: int,
+    ) -> List[torch.Tensor]:
+        helper = GroupedGemmInputsHelper(
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_tokens_dim,
+        )
+        num_tokens = token_selected_experts.size(0)
+        device = token_selected_experts.device
+        max_num_tiles = helper.get_max_num_tiles(num_tokens)
+        max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+        tile_idx_to_expert_idx = torch.empty((max_num_tiles, ),
+                                             dtype=torch.int32,
+                                             device=device)
+        tile_idx_to_mn_limit = torch.empty((max_num_tiles, ),
+                                           dtype=torch.int32,
+                                           device=device)
+        expanded_idx_to_permuted_idx = torch.empty((num_tokens, top_k),
+                                                   dtype=torch.int32,
+                                                   device=device)
+        permuted_idx_to_expanded_idx = torch.empty((max_num_permuted_tokens, ),
+                                                   dtype=torch.int32,
+                                                   device=device)
+        total_num_padded_tokens = torch.empty((1, ),
+                                              dtype=torch.int32,
+                                              device=device)
+        num_non_exiting_tiles = torch.empty((1, ),
+                                            dtype=torch.int32,
+                                            device=device)
+        return [
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+            total_num_padded_tokens, num_non_exiting_tiles
+        ]
+
+    @torch.library.register_fake("trtllm::moe_permute")
+    def _(
+        input: torch.Tensor,
+        input_sf: Optional[torch.Tensor],
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_tokens_dim: int,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+        permuted_output = torch.empty((max_num_permuted_tokens, input.size(1)),
+                                      dtype=input.dtype,
+                                      device=input.device)
+        if input.dtype == torch.float4_e2m1fn_x2:
+            hidden_size = input.size(1) * 2
+            sf_vec_size = 16
+            permuted_sf = torch.empty(
+                (max_num_permuted_tokens * hidden_size // sf_vec_size, ),
+                dtype=input_sf.dtype,
+                device=input.device)
+        else:
+            permuted_sf = None
+        return permuted_output, permuted_sf
+
+    @torch.library.register_fake("trtllm::moe_unpermute")
+    def _(
+        permuted_input: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        topk_scales: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = expanded_idx_to_permuted_idx.size(0)
+        output = torch.empty((num_tokens, permuted_input.size(1)),
+                             dtype=permuted_input.dtype,
+                             device=permuted_input.device)
+        return output
+
+    @torch.library.register_fake("trtllm::moe_swiglu")
+    def _(
+        input: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_tokens_dim: int,
+    ) -> torch.Tensor:
+        output = torch.empty((input.size(0), input.size(1) // 2),
+                             dtype=input.dtype,
+                             device=input.device)
+        return output
+
+    @torch.library.register_fake("trtllm::moe_swiglu_nvfp4_quantize")
+    def _(
+        input: torch.Tensor,
+        global_sf: float,
+        tile_idx_to_mn_limit: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_tokens_dim: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_num_permuted_tokens = input.size(0)
+        interm_size = input.size(1) // 2
+        sf_vec_size = 16
+        output = torch.empty((max_num_permuted_tokens, interm_size // 2),
+                             dtype=torch.float4_e2m1fn_x2,
+                             device=input.device)
+        output_sf = torch.empty(
+            (max_num_permuted_tokens * interm_size // sf_vec_size, ),
+            dtype=torch.uint8,
+            device=input.device)
+        return output, output_sf
+
+    @torch.library.register_fake("trtllm::moe_gelu")
+    def _(
+        input: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_tokens_dim: int,
+    ) -> torch.Tensor:
+        return torch.empty_like(input)
 
     @torch.library.register_fake("trtllm::allgather_list")
     def allgather_list(input_list, sizes, group):

@@ -1878,10 +1878,12 @@ def skip_by_mpi_world_size(request):
 @pytest.fixture(autouse=True)
 def skip_by_device_memory(request):
     "fixture for skip less device memory"
-    if request.node.get_closest_marker("skip_less_device_memory"):
+    # Get all markers, not just the closest one
+    markers = request.node.iter_markers("skip_less_device_memory")
+
+    for marker in markers:
         device_memory = get_device_memory()
-        expected_memory = request.node.get_closest_marker(
-            "skip_less_device_memory").args[0]
+        expected_memory = marker.args[0]
         if expected_memory > int(device_memory):
             pytest.skip(
                 f"Device memory {device_memory} is less than {expected_memory}")
@@ -2129,6 +2131,13 @@ def pytest_addoption(parser):
         "Number of completed tests before triggering a periodic save (default: 10). "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--periodic-junit-xmlpath",
+        action="store",
+        default=None,
+        help="Path to the output XML file for periodic JUnit XML reporter. "
+        "Only used with --periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2233,7 +2242,8 @@ def pytest_configure(config):
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
     output_dir = config.getoption("--output-dir", default=None)
-
+    periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
+                                              default=None)
     if periodic and output_dir:
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
@@ -2243,7 +2253,8 @@ def pytest_configure(config):
         os.makedirs(output_dir, exist_ok=True)
 
         # Create the reporter with logger
-        xmlpath = os.path.join(output_dir, "results.xml")
+        xmlpath = periodic_junit_xmlpath or os.path.join(
+            output_dir, "results.xml")
         reporter = PeriodicJUnitXML(
             xmlpath=xmlpath,
             interval=periodic_interval,
@@ -2679,6 +2690,7 @@ def torch_empty_cache() -> None:
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
     if torch.cuda.is_available():
+        gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
 

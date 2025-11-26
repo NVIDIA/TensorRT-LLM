@@ -1,25 +1,42 @@
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
-def _insert_fused_moe_ops(gm: GraphModule) -> int:
+def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     fused_key_counter = 0
     graph = gm.graph
+    backend = backend.lower()
+
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_moe_fused,
+    }[backend]
 
     for node in graph.nodes:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
         (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
+        assert backend != "triton" or mlp_style_val == "mlp", (
+            "Triton backend only supports mlp style."
+        )
 
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = (
             extract_op_args(
@@ -43,15 +60,10 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
                 dim=0,
             )
             new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-            # TRTLLM fused MoE op supports gated MLP only.
-            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
 
         elif mlp_style_val == "mlp":
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
-            # Triton fused MoE op supports mlp only.
-            replacement_op = torch.ops.auto_deploy.trtllm_moe_fused
-
         else:
             raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
 
@@ -573,7 +585,7 @@ class MatchNVFP4MoePattern(MatchMoePattern):
         return ["input_scale", "weight_scale", "alpha"]
 
 
-def _stack_fp8_moe_weights(gm: GraphModule) -> int:
+def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     """
     Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
     This is fast because we directly stack the tensor values (not graph nodes).
@@ -581,6 +593,13 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
     """
     fused_key_counter = 0
     graph = gm.graph
+
+    backend = backend.lower()
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_quant_fp8_moe,
+    }[backend]
 
     for node in graph.nodes:
         if not is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
@@ -657,20 +676,33 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
             )
         )
 
-        w1_weight_scale_stacked = torch.stack(
-            [get_param_or_buffer(n.target) for n in w1_weight_scale], dim=0
+        w1_weight_scale_stacked = (
+            torch.stack([get_param_or_buffer(n.target) for n in w1_weight_scale], dim=0)
+            .to(torch.float32)
+            .contiguous()
         )
-        w2_weight_scale_stacked = torch.stack(
-            [get_param_or_buffer(n.target) for n in w2_weight_scale], dim=0
+        w2_weight_scale_stacked = (
+            torch.stack([get_param_or_buffer(n.target) for n in w2_weight_scale], dim=0)
+            .to(torch.float32)
+            .contiguous()
         )
         w3_weight_scale_stacked = (
-            torch.stack([get_param_or_buffer(n.target) for n in w3_weight_scale], dim=0)
-            if w3_weight_scale
-            else torch.empty(
-                0, device=w1_weight_scale_stacked.device, dtype=w1_weight_scale_stacked.dtype
+            (
+                torch.stack([get_param_or_buffer(n.target) for n in w3_weight_scale], dim=0)
+                if w3_weight_scale
+                else torch.empty(
+                    0, device=w1_weight_scale_stacked.device, dtype=w1_weight_scale_stacked.dtype
+                )
             )
+            .to(torch.float32)
+            .contiguous()
         )
-
+        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
+            "All w1 scales should have the same value."
+        )
+        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
+            "All w2 scales should have the same value."
+        )
         # Register stacked tensors as new parameters
         new_key_w1 = f"quant_moe_w1_stacked_{fused_key_counter}"
         new_key_w2 = f"quant_moe_w2_stacked_{fused_key_counter}"
@@ -710,24 +742,55 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
             torch.nn.Parameter(w3_weight_scale_stacked, requires_grad=False),
         )
 
+        additional_nodes = []
+        if backend == "trtllm":
+            # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
+            # to avoid computing them at runtime.
+            gemm1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked[0]).squeeze()
+            gemm2_act_quant = (1.0 / w2_input_scale_stacked[0]).to(torch.float32)
+            gemm2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked[0]).squeeze()
+
+            new_key_gemm1_dequant = f"quant_moe_gemm1_dequant_stacked_{fused_key_counter}"
+            new_key_gemm2_act_quant = f"quant_moe_gemm2_act_quant_stacked_{fused_key_counter}"
+            new_key_gemm2_dequant = f"quant_moe_gemm2_dequant_stacked_{fused_key_counter}"
+            gm.register_parameter(
+                new_key_gemm1_dequant,
+                torch.nn.Parameter(gemm1_dequant, requires_grad=False),
+            )
+            gm.register_parameter(
+                new_key_gemm2_act_quant,
+                torch.nn.Parameter(gemm2_act_quant, requires_grad=False),
+            )
+            gm.register_parameter(
+                new_key_gemm2_dequant,
+                torch.nn.Parameter(gemm2_dequant, requires_grad=False),
+            )
+            additional_nodes = [
+                new_key_gemm1_dequant,
+                new_key_gemm2_act_quant,
+                new_key_gemm2_dequant,
+            ]
+
         # Create new node with get_attr for stacked parameters
         with graph.inserting_before(node):
+            args = (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                graph.get_attr(new_key_w1),
+                graph.get_attr(new_key_w2),
+                graph.get_attr(new_key_w3),
+                graph.get_attr(new_key_w1_input_scale),
+                graph.get_attr(new_key_w2_input_scale),
+                graph.get_attr(new_key_w3_input_scale),
+                graph.get_attr(new_key_w1_weight_scale),
+                graph.get_attr(new_key_w2_weight_scale),
+                graph.get_attr(new_key_w3_weight_scale),
+            )
+            additional_args = (graph.get_attr(node) for node in additional_nodes)
             new_node = graph.call_function(
-                torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
-                args=(
-                    hidden_states,
-                    selected_experts,
-                    routing_weights,
-                    graph.get_attr(new_key_w1),
-                    graph.get_attr(new_key_w2),
-                    graph.get_attr(new_key_w3),
-                    graph.get_attr(new_key_w1_input_scale),
-                    graph.get_attr(new_key_w2_input_scale),
-                    graph.get_attr(new_key_w3_input_scale),
-                    graph.get_attr(new_key_w1_weight_scale),
-                    graph.get_attr(new_key_w2_weight_scale),
-                    graph.get_attr(new_key_w3_weight_scale),
-                ),
+                replacement_op,
+                args=(*args, *additional_args),
                 kwargs=node.kwargs,
             )
 
@@ -743,12 +806,25 @@ def _stack_fp8_moe_weights(gm: GraphModule) -> int:
     return fused_key_counter
 
 
+class FuseMoeConfig(TransformConfig):
+    """Configuration for MoE fusion transform."""
+
+    backend: str = Field(
+        default="auto",
+        description="Backend to use for MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
+    )
+
+
 @TransformRegistry.register("fuse_moe")
 class FuseMoe(BaseTransform):
     """
     Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
     torch.ops.auto_deploy.trtllm_moe_fused.
     """
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseMoeConfig
 
     def _apply(
         self,
@@ -758,7 +834,7 @@ class FuseMoe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _insert_fused_moe_ops(gm)
+            fused_key_counter = _insert_fused_moe_ops(gm, backend=self.config.backend)
 
         info = TransformInfo(
             skipped=False,
@@ -767,6 +843,15 @@ class FuseMoe(BaseTransform):
             has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info
+
+
+class FuseFP8MoeConfig(TransformConfig):
+    """Configuration for FP8 MoE fusion transform."""
+
+    backend: str = Field(
+        default="auto",
+        description="Backend to use for FP8 MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
+    )
 
 
 @TransformRegistry.register("fuse_fp8_moe")
@@ -784,7 +869,7 @@ class FuseFP8Moe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _stack_fp8_moe_weights(gm)
+            fused_key_counter = _stack_fp8_moe_weights(gm, backend=self.config.backend)
 
         info = TransformInfo(
             skipped=(fused_key_counter == 0),

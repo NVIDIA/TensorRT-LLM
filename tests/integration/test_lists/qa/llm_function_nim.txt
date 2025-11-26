@@ -27,14 +27,6 @@ examples/test_llama.py::test_llm_llama_2gpu_fp4[llama-3.1-70b-instruct-fp4_plugi
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
 examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[mixtral-8x7b-v0.1-AWQ]
-examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1]
-examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-examples/test_multimodal.py::test_llm_multimodal_general[Phi-4-multimodal-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
-examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
-examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1]
-examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:2-bfloat16-bs:1-cpp_e2e:False-nb:1]
 # Multimodal Executor Cpp E2E Tests
 examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-scienceqa-Llama-3.2-11B-Vision-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False]
 
@@ -67,8 +59,6 @@ examples/test_qwen.py::test_llm_hf_qwen_quantization_1gpu[qwen2_vl_7b_instruct-f
 examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2_0.5b_instruct]
 examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_0.5b_instruct]
 examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
-examples/test_qwenvl.py::test_llm_qwenvl_single_gpu_summary[qwen-vl-chat]
-examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct]
 examples/test_gpt.py::test_llm_gpt2_starcoder_1node_4gpus[starcoder2-disable_fmha-enable_gemm_plugin-enable_attention_plugin]
 examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int4-float16]
 examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int8-float16]
@@ -352,9 +342,18 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[cutlass-au
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-fp8]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-one_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-one_model-no_overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-two_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-two_model-no_overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm-one_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm-one_model-no_overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm-two_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[trtllm-two_model-no_overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-one_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-one_model-no_overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-two_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-two_model-no_overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass]
@@ -382,6 +381,10 @@ accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-c
 accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4
 accuracy/test_llm_api_pytorch.py::TestCodestral_22B_V01::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency]
+accuracy/test_llm_api_pytorch.py::TestStarcoder2_3B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestStarcoder2_7B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestStarcoder2_15B::test_auto_dtype
+
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestLlava_V1_6_Mistral_7B::test_auto_dtype
@@ -398,9 +401,7 @@ test_e2e.py::test_llmapi_generation_logits[llama-3.1-model/Llama-3.1-8B-Instruct
 test_e2e.py::test_llmapi_generation_logits[llama-3.3-models/Llama-3.3-70B-Instruct-True]
 test_e2e.py::test_llmapi_generation_logits[llama-3.3-models/Llama-3.3-70B-Instruct-False]
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-0.6-image]
-test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-0.8-image]
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-0.6-image]
-test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-0.8-image]
 
 examples/serve/test_serve.py::test_extra_llm_api_options
 examples/serve/test_serve_negative.py::test_invalid_max_tokens
@@ -437,7 +438,7 @@ test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
-test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B-2]
+test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B-8]
 test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-70B-FP8-llama-3.1-model/Llama-3.1-70B-Instruct-FP8-2]
 test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Llama3.1-405B-FP8-llama-3.1-model/Llama-3.1-405B-Instruct-FP8-8]
 test_e2e.py::test_ptp_quickstart_advanced_multi_gpus[Mixtral-8x7B-BF16-Mixtral-8x7B-v0.1-8]
@@ -458,10 +459,8 @@ test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-mult
 test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image_audio]
 test_e2e.py::test_ptp_quickstart_multimodal_2gpu[gemma-3-27b-it-gemma/gemma-3-27b-it]
 test_e2e.py::test_ptp_quickstart_multimodal_2gpu[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503]
-test_e2e.py::test_ptp_quickstart_multimodal_2gpu[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct]
 test_e2e.py::test_ptp_quickstart_multimodal_multiturn[gemma-3-27b-it-gemma/gemma-3-27b-it]
 test_e2e.py::test_ptp_quickstart_multimodal_multiturn[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503]
-test_e2e.py::test_ptp_quickstart_multimodal_multiturn[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct]
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8]

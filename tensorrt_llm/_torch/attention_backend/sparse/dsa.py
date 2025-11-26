@@ -222,47 +222,62 @@ def split_prefill_chunks(
     return chunk_groups
 
 
-def compute_cu_seqlen_kv_bounds_nocache(
+def compute_cu_seqlen_kv_bounds_with_cache(
     seq_lens: torch.Tensor,
     num_contexts: int,
     num_ctx_tokens: int,
+    cached_token_lens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute attention window bounds for batched sequences with causal attention.
+    Compute attention window bounds for batched sequences with causal attention,
+    accounting for cached KV tokens.
 
     Args:
-        seq_lens: Sequence lengths [num_contexts], dtype=torch.int32
+        seq_lens: current token lengths [num_contexts], dtype=torch.int32
         num_contexts: Number of sequences in the batch
-        num_ctx_tokens: Total number of tokens across all sequences
+        num_ctx_tokens: Total number of context tokens across all sequences in current batch
+        cached_token_lens: Cached KV token lengths [num_contexts], dtype=torch.int32 (optional)
 
     Returns:
-        cu_seqlen_ks: Start index in KV for each token [num_ctx_tokens]
-        cu_seqlen_ke: End index (exclusive) in KV for each token [num_ctx_tokens]
+        cu_seqlen_ks: Start index in KV for each Q token [num_ctx_tokens]
+        cu_seqlen_ke: End index (exclusive) in KV for each Q token [num_ctx_tokens]
     """
     device = seq_lens.device
-    # Cumulative sequence offsets: where each sequence starts
-    cu_seq_offsets = torch.cat([
+    # Total KV lengths per request
+    kv_lens = seq_lens if cached_token_lens is None else cached_token_lens + seq_lens  # [num_contexts]
+
+    # Cumulative KV offsets: where each request's KV sequence starts in global KV space
+    cu_kv_offsets = torch.cat([
         torch.zeros(1, device=device, dtype=torch.int32),
-        torch.cumsum(seq_lens, dim=0).to(torch.int32)
+        torch.cumsum(kv_lens, dim=0).to(torch.int32)
     ])  # [num_contexts + 1]
 
-    # Map each token to its batch: [0,0,...,0, 1,1,...,1, ..., B-1,B-1,...,B-1]
+    # Map each Q token to its request: [0,0,...,0, 1,1,...,1, ..., B-1,B-1,...,B-1]
     batch_ids = torch.repeat_interleave(
         torch.arange(num_contexts, device=device, dtype=torch.int32),
         seq_lens)  # [num_ctx_tokens]
 
-    # Each token's KV window starts at its sequence's start
-    cu_seqlen_ks = cu_seq_offsets[batch_ids]  # [num_ctx_tokens]
+    # Each Q token's KV window starts at its request's KV sequence start
+    cu_seqlen_ks = cu_kv_offsets[batch_ids]  # [num_ctx_tokens]
 
-    # Compute local position within each sequence (0-based)
-    global_positions = torch.arange(num_ctx_tokens,
-                                    device=device,
-                                    dtype=torch.int32)
-    local_positions = global_positions - torch.repeat_interleave(
-        cu_seq_offsets[:-1], seq_lens)
+    # Compute local Q position within each request (0-based, relative to current batch context tokens)
+    cu_q_offsets = torch.cat([
+        torch.zeros(1, device=device, dtype=torch.int32),
+        torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    ])  # [num_contexts + 1]
 
-    # Causal: token at local position j attends to [seq_start, seq_start + j + 1)
-    cu_seqlen_ke = cu_seqlen_ks + local_positions + 1  # [num_ctx_tokens]
+    global_q_positions = torch.arange(num_ctx_tokens,
+                                      device=device,
+                                      dtype=torch.int32)
+    local_q_positions = global_q_positions - torch.repeat_interleave(
+        cu_q_offsets[:-1], seq_lens)  # [num_ctx_tokens]
+
+    if cached_token_lens is not None:
+        cached_per_token = torch.repeat_interleave(cached_token_lens,
+                                                   seq_lens)  # [num_ctx_tokens]
+        cu_seqlen_ke = cu_seqlen_ks + cached_per_token + local_q_positions + 1  # [num_ctx_tokens]
+    else:
+        cu_seqlen_ke = cu_seqlen_ks + local_q_positions + 1  # [num_ctx_tokens]
 
     return cu_seqlen_ks, cu_seqlen_ke
 
@@ -276,7 +291,6 @@ class IndexerPrefillChunkMetadata:
     token_end: int  # Q token end index in batch
     k_token_start: int  # K token start index in batch
     k_token_end: int  # K token end index in batch
-    ctx_kv_offsets: torch.Tensor  # Offsets for converting local to global topk indices
 
 
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
@@ -320,7 +334,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=True,
         )
 
-        # For mla_rope_append_paged_kv_assign_q
         if not self.enable_context_mla_with_cached_kv:
             self.ctx_cached_token_indptr = self.get_empty(
                 self.cuda_graph_buffers,
@@ -346,6 +359,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device='cpu',
                 pin_memory=True,
             )
+
+        # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
+        # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
+        if self.enable_context_mla_with_cached_kv:
+            self.slot_mapping_fp8_fullkv = None
+            self.slot_mapping_scale_fullkv = None
+
         # New generation buffers for dsa
         self.gen_cached_token_indptr = self.get_empty(
             self.cuda_graph_buffers,
@@ -477,17 +497,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # TODO: remove this function when fp8_paged_mqa_logits can support MTP > 1.
     def update_spec_dec_param(
         self,
+        batch_size,
         is_spec_decoding_enabled,
         is_spec_dec_tree,
         is_spec_dec_dynamic_tree,
-        max_draft_tokens,
+        max_draft_len,
+        max_total_draft_tokens,
+        model_is_wrapped: bool = False,
+        spec_metadata: Optional['SpecMetadata'] = None,
+        spec_tree_manager: Optional['SpecTreeManager'] = None,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
-        super().update_spec_dec_param(is_spec_decoding_enabled,
+        super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
-                                      is_spec_dec_dynamic_tree,
-                                      max_draft_tokens, spec_decoding_tensor)
-        self.max_draft_tokens = max_draft_tokens
+                                      is_spec_dec_dynamic_tree, max_draft_len,
+                                      max_total_draft_tokens, model_is_wrapped,
+                                      spec_metadata, spec_tree_manager,
+                                      spec_decoding_tensor)
+        self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             capture_graph = torch.cuda.is_current_stream_capturing()
@@ -541,7 +568,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         kv_lens = cached_token_lens + self.seq_lens_kv
 
-        if self.num_contexts > 0 and not self.enable_context_mla_with_cached_kv:
+        if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[:self.
                                                            num_contexts].sum(
                                                            ).item()
@@ -565,7 +592,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
                 self.host_ctx_kv_indptr[:self.num_contexts + 1],
                 non_blocking=True)
-        elif self.num_contexts == 0:
+        else:
             self.num_ctx_cached_tokens = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
@@ -674,6 +701,11 @@ def _scale(weights: torch.Tensor, q_scale: torch.Tensor,
     return weights * q_scale.squeeze(-1) * s
 
 
+@maybe_compile(dynamic=True)
+def _to_float(hidden_states: torch.Tensor) -> torch.Tensor:
+    return hidden_states.float()
+
+
 class Indexer(nn.Module):
 
     def __init__(self,
@@ -715,7 +747,7 @@ class Indexer(nn.Module):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            dtype=dtype,
+            dtype=torch.float32,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
@@ -723,7 +755,8 @@ class Indexer(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
-            is_neox=pos_embd_params.is_neox,
+            # RoPE in indexer is not interleaved
+            is_neox=True,
         )
 
         self.softmax_scale = self.head_dim**-0.5
@@ -737,7 +770,6 @@ class Indexer(nn.Module):
     def prepare_one_prefill_chunk(
         metadata: DSAtrtllmAttentionMetadata,
         chunk_specs: List[Tuple[int, int, int, int]],
-        seq_lens_cpu: torch.Tensor,
     ) -> IndexerPrefillChunkMetadata:
         """
         Build metadata for one prefill chunk for indexer forward pass.
@@ -746,81 +778,90 @@ class Indexer(nn.Module):
         Args:
             metadata: Attention metadata
             chunk_specs: List of (req_idx, token_start_in_req, token_end_in_req, req_cum_start)
-                        - For multi-request: multiple specs from different requests
+                        - token_start_in_req, token_end_in_req are indices into current batch context tokens
+                        - For multi-request: multiple specs from different requests (full requests)
                         - For intra-request: single spec from one request's Q-block
-            seq_lens_cpu: Sequence lengths for all requests
+
+        Note: Cached token counts are derived from metadata.host_ctx_cached_token_indptr
         """
         device = metadata.cu_seqlen_ks.device
-
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
             req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[
                 0]
             num_q_tokens = token_end_in_req - token_start_in_req
 
-            # For intra-request chunks: Q block attends to all previous K in the request
-            # Q tokens [token_start_in_req:token_end_in_req] within the request
-            # K tokens [0:token_end_in_req] within the request (causal attention)
+            # Get cached token count for this request from metadata
+            num_cached = (
+                metadata.host_ctx_cached_token_indptr[req_idx + 1] -
+                metadata.host_ctx_cached_token_indptr[req_idx]).item()
 
+            # For intra-request chunks: Q block attends to all previous K in the request
+            # Q tokens [token_start_in_req:token_end_in_req] within the request's current tokens
+            # K tokens [0:num_cached + token_end_in_req] within the request (causal attention)
             cu_seqlen_ks = torch.zeros(num_q_tokens,
                                        dtype=torch.int32,
                                        device='cpu')
             cu_seqlen_ke = torch.arange(token_start_in_req + 1,
                                         token_end_in_req + 1,
                                         dtype=torch.int32,
-                                        device='cpu')
+                                        device='cpu') + num_cached
 
-            # Q token range in batch
+            # Q token range in batch (indices into context tokens in the current batch)
             token_start = req_cum_start + token_start_in_req
             token_end = req_cum_start + token_end_in_req
 
-            # K token range in batch: from request start to Q block end
-            k_token_start = req_cum_start
-            k_token_end = req_cum_start + token_end_in_req
+            # K token range: index into full KV slot mapping (cached + current batch context tokens)
+            kv_offset_in_extended = metadata.host_ctx_kv_indptr[req_idx].item()
+            total_kv_for_req = num_cached + token_end_in_req
+            k_token_start = kv_offset_in_extended
+            k_token_end = kv_offset_in_extended + total_kv_for_req
 
-            kv_offset = metadata.host_ctx_kv_indptr[req_idx].item()
-            ctx_kv_offsets = torch.full((num_q_tokens, 1),
-                                        kv_offset,
-                                        dtype=torch.int32,
-                                        device='cpu')
         else:
             # Multi-request chunk: batch multiple full requests together
             # Extract sequence lengths for these requests
             req_seq_lens = []
+            req_cached_lens = []
+            first_req_idx = chunk_specs[0][0]
+
             for spec in chunk_specs:
                 req_idx, token_start_in_req, token_end_in_req, _ = spec
-                assert token_start_in_req == 0, "Multi-request chunk must contain full requests"
-                assert token_end_in_req == seq_lens_cpu[req_idx].item(), \
-                    "Multi-request chunk must contain full requests"
-                req_seq_lens.append(token_end_in_req)
+                req_seq_lens.append(token_end_in_req - token_start_in_req)
+                # Get cached token count from metadata
+                num_cached = (
+                    metadata.host_ctx_cached_token_indptr[req_idx + 1] -
+                    metadata.host_ctx_cached_token_indptr[req_idx]).item()
+                req_cached_lens.append(num_cached)
 
             req_seq_lens_tensor = torch.tensor(req_seq_lens,
                                                dtype=torch.int32,
                                                device='cpu')
+            req_cached_lens_tensor = torch.tensor(req_cached_lens,
+                                                  dtype=torch.int32,
+                                                  device='cpu')
             num_q_tokens = sum(req_seq_lens)
 
             # Compute causal attention bounds for batched requests
-            cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
-                req_seq_lens_tensor, len(chunk_specs), num_q_tokens)
+            cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+                req_seq_lens_tensor, len(chunk_specs), num_q_tokens,
+                req_cached_lens_tensor)
 
-            # Global Q and K token ranges (same for multi-request chunks)
+            # Global Q token ranges (indices into ctx tokens in the current batch)
             token_start = chunk_specs[0][3]  # req_cum_start of first request
-            token_end = chunk_specs[-1][3] + chunk_specs[-1][
-                2]  # last req start + length
-            k_token_start = token_start
-            k_token_end = token_end
+            token_end = token_start + num_q_tokens
 
-            # KV offsets for each request
-            ctx_kv_offsets_list = []
-            for spec in chunk_specs:
-                req_idx, _, token_end_in_req, _ = spec
-                kv_offset = metadata.host_ctx_kv_indptr[req_idx].item()
-                ctx_kv_offsets_list.append(
-                    torch.full((token_end_in_req, ),
-                               kv_offset,
-                               dtype=torch.int32,
-                               device='cpu'))
-            ctx_kv_offsets = torch.cat(ctx_kv_offsets_list).unsqueeze(1)
+            # K token range: index into full kv slot mapping (cached + current ctx tokens within the batch)
+            kv_offset_in_extended = metadata.host_ctx_kv_indptr[
+                first_req_idx].item()
+            total_kv_len = sum(req_seq_lens_tensor +
+                               req_cached_lens_tensor).item()
+            k_token_start = kv_offset_in_extended
+            k_token_end = kv_offset_in_extended + total_kv_len
+
+        assert cu_seqlen_ks.shape[0] == num_q_tokens == token_end - token_start, \
+            f"Indexer.prepare_one_prefill_chunk - cu_seqlen_ks length mismatch: {cu_seqlen_ks.shape[0]} != {num_q_tokens}"
+        assert cu_seqlen_ke.shape[0] == num_q_tokens == token_end - token_start, \
+            f"Indexer.prepare_one_prefill_chunk - cu_seqlen_ke length mismatch: {cu_seqlen_ke.shape[0]} != {num_q_tokens}"
 
         return IndexerPrefillChunkMetadata(
             cu_seqlen_ks=cu_seqlen_ks.to(device, non_blocking=True),
@@ -829,7 +870,6 @@ class Indexer(nn.Module):
             token_end=token_end,
             k_token_start=k_token_start,
             k_token_end=k_token_end,
-            ctx_kv_offsets=ctx_kv_offsets.to(device, non_blocking=True),
         )
 
     @staticmethod
@@ -859,32 +899,51 @@ class Indexer(nn.Module):
             # cu_seqlen_ks[i]: start index in global KV for query token i
             # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
             host_seq_lens = seq_lens[:num_contexts]
+            host_cached_tokens = torch.tensor(cached_tokens[:num_contexts],
+                                              dtype=torch.int32,
+                                              device='cpu')
 
-            # Two-level chunking: request-boundary + intra-request
-            chunk_groups = split_prefill_chunks(
-                host_seq_lens,
-                metadata.indexer_max_chunk_size,
-                start_idx=0,
-            )
+            # When MLA chunked prefill is active, it already handles chunking
+            # Indexer should just process the current MLA chunk as a single chunk
+            has_mla_chunked_prefill = (
+                metadata.enable_context_mla_with_cached_kv
+                and host_cached_tokens.sum().item() > 0
+                and metadata.runtime_features.chunked_prefill)
 
-            # Enable chunking when num_chunk > 1
-            if len(chunk_groups) > 1:
+            if has_mla_chunked_prefill:
+                # The MLA has already split the sequence, here just process what's given (as a single chunk)
+                # Cached token info is derived from metadata.host_ctx_cached_token_indptr in prepare_one_prefill_chunk
+                chunk_specs = [(i, 0, host_seq_lens[i].item(),
+                                host_seq_lens[:i].sum().item() if i > 0 else 0)
+                               for i in range(num_contexts)]
                 metadata.indexer_prefill_chunks = [
                     Indexer.prepare_one_prefill_chunk(
                         metadata,
                         chunk_specs,
-                        host_seq_lens,
-                    ) for chunk_specs in chunk_groups
+                    )
                 ]
             else:
-                # Single chunk - use non-chunked fallback path
-                metadata.indexer_prefill_chunks = None
+                # Normal mode: use indexer's own chunking logic to prevent L^2 complexity when long-sequence is used.
+                chunk_groups = split_prefill_chunks(
+                    host_seq_lens,
+                    metadata.indexer_max_chunk_size,
+                    start_idx=0,
+                )
 
-            # TODO: Still compute global cu_seqlen bounds for fallback/debugging.
-            # Remove this when indexer chunked prefill is fully tested.
-            # Still compute global cu_seqlen bounds for fallback/debugging
-            host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
-                host_seq_lens, num_contexts, num_ctx_tokens)
+                if len(chunk_groups) > 1:
+                    metadata.indexer_prefill_chunks = [
+                        Indexer.prepare_one_prefill_chunk(
+                            metadata,
+                            chunk_specs,
+                        ) for chunk_specs in chunk_groups
+                    ]
+                else:
+                    # Single chunk - use non-chunked fallback path
+                    metadata.indexer_prefill_chunks = None
+
+            host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+                host_seq_lens, num_contexts, num_ctx_tokens, host_cached_tokens)
+
             metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
                                                          non_blocking=True)
             metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
@@ -919,35 +978,103 @@ class Indexer(nn.Module):
                                            )  # Bytes per block
         scale_base_offset = tokens_per_block * head_dim  # Offset to scale region in block
 
-        token_idx = 0
-        for req_idx, req_id in enumerate(request_ids):
-            num_tokens = seq_lens[req_idx].item()
-            start_pos = start_positions[req_idx].item()
-            # Compute slots for each token in this request
-            for local_token_idx in range(num_tokens):
-                global_pos = start_pos + local_token_idx
-                block_idx_in_seq = global_pos // tokens_per_block
-                pos_in_block = global_pos % tokens_per_block
-                # Get physical block ID
-                if block_idx_in_seq < metadata.host_indexer_k_cache_block_offsets.shape[
-                        1]:
-                    block_id = metadata.host_indexer_k_cache_block_offsets[
-                        req_idx, block_idx_in_seq].item()
-                    if block_id >= 0:
-                        # Flat byte index for FP8 data
-                        fp8_flat_idx = block_id * block_stride + pos_in_block * head_dim
-                        metadata.host_slot_mapping_fp8[token_idx] = fp8_flat_idx
+        batch_size = len(request_ids)
 
-                        # Flat byte index for scale
-                        scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
-                        metadata.host_slot_mapping_scale[
-                            token_idx] = scale_flat_idx
-                token_idx += 1
+        req_indices = torch.repeat_interleave(
+            torch.arange(batch_size, dtype=torch.int64, device='cpu'), seq_lens)
+
+        token_offsets = torch.cat([
+            torch.arange(seq_lens[i].item(), dtype=torch.int64, device='cpu')
+            for i in range(batch_size)
+        ])
+
+        # Compute global positions for all tokens in the batch
+        global_positions = start_positions[req_indices] + token_offsets
+
+        # Block indices/pos for all tokens in the batch
+        block_indices_in_seq = global_positions // tokens_per_block
+        pos_in_blocks = global_positions % tokens_per_block
+
+        max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+        assert (block_indices_in_seq < max_blocks).all(), \
+            f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+
+        # Gather block IDs
+        block_ids = metadata.host_indexer_k_cache_block_offsets[
+            req_indices, block_indices_in_seq]
+
+        assert (block_ids >= 0).all(), \
+            f"Unallocated block (block_id < 0) found at positions {torch.where(block_ids < 0)[0].tolist()}"
+
+        # Compute flat indices for all tokens in the batch
+        fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
+        scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+
+        metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
+        metadata.host_slot_mapping_scale[:total_tokens] = scale_flat_indices
 
         metadata.slot_mapping_fp8[:total_tokens].copy_(
             metadata.host_slot_mapping_fp8[:total_tokens], non_blocking=True)
         metadata.slot_mapping_scale[:total_tokens].copy_(
             metadata.host_slot_mapping_scale[:total_tokens], non_blocking=True)
+
+        # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
+        # Indexer's own chunking does not need full KV gathering, instead it gathers only the current chunk with loop-based gathering.
+        _need_full_kv_gathering = num_contexts > 0 and has_mla_chunked_prefill
+        if _need_full_kv_gathering:
+            total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
+            total_kv_per_request = seq_lens[:
+                                            num_contexts] + start_positions[:
+                                                                            num_contexts]
+            host_slot_mapping_fp8_fullkv = torch.empty(total_kv_len,
+                                                       dtype=torch.int64,
+                                                       pin_memory=True)
+            host_slot_mapping_scale_fullkv = torch.empty(total_kv_len,
+                                                         dtype=torch.int64,
+                                                         pin_memory=True)
+
+            req_indices = torch.repeat_interleave(
+                torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
+                total_kv_per_request)
+
+            kv_positions = torch.cat([
+                torch.arange(total_kv_per_request[i].item(),
+                             dtype=torch.int64,
+                             device='cpu') for i in range(num_contexts)
+            ])
+
+            block_indices_in_seq = kv_positions // tokens_per_block
+            pos_in_blocks = kv_positions % tokens_per_block
+
+            max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+            assert (block_indices_in_seq < max_blocks).all(), \
+                f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+
+            # Gather block IDs
+            block_ids = metadata.host_indexer_k_cache_block_offsets[
+                req_indices, block_indices_in_seq]
+
+            assert (block_ids >= 0).all(), \
+                f"Unallocated block (block_id < 0) found at positions {torch.where(block_ids < 0)[0].tolist()}"
+
+            # Compute flat indices for all kv slots in the batch
+            fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
+            scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+
+            host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
+            host_slot_mapping_scale_fullkv[:total_kv_len] = scale_flat_indices
+
+            assert len(fp8_flat_indices) == total_kv_len, \
+                f"host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv length mismatch: {len(fp8_flat_indices)} != total_kv_len={total_kv_len}"
+
+            # Store extended mappings for indexer full KV gathering
+            metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(
+                non_blocking=True)
+            metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(
+                non_blocking=True)
+        else:
+            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
+            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
 
     def _update_k_cache(self, k_fp8: torch.Tensor, k_scale: torch.Tensor,
                         metadata: DSAtrtllmAttentionMetadata) -> None:
@@ -999,31 +1126,35 @@ class Indexer(nn.Module):
         """
         Gather K values from indexer cache for a specific chunk.
 
-        Uses pre-computed slot_mapping for efficient vectorized gather.
-        For intra-request Q-blocks, gathers all previous K tokens in the request.
+        Uses pre-computed extended slot mappings that cover cached + current batch context tokens.
+        chunk.k_token_start/k_token_end directly index into the extended slot mapping.
 
         Args:
             metadata: Attention metadata
-            chunk: Chunk metadata containing token ranges
+            chunk: Chunk metadata with k_token_start/end as indices into extended slot mapping
 
         Returns:
             k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
             k_scale: Scaling factors, shape [num_k_tokens, 1]
         """
+        assert metadata.slot_mapping_fp8_fullkv is not None, \
+            "_gather_k_cache_for_chunk requires extended slot mappings (only available with cached tokens)"
+
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
 
         head_dim = self.head_dim
         scale_size = 4  # float32 = 4 bytes
 
-        # Extract slot mappings for K token range
+        # Extract slot mappings using chunk's k_token_start/end
+        # These indices point directly into the extended slot mapping array
         k_token_start = chunk.k_token_start
         k_token_end = chunk.k_token_end
         num_k_tokens = k_token_end - k_token_start
 
-        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8[
+        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[
             k_token_start:k_token_end]
-        slot_mapping_scale_chunk = metadata.slot_mapping_scale[
+        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[
             k_token_start:k_token_end]
 
         # Vectorized gather using pre-computed slot mappings
@@ -1059,7 +1190,6 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
-        use_custom_topk = use_custom_topk and self.index_topk == 2048  #@TODO: Do we need to add a warning?
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -1091,7 +1221,7 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ke,
                     )
                     if use_custom_topk:
-                        torch.ops.trtllm.indexer_topk_prefill_op(
+                        torch.ops.trtllm.indexer_topk_prefill(
                             logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
                             topk_indices_buffer[
                                 chunk.token_start:chunk.token_end, :])
@@ -1127,7 +1257,7 @@ class Indexer(nn.Module):
                     cu_seqlen_ke,
                 )
                 if use_custom_topk:
-                    torch.ops.trtllm.indexer_topk_prefill_op(
+                    torch.ops.trtllm.indexer_topk_prefill(
                         logits, cu_seqlen_ks, cu_seqlen_ke,
                         topk_indices_buffer[:num_ctx_tokens, :])
                 else:
@@ -1195,7 +1325,7 @@ class Indexer(nn.Module):
                 # This is because rowEnd = seq_len - next_n + offset + 1
                 gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-                torch.ops.trtllm.indexer_topk_decode_op(
+                torch.ops.trtllm.indexer_topk_decode(
                     logits_decode, gen_kv_lens_cuda,
                     topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :], next_n)
@@ -1233,82 +1363,63 @@ class Indexer(nn.Module):
                                         dtype=torch.int32)
         return topk_indices_buffer
 
-    def weight_scale(self, hidden_states: torch.Tensor,
-                     indexer_weights: Optional[torch.Tensor],
-                     q_scale: torch.Tensor) -> torch.Tensor:
-        weights = indexer_weights if indexer_weights is not None else self.weights_proj(
-            hidden_states)
+    def _weight_scale(self, weights: torch.Tensor,
+                      q_scale: torch.Tensor) -> torch.Tensor:
         weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
+
+    def _qk_projection_and_rope(self, qr: torch.Tensor, indexer_k: torch.Tensor,
+                                position_ids: torch.Tensor):
+        """Project Q/K and apply RoPE"""
+        q = self.wq_b(qr)
+        k = self.k_norm(indexer_k)
+        q = q.view(-1, self.n_heads, self.head_dim)
+        q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
+                               dim=-1)
+        k_pe, k_nope = k.split([self.rope_dim, self.head_dim - self.rope_dim],
+                               dim=-1)
+        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
+        k_pe = k_pe[:, 0, :]
+        return q_pe, q_nope, k_pe, k_nope
+
+    def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
+        """Concatenate, rotate, and FP8 quantize for Q or K"""
+        q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
+        q_or_k = rotate_activation(q_or_k)
+        q_or_k = q_or_k.view(-1, self.head_dim)
+        q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
+            q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
+        return q_or_k
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor, indexer_k: Optional[torch.Tensor],
-                indexer_weights: Optional[torch.Tensor]):
+                position_ids: torch.Tensor, indexer_k: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        if indexer_k is not None:
-            q, k = maybe_execute_in_parallel(
-                lambda: self.wq_b(
-                    qr),  # TODO: fuse wq_b and move this outside of the indexer
-                lambda: self.k_norm(indexer_k),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-        else:
-            q, k = maybe_execute_in_parallel(
-                lambda: self.wq_b(qr),
-                lambda: self.k_norm(self.wk(hidden_states)),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-
-        # q/k rope + possible fast_hadamard_transform
-        q = q.view(-1, self.n_heads, self.head_dim)
-
-        q, k = maybe_execute_in_parallel(
-            lambda: torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
-            lambda: torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1),
+        q_and_k, weights = maybe_execute_in_parallel(
+            lambda: self._qk_projection_and_rope(qr, indexer_k, position_ids),
+            lambda: self.weights_proj(_to_float(hidden_states)),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-
-        q_pe, q_nope = q
-        k_pe, k_nope = k
-        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
-
-        k_pe = k_pe[:, 0, :]
-
-        def _prep_q_or_k(qk_pe, qk_nope):
-            q_or_k = torch.cat([qk_pe, qk_nope], dim=-1)
-            q_or_k = rotate_activation(q_or_k)
-            q_or_k = q_or_k.view(-1, self.head_dim)
-            q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
-                q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
-            return q_or_k
-
+        q_pe, q_nope, k_pe, k_nope = q_and_k
         q, k = maybe_execute_in_parallel(
-            lambda: _prep_q_or_k(q_pe, q_nope),
-            lambda: _prep_q_or_k(k_pe, k_nope),
+            lambda: self._prep_q_or_k(q_pe, q_nope),
+            lambda: self._prep_q_or_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
         weights, _ = maybe_execute_in_parallel(
-            lambda: self.weight_scale(hidden_states, indexer_weights, q_scale),
+            lambda: self._weight_scale(weights, q_scale),
             lambda: self._update_k_cache(
                 k_fp8, k_scale, metadata),  # store k_fp8 and k_scale in k cache
             self.ln_events[0],
