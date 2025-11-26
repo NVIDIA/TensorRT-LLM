@@ -619,7 +619,7 @@ class TritonDecoder(Decoder):
             num_output_tokens=gen_res.num_output_tokens)
         return response
 
-    def _load_each_model_config(self, model_config_api_baseurl: str,
+    def _load_each_model_config(self, triton_host_and_port: str,
                                 model_name: str, n_retries: int,
                                 retry_interval_sec: int):
         import time
@@ -628,16 +628,8 @@ class TritonDecoder(Decoder):
         # TODO: Making it possible to switch HTTP/gRPC
         import tritonclient.grpc as grpcclient
 
-        # NOTE: Assuming URL consists of:
-        # /v2/models/{model_name}/config
-        if not model_config_api_baseurl.endswith("/v2/models/"):
-            raise RuntimeError("model_config_api_baseurl is unexpected format: "
-                               f"{model_config_api_baseurl=}")
-        model_config_api_url = "".join(
-            [model_config_api_baseurl, model_name, "/config"])
-
         with grpcclient.InferenceServerClient(
-                url=model_config_api_url) as client:
+                url=triton_host_and_port) as client:
             is_model_ready = False
             for _ in range(n_retries):
                 if not client.is_model_ready(model_name):
@@ -648,7 +640,7 @@ class TritonDecoder(Decoder):
             if not is_model_ready:
                 raise RuntimeError(
                     "Unexpectedly a model has not been ready yet."
-                    f" Tried URL: {model_config_api_url}")
+                    f" Tried URL: {triton_host_and_port}")
 
             model_config = client.get_model_config(model_name)
             raw_config = model_config.config
@@ -665,7 +657,7 @@ class TritonDecoder(Decoder):
 
     @override
     def load_model_configs(self,
-                           model_config_api_baseurl: Optional[str] = None,
+                           triton_host_and_port: Optional[str] = None,
                            target_model_name: Optional[str] = None,
                            draft_model_name: Optional[str] = None,
                            n_retries: Optional[int] = 5,
@@ -673,18 +665,18 @@ class TritonDecoder(Decoder):
         if self._exclude_input_in_output_for_target is not None and self._exclude_input_in_output_for_draft is not None:
             # Already loaded. Skip.
             return
-        if model_config_api_baseurl is None:
-            raise RuntimeError("model_config_api_baseurl must be specified.")
+        if triton_host_and_port is None:
+            raise RuntimeError("triton_host_and_port must be specified.")
         if target_model_name is None:
             raise RuntimeError("target_model_name must be specified.")
         if draft_model_name is None:
             raise RuntimeError("draft_model_name must be specified.")
 
         self._exclude_input_in_output_for_target = self._load_each_model_config(
-            model_config_api_baseurl, target_model_name, n_retries,
+            triton_host_and_port, target_model_name, n_retries,
             retry_interval_sec)
         self._exclude_input_in_output_for_draft = self._load_each_model_config(
-            model_config_api_baseurl, draft_model_name, n_retries,
+            triton_host_and_port, draft_model_name, n_retries,
             retry_interval_sec)
         return
 
