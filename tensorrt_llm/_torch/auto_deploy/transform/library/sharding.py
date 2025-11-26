@@ -610,7 +610,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
-                            dist_backend=sharding_config.dist_backend,
+                            dist_backend=transform_container.dist_backend,
                         )
                     ):
                         num_row_col_shards += 1
@@ -623,7 +623,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
-                            dist_backend=sharding_config.dist_backend,
+                            dist_backend=transform_container.dist_backend,
                         )
                     ):
                         num_row_col_shards += 1
@@ -637,7 +637,7 @@ def detect_sharding_from_config(
                             dist_op=None,
                             min_local_shape=min_local_shape,
                             layer_type=LayerType.MAMBA,
-                            dist_backend=sharding_config.dist_backend,
+                            dist_backend=transform_container.dist_backend,
                         )
                     )
                     num_row_col_shards += 1
@@ -658,7 +658,7 @@ def detect_sharding_from_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
-                                    dist_backend=sharding_config.dist_backend,
+                                    dist_backend=transform_container.dist_backend,
                                 )
                             )
                         elif col_row_action == "rowwise":
@@ -670,7 +670,7 @@ def detect_sharding_from_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
-                                    dist_backend=sharding_config.dist_backend,
+                                    dist_backend=transform_container.dist_backend,
                                 )
                             ):
                                 num_row_col_shards += 1
