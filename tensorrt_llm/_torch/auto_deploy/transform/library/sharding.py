@@ -35,12 +35,12 @@ from typing import (
     Set,
     Tuple,
     Type,
+    Union,
 )
 
 import torch
-from pydantic import Field, field_validator
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from .....functional import AllReduceStrategy
@@ -106,6 +106,9 @@ class ShardingTransformConfig(TransformConfig):
     """Configuration for sharding the model."""
 
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
+    rank: int = Field(default=0)
+    world_size: int = Field(default=1)
+    predefined_config: Optional[Dict[str, Any]] = None
     factory_config: Dict[str, Any] = Field(default_factory=dict)
     manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
@@ -132,61 +135,96 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+
     process_grid: Dict[ShardingDim, int] = Field(default_factory=dict)
 
-    def validate_config(self, source: ShardingSource) -> bool:
-        if (
-            source == ShardingSource.FACTORY
-            and self.factory_source != ShardingConfigSource.HUGGINGFACE
-        ):
-            ad_logger.debug(
-                "Sharding config is currently only supported for HuggingFace. Skipping."
-            )
-            # invalidate the config
-            self.factory_config.clear()
-            return False
+    def validate_config(self, sources: Union[ShardingSource, List[ShardingSource]] = None) -> bool:
+        init_process_grid_from_config(self)
+        if sources is None:
+            sources = [ShardingSource.FACTORY, ShardingSource.MANUAL]
+        if not isinstance(sources, list):
+            sources = [sources]
+        for source in sources:
+            config = self.manual_config if source == ShardingSource.MANUAL else self.factory_config
+            if (
+                source == ShardingSource.FACTORY
+                and self.factory_source != ShardingConfigSource.HUGGINGFACE
+            ):
+                ad_logger.debug(
+                    "Sharding config is currently only supported for HuggingFace. Skipping."
+                )
+                config.clear()
+                continue
 
-        config = self.manual_config if source == ShardingSource.MANUAL else self.factory_config
+            if "head_dim" not in config:
+                ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
+                # invalidate the config
+                config.clear()
+                continue
 
-        if "head_dim" not in config:
-            ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
-            # invalidate the config
-            config.clear()
-            return False
+            if "tp_plan" not in config or config["tp_plan"] is None or len(config["tp_plan"]) == 0:
+                ad_logger.debug("Sharding config does not contain tp_plan. Skipping.")
+                # invalidate the config
+                config.clear()
+                continue
 
-        if "tp_plan" not in config or config["tp_plan"] is None:
-            ad_logger.debug("Sharding config does not contain tp_plan. Skipping.")
-            # invalidate the config
-            config.clear()
-            return False
-        tp_plan = config["tp_plan"]
+            tp_plan = config["tp_plan"]
 
-        values = set(tp_plan.values())
-        supported_modes = {
-            "colwise",  # row split and no collective
-            "rowwise",  # column split and all-reduce
-            "mamba",  # mamba SSM layer
-            "gather",  # simple shard (row + all_gather)
-            # TODO: remaining values are not supported yet.
-            # They require hybrid EP+TP and/or SP support.
-            # "sequence_parallel", # sequence parallelism
-            # "local_colwise",
-            # "local_rowwise",
-            # "local_packed_rowwise",
-            # "local",
-        }
-        if not self.support_partial_config and not values.issubset(supported_modes):
-            ad_logger.debug("Sharding config contains invalid values. Skipping.")
-            # invalidate the config
-            config.clear()
-            return False
-        return True
+            values = set(tp_plan.values())
+            supported_modes = {
+                "colwise",  # row split and no collective
+                "rowwise",  # column split and all-reduce
+                "mamba",  # mamba SSM layer
+                "gather",  # simple shard (row + all_gather)
+                # TODO: remaining values are not supported yet.
+                # They require hybrid EP+TP and/or SP support.
+                # "sequence_parallel", # sequence parallelism
+                # "local_colwise",
+                # "local_rowwise",
+                # "local_packed_rowwise",
+                # "local",
+            }
+            if not self.support_partial_config and not values.issubset(supported_modes):
+                ad_logger.debug("Sharding config contains invalid values. Skipping.")
+                # invalidate the config
+                config.clear()
+                continue
 
     def get_factory_config(self) -> Dict[str, Any]:
         return self.factory_config
 
     def get_manual_config(self) -> Dict[str, Any]:
         return self.manual_config
+
+
+def validate_allreduce_strategy(v):
+    """Convert string names like 'AUTO' to AllReduceStrategy enum.
+
+    This is a shared validator for allreduce_strategy fields across all config classes.
+
+    Args:
+        v: Value to validate - can be AllReduceStrategy enum, string name, or integer value
+
+    Returns:
+        AllReduceStrategy enum value
+
+    Raises:
+        ValueError: If the input is an invalid strategy string
+    """
+    if isinstance(v, AllReduceStrategy):
+        return v
+    if isinstance(v, str):
+        # Try to get enum by name
+        try:
+            return AllReduceStrategy[v]
+        except KeyError:
+            raise ValueError(
+                f"Invalid allreduce strategy: {v}. "
+                f"Valid options: {', '.join(s.name for s in AllReduceStrategy)}"
+            )
+    if isinstance(v, int):
+        return AllReduceStrategy(v)
+    return v  # Let Pydantic handle other types
 
 
 def _load_hook(
@@ -379,177 +417,6 @@ def get_all_weights_in_subgraph(
     """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
     weight_nodes = subgraph(sources, sinks, include=lambda n: n.op == "get_attr")
     return weight_nodes
-
-
-def _insert_sharded_mamba(
-    gm: GraphModule,
-    entry_node: Node,
-    dim: int,
-    rank: int,
-    world_size: int,
-    add_dist: bool = False,
-    min_local_shape: int = 1,
-    weights_to_shard: Optional[list[str]] = None,
-    weight_shard_dims: Optional[Dict[str, int]] = None,
-    fused_weight_dims: Optional[Dict[str, list]] = None,
-    quantization_cb: Optional[
-        Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
-    ] = None,
-) -> bool:
-    """
-    To shard Mamba layer, first column-shard the first linear layer: entry_node,
-    then shard all remaining weight tensors found in the subgraph defined between
-    entry_node and the next successor linear node.
-    First, validate if this is indeed a mamba module: within the subgraph,
-    there should be an torch_ssm node and conv1d node.
-
-    Args:
-        gm: GraphModule
-        entry_node: The first linear node of the Mamba layer
-        dim: Default shard dimension
-        rank: Current rank
-        world_size: Total number of ranks
-        add_dist: Whether to add distribution op after entry_node
-        min_local_shape: Minimum local shape constraint
-        weights_to_shard: Optional list of regex patterns to match weight names
-        weight_shard_dims: Optional dict mapping weight keys to their shard dimensions
-        fused_weight_dims: Optional dict mapping weight keys to their fused dimension lists
-        quantization_cb: Optional quantization callback
-    """
-    # Find next linear node to define subgraph boundary
-    try:
-        next_lin_node, depth = bfs(entry_node, is_any_lin_op, include_root=False)
-    except RuntimeError:
-        ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
-        return False
-
-    # Get subgraph between entry_node and next linear node
-    subgraph_nodes = subgraph([entry_node], [next_lin_node])
-
-    ##############################################################
-    ########## validate if this is a valid Mamba module ##########
-    ##############################################################
-    # has_ssm = any(is_op(n, torch.ops.auto_deploy.mamba.torch_ssm_transform) for n in subgraph_nodes)
-    has_ssm = True
-    conv1d_nodes = [
-        n
-        for n in subgraph_nodes
-        if is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
-    ]
-    if len(conv1d_nodes) != 1 or not has_ssm:
-        ad_logger.warning(
-            f"Subgraph does not contain exactly one conv1d node and torch_ssm_transform. "
-            f"Skipping Mamba sharding. conv1d_nodes={conv1d_nodes}, has_ssm={has_ssm}"
-        )
-        return False
-
-    ##############################################################
-    ########## infer split sizes for in_proj and conv1d ##########
-    ##############################################################
-    # in_proj and conv1d are most likely fused, followed up by split nodes. Infer split sizes:
-    if fused_weight_dims is None:
-        split_nodes = [
-            n
-            for n in subgraph_nodes
-            if is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes])
-        ]
-        if len(split_nodes) != 2:
-            ad_logger.warning(
-                f"Subgraph does not contain exactly two split nodes. "
-                f"Skipping Mamba sharding. split_nodes={split_nodes}"
-            )
-            return False
-        split_sizes_1 = split_nodes[0].args[1]
-        split_sizes_2 = split_nodes[1].args[1]
-        if split_sizes_1[1] != sum(split_sizes_2):
-            ad_logger.warning(
-                f"Split nodes have different sizes. "
-                f"Skipping Mamba sharding. split_sizes_1={split_sizes_1}, split_sizes_2={split_sizes_2}"
-            )
-            return False
-        fused_weight_dims = {
-            "in_proj": split_sizes_1[0:1] + split_sizes_2 + split_sizes_1[2:],
-            "conv1d": split_sizes_2,
-        }
-
-    conv1d_node = conv1d_nodes[0]
-    # conv1d_node last argument is the number of output channels.
-    # This one is also sharded, so we need to update this parameter
-    conv_args = list(conv1d_node.args)
-    conv_args[-1] = conv1d_node.args[-1] // world_size
-    conv1d_node.args = tuple(conv_args)
-
-    # First, shard the entry_node (the first linear layer)
-    # Extract entry node's fused_weight_dims by matching weight name against patterns
-    entry_fused_dims = None
-    if fused_weight_dims:
-        entry_weight_key, _ = extract_param_names_from_node(entry_node)
-        for pattern, dims in fused_weight_dims.items():
-            if re.search(pattern, entry_weight_key):
-                entry_fused_dims = dims
-                break
-
-    _shard_parameter_node(
-        gm=gm,
-        node=entry_node,
-        dim=SplitDimension.COLUMN,
-        rank=rank,
-        world_size=world_size,
-        add_dist=False,
-        min_local_shape=min_local_shape,
-        fused_weight_dims=entry_fused_dims,
-        quantization_cb=quantization_cb,
-    )
-
-    # Get all weight nodes in the subgraph except for out_proj
-    weight_nodes = [
-        n
-        for n in get_all_weights_in_subgraph([entry_node], [next_lin_node])
-        if "out_proj" not in str(n)
-    ]
-
-    # Shard remaining weights, such as conv1d or RMSNorm
-    for weight_node in weight_nodes:
-        weight_key = weight_node.target
-
-        # Filter by regex patterns if provided
-        if weights_to_shard is not None:
-            if not any(pattern in weight_key for pattern in weights_to_shard):
-                continue
-
-        # Determine shard dimension for this weight
-        shard_dim = weight_shard_dims.get(weight_key, dim) if weight_shard_dims else dim
-
-        # Get the weight parameter
-        try:
-            weight_param = gm.get_parameter(weight_key)
-        except AttributeError:
-            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
-            continue
-
-        # Get fused dims for this weight if specified
-        fused_dims = None
-        for k, v in fused_weight_dims.items():
-            if k in weight_key:
-                fused_dims = v
-                break
-
-        # Shard the weight tensor (also updates the parameter in the module)
-        _, sharded_shape = shard_weight_tensor(
-            gm=gm,
-            weight_tensor=weight_param,
-            param_key=weight_key,
-            dim=shard_dim,
-            rank=rank,
-            world_size=world_size,
-            min_local_shape=min_local_shape,
-            fused_weight_dims=fused_dims,
-        )
-
-        ad_logger.debug(
-            f"Sharded weight {weight_key} on dim {shard_dim}: "
-            f"{weight_param.shape} -> {sharded_shape}"
-        )
 
 
 def _shard_parameter_node(
@@ -760,32 +627,17 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
-            _insert_sharded_mamba(
-                gm=gm,
-                entry_node=node,
-                dim=self.split_dim.value,
-                rank=self.config.rank,
-                world_size=self.config.world_size,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims
-                if isinstance(self.fused_weight_dims, dict)
-                else None,
-                quantization_cb=self.quantization_cb,
-            )
-        else:
-            _shard_parameter_node(
-                gm=gm,
-                node=node,
-                dim=self.split_dim.value,
-                rank=self.config.rank,
-                world_size=self.config.world_size,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-                quantization_cb=self.quantization_cb,
-            )
+        _shard_parameter_node(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.config.rank,
+            world_size=self.config.world_size,
+            add_dist=self.dist_op is not None,
+            min_local_shape=self.min_local_shape,
+            fused_weight_dims=self.fused_weight_dims,
+            quantization_cb=self.quantization_cb,
+        )
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
@@ -1428,20 +1280,20 @@ class ShardingTransformExecutor(BaseTransform):
                 return False
             return transform.check_and_apply(gm, node_dict[transform.target_node])
 
+        transform_container = shared_config.sharding_transform_container
         num_matches = 0
-        transforms = shared_config.sharding_transform_container
-        for tp_transform in transforms.weight_sharding_transforms:
+        for tp_transform in transform_container.weight_sharding_transforms:
             if check_and_apply(tp_transform):
                 num_matches += 1
-        for bmm_transform in transforms.bmm_transforms:
+        for bmm_transform in transform_container.bmm_transforms:
             if check_and_apply(bmm_transform):
                 num_matches += 1
-        for ep_transform in transforms.ep_transforms:
+        for ep_transform in transform_container.ep_transforms:
             if check_and_apply(ep_transform):
                 num_matches += 1
 
         # post-sharding cleanup transformations
-        for update_transform in transforms.parameter_update_transforms:
+        for update_transform in transform_container.parameter_update_transforms:
             if not check_and_apply(update_transform):
                 ad_logger.warning(f"Invalid parameter update transformation {update_transform}.")
 
@@ -1455,11 +1307,8 @@ class ShardingTransformExecutor(BaseTransform):
 
 
 def _process_simple_shard(
-    nodes_linear: Union[Dict[Node, List[Node]], List[Node]],
-    rank: int,
-    world_size: int,
+    nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
-    layer_type: LayerType = LayerType.MLP,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
@@ -1520,9 +1369,16 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
-        self.config.factory_config = factory.get_sharding_config() if factory else {}
-        transform_container = shared_config.sharding_transform_container
-        transform_container.init_params(self.config, local_rank, world_size)
+        config = self.config
+        config.factory_config = factory.get_sharding_config() if factory else {}
+        config.rank = local_rank
+        config.world_size = world_size
+        # validate the config
+        config.validate_config()
+        # initialize the transform container
+        transform_container = ShardingTransformContainer(config=config)
+        shared_config.sharding_transform_container = transform_container
+        ad_logger.info(f"Using allreduce strategy: {config.allreduce_strategy.name}")
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -1570,8 +1426,6 @@ def _process_ssm_sharding(
     gm: GraphModule,
     entry_node: Node,
     transform_container: ShardingTransformContainer,
-    rank: int,
-    world_size: int,
     min_local_shape: int = 1,
 ) -> int:
     """
@@ -1584,6 +1438,7 @@ def _process_ssm_sharding(
         ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
         return 0
 
+    world_size = transform_container.config.world_size
     # Get subgraph between entry_node and next linear node
     subgraph_nodes = subgraph([entry_node], [out_proj_node])
 
@@ -1729,7 +1584,7 @@ def _process_ssm_sharding(
             args[1] = tuple(view_shape)
             transform_container.add(
                 ParameterUpdateInfo(
-                    rank=rank, world_size=world_size, target_node=view_node.name, args=tuple(args)
+                    config=transform_container.config, target_node=view_node.name, args=tuple(args)
                 )
             )
             ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
@@ -1753,8 +1608,6 @@ def _process_column_sharding(
     linear_nodes: List[Node],
     subgraph_nodes: Union[List[Node], None],
     transform_container: ShardingTransformContainer,
-    rank: int,
-    world_size: int,
     min_local_shape: int = 1,
 ) -> None:
     """
@@ -2134,7 +1987,7 @@ def detect_column_row_shard(
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
     config = transform_container.config
-    rank, world_size = config.rank, config.world_size
+    world_size = config.world_size
     if world_size < 2:
         ad_logger.info("Skipping TP sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
@@ -2220,7 +2073,6 @@ def detect_column_row_shard(
                             rank,
                             world_size,
                             transfrom_container,
-                            layer_type=layer_type,
                         )
                         # TODO: handle the case where num_kv_heads is not divisible by world_size
                         continue
@@ -2232,27 +2084,26 @@ def detect_column_row_shard(
             transform_container=transfrom_container,
             rank=rank,
             world_size=world_size,
-            min_local_shape=min_local_shape,
-        )
+        else:
+            min_local_shape = 1
 
-        # shard single row node
-        if transfrom_container.add(
-            WeightShardingInfo.from_node(
-                closing,
-                split_dim=SplitDimension.ROW,
-                config=transform_container.config,
-                dist_op="all_reduce",
-                min_local_shape=min_local_shape,
-                layer_type=layer_type,
+        # We are inserting column-row shard for each group of linear enodes
+        # This may require parameter update of nodes whose args depend on (sharded) dimensions,
+        # such as view or split nodes.
+        nodes_to_column_shard = list(nodes_linear.values())[0]
+        nodes_to_row_shard = list(nodes_linear.values())[1]
+        if len(nodes_to_row_shard) != 1:
+            ad_logger.warning(
+                "Expecting only one linear node for row sharding, but got %s",
+                len(nodes_to_row_shard),
             )
-        ):
-            num_column_row_shards += 1
-            if layer_type == LayerType.ATTENTION:
-                num_attention_shards += 1
+            num_simple_shards += _process_simple_shard(nodes_linear, transform_container)
+            continue
 
-    # simple shard remaining linear nodes
-    num_simple_shards += _process_simple_shard(
-        unprocessed_linear_nodes, rank, world_size, transfrom_container
+        # column-row sharding
+        _process_column_sharding(
+            gm,
+            linear_nodes=nodes_to_column_shard,
     )
     num_column_row_shards += num_ssm_shards
     ad_logger.info(
@@ -2345,7 +2196,7 @@ def detect_dp_bmm_shard(
     )
 
 
-def get_process_grid_from_config(
+def init_process_grid_from_config(
     config: ShardingTransformConfig,
 ) -> Dict[ShardingDim, Dict[str, int]]:
     rank, world_size = config.rank, config.world_size
@@ -2381,6 +2232,7 @@ def get_process_grid_from_config(
         ShardingDim.EP: {"p": ep_rank, "w": ep_size},
         ShardingDim.TP: {"p": tp_rank, "w": tp_size},
     }
+    config.process_grid = process_grid
     return process_grid
 
 
