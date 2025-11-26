@@ -3,6 +3,7 @@
 set -euo pipefail
 
 # CONTAINER_IMAGE=
+CONTAINER_NAME=${CONTAINER_NAME:-layer_wise_benchmarks}
 CONTAINER_MOUNTS=$(realpath "$(pwd)/../.."):$(realpath "$(pwd)/../..")
 
 if [ "${SLURM_JOB_ID:-}" == "" ]; then
@@ -46,7 +47,7 @@ set -x
 srun -N "$NODES" \
     --ntasks-per-node 1 \
     --container-image "$CONTAINER_IMAGE" \
-    --container-name "layer_wise_benchmarks" \
+    --container-name "$CONTAINER_NAME" \
     --container-mounts "$CONTAINER_MOUNTS" \
     --container-workdir "$WORKDIR" \
 bash -c "pip install -U packaging &&

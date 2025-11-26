@@ -67,10 +67,6 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        # TODO: fix accuracy issue
-        if self.is_mtp_eagle():
-            return False
-
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.has_draft_model()
 
@@ -130,16 +126,32 @@ class SpeculativeDecodingMode(IntEnum):
         spec_resource_manager: BaseResourceManager,
         is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
-        use_chain_drafter: bool,
+        use_chain_drafter: bool,  # CDL
         is_spec_dec_tree: bool,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
+        Args:
+            spec_resource_manager: the resource manager for the spec-dec mode.
+            is_draft_model: whether the model is a draft model.
+            attention_backend: the attention backend.
+            use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
+            is_spec_dec_tree: whether the spec-dec mode is a tree, i.e., static tree or dynamic tree.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
-        return self.is_eagle3_one_model() or (
-            self.is_eagle3() and spec_resource_manager.is_first_draft
-            and is_trtllm_attention and use_chain_drafter and is_draft_model)
+        # Case 1: one model
+        use_case_1 = self.is_eagle3_one_model()
+        # Case 2: eagle3 two model + draft model + CDL + is_first_draft + TRTLLM attention
+        use_case_2 = self.is_eagle3(
+        ) and spec_resource_manager.is_first_draft and use_chain_drafter and is_draft_model and is_trtllm_attention
+        # Case 3: eagle3 two model + tree decoding + draft model + CDL + TRTLLM attention
+        use_case_3 = self.is_eagle3(
+        ) and is_spec_dec_tree and is_draft_model and use_chain_drafter and is_trtllm_attention
+        # Case 4: eagle3 two model + tree decoding + target model + TRTLLM attention
+        use_case_4 = self.is_eagle3(
+        ) and is_spec_dec_tree and not is_draft_model and is_trtllm_attention
+
+        return use_case_1 or use_case_2 or use_case_3 or use_case_4
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

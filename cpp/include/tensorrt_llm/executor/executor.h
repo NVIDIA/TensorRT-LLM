@@ -1465,16 +1465,19 @@ public:
         NIXL = 3
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
-        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt);
+        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
+    void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
 
-    [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
+    [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1483,6 +1486,9 @@ private:
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
     std::optional<int> mKvTransferTimeoutMs;
+    // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
+    // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+    std::optional<int> mKvTransferSenderFutureTimeoutMs;
 };
 
 /// @brief Configuration class for the model executor
