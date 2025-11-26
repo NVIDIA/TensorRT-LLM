@@ -13,12 +13,12 @@ from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ShardingTransformContainer,
     SplitDimension,
     WeightShardingInfo,
 )
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.commands.bench import main
 from tensorrt_llm.functional import AllReduceStrategy
 

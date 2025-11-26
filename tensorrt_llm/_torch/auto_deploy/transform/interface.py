@@ -60,9 +60,6 @@ class Stages(Enum):
 class SharedConfig(BaseModel):
     """Global config shared between multiple transforms in the inference optimizer."""
 
-    # sharding_transform_container: ShardingTransformContainer = Field(
-    #     default_factory=ShardingTransformContainer
-    # )
     model_config = {
         # to provide an easy way to do config validation of child config classes with more fields
         "extra": "allow",
