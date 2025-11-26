@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -49,7 +50,7 @@ def main(
     model_path: Path,
     workspace: Path,
     log_level: str,
-    revision: str,
+    revision: Optional[str],
 ) -> None:
     logger.set_level(log_level)
     ctx.obj = BenchmarkEnvironment(model=model,
