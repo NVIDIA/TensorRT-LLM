@@ -8,7 +8,8 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm._utils import (confidential_compute_enabled,
+                                 str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           EagleDecodingConfig, KvCacheConfig,
@@ -828,7 +829,8 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
                               max_batch_size: int,
                               speculative_config: SpeculativeConfig,
                               max_beam_width: int,
-                              disable_flash_infer_sampling: bool):
+                              disable_flash_infer_sampling: bool,
+                              enable_async_worker: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
@@ -842,6 +844,7 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
         disable_flash_infer_sampling=disable_flash_infer_sampling,
+        enable_async_worker=enable_async_worker,
     )
 
 
@@ -859,6 +862,9 @@ def instantiate_sampler(
     kv_cache_config: KvCacheConfig,
     disable_flash_infer_sampling: bool,
 ):
+    enable_async_worker = (confidential_compute_enabled()
+                           or llm_args.enable_sampler_async_worker)
+
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,
@@ -866,6 +872,7 @@ def instantiate_sampler(
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
         disable_flash_infer_sampling=disable_flash_infer_sampling,
+        enable_async_worker=enable_async_worker,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
@@ -892,7 +899,8 @@ def instantiate_sampler(
                              max_batch_size=max_batch_size,
                              max_beam_width=max_beam_width,
                              decoding_config=decoding_config,
-                             kv_cache_config=kv_cache_config)
+                             kv_cache_config=kv_cache_config,
+                             enable_async_worker=enable_async_worker)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()

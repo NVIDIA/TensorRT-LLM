@@ -2565,6 +2565,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
         status="beta")
 
+    enable_sampler_async_worker: bool = Field(
+        default=False,
+        description="Enable the async worker in the sampler for D2H copies.",
+        status="prototype")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
