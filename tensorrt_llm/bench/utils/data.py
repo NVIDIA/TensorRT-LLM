@@ -103,7 +103,7 @@ def create_dataset_from_stream(
         # "lora_request": {"lora_name": "my_lora", "lora_int_id": 1, "lora_path": "/path/to/lora"}}
         #
         # Each line should be a complete JSON dictionary with no indentation
-        # or newline characters. The task_id field is required and must be unique.
+        # or newline characters. The task_id field is required.
         data = json.loads(line)
         prompts.append(data.get("prompt"))
         media_paths.append(data.get("media_paths", None))
