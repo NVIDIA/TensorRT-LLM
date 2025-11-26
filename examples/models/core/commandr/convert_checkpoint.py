@@ -126,7 +126,7 @@ def convert_and_save_hf(args):
     override_fields.update(args_to_build_options(args))
 
     quant_config = args_to_quant_config(args)
-    
+
     # Make sure we create the correct model architecture
     config_path = os.path.join(model_dir, 'config.json')
 
@@ -163,6 +163,7 @@ def convert_and_save_hf(args):
                 **override_fields,
             )
         else:
+            assert architecture == "CohereForCausalLM"
             cohere = CohereForCausalLM.from_hugging_face(
                 model_dir,
                 args.dtype,
