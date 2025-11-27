@@ -2760,19 +2760,19 @@ files = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.3.0.dev0"
+version = "4.3.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:91e43fdff82275015b958a2b681c7f148ba73b7dd453a05d4d24b782666bcecd"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:ac789bc89b78884886e8832b5a393ff0ceb29c52f666a19c304320b2297452b5"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:98257ec72111c4b9e9e5d7206488fab67241f66f85fabd84f862b6a8bd25c462"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:ce4eab23d2ada338b8181ed98219535dc6a623b3df8d9f715f433af296c9f393"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:edb69754a98ebb178c31cd90131ab5405dd61d9e808cecb31ff09f8448076071"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:9e9b5d9d4ddec47b62666e68a7a4c91811ae50ce372c3de88d05d09d488af592"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:5e3c1f20924b1abc05b47c17a716ecf3e98a00159d3c0a5579a228a364147f56"},
-    {file = "nvidia_cutlass_dsl-4.3.0.dev0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:cb0f87ed600efa442845dac5c7a30181351d9de80e1168cf1d090f4e0ff5e541"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:dc7a9c102205decae07c67d42065976875e96fbd3886181be76f2c3283c59200"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:30058f74242d0b9aaac9779a7deb8b91f7478f19c800e2a7cdcd177b69e4d612"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:64a7e0f0c3234871bd84d136f587bc63577eecc6855251edd8b1774ab10d0384"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:cfe67f5f7e2dccb5f2fa4afb26a0f3e6261fbfbc8f105c8ec593a52292b6bee6"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:50adac296c377c4766bee91681fe1f9c988e93a5bbb47067f65bc5c22aed3fba"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f09c6a02a99466b43fdca505e42884a1fb753c9c4ca3c302b7ca4b256df61408"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:9af8781631b4f07d59926a29f1d2b04b943a3b5af39e4437523a123e02dff612"},
+    {file = "nvidia_cutlass_dsl-4.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:2e6edc1468d98e1760e185dfb708dc99a0154e14a0f4839e8d491ceb5633a199"},
 ]
 
 [package.dependencies]
@@ -3774,13 +3774,13 @@ files = [
 
 [[package]]
 name = "pydantic"
-version = "2.12.4"
+version = "2.12.5"
 description = "Data validation using Python type hints"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "pydantic-2.12.4-py3-none-any.whl", hash = "sha256:92d3d202a745d46f9be6df459ac5a064fdaa3c1c4cd8adcfa332ccf3c05f871e"},
-    {file = "pydantic-2.12.4.tar.gz", hash = "sha256:0f8cb9555000a4b5b617f66bfd2566264c4984b27589d3b845685983e8ea85ac"},
+    {file = "pydantic-2.12.5-py3-none-any.whl", hash = "sha256:e561593fccf61e8a20fc46dfc2dfe075b8be7d0188df33f221ad1f0139180f9d"},
+    {file = "pydantic-2.12.5.tar.gz", hash = "sha256:4d351024c75c0f085a9febbb665ce8c0c6ec5d30e903bdb6394b7ede26aebb49"},
 ]
 
 [package.dependencies]
@@ -5763,4 +5763,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "6423e1b4e21e21f2d6ba5ea76ad6048b645097ec825d9c580c59f00ae95addc5"
+content-hash = "57e485eddf3bc1a0111cf2fdd6a360d5c0a6cf5062007c33fcb7c694b7dd8aed"
