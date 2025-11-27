@@ -403,3 +403,4 @@ disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-True] SKIP (https://nvbugs/5670480)
 accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True] SKIP (https://nvbugs/5688721)
 unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-FLASHINFER-False-False-False-False-True-False-False] SKIP (https://nvbugs/5691246)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/5698897)
