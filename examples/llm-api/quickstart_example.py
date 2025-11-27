@@ -5,7 +5,7 @@ def main():
 
     # Model could accept HF model name, a path to local HF model,
     # or TensorRT Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.
-    llm = LLM(model="/home/scratch.trt_llm_data/llm-models/DeepSeek-V3-Lite/fp8")
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     # Sample prompts.
     prompts = [
