@@ -992,7 +992,7 @@ def test_llm_context_only_timed_out():
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
-                  backend="DEFAULT", kv_transfer_timeout_ms=1000),
+                  backend="UCX", kv_transfer_timeout_ms=1000),
               **llm_args_extra)
 
     max_tokens = 1
@@ -1070,7 +1070,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=tp_size,
         cache_transceiver_config=CacheTransceiverConfig(
-            backend="DEFAULT",
+            backend="UCX",
             kv_transfer_timeout_ms=1000,
             kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
         **llm_args_extra)
