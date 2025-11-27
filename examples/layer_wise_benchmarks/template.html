@@ -747,15 +747,15 @@
         if (container) {
             container.innerHTML = '';
             for (let i = 1; i < maxDepth; i++) {
-                 const btn = document.createElement('button');
-                 btn.innerText = 'Level ' + i;
-                 btn.onclick = function() { expandToLevel(i); };
-                 // Copy styles from other buttons if possible, or rely on CSS
-                 // The existing buttons don't have inline styles, just CSS class likely.
-                 // But wait, <button> elements in this file might be styled by tag selector.
-                 container.appendChild(btn);
-                 // Add a space
-                 container.appendChild(document.createTextNode(' '));
+                const btn = document.createElement('button');
+                btn.innerText = 'Level ' + i;
+                btn.onclick = function() { expandToLevel(i); };
+                // Copy styles from other buttons if possible, or rely on CSS
+                // The existing buttons don't have inline styles, just CSS class likely.
+                // But wait, <button> elements in this file might be styled by tag selector.
+                container.appendChild(btn);
+                // Add a space
+                container.appendChild(document.createTextNode(' '));
             }
         }
     }
