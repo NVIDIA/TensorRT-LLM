@@ -87,6 +87,22 @@ def launch_disaggregated_llm(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
 
+    enable_perf = True
+    perf_max_requests = 10000
+
+    def _apply_perf_flags(cfg: Optional[Dict[str, Any]]):
+        if not isinstance(cfg, dict):
+            return
+        if enable_perf:
+            # Only set these if the switch is enabled.
+            # Use `setdefault` so explicit per-test overrides are preserved.
+            cfg.setdefault("return_perf_metrics", True)
+            cfg.setdefault("perf_metrics_max_requests", perf_max_requests)
+
+    _apply_perf_flags(disaggregated_server_config)
+    _apply_perf_flags(ctx_server_config)
+    _apply_perf_flags(gen_server_config)
+
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
     ctx_server_config_path = os.path.join(temp_dir.name,
@@ -302,8 +318,32 @@ def launch_disaggregated_llm(
             thread_pool.futures.append(future)
             return future
 
+        def get_perf_metrics():
+            path = "/perf_metrics"
+            perf_url = f"http://localhost:8000{path}"
+            try:
+                print(f"Fetching perf metrics from {perf_url}")
+                resp = requests.get(perf_url, timeout=10)
+                if resp.status_code == 200:
+                    try:
+                        metrics = resp.json()
+                        print("perf_metrics JSON:")
+                        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+                    except ValueError:
+                        print("perf_metrics returned non-JSON response:",
+                              resp.text)
+                else:
+                    print(
+                        f"perf_metrics returned status {resp.status_code}: {resp.text}"
+                    )
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching {perf_url}: {e}")
+
         tokenizer = load_hf_tokenizer(model_name)
         yield DuckLLM(args, tokenizer, generate_async)
+
+        if enable_perf:
+            get_perf_metrics()
 
 
 def run_parallel_test(model_name: str,
