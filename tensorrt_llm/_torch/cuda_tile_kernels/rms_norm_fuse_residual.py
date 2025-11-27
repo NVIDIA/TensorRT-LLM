@@ -14,6 +14,7 @@ if IS_CUDA_TILE_AVAILABLE:
         N: ct.Constant[int],
         eps: ct.Constant[float],
         TILE_SIZE: ct.Constant[int],
+        use_gemma: ct.Constant[bool],
     ):
         """RMSNorm kernel with residual fusion for non-static persistent mode with tiled loads"""
         row = ct.bid(0)
@@ -58,6 +59,9 @@ if IS_CUDA_TILE_AVAILABLE:
                 latency=1,
             )
             wj = ct.astype(wj, ct.float32)
+            # Apply Gemma-style bias if enabled
+            if use_gemma:
+                wj = wj + 1.0
             residual_j = ct.load(
                 residual, index=(row, j), shape=(1, TILE_SIZE),
                 allow_tma=False,
@@ -83,6 +87,7 @@ if IS_CUDA_TILE_AVAILABLE:
         N: ct.Constant[int],
         eps: ct.Constant[float],
         TILE_SIZE: ct.Constant[int],
+        use_gemma: ct.Constant[bool],
     ):
         """RMSNorm kernel with residual fusion for non-static persistent mode with ptr loads"""
         row = ct.bid(0)
@@ -114,6 +119,9 @@ if IS_CUDA_TILE_AVAILABLE:
             offs = j * TILE_SIZE + offsets
             wj = ct.gather(w, offs, latency=1)
             wj = ct.astype(wj, ct.float32)
+            # Apply Gemma-style bias if enabled
+            if use_gemma:
+                wj = wj + 1.0
             residual_j = ct.gather(residual, (row, offs), latency=1)
             # Load from residual (which now contains x + residual sum)
             residual_j = ct.astype(residual_j, ct.float32)
@@ -130,6 +138,7 @@ if IS_CUDA_TILE_AVAILABLE:
         TILE_SIZE_M: ct.Constant[int],  # 4 rows per block
         TILE_SIZE_N: ct.Constant[int],  # columns per block
         eps: ct.Constant[float],  # Epsilon value
+        use_gemma: ct.Constant[bool],  # Gemma-style weight bias
     ):
         """
         CuTile static persistent RMSNorm kernel with residual fusion that processes multiple blocks per program.
@@ -148,6 +157,9 @@ if IS_CUDA_TILE_AVAILABLE:
         # Load weight vector once (shared across all blocks processed by this program)
         w = ct.load(W, index=(0,), shape=(TILE_SIZE_N,))
         w = ct.astype(w, ct.float32)
+        # Apply Gemma-style bias if enabled
+        if use_gemma:
+            w = w + 1.0
 
         # Static persistent loop: each program processes multiple blocks
         num_tiles_x = ct.num_blocks(0)

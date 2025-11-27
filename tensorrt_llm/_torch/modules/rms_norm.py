@@ -77,8 +77,6 @@ class RMSNorm(nn.Module):
             residual = None
 
         if self.use_cuda_tile:
-            # TODO:
-            # 1. Fuse Gemma-style RMS norm to kernels.
             from ..custom_ops.cuda_tile_custom_ops import cuda_tile_rms_norm
             from ..custom_ops.cuda_tile_custom_ops import cuda_tile_rms_norm_fuse_residual_
 
@@ -89,18 +87,20 @@ class RMSNorm(nn.Module):
                 cuda_tile_rms_norm_fuse_residual_(
                     x=hidden_states,
                     residual=residual,
-                    weight=(self.weight + 1) if self.use_gemma else self.weight,
+                    weight=self.weight,
                     eps=self.variance_epsilon,
                     static_persistent=True,
                     gather=True,  # gather=False cases subsequent device assertion failures.
+                    use_gemma=self.use_gemma,
                 )
             else:
                 hidden_states = cuda_tile_rms_norm(
                     x=hidden_states,
-                    weight=(self.weight + 1) if self.use_gemma else self.weight,
+                    weight=self.weight,
                     eps=self.variance_epsilon,
                     static_persistent=True,
                     gather=True,
+                    use_gemma=self.use_gemma,
                 )
         elif IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,

@@ -24,6 +24,7 @@ if IS_CUDA_TILE_AVAILABLE:
         eps: float,
         static_persistent: bool,
         gather: bool,
+        use_gemma: bool,
     ) -> torch.Tensor:
         x = x.contiguous()
         weight = weight.contiguous()
@@ -57,6 +58,7 @@ if IS_CUDA_TILE_AVAILABLE:
                 TILE_SIZE_M,
                 TILE_SIZE_N,
                 eps,
+                use_gemma,
             ))
         else:
             # Standard RMSNorm kernel
@@ -73,6 +75,7 @@ if IS_CUDA_TILE_AVAILABLE:
                 N,
                 eps,
                 TILE_SIZE,
+                use_gemma,
             ))
         return y.view(*x.shape)
 
@@ -84,6 +87,7 @@ if IS_CUDA_TILE_AVAILABLE:
         eps: float,
         static_persistent: bool,
         gather: bool,
+        use_gemma: bool,
     ) -> torch.Tensor:
         return torch.empty_like(x.contiguous())
 
@@ -99,6 +103,7 @@ if IS_CUDA_TILE_AVAILABLE:
         eps: float,
         static_persistent: bool,
         gather: bool,
+        use_gemma: bool,
     ) -> None:
         assert x.is_contiguous(), "x must be contiguous for in-place operation"
         assert residual.is_contiguous(), "residual must be contiguous for in-place operation"
@@ -135,6 +140,7 @@ if IS_CUDA_TILE_AVAILABLE:
                     TILE_SIZE_M,
                     TILE_SIZE_N,
                     eps,
+                    use_gemma,
             ))
         else:
             # Standard RMSNorm kernel with residual fusion
@@ -153,4 +159,5 @@ if IS_CUDA_TILE_AVAILABLE:
                 N,
                 eps,
                 TILE_SIZE,
+                use_gemma,
             ))
