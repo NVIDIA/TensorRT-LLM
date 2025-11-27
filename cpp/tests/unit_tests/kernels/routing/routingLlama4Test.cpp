@@ -132,7 +132,7 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/3,
         /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
@@ -144,7 +144,7 @@ TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/10,
         /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
@@ -155,7 +155,7 @@ TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/300,
         /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
@@ -166,7 +166,7 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationTopKAsInput)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/3,
         /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
@@ -178,7 +178,7 @@ TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelizationTopKAsInput)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/10,
         /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
@@ -189,7 +189,7 @@ TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelizationTopKAsInput)
 {
     RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/300,
         /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);

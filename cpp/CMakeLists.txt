@@ -32,6 +32,7 @@ option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
+option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -54,6 +55,15 @@ option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
        ON)
+option(ENABLE_CUBLASLT_FP4_GEMM "Enable cuBLASLt FP4 GEMM support" ON)
+if(NOT ${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+  set(ENABLE_CUBLASLT_FP4_GEMM
+      OFF
+      CACHE BOOL "" FORCE)
+  message(
+    STATUS
+      "CUDA ${CUDAToolkit_VERSION} < 12.8: disabling ENABLE_CUBLASLT_FP4_GEMM")
+endif()
 option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
@@ -233,15 +243,35 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
+add_subdirectory(${3RDPARTY_DIR} 3rdparty)
+
 if(BINDING_TYPE STREQUAL "pybind"
    OR BUILD_DEEP_EP
    OR BUILD_DEEP_GEMM)
-  add_subdirectory(${3RDPARTY_DIR}/pybind11
-                   ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+  FetchContent_MakeAvailable(pybind11)
+  include_directories(${CMAKE_BINARY_DIR}/_deps/pybind11-src/include)
 endif()
 if(BINDING_TYPE STREQUAL "nanobind")
-  add_subdirectory(${3RDPARTY_DIR}/nanobind
-                   ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
+  FetchContent_MakeAvailable(nanobind)
+  include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
+endif()
+
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+
+if(ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq ucxx)
+endif()
+
+if(NOT NVTX_DISABLE)
+  FetchContent_MakeAvailable(nvtx)
+endif()
+
+if(BUILD_DEEP_GEMM)
+  FetchContent_MakeAvailable(deepgemm)
+endif()
+
+if(NOT NVTX_DISABLE)
+  set(maybe_nvtx_includedir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
 endif()
 
 # include as system to suppress warnings
@@ -251,18 +281,10 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
-  ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include
-  ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include)
-if(BINDING_TYPE STREQUAL "pybind"
-   OR BUILD_DEEP_EP
-   OR BUILD_DEEP_GEMM)
-  include_directories(${3RDPARTY_DIR}/pybind11/include)
-endif()
-if(BINDING_TYPE STREQUAL "nanobind")
-  include_directories(${3RDPARTY_DIR}/nanobind/include)
-endif()
+  ${maybe_nvtx_includedir}
+  ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
+  ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
+  ${CMAKE_BINARY_DIR}/_deps/json-src/include)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -476,7 +498,7 @@ print(os.path.dirname(torch.__file__),end='');"
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
-  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(nvtx3_dir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
   set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
   set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
@@ -528,14 +550,15 @@ if(ENABLE_UCX)
   if(NOT ${ucx_FOUND})
     set(ENABLE_UCX 0)
   else()
+    set(ucxx_source_dir ${CMAKE_BINARY_DIR}/_deps/ucxx-src)
     if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
-      if(EXISTS "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake")
-        file(READ "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" FILE_CONTENTS)
+      if(EXISTS "${ucxx_source_dir}/fetch_rapids.cmake")
+        file(READ "${ucxx_source_dir}/fetch_rapids.cmake" FILE_CONTENTS)
         string(
           REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
-        file(WRITE "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" "${FILE_CONTENTS}")
+        file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
         message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
       endif()
     endif()
@@ -546,13 +569,13 @@ if(ENABLE_UCX)
     execute_process(
       COMMAND
         ${CMAKE_COMMAND} -E env LIB_BUILD_DIR=${CMAKE_BINARY_DIR}/ucxx/build
-        ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
+        ${ucxx_source_dir}/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
       OUTPUT_VARIABLE UCXX_BUILD_OUTPUT
       RESULT_VARIABLE UCXX_BUILD_RESULT)
     if(UCXX_BUILD_RESULT)
-      message(${UCXX_BUILD_OUTPUT})
+      message("ucxx build: ${UCXX_BUILD_OUTPUT}")
       message(FATAL_ERROR "ucxx build failed")
     endif()
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build

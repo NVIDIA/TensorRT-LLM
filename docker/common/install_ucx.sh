@@ -1,7 +1,6 @@
 #!/bin/bash
 set -ex
 
-GITHUB_URL="https://github.com"
 UCX_VERSION="v1.19.x"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"

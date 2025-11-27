@@ -1,7 +1,3 @@
-# I want to create accuracy tests for disaggregated serving.
-# I need to to this by creating a new class that mimics LLM class. Instead of implementing the
-# actual methods it will send OAI requests to the disaggregated serving endpoint.
-# Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
 import itertools
@@ -48,8 +44,9 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
-DEFAULT_TEST_TIMEOUT = 1800
-DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+# TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
+DEFAULT_TEST_TIMEOUT = 3600
+DEFAULT_SERVER_WAITING_TIMEOUT = 3600
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -79,7 +76,8 @@ def launch_disaggregated_llm(
         tensor_parallel_size: int = 1,
         ctx_model: str = None,
         gen_model: str = None,
-        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT):
+        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
+        max_workers: int = 16):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -102,6 +100,8 @@ def launch_disaggregated_llm(
 
     args = LlmArgs.from_kwargs(model=model_name,
                                tensor_parallel_size=tensor_parallel_size)
+    if "FP4" in model_name:
+        args.quant_config.quant_algo = "NVFP4"
 
     trtllm_serve_path = "trtllm-serve"
     # Common arguments for both servers
@@ -185,11 +185,18 @@ def launch_disaggregated_llm(
         gen_servers.append((env_gen, gen_server_args))
 
     @contextlib.contextmanager
-    def multi_popen(server_configs):
+    def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
+        log_files = []
         try:
-            for env, args in server_configs:
-                proc = popen(args, env=env)
+            for i, (env, args) in enumerate(server_configs):
+                if enable_redirect_log:
+                    f = open(f"output_{server_name}_{i}.log", "w+")
+                    env["TLLM_LOG_LEVEL"] = "INFO"
+                    proc = popen(args, env=env, stdout=f, stderr=f)
+                    log_files.append(f)
+                else:
+                    proc = popen(args, env=env)
                 processes.append(proc)
 
             with contextlib.ExitStack() as stack:
@@ -197,6 +204,8 @@ def launch_disaggregated_llm(
                     stack.enter_context(proc) for proc in processes
                 ]
                 yield opened_processes
+            for f in log_files:
+                f.close()
         except Exception as e:
             print(
                 f"Failed to start disaggregated server processes in multi_popen: {e}"
@@ -206,15 +215,21 @@ def launch_disaggregated_llm(
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
         disaggregated_serving_config_path, "--server_start_timeout",
-        str(server_waiting_timeout)
+        str(server_waiting_timeout), "-r", "360000"
     ]
-    with (MyThreadPoolExecutor(max_workers=16) as
-          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers) as
-          worker_processes, popen(server_cmd) as server_process):
+    with (
+            MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
+            temp_dir,
+            multi_popen(ctx_servers, "ctx") as ctx_processes,
+            multi_popen(gen_servers, "gen") as gen_processes,
+            multi_popen([(os.environ, server_cmd)], "disagg") as
+            server_processes,
+    ):
         start_time = time.time()
         while time.time() - start_time < server_waiting_timeout:
             time.sleep(5)
-            for process in itertools.chain(worker_processes, [server_process]):
+            for process in itertools.chain(ctx_processes, gen_processes,
+                                           server_processes):
                 if process.poll() is not None:
                     raise Exception(
                         f"process {process.pid} exited with code {process.returncode}"
@@ -228,17 +243,24 @@ def launch_disaggregated_llm(
                 continue
 
         client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:8000/v1")
+                               base_url=f"http://localhost:8000/v1",
+                               timeout=1800000)
 
         def send_request(prompt: str, sampling_params: SamplingParams,
                          streaming: bool):
             kwargs = {}
             if sampling_params is not None:
-                kwargs.update(max_tokens=sampling_params.max_tokens,
-                              temperature=sampling_params.temperature,
-                              top_p=sampling_params.top_p,
-                              stop=sampling_params.stop,
-                              seed=sampling_params.seed)
+                kwargs.update(
+                    max_tokens=sampling_params.max_tokens,
+                    # NB: 'LLM' (cf. SamplingParams) and OpenAI API
+                    #     defaults differ (top_p=0 vs. top_p=1).
+                    # FIXME: Because 'LLM' does not permit expressly setting
+                    #     top_p=0, diverting to temperature=0.
+                    temperature=(sampling_params.temperature
+                                 if sampling_params.top_p is not None else 0),
+                    top_p=sampling_params.top_p,
+                    stop=sampling_params.stop,
+                    seed=sampling_params.seed)
                 if (guided_decoding_params :=
                         sampling_params.guided_decoding) is not None:
                     extra_body = {}
@@ -304,6 +326,7 @@ def run_parallel_test(model_name: str,
 
     kv_cache_config = {
         "free_gpu_memory_fraction": 0.5,
+        "enable_block_reuse": True
     }
     ctx_server_config = {
         "pipeline_parallel_size": ctx_pp,
@@ -356,15 +379,29 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-    def test_auto_dtype(self, disable_overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {
-            "disable_overlap_scheduler": disable_overlap_scheduler
+    @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
+    @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
+    def test_auto_dtype(self, disable_overlap_scheduler, ctx_enable_block_reuse,
+                        gen_enable_block_reuse):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "enable_block_reuse": ctx_enable_block_reuse
+            }
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config = {
+            "disable_overlap_scheduler": disable_overlap_scheduler,
+            "kv_cache_config": {
+                "enable_block_reuse": gen_enable_block_reuse
+            },
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -388,7 +425,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
-    @skip_pre_hopper
     def test_ngram(self):
         speculative_decoding_config = {
             "decoding_type": "NGram",
@@ -533,7 +569,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(48000)
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_eagle3(self, backend: str,
@@ -655,6 +692,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
@@ -697,7 +735,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(8)
-    @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @pytest.mark.skip_less_device(8)
@@ -738,8 +775,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
@@ -798,11 +836,8 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
-        pytest.skip(
-            "Currently we require full kvcache for variable sliding window. "
-            "This test only transfers the kvcache inside the sliding window.")
+    @pytest.mark.parametrize("block_reuse", [False, True])
+    def test_auto_dtype(self, block_reuse):
 
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -812,19 +847,21 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config = {
-            "disable_overlap_scheduler": overlap_scheduler,
+            "disable_overlap_scheduler": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
             }
         }
         ctx_server_config["kv_cache_config"] = {
-            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": True
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": block_reuse,
+            "enable_partial_reuse": False,
         }
         gen_server_config["kv_cache_config"] = {
-            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": True
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": block_reuse,
+            "enable_partial_reuse": False,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -842,6 +879,139 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestGPTOSS(LlmapiAccuracyTestHarness):
+    extra_evaluator_kwargs = {
+        "fewshot_as_multiturn": True,
+        "apply_chat_template": True,
+    }
+
+    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("block_reuse", [False, True])
+    def test_auto_dtype(self, block_reuse, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "tensor_parallel_size": 4
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "tensor_parallel_size": 4
+        }
+        ctx_server_config["kv_cache_config"] = {
+            "max_attention_window": [128, 32768],
+            "enable_block_reuse": block_reuse,
+            "enable_partial_reuse": False,
+        }
+        gen_server_config["kv_cache_config"] = {
+            "max_attention_window": [128, 32768],
+            "enable_block_reuse": block_reuse,
+            "enable_partial_reuse": False,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("overlap_scheduler", [False])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        ctx_server_config["kv_cache_config"] = {
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.7,
+            "tokens_per_block": 64,
+            "dtype": "fp8"
+        }
+        ctx_server_config["moe_config"] = {
+            "backend": "TRTLLM",
+            "max_num_tokens": 16384
+        }
+        ctx_server_config["tensor_parallel_size"] = 4
+        ctx_server_config["pipeline_parallel_size"] = 1
+        ctx_server_config["moe_expert_parallel_size"] = 4
+        ctx_server_config["max_batch_size"] = 24
+        ctx_server_config["cuda_graph_config"] = None
+        ctx_server_config["enable_attention_dp"] = True
+        ctx_server_config["enable_autotuner"] = False
+        gen_server_config["kv_cache_config"] = {
+            "enable_block_reuse": False,
+            "tokens_per_block": 64,
+            "free_gpu_memory_fraction": 0.7,
+            "dtype": "fp8"
+        }
+        gen_server_config["moe_config"] = {
+            "backend": "TRTLLM",
+            "max_num_tokens": 16384
+        }
+        gen_server_config["max_batch_size"] = 128
+        gen_server_config["max_num_tokens"] = 128
+        gen_server_config["cuda_graph_config"] = None
+        gen_server_config["tensor_parallel_size"] = 4
+        gen_server_config["pipeline_parallel_size"] = 1
+        gen_server_config["moe_expert_parallel_size"] = 4
+        gen_server_config["enable_attention_dp"] = True
+        gen_server_config["enable_autotuner"] = False
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)

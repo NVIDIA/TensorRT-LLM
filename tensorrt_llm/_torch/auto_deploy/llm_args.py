@@ -8,10 +8,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
-from ...llmapi.utils import get_type_repr
+from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
+from .utils.logger import ad_logger
 
 PathLike = Union[str, Path]
 
@@ -36,6 +36,19 @@ def _check_for_default_value_only(
     if value != cls.model_fields[field_name].get_default(call_default_factory=True):
         raise ValueError(msg)
     return value
+
+
+_TRANSFORMS_SHORTCUT_LOOKUP = {
+    "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
+    "free_mem_ratio": ("resize_kv_cache.free_mem_ratio",),
+    "compile_backend": ("compile_model.backend",),
+    "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
+}
+
+
+def _shortcut_description(description: str, shortcut: str) -> str:
+    long_names_str = ", ".join([f"transforms.{k}" for k in _TRANSFORMS_SHORTCUT_LOOKUP[shortcut]])
+    return f"{description} Alias for: {long_names_str}."
 
 
 class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
@@ -75,12 +88,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If True, only the model architecture is loaded.",
     )
 
-    checkpoint_device: Optional[str] = Field(
-        default=None,
-        description="Device on which to load the model checkpoint. "
-        "Defaults to the same device as the rest of the pipeline.",
-    )
-
     tokenizer: Optional[PathLike] = Field(
         description="The tokenizer",
         default=None,
@@ -116,10 +123,18 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
+    # TODO: see if we can just remove this field and use kv_cache_config.dtype instead?
     kv_cache_dtype: str = Field(
         default="auto",
         description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
         "supported in AutoDeploy.",
+    )
+
+    # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
+    # see https://github.com/NVIDIA/TensorRT-LLM/issues/7142
+    kv_cache_config: KvCacheConfig = Field(
+        default_factory=lambda **kwargs: KvCacheConfig(copy_on_partial_reuse=False, **kwargs),
+        description="KV cache config.",
     )
 
     max_beam_width: int = Field(
@@ -128,54 +143,9 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         frozen=True,
     )
 
+    enable_chunked_prefill: bool = Field(default=False, description="Enable chunked prefill.")
+
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
-        default="flashinfer", description="Attention backend to use."
-    )
-
-    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-        default="MultiHeadLatentAttention",
-        description="The Multi-Head Latent Attention backend to use.",
-    )
-
-    free_mem_ratio: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="The fraction of available memory to allocate for cache.",
-    )
-
-    simple_shard_only: bool = Field(
-        default=False,
-        description="If True, force simple sharding (all_gather) in tensor parallelism. "
-        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    )
-
-    use_sharding_from_factory: bool = Field(
-        default=False,
-        description="If True, use sharding from the model factory. If False, use sharding from the "
-        "AutoDeployConfig.",
-    )
-
-    sharding_dims: List[str] = Field(
-        default=["tp", "ep", "dp"],
-        description="The sharding methods to apply by the heuristic sharding stage.",
-    )
-
-    compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
-        Field(
-            default="torch-compile",
-            description="The backend to use for compiling the model.",
-        )
-    )
-
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
-        default=None, description="List of batch sizes to create CUDA graphs for."
-    )
-
-    visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
-
-    ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
@@ -183,10 +153,36 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "or transformers-only cached attention optimization.",
     )
 
-    transforms: Dict[str, Any] = Field(
+    transforms: Dict[str, Dict[str, Any]] = Field(
         default_factory=dict,
         description="A dictionary of transform configurations. The key is the transform name and "
         "the value is the transform configuration.",
+    )
+
+    ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
+    attn_backend: str = Field(
+        default="flashinfer",
+        description=_shortcut_description("Attention backend to use.", "attn_backend"),
+    )
+    free_mem_ratio: float = Field(
+        default=0.0,
+        description=_shortcut_description(
+            "The fraction of available memory to allocate for cache.", "free_mem_ratio"
+        ),
+    )
+    compile_backend: str = Field(
+        default="torch-compile",
+        description=_shortcut_description(
+            "The backend to use for compiling the model.", "compile_backend"
+        ),
+    )
+    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description=_shortcut_description(
+            "List of batch sizes for CUDA graph creation. If not provided, a heuristic will"
+            " be used to determine the batch sizes.",
+            "cuda_graph_batch_sizes",
+        ),
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
@@ -201,13 +197,32 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
         "properly passed through.",
     )
+    enable_iter_perf_stats: bool = Field(
+        default=False, description="Enable iteration performance statistics.", status="prototype"
+    )
+
+    enable_iter_req_stats: bool = Field(
+        default=False,
+        description="If true, enables per request stats per iteration. Must also set "
+        "enable_iter_perf_stats to true to get request stats.",
+        status="prototype",
+    )
 
     ### VALIDATION #################################################################################
     @model_validator(mode="after")
     # TODO: discuss what to do with this once we fully transition to the new inference optimizer
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.attn_backend == "triton" or self.attn_backend == "torch":
+        if self.transforms.get("insert_cached_attention", {}).get("backend") in [
+            "triton",
+            "torch",
+        ]:
+            self.attn_page_size = self.max_seq_len
+        # NOTE: (hg) For transformers mode. This is ugly.
+        if self.transforms.get("transformers_replace_cached_attn", {}).get("backend") in [
+            "triton",
+            "torch",
+        ]:
             self.attn_page_size = self.max_seq_len
         return self
 
@@ -221,6 +236,37 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             )
 
         return value
+
+    @model_validator(mode="after")
+    def update_transforms_with_shortcuts(self) -> Dict[str, Any]:
+        """Synchronize the transforms config with the values from the defined shortcuts.
+
+        NOTE: shortcut values always take precedence over the values in the transforms config.
+        """
+        for shortcut_key, transforms_keys in _TRANSFORMS_SHORTCUT_LOOKUP.items():
+            for transform_key in transforms_keys:
+                t_key, config_key = transform_key.split(".")
+                if t_key not in self.transforms:
+                    continue
+
+                # first update the transforms config with the shortcut value
+                if shortcut_key in self.model_fields_set:
+                    self.transforms[t_key][config_key] = getattr(self, shortcut_key)
+                # then update the shortcut field with the value from the transforms config to make
+                # sure both fields are in sync
+                setattr(self, shortcut_key, self.transforms[t_key][config_key])
+
+        return self
+
+    @field_validator("kv_cache_config", mode="after")
+    @classmethod
+    def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
+        if kv_cache_config.copy_on_partial_reuse:
+            kv_cache_config.copy_on_partial_reuse = False
+            ad_logger.warning(
+                "copy_on_partial_reuse is not supported by AutoDeploy. Setting it to False."
+            )
+        return kv_cache_config
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
@@ -281,12 +327,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
-    build_config: Optional[object] = Field(
-        default_factory=lambda: BuildConfig(),
+    build_config: Optional[BuildConfig] = Field(
+        default_factory=BuildConfig,
         description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
         exclude_from_json=True,
         frozen=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
         repr=False,
     )
     backend: Literal["_autodeploy"] = Field(
@@ -354,23 +399,19 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         rank to automatically shard the model. This is just to ensure that other objects in the
         runtime that may read parallel_config can do so.
         """
+
+        # Set tp_size = self.world_size so that _ParallelConfig.world_size will return the
+        # correct value (computed as tp_size * pp_size * cp_size). This does not necessarily
+        # mean that TP will actually be used.
         self._parallel_config = _ParallelConfig(
-            auto_parallel=True, gpus_per_node=self.gpus_per_node
+            tp_size=self.world_size, gpus_per_node=self.gpus_per_node
         )
-        self._parallel_config.world_size = self.world_size
         return self
 
     @model_validator(mode="after")
     def validate_and_init_tokenizer(self):
         """Skip tokenizer initialization in config. We do this in the AutoDeploy LLM class."""
         return self
-
-    ### UTILITY METHODS ############################################################################
-    # TODO: Remove this after the PyTorch backend is fully migrated to LlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "LlmArgs":
-        """Return the LlmArgs (self) object."""
-        # TODO: can we just pass through self directly??
-        return type(self)(**self.to_llm_kwargs())
 
     def to_dict(self) -> Dict:
         """Convert model to a dictionary such that cls(**self.to_dict()) == self."""

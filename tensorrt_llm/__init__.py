@@ -13,12 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+# Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
+os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
+
 
 def _add_trt_llm_dll_directory():
     import platform
     on_windows = platform.system() == "Windows"
     if on_windows:
-        import os
         import sysconfig
         from pathlib import Path
         os.add_dll_directory(
@@ -77,7 +81,6 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
                      torch_dtype_to_trt)
-from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
@@ -130,8 +133,6 @@ __all__ = [
     'Module',
     'functional',
     'models',
-    'auto_parallel',
-    'AutoParallelConfig',
     'quantization',
     'tools',
     'LLM',

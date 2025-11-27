@@ -605,7 +605,7 @@ if __name__ == '__main__':
         hf_model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                         trust_remote_code=True,
                                                         device_map="auto",
-                                                        torch_dtype=getattr(
+                                                        dtype=getattr(
                                                             torch, args.dtype),
                                                         config=hf_config)
         return hf_model

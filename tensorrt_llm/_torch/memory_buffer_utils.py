@@ -1,8 +1,15 @@
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+from tensorrt_llm.logger import logger
+
+
+def get_size_in_byte(target_shape: list[int], target_dtype: torch.dtype):
+    return math.prod(target_shape) * target_dtype.itemsize
 
 
 @dataclass
@@ -33,20 +40,26 @@ class Buffers:
                  target_dtype: torch.dtype) -> torch.Tensor:
         """Safely creates a view of a raw byte buffer with the desired shape and dtype."""
         # The buffer is stored as uint8, so its numel is its size in bytes.
-        required_size_in_bytes = math.prod(target_shape) * target_dtype.itemsize
-        if buffer.numel() < required_size_in_bytes:
+        required_memory_size = get_size_in_byte(target_shape, target_dtype)
+        if buffer.numel() < required_memory_size:
             raise ValueError(
                 "Buffer is too small for the requested shape and dtype.")
 
         # Slice the buffer to the exact required size, then view it with the correct type and shape.
-        return buffer[:required_size_in_bytes].view(target_dtype).view(
+        return buffer[:required_memory_size].view(target_dtype).view(
             target_shape)
 
     def get_buffer(self, tensor_shape: list[int], dtype: torch.dtype,
                    buffer_name: str, reserve_buffer: bool):
+        """Return a reusable buffer view for the requested shape/dtype.
+        The returned tensor is backed by an underlying `torch.uint8` buffer. When
+        no suitable buffer exists in the pool, a new tensor is created via
+        `torch.empty`, so its contents are uninitialized. Overwrite the data before use if needed.
+        """
 
         # all buffers are allocated with 1 byte element size
         required_memory_size = math.prod(tensor_shape) * dtype.itemsize
+
         candidate_blocks = self.buffers.get(buffer_name, [])
 
         # Find the best-fit available buffer.
@@ -80,9 +93,23 @@ class Buffers:
 
         # No suitable buffer was found, so allocate a new one.
         # The new buffer is created with uint8 to represent raw bytes.
-        new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                        device='cuda',
-                                        dtype=torch.uint8)
+        new_buffer_tensor = None
+        try:
+            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
+                new_buffer_tensor = torch.empty((required_memory_size, ),
+                                                device='cuda',
+                                                dtype=torch.uint8)
+        except Exception as ex:
+            # Need to check if this is an OOM exception
+            logger.debug(
+                f"Exception happened to create tensor from given memory pool: {str(ex)}"
+            )
+            # if exception happens during allocating memory from shared pool, retry
+            # to allocate from default pool
+            new_buffer_tensor = torch.empty((required_memory_size, ),
+                                            device='cuda',
+                                            dtype=torch.uint8)
+
         new_block = BufferBlock(buffer=new_buffer_tensor,
                                 is_reserved=reserve_buffer)
 
@@ -97,3 +124,52 @@ _buffer = Buffers()
 def get_memory_buffers():
     global _buffer
     return _buffer
+
+
+_shared_pool = None
+
+
+def set_shared_pool(shared_pool):
+    """Sets the global memory pool for buffer allocation.
+
+    Args:
+        shared_pool: A CUDA memory pool object to use for allocations.
+    """
+    global _shared_pool
+    _shared_pool = shared_pool
+
+
+def get_shared_pool():
+    """Retrieves the current global memory pool.
+
+    Returns:
+        The current memory pool, or None if not set.
+    """
+    return _shared_pool
+
+
+@contextlib.contextmanager
+def with_shared_pool(shared_pool) -> contextlib.AbstractContextManager:
+    """Temporarily sets a preferred memory pool and restores the previous one on exit.
+
+    This context manager allows temporarily switching to a different memory pool
+    for CUDA graph operations, ensuring the original pool is restored even if
+    an exception occurs.
+
+    Args:
+        shared_pool: The memory pool to use within the context.
+
+    Yields:
+        None
+
+    Example:
+        >>> with with_shared_pool(shared_pool):
+        ...     # Allocations within this block use shared_pool
+        ...     tensor = allocate_buffer(...)
+    """
+    old_shared_pool = get_shared_pool()
+    set_shared_pool(shared_pool)
+    try:
+        yield
+    finally:
+        set_shared_pool(old_shared_pool)

@@ -15,11 +15,12 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     SplitDimension,
-    TPShardingInfo,
+    WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
+from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
     "q_proj": "colwise",
@@ -90,7 +91,7 @@ class GQA_Block(nn.Module):
         k = self.k_proj(x).view(b, s, -1, self.head_dim)
         v = self.v_proj(x).view(b, s, -1, self.head_dim)
 
-        y = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(q, k, v, is_causal=True)
+        y = torch.ops.auto_deploy.torch_attention(q, k, v, is_causal=True, layout="bsnd")
         y = y.contiguous().view(b, s, -1)
 
         return self.o_proj(y)
@@ -272,13 +273,14 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.COLUMN
                         dist_op = None
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == MLP:
@@ -293,13 +295,14 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == nn.Linear:
@@ -307,13 +310,14 @@ def _run_pattern_detection_job(
             for node in gm.graph.nodes:
                 if is_linear_op(node):
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
                             rank=rank,
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == FP8MLP:
@@ -335,6 +339,7 @@ def _run_pattern_detection_job(
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
 
@@ -351,7 +356,7 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
+    detected_transformations = optimizer.shared_config.sharding_config.weight_sharding_transforms
 
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")

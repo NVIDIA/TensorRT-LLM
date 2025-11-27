@@ -27,16 +27,17 @@ if(NOT Python3_EXECUTABLE)
     REQUIRED)
 endif()
 
+set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 execute_process(
-  WORKING_DIRECTORY ${3RDPARTY_DIR}/cutlass/python/
+  WORKING_DIRECTORY ${cutlass_source_dir}/python/
   COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
 if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
   message(
     FATAL_ERROR
-      "Failed to set up the CUTLASS library due to ${_CUTLASS_LIBRARY_SUCCESS}."
-  )
+      "Failed to set up the CUTLASS library in ${cutlass_source_dir} due to"
+      " ${_CUTLASS_LIBRARY_SUCCESS}.")
 endif()
 
 set(GENERATE_KERNELS_SCRIPT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/python)
@@ -200,12 +201,12 @@ add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
-set_cuda_architectures(fb_gemm_src 89 90 120f)
+set_cuda_architectures(fb_gemm_src 89 90 100f 120f)
 # add_instantiations(fb_gemm_src
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f)
+set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f 120f)
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
@@ -218,7 +219,7 @@ if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
   set_cuda_architectures(low_latency_gemm_src 90)
   target_include_directories(low_latency_gemm_src
-                             PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
+                             PRIVATE ${cutlass_source_dir}/examples)
 endif()
 
 if(USING_OSS_CUTLASS_FP4_GEMM)

@@ -405,13 +405,13 @@ def main():
 
         if args.model_type == "llava":
             hf_llava = LlavaForConditionalGeneration.from_pretrained(
-                args.model_dir, torch_dtype="auto")
+                args.model_dir, dtype="auto")
             model = hf_llava.language_model
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_dir,
                 device_map='auto' if not args.load_model_on_cpu else 'cpu',
-                torch_dtype='auto' if not args.smoothquant else torch.float16,
+                dtype='auto' if not args.smoothquant else torch.float16,
                 trust_remote_code=True,
             )
         if args.smoothquant is not None or args.int8_kv_cache:

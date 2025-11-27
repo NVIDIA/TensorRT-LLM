@@ -2,11 +2,13 @@ import copy
 import datetime
 import enum
 import json
+import os
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 
 from tensorrt_llm.logger import logger
@@ -16,11 +18,10 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, print_colored_debug
-from ..lora_helper import LoraConfig
+from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -39,7 +40,30 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
 
 __all__ = [
     "BaseWorker",
+    "_init_hf_modules",
 ]
+
+
+def _init_hf_modules():
+    """Initialize cached HuggingFace modules for models with trust_remote_code=True.
+
+    This is safe to call multiple times (idempotent) and should be called:
+    1. At module import time (for main process and spawned subprocesses)
+    2. At worker_main entry (for forked processes or external MPI ranks)
+
+    References: https://github.com/vllm-project/vllm/pull/871
+    """
+    try:
+        from transformers.dynamic_module_utils import init_hf_modules
+        init_hf_modules()
+        logger.debug("HF modules initialized")
+    except ImportError as e:
+        logger.warning(f"ImportError initializing HF modules: {e}")
+    except Exception as e:
+        logger.error(f"Exception initializing HF modules: {e}")
+
+
+_init_hf_modules()
 
 
 class BaseWorker(GenerationExecutor):
@@ -54,8 +78,6 @@ class BaseWorker(GenerationExecutor):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -73,8 +95,6 @@ class BaseWorker(GenerationExecutor):
         self._batched_logits_processor = batched_logits_processor
         self._postproc_worker_config = postproc_worker_config
         self._is_llm_executor = is_llm_executor
-        self._lora_config = lora_config
-        self._kv_connector_config = kv_connector_config
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
         self.llm_args = llm_args
@@ -89,16 +109,66 @@ class BaseWorker(GenerationExecutor):
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
-            "pytorch", "_autodeploy"
-        ]
-
-        if not self._is_pytorch_backend and kv_connector_config is not None:
-            raise ValueError(
-                "KV connector config is only supported for PyTorch backend")
+        self._backend = None if llm_args is None else llm_args.backend
+        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
+        self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    def _configure_affinity(self, device_id):
+        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
+
+        Args:
+            device_id: The CUDA device ID to determine optimal CPU affinity.
+
+        Note:
+            If the process already has constrained affinity, a warning is logged.
+            Configuration is handled as follows:
+                TLLM_NUMA_WORKER_AFFINITY = <unset>
+                    -> affinity is auto-configured only if it is unconstrained
+                TLLM_NUMA_WORKER_AFFINITY = 1
+                    -> affinity is unconditionally auto-configured
+                TLLM_NUMA_WORKER_AFFINITY = 0 or any other value
+                    -> affinity is unconditionally _not_ auto-configured
+        '''
+
+        # Get the current affinity setting
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        cpu_affinity = process.cpu_affinity()
+
+        all_cpus = list(range(psutil.cpu_count()))
+
+        constrained_affinity = (cpu_affinity != all_cpus)
+
+        # If the process is affined to a constrained set of CPUs, warn the user
+        # so as to ensure that this is what is intended
+        if constrained_affinity:
+            logger.warning(
+                f"Worker process {pid} is affined to run on the following CPUs: "
+                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+                f"performance if set incorrectly.")
+
+        # If affinity is unconstrained and the user hasn't explicitly
+        # prohibited it or the user has explicitly requested it, choose the
+        # optimal affinity based upon the NUMA topology
+        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+        if ((numa_aware_affinity is None and not constrained_affinity)
+                or (numa_aware_affinity == "1")):
+            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+
+    def _get_comm_ranks_device_id(self):
+        device_id = self.global_rank % torch.cuda.device_count()
+        torch.cuda.set_device(device_id)
+        # Make sure C++ executor would use same devices/ranks as py_executor
+        global_rank = global_mpi_rank()
+        comm_ranks = mpi_comm().allgather(global_rank)
+        device_ids = mpi_comm().allgather(device_id)
+
+        self._configure_affinity(device_id)
+
+        return comm_ranks, device_ids
 
     def setup_engine(self):
         """
@@ -108,54 +178,44 @@ class BaseWorker(GenerationExecutor):
         if isinstance(self._engine, list):
             self._engine = self._engine[self.rank]
 
-        def _get_comm_ranks_device_id():
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
-            # Make sure C++ executor would use same devices/ranks as py_executor
-            global_rank = global_mpi_rank()
-            comm_ranks = mpi_comm().allgather(global_rank)
-            device_ids = mpi_comm().allgather(device_id)
-            return comm_ranks, device_ids
-
         def _create_py_executor():
             args = {}
             assert hasattr(
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
-            _ = _get_comm_ranks_device_id()
-            if self.llm_args.backend == "pytorch":
+            _ = self._get_comm_ranks_device_id()
+            if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-                args["lora_config"] = self._lora_config
-                args["kv_connector_config"] = self._kv_connector_config
-            elif self.llm_args.backend == "_autodeploy":
+            elif self._backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["ad_config"] = self.llm_args
+                args["tokenizer"] = self._tokenizer
             else:
-                raise ValueError(
-                    f"Unsupported backend config: {self.llm_args.backend}")
+                raise ValueError(f"Unsupported backend config: {self._backend}")
 
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
-            if self.llm_args.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.config import \
+            if self._backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend, self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format)
 
-            _executor = create_executor(**args)
             self.max_seq_len = self.llm_args.max_seq_len
+            # creare_py_executor may change some fields of llm_args
+            _executor = create_executor(**args)
             if _executor.max_seq_len is not None:
                 # max_seq_len might be updated by model engine as in create_py_executor
                 self.max_seq_len = _executor.max_seq_len
@@ -168,7 +228,7 @@ class BaseWorker(GenerationExecutor):
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
                 processor_batched=self._batched_logits_processor,
                 replicate=False)
-            comm_ranks, device_ids = _get_comm_ranks_device_id()
+            comm_ranks, device_ids = self._get_comm_ranks_device_id()
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
 
@@ -205,19 +265,19 @@ class BaseWorker(GenerationExecutor):
                 # point in the TRT flow is currently not supported (it's at the CPP
                 # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
                 # optimization is not available in TRT-python flow.
-                self._lora_manager = LoraManager(cpp_peft_cache_manager=None)
+                self._lora_manager = LoraManager(
+                    mapping=engine_config.pretrained_config.mapping,
+                    model_config=self._runtime_model_config,
+                    cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if self.llm_args and getattr(
-                self.llm_args, "backend",
-                "") == "pytorch" and self._lora_config is not None:
+        if self._backend == "pytorch" and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
                 ResourceManagerType.PEFT_CACHE_MANAGER)
-            self._lora_manager = LoraManager(
-                cpp_peft_cache_manager=peft_cache_manager.impl)
+            self._lora_manager = peft_cache_manager.get_lora_manager()
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
@@ -234,6 +294,12 @@ class BaseWorker(GenerationExecutor):
             return [(iter_stat, None) for iter_stat in iter_stats]
         else:
             return self.engine.get_latest_iteration_stats()
+
+    def fetch_kv_cache_events(self) -> list:
+        if isinstance(self.engine, tllm.Executor):
+            return self.engine.get_latest_kv_cache_events()
+        else:
+            return self.engine.get_latest_kv_cache_events()
 
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
@@ -296,7 +362,6 @@ class BaseWorker(GenerationExecutor):
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
-            runtime_mapping=None,
             uids=[adapter_id],
             ckpt_source=lora_request.ckpt_source)
         return adapter_id in newly_loaded_uids
@@ -308,7 +373,9 @@ class BaseWorker(GenerationExecutor):
             model_config=self._runtime_model_config,
             uids=[str(prompt_adapter_request.adapter_id)])
 
-    def _enqueue_request(self, request: GenerationRequest) -> int:
+    def _enqueue_request(self,
+                         request: GenerationRequest,
+                         result_wait_queue=None) -> int:
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -419,25 +486,27 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
-                logger.warning(
-                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                raise ValueError(
+                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
                     f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
                 )
-                if max_tokens is None:
-                    raise ValueError(
-                        "`max_tokens` must be set when `default_max_tokens` is illegal"
-                    )
+
             # default_max_tokens is the biggest available value
             if max_tokens is None:
                 return default_max_tokens
-            elif max_tokens > default_max_tokens:
+            elif max_tokens > default_max_tokens and default_max_tokens > 0:
                 logger.warning(
                     f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
                     f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
                 )
                 return default_max_tokens
-            return max_tokens
+            elif max_tokens <= 0:
+                raise ValueError(
+                    f"`max_tokens` ({max_tokens}) must be greater than 0")
+            else:
+                return max_tokens
 
         try:
             executor_request = tllm.Request(
@@ -480,6 +549,7 @@ class BaseWorker(GenerationExecutor):
                 context_phase_params=context_phase_params,
                 type=request_type,
                 cache_salt_id=request.cache_salt_id)
+            executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
@@ -505,10 +575,20 @@ class BaseWorker(GenerationExecutor):
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update
-                req_id = self.engine.enqueue_request(executor_request,
-                                                     request.query_token_ids)
+                if self._is_pytorch_backend and result_wait_queue is not None:
+                    req_id = self.engine.enqueue_request(
+                        executor_request,
+                        request.query_token_ids,
+                        result_wait_queue=result_wait_queue)
+                else:
+                    req_id = self.engine.enqueue_request(
+                        executor_request, request.query_token_ids)
             else:
-                req_id = self.engine.enqueue_request(executor_request)
+                if self._is_pytorch_backend and result_wait_queue is not None:
+                    req_id = self.engine.enqueue_request(
+                        executor_request, result_wait_queue=result_wait_queue)
+                else:
+                    req_id = self.engine.enqueue_request(executor_request)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
@@ -547,6 +627,38 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def shutdown(self):
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        if self.engine is not None and self.engine.can_enqueue_requests():
+            self.engine.shutdown()
+            self.engine = None
+
+    # Define a Callable to join iteration and request stats
+    @staticmethod
+    def _stats_serializer(
+            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+        iteration_stats, req_stats = stats
+        stats_dict = json.loads(iteration_stats.to_json_str())
+
+        if req_stats is not None and len(req_stats) > 0:
+            stats_dict["requestStats"] = []
+            for req_stat in req_stats:
+                stats_dict["requestStats"].append(
+                    json.loads(req_stat.to_json_str()))
+
+        # Convert back to JSON string
+        return json.dumps(stats_dict)
+
+    # Define a Callable to serialize KV cache events
+    @staticmethod
+    def _kv_cache_events_serializer(events) -> str:
+        from .._utils import KVCacheEventSerializer
+        return json.dumps(KVCacheEventSerializer.serialize(events))
+
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
         self._client_id_to_request_id.pop(client_id, None)
@@ -556,7 +668,7 @@ class BaseWorker(GenerationExecutor):
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         self.shutdown()
-        return exc_type is None or exc_type == BaseWorker.WorkerExit
+        return exc_type is None or exc_type == self.WorkerExit
 
     def __del__(self):
         self.shutdown()
@@ -584,16 +696,15 @@ class AwaitResponseHelper:
         if self.handler_kind is HandlerKind.unknown:
             if not (self.worker.result_queue is not None
                     or self.worker.postproc_queues is not None):
-                print_colored_debug(
-                    f"creating await_response helper for Worker\n",
-                    color="yellow")
+                logger_debug(f"creating await_response helper for Worker\n",
+                             color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
             elif self.worker.result_queue is not None or self.worker.postproc_queues is not None:
                 # The ExecutorBindingProxy is used
-                print_colored_debug(f"creating await_response helper for IPC\n",
-                                    color="yellow")
+                logger_debug(f"creating await_response helper for IPC\n",
+                             color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
             else:
                 raise NotImplementedError
@@ -845,7 +956,15 @@ def _get_metrics_dict(
                 req_perf_metrics.timing_metrics.first_scheduled_time.
                 total_seconds(),
                 RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_START:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_TRANSFER_END:
+                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
+                total_seconds(),
+                RequestEventTiming.KV_CACHE_SIZE:
+                req_perf_metrics.timing_metrics.kv_cache_size,
             }
     return metrics_dict
 

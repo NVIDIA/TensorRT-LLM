@@ -161,7 +161,7 @@ class NemotronHLayer(DecoderLayer):
         elif layer_type == "*":
             self.mixer = TransformerLayer(model_config, layer_idx)
         else:
-            ValueError(f"{layer_type} is not supported")
+            raise ValueError(f"{layer_type} is not supported")
 
     def forward(
         self,

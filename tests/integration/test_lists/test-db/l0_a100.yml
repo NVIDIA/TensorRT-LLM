@@ -14,8 +14,13 @@ l0_a100:
       backend: "pytorch"
   tests:
     - unittest/llmapi/test_llm_pytorch.py
-    - unittest/llmapi/test_mpi_session.py # generic tests
+    - unittest/llmapi/test_mpi_session.py ISOLATION
+    - unittest/llmapi/test_memory_profiling.py # profile kvcache for vision encoder
     - unittest/trt/model_api/test_model_quantization.py
+    # executor
+    - unittest/executor/test_base_worker.py
+    - unittest/executor/test_rpc_proxy.py
+    - unittest/executor/test_rpc_worker.py
 - condition:
     ranges:
       system_gpu_count:
@@ -99,14 +104,6 @@ l0_a100:
   - triton_server/test_triton.py::test_eagle[eagle]
   - triton_server/test_triton.py::test_llava_onevision[llava_onevision]
   - triton_server/test_triton.py::test_qwen2_vl[qwen2_vl]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-ensemble]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-tensorrt_llm_bls]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-ensemble]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-ensemble]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-tensorrt_llm_bls]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-ensemble]
-  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
 - condition:
     ranges:
       system_gpu_count:

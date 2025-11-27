@@ -6,7 +6,9 @@ import llguidance.torch
 import torch
 import xgrammar
 
-from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
+from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
+
+from ...bindings.executor import GuidedDecodingParams
 
 
 class GrammarMatcher(ABC):

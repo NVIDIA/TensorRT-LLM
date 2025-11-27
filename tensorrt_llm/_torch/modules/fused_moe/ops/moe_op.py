@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_100f
 
 if TYPE_CHECKING:
     from ..interface import MoE
@@ -224,7 +224,7 @@ class MoEOpSelector:
 
         # Check if we should use DeepGemm op
         # Blackwell has SM version 100
-        is_blackwell = get_sm_version() == 100
+        is_blackwell = is_sm_100f()
         has_block_fp8 = module.has_deepseek_fp8_block_scales
 
         if is_blackwell and has_block_fp8:

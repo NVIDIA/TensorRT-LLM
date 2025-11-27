@@ -94,12 +94,9 @@ async def test_request_cancellation(server: RemoteOpenAIServer,
     # Request about 2 million tokens
     for _ in range(200):
         task = asyncio.create_task(
-            # FIXME: Some requests complete quickly without temperature=0,
-            #        despite min_tokens being specified, cf. https://nvbugs/5513423
             client.chat.completions.create(messages=chat_input,
                                            model=model_name,
                                            max_tokens=10000,
-                                           temperature=0,
                                            extra_body={"min_tokens": 10000}))
         tasks.append(task)
 

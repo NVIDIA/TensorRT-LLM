@@ -48,6 +48,15 @@
 namespace batchedGemm
 {
 
+namespace trtllm
+{
+namespace gen
+{
+class CudaRunner;
+class GenCfg;
+} // namespace gen
+} // namespace trtllm
+
 namespace gemmGatedAct
 {
 
@@ -58,15 +67,16 @@ namespace tg = trtllm::gen;
 // Type of the gated activation
 enum class ActType
 {
-    // For ActType == SwiGlu, ideally we would like to have something like
-    //    gatedAct = quantScaleC * (x0 * dequantScaleAb + beta) * ((x1 * scaleGate) *
-    //    sigmoid(alpha * x1 * scaleGate)).
-    // But for now, we use the simplified version
-    //    gatedAct = scaleC * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
-    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
-    // beta' = beta / dequantScaleAb, scaleC = quantScaleC * dequantScaleAb.
-    //
-    // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+    // clang-format off
+  // For ActType == SwiGlu, ideally we would like to have something like
+  //    gatedAct = quantScaleC * (x0 * dequantScaleAb + beta) * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)).
+  // But for now, we use the simplified version
+  //    gatedAct = scaleC      * (x0                 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
+  // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+  // beta' = beta / dequantScaleAb, scaleC = quantScaleC * dequantScaleAb.
+  //
+  // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+    // clang-format on
     SwiGlu,
     // For ActType == GeGlu, we use the simplified version
     //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
@@ -125,7 +135,7 @@ struct GemmGatedActOptions : public gemm::GemmOptions
 
 // Check if the options are valid or not.
 inline bool checkAndUpdateGemmGatedActOptions(
-    gemmGatedAct::GemmGatedActOptions& options, bool isBlackwell, bool updateOptions = true)
+    gemmGatedAct::GemmGatedActOptions& options, tg::CudaArch cudaArch, bool updateOptions = true)
 {
 
     // tmpOut is already transposed at this stage
@@ -144,11 +154,6 @@ inline bool checkAndUpdateGemmGatedActOptions(
             "Unsupported output hidden tile size");
     }
 
-    if (options.mUseDeepSeekFp8)
-    {
-        TLLM_CHECK_ERROR(hiddenSize % 256 == 0, "Output hidden size must be a multiple of 256");
-    }
-
     if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3)
     {
         int const outHiddenSize = (options.mTransposeMmaOutput ? options.mM : options.mN) / 2;
@@ -157,7 +162,7 @@ inline bool checkAndUpdateGemmGatedActOptions(
             ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
     }
 
-    auto isValid = gemm::checkAndUpdateGemmOptions(options, isBlackwell,
+    auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
         /* tpGrpSize */ 1, updateOptions);
 
     if (!isValid)
@@ -165,6 +170,21 @@ inline bool checkAndUpdateGemmGatedActOptions(
         return false;
     }
 
+    auto const validHiddenSize = options.mTransposeMmaOutput ? options.mValidM : options.mValidN;
+    if (options.mUseDeepSeekFp8)
+    {
+        TLLM_CHECK_ERROR(hiddenSize % 256 == 0 && validHiddenSize % 256 == 0, "Hidden size (", hiddenSize,
+            ") and valid hidden size (", validHiddenSize, ") must be a multiple of 256");
+    }
+
+    //
+    if (options.mUseShuffledMatrixA)
+    {
+        auto const shuffleBlockSize = gemm::getShuffleBlockSize(options.mEpilogueTileM);
+        TLLM_CHECK_ERROR(hiddenSize % (2 * shuffleBlockSize) == 0 && validHiddenSize % (2 * shuffleBlockSize) == 0,
+            "M/validM must be a multiple of 2 * shuffle block size (", 2 * shuffleBlockSize,
+            ") when useShuffledMatrixA");
+    }
     if (options.mNumSlicesForSplitK > 1)
     {
         TLLM_CHECK_ERROR(doesSplitKUseDsmem(options.mSplitK), "Split-k GMEM and GemmGatedAct are not supported yet.");
@@ -180,10 +200,10 @@ inline bool checkAndUpdateGemmGatedActOptions(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline std::string dumpOptions(GemmGatedActOptions const& options)
+inline std::string dumpOptions(GemmGatedActOptions const& options, bool dumpRuntimeParams = true)
 {
     std::stringstream ss;
-    ss << gemm::dumpOptions(options) << ", ";
+    ss << gemm::dumpOptions(options, dumpRuntimeParams) << ", ";
     ss << "mActType="
        << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
     ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
@@ -198,22 +218,21 @@ inline std::string dumpOptions(GemmGatedActOptions const& options)
 
 struct GemmGatedActConfig
 {
-    // When TRT-LLM Gen is exported to the other frameworks, the TLLM_GEN_EXPORT_INTERFACE must be
-    // defined. In this case, the cubins will be loaded from the provided data and function name.
-    // Otherwise, the kernel will be loaded from the CudaRunner.
-#ifdef TLLM_GEN_EXPORT_INTERFACE
     uint8_t const* mData{nullptr};
-    uint32_t const mSize{0};
-    uint32_t const mSharedMemSize{0};
+    uint32_t mSize{0};
+    uint32_t mSharedMemSize{0};
     char const* mFunctionName{nullptr};
-    uint32_t const mNumThreadsPerCTA{0};
+    uint32_t mNumThreadsPerCTA{0};
     char const* mHash{nullptr};
-#else
+
+    std::string mGenCfgJsonStr{""};
+    char const* mExecPath{nullptr};
     trtllm::gen::CudaRunner* mCudaRunner{nullptr};
-#endif
+    trtllm::gen::GenCfg* mGenCfg{nullptr};
+    int32_t mInstanceIdx{0};
 
     GemmGatedActOptions mOptions{};
-    gemm::SmVersion mSm{gemm::SmVersion::Sm100a};
+    tg::CudaArch mSm{tg::CudaArch::Sm100a};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

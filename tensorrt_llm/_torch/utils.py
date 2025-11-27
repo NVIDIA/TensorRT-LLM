@@ -2,7 +2,7 @@ import contextlib
 import os
 import threading
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
@@ -13,6 +13,7 @@ from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
+is_piecewise_running_flag = False
 
 aux_stream_name_list = [
     'Attention',
@@ -31,6 +32,20 @@ EventType = Enum(
 )
 
 
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    InvalidType = 0
+    Identity = 1
+    Gelu = 2
+    Relu = 3
+    Silu = 4
+    Swiglu = 5
+    Geglu = 6
+    SwigluBias = 7
+    Relu2 = 8
+
+
 def set_torch_compiling(enable: bool):
     global is_torch_compiling_flag
     is_torch_compiling_flag = enable
@@ -39,6 +54,16 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+def set_piecewise_running(enable: bool):
+    global is_piecewise_running_flag
+    is_piecewise_running_flag = enable
+
+
+def is_piecewise_running() -> bool:
+    global is_piecewise_running_flag
+    return is_piecewise_running_flag
 
 
 _global_attrs = threading.local()
@@ -288,9 +313,20 @@ def get_per_request_piecewise_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
 
 
-def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
-    lm_head_tp_size = int(os.getenv('LM_HEAD_TP_SIZE', 2))
-    assert mapping.tp_size % lm_head_tp_size == 0
+def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
+    # We use heuristic to determine the lm_head_tp_size
+    # Since token_count=256 will hit the boundary of math-bound problem
+    # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
+    lm_head_tp_size_raw = 256 // token_count
+    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw,
+                               [1, lm_head_tp_size_upper_bound])))
+    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
     return Mapping(
@@ -304,7 +340,33 @@ def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
     )
 
 
-# Development function to control chain drafter feature.
-# It's here so that unit tests can mock it and turn it off.
-def _get_allow_chain_drafter() -> bool:
-    return True
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using torch cuda api"""
+
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid
+
+
+def maybe_compile(func=None, **compile_kwargs):
+    """
+    Conditionally compile a function with torch.compile.
+    If is_piecewise_running() is True, the function will not be compiled to avoid host overhead in attention op.
+    Args:
+        func: The function to decorate (optional, for direct decoration).
+        **compile_kwargs: Keyword arguments for torch.compile.
+    Returns:
+        The conditionally compiled function..
+    """
+
+    def decorator(f):
+        compiled_func = torch.compile(f, **compile_kwargs)
+
+        def wrapper(*args, **kwargs):
+            if is_piecewise_running():
+                return f(*args, **kwargs)
+            return compiled_func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator(func) if func else decorator

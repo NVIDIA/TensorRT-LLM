@@ -1,4 +1,8 @@
-"""A patch to handle vision branch in Llama4ForConditionalGeneration."""
+"""A patch to handle vision branch in Llama4ForConditionalGeneration.
+
+NOTE: most patches are not used at the moment since only text submodule is exported. Keeping it here
+for future reference in case we decide to also export the image model.
+"""
 
 from typing import List, Optional, Tuple, Union
 
@@ -7,7 +11,7 @@ import torch.nn as nn
 from transformers import Llama4ForConditionalGeneration
 from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast, Llama4TextMoe
 
-from ...export.interface import BaseExportPatch, ExportPatchRegistry
+from ...export.interface import BaseExportPatch, DisabledBaseExportPatch, ExportPatchRegistry
 
 
 # Copy from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/modeling_llama4.py#L1651
@@ -168,8 +172,9 @@ def _forward_with_cond(
     )
 
 
+# NOTE: registered as patch that is disabled by default since it is not used at the moment
 @ExportPatchRegistry.register("hf_llama4_vision")
-class Llama4VisionPatch(BaseExportPatch):
+class Llama4VisionPatch(DisabledBaseExportPatch):
     """Patch for Llama4ForConditionalGeneration to make it compatible with torch.export.
 
     This patch replaces the forward method of Llama4ForConditionalGeneration with
@@ -214,7 +219,8 @@ def _moe_forward_with_transpose(self, hidden_states):
 
 
 # TODO: remove this patch once https://github.com/huggingface/transformers/pull/40609 is merged,
-# gets released, and TRT-LLM updates to the relevant transformers version
+# gets released, and TRT-LLM updates to the relevant transformers version --> this is part of
+# 4.56.1 onwards.
 @ExportPatchRegistry.register("hf_llama4_moe")
 class Llama4MoEPatch(BaseExportPatch):
     """Patch for Llama4 MoE routing to fix its current accuracy issue."""

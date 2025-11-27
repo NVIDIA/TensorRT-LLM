@@ -3,6 +3,7 @@ import copy
 import inspect
 import os
 import pathlib
+from collections.abc import Mapping
 from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from pprint import pprint
 from types import MethodType, NoneType
@@ -78,6 +79,11 @@ class ParamSnapshot:
     annotation: type
     default: Any = None
     status: Optional[str] = None
+
+    def __post_init__(self):
+        # Unify default value of None and inspect._empty
+        if self.default is inspect._empty:
+            self.default = None
 
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):

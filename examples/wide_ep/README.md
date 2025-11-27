@@ -31,6 +31,19 @@ For GB200 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup,
 
 For more information on NVIDIA IMEX service for NVLink networks, refer to https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html.
 
+#### Coherent Driver-Based Memory Management (CDMM)
+
+Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-65-06/index.html#hardware-software-support) for GB200 platforms is introduced. With CDMM, the driver manages GPU memory instead of the OS. CDMM avoids OS onlining of the GPU memory and the exposing of the GPU memory as a NUMA node to the OS. In Wide-EP, online EPLB need host threads be able to access the GPU memory to do the weights update.
+
+When CDMM mode is off, GPU memory are exposed as NUMA nodes, so no additional prerequisites is required.
+
+When CDMM mode is on, GPU memory doesn't exist in NUMA nodes, in that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed. 
+
+When GDRCopy is installed and the kernel module is loaded, you should be able to see the device file `/dev/gdrdrv` and kernel module `gdrdrv` by `lsmod`. The device file needs to be mapped into the container.
+
+* For docker, this can be done by adding a device mapping like `--device=/dev/gdrdrv:/dev/gdrdrv`.
+* For slurm with enroot, `--container-mounts="/dev/gdrdrv:/dev/gdrdrv"` needs to be added when starting containers and environment variable `export ENROOT_ALLOW_DEV=yes` needs to be set.
+
 ### Configurations
 
 An example yaml file to enable wide EP:
@@ -124,6 +137,14 @@ rm -f /dev/shm/moe_shared_l0_lr0_all
 ```
 
 **Warning:** Be careful when removing shared memory manually, as this may affect running processes that depend on these shared memory segments.
+
+### Hang issue caused by `UnpicklingError`
+
+It's possible to see hang issue that is caused by an `UnpicklingError`, we've noticed that and recorded it as a known issue. The issue seems to be existing in MPI, because we are not reproducing again after by-passing the MPI route by implementing customized InfiniBand communicator and replacing MPI API calls with that. We did not proceed because:
+1. The implementation only works on InfiniBand, hence not general enough.
+2. The implementation largely duplicated with InfiniBand communicator implementation in NCCL, which is hard to maintain.
+
+That being said, we are aware of the `UnpicklingError`, but instead of pushing further, we decided to keep observing for a while to see if it would be gone with further 3rd-party dependency upgrade. Please let us know if it's a blocker in your workload, and we will do necessary adjustment based on the feedback.
 
 ### Disaggregated serving related issues
 

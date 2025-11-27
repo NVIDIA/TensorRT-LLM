@@ -350,7 +350,7 @@ def main():
             hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
             model = hf_model.from_pretrained(
                 args.model_dir,
-                torch_dtype='auto',
+                dtype='auto',
                 device_map='auto' if not args.load_model_on_cpu else 'cpu',
                 trust_remote_code=True)
 

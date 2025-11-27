@@ -19,6 +19,9 @@
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
+#if ENABLE_FP4
+#include <cuda_fp4.h>
+#endif
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <algorithm>
@@ -295,7 +298,11 @@ struct CudaDataType<__nv_bfloat16>
 };
 #endif
 
-inline int getSMVersion()
+/// @brief Get the SM version of the current device.
+/// @param queryRealSmArch Whether to query the real SM architecture. example usage: use real sm arch when do LUT tuning
+/// and use fake sm arch when reuse sm120 code on sm121 devices.
+/// @return The SM version of the current device.
+inline int getSMVersion(bool queryRealSmArch = false)
 {
     int device{-1};
     check_cuda_error(cudaGetDevice(&device));
@@ -304,7 +311,7 @@ inline int getSMVersion()
     check_cuda_error(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda_error(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
     int sm = sm_major * 10 + sm_minor;
-    if (sm == 121)
+    if (sm == 121 && !queryRealSmArch)
     {
         return 120;
     }
@@ -540,6 +547,9 @@ template void printArrayInfo(__nv_bfloat16 const* ptr, uint64_t nElement, std::s
 #endif
 #ifdef ENABLE_FP8
 template void printArrayInfo(__nv_fp8_e4m3 const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+#endif
+#ifdef ENABLE_FP4
+template void printArrayInfo(__nv_fp4_e2m1 const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
 #endif
 template void printArrayInfo(uint32_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
 template void printArrayInfo(uint64_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);

@@ -302,7 +302,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         hf_gemma = transformers.AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             device_map="cpu" if load_model_on_cpu else "auto",
-            torch_dtype='auto',
+            dtype='auto',
         )
         weights = load_gemma_weights_from_hf_model(hf_gemma, trt_llm_config)
         del hf_gemma
