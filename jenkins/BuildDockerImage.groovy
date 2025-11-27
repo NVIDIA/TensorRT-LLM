@@ -52,11 +52,14 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def GITHUB_SOURCE_REPO_AND_BRANCH = "github_source_repo_and_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
+    (GITHUB_SOURCE_REPO_AND_BRANCH): null,
 ]
 
 @Field
@@ -532,7 +535,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 }
 
 
-def updateCIImageTag() {
+def updateCIImageTag(globalVars) {
     echo "Update CI Image Tag"
     // Update jenkins/current_image_tags.properties with newly built image tags and create a commit to the current PR
 
@@ -553,79 +556,47 @@ def updateCIImageTag() {
     def filePath = "jenkins/current_image_tags.properties"
 
     withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_PASSWORD')]) {
-        // The user fork's repo URL, expected to be available in env.gitlabSourceRepoHttpUrl or can be customized as needed
-        def forkRepoUrl = env.gitlabSourceRepoHttpUrl ?: LLM_REPO
-        def currentBranch = env.gitlabBranch ?: params.branch
+        // 1. Validate and parse source repo and branch
+        def srcRepoAndBranch = globalVars[GITHUB_SOURCE_REPO_AND_BRANCH]
+        if (!srcRepoAndBranch || !srcRepoAndBranch.contains(":")) {
+            error "No GitHub source repo and branch found in globalVars, skipping update of ${filePath}"
+        }
+        def (repoPart, branchPart) = srcRepoAndBranch.tokenize(":")
+        def githubRepoUrl = "https://github.com/${repoPart}.git"
+        def githubBranch = branchPart
+        echo "Using GitHub repo: ${githubRepoUrl}, branch: ${githubBranch}"
 
-        // Remove any possible existing remote named 'fork' to avoid duplication
+        // 2. Setup Git remote and checkout branch
         sh """
         git remote remove fork || true
+        git remote add fork ${githubRepoUrl}
+        git fetch fork ${githubBranch}
+        git checkout -B ${githubBranch} fork/${githubBranch}
         """
 
-        // Add fork remote and pull the latest branch
+        echo "Using default tensorrt-cicd for git config"
         sh """
-        git remote add fork ${forkRepoUrl}
-        git fetch fork ${currentBranch}
-        git checkout -B ${currentBranch} fork/${currentBranch}
+        git config user.name "tensorrt-cicd"
+        git config user.email "90828364+tensorrt-cicd@users.noreply.github.com"
         """
 
-        // Get the 'Signed-off-by' field from the latest commit message
-        def lastSignedBy = sh(script: "git log -1 --pretty=format:'%B' | grep -i '^Signed-off-by:' | tail -1 | sed 's/^Signed-off-by:[ ]*//'", returnStdout: true).trim()
-
-        if (lastSignedBy) {
-            // Try to extract the user name and email from the Signed-off-by line
-            def matcher = lastSignedBy =~ /(.*)<(.+)>/
-            if (matcher.matches()) {
-                def signedName = matcher[0][1].trim()
-                def signedEmail = matcher[0][2].trim()
-                // Set git config user.name and user.email to match Signed-off-by for signed commit consistency
-                if (signedName && signedEmail) {
-                    echo "Setting git config user.name to '${signedName}' and user.email to '${signedEmail}' for consistency with Signed-off-by"
-                    sh """
-                    git config user.name "${signedName}"
-                    git config user.email "${signedEmail}"
-                    """
-                } else {
-                    echo "Failed to extract user.name and user.email from Signed-off-by, using default ci-bot"
-                }
-            } else {
-                echo "Signed-off-by format parse failed: ${lastSignedBy}, using default ci-bot"
-            }
-        } else {
-            echo "No Signed-off-by found in the latest commit message, using default ci-bot"
-        }
-
-        // Now update the file (after checkout)
+        // 4. Update the file (AFTER checkout to avoid being overwritten)
         echo "Updating ${filePath} with new image tags"
-
-        // Read the current file lines
         def lines = readFile(filePath).split("\n") as List
-
-        // Replace lines for our four keys
         def updatedLines = lines.collect { line ->
-            def resultLine = line
-            imageTagKeys.each { key ->
-                if (line.startsWith(key + "=")) {
-                    resultLine = "${key}=${newImageTags[key]}"
-                }
-            }
-            resultLine
+            def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
+            matchedKey ? "${matchedKey}=${newImageTags[matchedKey]}" : line
         }
-
-        // Write back the updated file
         writeFile file: filePath, text: updatedLines.join("\n") + "\n"
 
+        // 5. Commit and push changes
         sh """
         git add ${filePath}
         git commit -s -m "[auto] Update CI image tags with newly built images" || echo "No changes to commit"
+        git push fork HEAD:${githubBranch}
         """
 
-        // Push the changes to the user fork's branch
-        sh """
-        git push fork HEAD:${currentBranch}
-        """
-
-        echo "Committed and pushed updated ${filePath} to user fork branch: ${currentBranch}"
+        echo "Successfully committed and pushed updated ${filePath} to branch: ${githubBranch}"
     }
 }
 
@@ -703,7 +674,7 @@ pipeline {
             }
             steps {
                 script {
-                    updateCIImageTag()
+                    updateCIImageTag(globalVars)
                 }
             }
         }
