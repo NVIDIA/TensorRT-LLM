@@ -33,8 +33,21 @@ def num_postprocess_workers(request):
 def server(model_name: str, backend: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    if backend == "trt":
-        args.extend(["--max_beam_width", "4"])
+    args.extend(["--kv_cache_free_gpu_memory_fraction",
+                 "0.2"])  # for co-existence with other servers
+    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
+    with RemoteOpenAIServer(model_path, args) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
+def server_with_beam_search(model_name: str, backend: str,
+                            num_postprocess_workers: int):
+    model_path = get_model_path(model_name)
+    args = ["--backend", f"{backend}"]
+    args.extend(["--kv_cache_free_gpu_memory_fraction",
+                 "0.2"])  # for co-existence with other servers
+    args.extend(["--max_beam_width", "2"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
@@ -48,6 +61,11 @@ def client(server: RemoteOpenAIServer):
 @pytest.fixture(scope="module")
 def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
+
+
+@pytest.fixture(scope="module")
+def async_client_with_beam_search(server_with_beam_search: RemoteOpenAIServer):
+    return server_with_beam_search.get_async_client()
 
 
 def test_single_completion(client: openai.OpenAI, model_name):
@@ -146,12 +164,10 @@ async def test_batch_completions(async_client: openai.AsyncOpenAI, model_name,
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("prompts",
                          [["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2])
-async def test_batch_completions_beam_search(async_client: openai.AsyncOpenAI,
-                                             model_name, prompts, backend):
+async def test_batch_completions_beam_search(
+        async_client_with_beam_search: openai.AsyncOpenAI, model_name, prompts):
     # test beam search
-    if backend == 'pytorch':
-        pytest.skip("Beam search is not supported in PyTorch backend yet")
-    batch = await async_client.completions.create(
+    batch = await async_client_with_beam_search.completions.create(
         model=model_name,
         prompt=prompts,
         n=2,
@@ -187,6 +203,28 @@ async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
         choice = chunk.choices[0]
         texts[choice.index] += choice.text
     assert texts[0] == texts[1]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("prompts", [["Hello, my name is", "What is the AI?"]])
+async def test_batch_completions_with_option_n_streaming(
+        async_client: openai.AsyncOpenAI, model_name, prompts):
+    # test beam search with streaming
+    batch = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts,
+        n=3,  # number of completions to generate for each prompt.
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+    )
+    texts = [""] * 6  # 2 prompts × 3 generations per prompt = 6 choices
+    async for chunk in batch:
+        assert len(chunk.choices) == 1
+        choice = chunk.choices[0]
+        texts[choice.index] += choice.text
+
+    assert [""] not in texts  # Assert all the generations are not empty
 
 
 @pytest.mark.asyncio(loop_scope="module")
