@@ -39,6 +39,7 @@ from ...utils.node_utils import (
     subgraph,
 )
 from ...utils.sharding_utils import (
+    BmmEPShardingInfo,
     BMMShardingInfo,
     EPShardingInfo,
     LayerType,
@@ -136,6 +137,9 @@ class ShardingTransformExecutor(BaseTransform):
                 num_matches += 1
         for ep_transform in transforms.ep_transforms:
             if check_and_apply(ep_transform):
+                num_matches += 1
+        for stacked_ep_transform in transforms.stacked_ep_transforms:
+            if check_and_apply(stacked_ep_transform):
                 num_matches += 1
 
         # post-sharding cleanup transformations
@@ -1058,20 +1062,31 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingTransformContainer
             node,
             (
                 torch.ops.auto_deploy.torch_moe,
+                torch.ops.auto_deploy.torch_moe_bmm,
                 torch.ops.auto_deploy.torch_quant_fp8_moe,
                 torch.ops.auto_deploy.torch_quant_nvfp4_moe,
                 torch.ops.auto_deploy.triton_mxfp4_moe,
             ),
         ):
             continue
-        if sharding_config.add(
-            EPShardingInfo.from_node(
-                node,
-                rank=rank,
-                world_size=world_size,
-            )
-        ):
-            num_moe_patterns += 1
+        if is_op(node, torch.ops.auto_deploy.torch_moe_bmm):
+            if sharding_config.add(
+                BmmEPShardingInfo.from_node(
+                    node,
+                    rank=rank,
+                    world_size=world_size,
+                )
+            ):
+                num_moe_patterns += 1
+        else:
+            if sharding_config.add(
+                EPShardingInfo.from_node(
+                    node,
+                    rank=rank,
+                    world_size=world_size,
+                )
+            ):
+                num_moe_patterns += 1
 
     ad_logger.info(f"Found {num_moe_patterns} MoE patterns")
 

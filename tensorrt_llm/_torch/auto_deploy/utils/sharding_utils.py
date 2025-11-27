@@ -6,10 +6,18 @@ import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
-
-if TYPE_CHECKING:
-    from ..transform.library.sharding import ShardingTransformConfig
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -31,6 +39,9 @@ from .quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
+
+if TYPE_CHECKING:
+    from ..transform.library.sharding import ShardingTransformConfig
 
 
 def validate_allreduce_strategy(v):
@@ -1082,14 +1093,268 @@ def _insert_sharded_moe(
         dist_node.replace_input_with(dist_node, node)
 
 
-def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
-    """Return tensor_node[lo:hi, ...] via aten.slice along dim 0."""
-    with gm.graph.inserting_after(tensor_node):
-        # aten.slice.Tensor(self, dim, start, end, step)
-        return gm.graph.call_function(
-            torch.ops.aten.slice.Tensor,
-            args=(tensor_node, 0, lo, hi, 1),
+def _slice_expert_dim(
+    gm: GraphModule, tensor_node_or_tensor: Union[Node, torch.Tensor], lo: int, hi: int
+) -> Union[Node, torch.Tensor]:
+    """Slice expert weights along dim 0 and register load hook.
+    Args:
+        gm: The graph module
+        tensor_node_or_tensor: Either a Node (from FX graph) or a Tensor
+        lo: Start index for slicing
+        hi: End index for slicing
+
+    Returns:
+        Node or Tensor depending on input type
+    """
+    # Handle raw tensor case
+    if isinstance(tensor_node_or_tensor, torch.Tensor):
+        return tensor_node_or_tensor[lo:hi]
+
+    # Handle Node case
+    tensor_node = tensor_node_or_tensor
+
+    if tensor_node.op != "get_attr":
+        # If not a parameter node, just add a runtime slice node
+        with gm.graph.inserting_after(tensor_node):
+            return gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(tensor_node, 0, lo, hi, 1),
+            )
+
+    # Get the parameter
+    param_key = str(tensor_node.target)
+    modname, _, param_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname) if modname else gm
+    full_param = getattr(submod, param_name)
+
+    # Slice the parameter
+    sliced_param = full_param[lo:hi].detach().clone()
+    sliced_shape = sliced_param.shape
+
+    # Define slice function for load hook
+    def slice_expert_tensor(t: torch.Tensor) -> torch.Tensor:
+        return t[lo:hi]
+
+    # Register load hook to slice during checkpoint loading
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=slice_expert_tensor,
+            param_key=param_key,
+            param_shape=sliced_shape,
         )
+    )
+
+    # Replace the parameter with the sliced version
+    new_param = nn.Parameter(sliced_param, requires_grad=full_param.requires_grad)
+    setattr(submod, param_name, new_param)
+
+    # Return the same node (it now points to the sliced parameter)
+    return tensor_node
+
+
+def _slice_and_transpose_expert_dim(
+    gm: GraphModule,
+    tensor_node_or_tensor: Union[Node, torch.Tensor],
+    lo: int,
+    hi: int,
+    transpose_dim1: int,
+    transpose_dim2: int,
+    swap_gate_up: bool = False,
+) -> Union[Node, torch.Tensor]:
+    """Slice expert weights along dim 0 and transpose, with load hook registration.
+
+    This is specifically for converting Llama4 MoE weight format to TRT-LLM format.
+    Llama4 stores weights as (E, H, 2*I) and (E, I, H), but TRT-LLM expects (E, 2*I, H) and (E, H, I).
+    For gate_up weights, Llama4 has [W1, W3] but TRT-LLM expects [W3, W1], so we swap them.
+
+    Args:
+        gm: The graph module
+        tensor_node_or_tensor: Either a Node (from FX graph) or a Tensor
+        lo: Start index for slicing along expert dimension
+        hi: End index for slicing along expert dimension
+        transpose_dim1: First dimension to transpose
+        transpose_dim2: Second dimension to transpose
+        swap_gate_up: If True, swap W1 and W3 in the fused gate_up dimension
+
+    Returns:
+        Node or Tensor depending on input type, sliced and transposed
+    """
+    # Handle raw tensor case
+    if isinstance(tensor_node_or_tensor, torch.Tensor):
+        sliced = tensor_node_or_tensor[lo:hi]
+        if swap_gate_up:
+            # For gate_up: (E_shard, H, 2*I) -> swap last dim -> transpose
+            intermediate_size = sliced.shape[2] // 2
+            w1 = sliced[:, :, :intermediate_size]
+            w3 = sliced[:, :, intermediate_size:]
+            sliced = torch.cat([w3, w1], dim=2)
+        return sliced.transpose(transpose_dim1, transpose_dim2).contiguous()
+
+    # Handle Node case
+    tensor_node = tensor_node_or_tensor
+
+    if tensor_node.op != "get_attr":
+        # If not a parameter node, add runtime operations
+        with gm.graph.inserting_after(tensor_node):
+            sliced_node = gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(tensor_node, 0, lo, hi, 1),
+            )
+            if swap_gate_up:
+                # Would need complex graph operations, skip for now
+                ad_logger.warning(f"Cannot swap gate_up for non-parameter node {tensor_node}")
+            return gm.graph.call_function(
+                torch.ops.aten.transpose.int,
+                args=(sliced_node, transpose_dim1, transpose_dim2),
+            )
+
+    # Get the parameter
+    param_key = str(tensor_node.target)
+    modname, _, param_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname) if modname else gm
+    full_param = getattr(submod, param_name)
+
+    # Slice the parameter
+    sliced_param = full_param[lo:hi].detach().clone()
+
+    # Swap W1 and W3 if needed (for gate_up weights)
+    if swap_gate_up:
+        # Llama4: (E, H, 2*I) with [W1, W3], TRT-LLM wants [W3, W1]
+        intermediate_size = sliced_param.shape[2] // 2
+        w1 = sliced_param[:, :, :intermediate_size]
+        w3 = sliced_param[:, :, intermediate_size:]
+        sliced_param = torch.cat([w3, w1], dim=2)
+
+    # Transpose the parameter
+    transposed_param = sliced_param.transpose(transpose_dim1, transpose_dim2).contiguous()
+    transposed_shape = transposed_param.shape
+
+    # Define slice+swap+transpose function for load hook
+    def slice_swap_and_transpose(t: torch.Tensor) -> torch.Tensor:
+        t_sliced = t[lo:hi]
+        if swap_gate_up:
+            intermediate_size = t_sliced.shape[2] // 2
+            w1 = t_sliced[:, :, :intermediate_size]
+            w3 = t_sliced[:, :, intermediate_size:]
+            t_sliced = torch.cat([w3, w1], dim=2)
+        return t_sliced.transpose(transpose_dim1, transpose_dim2).contiguous()
+
+    # Register load hook to slice+swap+transpose during checkpoint loading
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=slice_swap_and_transpose,
+            param_key=param_key,
+            param_shape=transposed_shape,
+        )
+    )
+
+    # Replace the parameter with the sliced+transposed version
+    new_param = nn.Parameter(transposed_param, requires_grad=full_param.requires_grad)
+    setattr(submod, param_name, new_param)
+
+    # Return the same node (it now points to the transformed parameter)
+    return tensor_node
+
+
+def _get_dim0_from_arg(gm: GraphModule, arg: Union[Node, torch.Tensor]) -> int:
+    """Helper to get the first dimension size of an argument (Node or Tensor)."""
+    if isinstance(arg, torch.Tensor):
+        return arg.shape[0]
+    if isinstance(arg, Node):
+        if arg.op == "get_attr":
+            # Traverse attributes to find the tensor
+            obj = gm
+            for atom in arg.target.split("."):
+                obj = getattr(obj, atom)
+            return obj.shape[0]
+        if "val" in arg.meta:
+            return arg.meta["val"].shape[0]
+    raise ValueError(f"Cannot determine shape[0] for {arg}")
+
+
+def _insert_sharded_moe_bmm(
+    gm: GraphModule,
+    node: Node,
+    rank: int,
+    world_size: int,
+    allreduce_strategy: AllReduceStrategy,
+    scale_names: Sequence[str] = (),
+):
+    """Update the torch_moe_bmm node with sliced weight tensors,
+    sharded `selected_experts` and `final_scales(router_logics)`.
+    Add an all_reduce node after the moe node.
+    Similar to _insert_sharded_moe but for BMM-based (stacked) tensors instead of lists.
+
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
+    """
+    if allreduce_strategy is None:
+        raise ValueError(f"allreduce_strategy must be set for MoE BMM sharding on node {node.name}")
+    scale_names = list(scale_names)
+
+    # Get num_experts from the first weight tensor (w3_w1_stacked)
+    w3_w1_tensor_arg = node.args[3]
+    num_experts = _get_dim0_from_arg(gm, w3_w1_tensor_arg)
+
+    args = list(node.args)
+
+    # -- Handle selected_experts and final_scales sharding --
+    selected_experts = args[1]
+    final_scales = args[2]
+
+    experts_per_rank = num_experts // world_size
+
+    with gm.graph.inserting_before(node):
+        lower = experts_per_rank * rank
+        # selected_experts_local = selected_experts - low
+        selected_experts_local = gm.graph.create_node(
+            "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
+        )
+
+        # For num_experts % world_size != 0 case,
+        # assign the last (num_experts % world_size) experts to the last rank
+        div_node = gm.graph.create_node(
+            "call_function", operator.floordiv, args=(selected_experts, experts_per_rank), kwargs={}
+        )
+
+        comp_op = torch.ge if rank == world_size - 1 else torch.eq
+        rank_mask = gm.graph.create_node("call_function", comp_op, args=(div_node, rank), kwargs={})
+
+        # final_scales_local = final_scales * rank_mask
+        final_scales_local = gm.graph.create_node(
+            "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
+        )
+
+    # -- Slice expert weights along dim 0 (expert dimension) --
+    local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
+
+    # -- Update args --
+    args[1] = selected_experts_local
+    args[2] = final_scales_local
+    # Slice, swap [W1,W3]->[W3,W1], and transpose for TRT-LLM format: Llama4 (E, H, 2*I) -> TRT-LLM (E, 2*I, H)
+    args[3] = _slice_and_transpose_expert_dim(
+        gm, args[3], local_lo, local_hi, 1, 2, swap_gate_up=True
+    )  # w3_w1_stacked
+    # Slice and transpose for TRT-LLM format: Llama4 (E, I, H) -> TRT-LLM (E, H, I)
+    args[4] = _slice_and_transpose_expert_dim(
+        gm, args[4], local_lo, local_hi, 1, 2, swap_gate_up=False
+    )  # w2_stacked
+
+    ad_logger.debug(
+        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
+    )
+
+    node.args = tuple(args)
+
+    # -- add an all_reduce node --
+    with gm.graph.inserting_after(node):
+        dist_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+            args=(node, allreduce_strategy.name),
+        )
+        node.replace_all_uses_with(dist_node)
+        dist_node.replace_input_with(dist_node, node)
 
 
 def _split_range_last_remainder(n: int, world_size: int, rank: int):
@@ -1240,10 +1505,24 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         )
 
 
+class BmmEPShardingInfo(EPShardingInfo):
+    """EP sharding behavior for torch_moe_bmm (BMM-based MoE with stacked weights)."""
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_moe_bmm):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe_bmm(gm, node, self.rank, self.world_size, self.allreduce_strategy)
+
+
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe_bmm), BmmEPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
 
@@ -1301,6 +1580,7 @@ class ShardingTransformContainer(BaseModel):
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+    stacked_ep_transforms: List[BmmEPShardingInfo] = Field(default_factory=list)
 
     @field_validator("allreduce_strategy", mode="before")
     @classmethod
@@ -1315,6 +1595,7 @@ class ShardingTransformContainer(BaseModel):
             BMMShardingInfo: self.bmm_transforms,
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
+            BmmEPShardingInfo: self.stacked_ep_transforms,
         }
 
     def init_params(
