@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -35,4 +36,5 @@ std::deque<KVCacheEvent> KVCacheEventManager::getLatestEvents(std::optional<std:
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

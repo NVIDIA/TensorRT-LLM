@@ -27,6 +27,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -238,4 +239,5 @@ template void invokeScatterDecodingParams(
     int32_t const* src, int32_t scalar, int32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

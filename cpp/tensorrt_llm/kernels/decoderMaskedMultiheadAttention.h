@@ -28,6 +28,7 @@
 #include <stdlib.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -294,4 +295,5 @@ inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shm
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

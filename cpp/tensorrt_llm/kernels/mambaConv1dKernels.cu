@@ -99,6 +99,7 @@ __device__ static inline void cp_wait_group()
 }
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1318,4 +1319,5 @@ template void invokeMambaConv1dGeneration<__nv_bfloat16>(MambaConv1dParamsBase& 
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

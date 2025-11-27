@@ -23,6 +23,7 @@
 #include <NvInfer.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 struct LayerProfile
@@ -47,4 +48,5 @@ private:
     int32_t mUpdatesCount{0};
 };
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

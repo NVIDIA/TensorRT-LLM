@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -376,4 +377,5 @@ void LlmRequest::removeLoraTensors()
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

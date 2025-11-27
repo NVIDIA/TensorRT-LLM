@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/runtime/loraCache.h"
 #include "bufferManager.h"
 #include "cudaEvent.h"
 #include "cudaStream.h"
@@ -23,7 +24,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include <memory>
 #include <mutex>
@@ -34,6 +34,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -956,4 +957,5 @@ bool LoraCache::isDone(TaskIdType taskId) const
     return false;
 }
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

@@ -24,6 +24,7 @@ namespace batchedGemm
 {
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 // clang-format off
@@ -44946,5 +44947,6 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 };
 // clang-format on
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 } // namespace batchedGemm

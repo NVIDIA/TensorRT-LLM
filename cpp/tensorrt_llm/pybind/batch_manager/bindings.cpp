@@ -49,6 +49,7 @@ namespace tr = tensorrt_llm::runtime;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::batch_manager
 {
 
@@ -500,4 +501,5 @@ void initBindings(pybind11::module_& m)
 }
 
 } // namespace pybind::batch_manager
+
 TRTLLM_NAMESPACE_END

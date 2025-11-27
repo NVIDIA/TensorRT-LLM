@@ -32,6 +32,7 @@
 #include <random>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 
@@ -1157,4 +1158,5 @@ TYPED_TEST(EagleDecodingLayerTest, IODifferentPathsBs2)
 }
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

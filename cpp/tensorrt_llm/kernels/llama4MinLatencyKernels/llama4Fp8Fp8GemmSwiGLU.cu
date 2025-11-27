@@ -22,6 +22,7 @@
 #include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
 {
 
@@ -239,4 +240,5 @@ void llama4_fp8_fp8_gemm_swiglu_op(int num_tokens, int hidden_in, int hidden_out
 }
 
 } // namespace kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
+
 TRTLLM_NAMESPACE_END

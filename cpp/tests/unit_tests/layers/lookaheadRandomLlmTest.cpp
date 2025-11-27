@@ -23,6 +23,7 @@
 #include "tests/unit_tests/layers/randomLlm.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 namespace tk = tensorrt_llm::kernels;
@@ -241,4 +242,5 @@ TEST(LookaheadRandomllm, gpuSampling)
 }
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

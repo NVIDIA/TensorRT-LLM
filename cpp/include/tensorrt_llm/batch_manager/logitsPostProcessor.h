@@ -54,4 +54,5 @@ public:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

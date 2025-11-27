@@ -32,6 +32,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -802,4 +803,5 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
 }
 
 } // namespace runtime::kernels
+
 TRTLLM_NAMESPACE_END

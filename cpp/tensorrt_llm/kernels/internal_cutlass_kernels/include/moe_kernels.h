@@ -35,6 +35,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -958,5 +959,5 @@ private:
 void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 } // namespace kernels
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

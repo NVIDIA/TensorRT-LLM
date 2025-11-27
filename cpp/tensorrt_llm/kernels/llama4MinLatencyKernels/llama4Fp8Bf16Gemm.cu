@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
 
@@ -189,4 +190,5 @@ void llama4_fp8_bf16_gemm_op(void const* A, void const* B, void* C, void const* 
 }
 
 } // namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+
 TRTLLM_NAMESPACE_END

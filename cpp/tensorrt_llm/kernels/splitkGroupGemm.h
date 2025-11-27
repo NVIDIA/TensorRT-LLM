@@ -16,11 +16,12 @@
 #pragma once
 
 #include "cutlass/gemm_coord.h"
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -32,4 +33,5 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problem_size
     bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

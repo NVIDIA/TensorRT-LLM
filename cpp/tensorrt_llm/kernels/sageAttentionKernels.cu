@@ -26,6 +26,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -610,4 +611,5 @@ void unpadding(
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

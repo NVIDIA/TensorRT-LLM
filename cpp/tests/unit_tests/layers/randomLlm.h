@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
@@ -151,4 +152,5 @@ private:
 };
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

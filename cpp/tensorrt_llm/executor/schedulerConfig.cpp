@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -52,4 +53,5 @@ bool SchedulerConfig::operator==(SchedulerConfig const& other) const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

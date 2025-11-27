@@ -22,6 +22,7 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::executor
 {
 
@@ -29,4 +30,5 @@ namespace pybind::executor
 void initConfigBindings(pybind11::module_& m);
 
 } // namespace pybind::executor
+
 TRTLLM_NAMESPACE_END

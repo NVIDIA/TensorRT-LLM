@@ -32,6 +32,7 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -266,4 +267,5 @@ template class DecodingLayer<float>;
 template class DecodingLayer<half>;
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

@@ -42,6 +42,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -700,5 +701,5 @@ public:
 std::ostream& operator<<(std::ostream& output, IBuffer const& buffer);
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

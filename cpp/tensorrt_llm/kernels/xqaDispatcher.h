@@ -27,6 +27,7 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::common::op::UniqPtrWNullCopy;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -117,4 +118,5 @@ constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

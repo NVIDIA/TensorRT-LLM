@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -42,4 +43,5 @@ void from_json(nlohmann::json const& json, RuntimeDefaults& runtimeDefaults)
 // End RuntimeDefaults
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

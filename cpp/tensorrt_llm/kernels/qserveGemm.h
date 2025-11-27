@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace qserve
@@ -71,4 +72,5 @@ public:
 
 } // namespace qserve
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

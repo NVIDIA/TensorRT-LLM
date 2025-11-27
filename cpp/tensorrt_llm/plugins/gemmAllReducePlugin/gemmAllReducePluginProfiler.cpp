@@ -22,6 +22,7 @@
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 void GemmAllReducePluginProfiler::serializeToOwnFile(GemmIdCore gemmId)
@@ -140,4 +141,5 @@ std::vector<cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig> GemmAllRe
     return mRunner->getSupportedLaunchConfigs();
 }
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

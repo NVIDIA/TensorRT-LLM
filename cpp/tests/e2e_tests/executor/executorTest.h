@@ -28,6 +28,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing
 {
 

@@ -25,6 +25,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 // self: [B, M, K], fp16/bf16/fp8_quantized
@@ -99,6 +100,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(
     return {valueE2M1, scaleFP8SF};
 }
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

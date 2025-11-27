@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -35,4 +36,5 @@ void invokeTopkLastDim(runtime::SizeType32 batchSize, runtime::SizeType32 inputL
     void* workspace, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

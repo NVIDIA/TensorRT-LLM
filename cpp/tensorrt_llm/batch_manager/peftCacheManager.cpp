@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -43,6 +43,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -647,4 +648,5 @@ SizeType32 NoOpPeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> l
     return 0;
 }
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

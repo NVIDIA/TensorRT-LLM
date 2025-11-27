@@ -34,6 +34,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -492,4 +493,5 @@ void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_
         const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

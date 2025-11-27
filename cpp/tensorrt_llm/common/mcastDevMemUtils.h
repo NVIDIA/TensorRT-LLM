@@ -15,10 +15,10 @@
  */
 #pragma once
 
-
 #include "tensorrt_llm/common/config.h"
 // Avoid circular dependency
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class McastDeviceMemory;
@@ -35,4 +35,5 @@ void unregisterMcastDevMemBuffer(McastDeviceMemory* buf);
 McastDeviceMemory* findMcastDevMemBuffer(void* ptr);
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

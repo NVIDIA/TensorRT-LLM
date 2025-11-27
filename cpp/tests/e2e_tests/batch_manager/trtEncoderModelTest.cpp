@@ -53,6 +53,7 @@ auto const ENC_DEC_DATA_BASE = TEST_RESOURCE_PATH / "data/enc_dec";
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 

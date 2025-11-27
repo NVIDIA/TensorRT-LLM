@@ -41,7 +41,7 @@ TRTLLM_NAMESPACE_END
     do                                                                                                                 \
     {                                                                                                                  \
         TLLM_LIKELY(static_cast<bool>(val))                                                                            \
-        ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                \
+        ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                              \
     } while (0)
 
 #define TLLM_CHECK_WITH_INFO(val, info, ...)                                                                           \
@@ -49,28 +49,28 @@ TRTLLM_NAMESPACE_END
     {                                                                                                                  \
         TLLM_LIKELY(static_cast<bool>(val))                                                                            \
         ? ((void) 0)                                                                                                   \
-        : tensorrt_llm::common::throwRuntimeError(                                                       \
-            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());              \
+        : tensorrt_llm::common::throwRuntimeError(                                                                     \
+            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                            \
     } while (0)
 
 #define TLLM_CHECK_DEBUG(val)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                             \
+        if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                                           \
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
-            ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);            \
+            ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                          \
         }                                                                                                              \
     } while (0)
 
 #define TLLM_CHECK_DEBUG_WITH_INFO(val, info, ...)                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                             \
+        if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                                           \
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
             ? ((void) 0)                                                                                               \
-            : tensorrt_llm::common::throwRuntimeError(                                                   \
-                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());          \
+            : tensorrt_llm::common::throwRuntimeError(                                                                 \
+                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                        \
         }                                                                                                              \
     } while (0)

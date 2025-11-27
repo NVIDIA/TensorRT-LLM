@@ -25,6 +25,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common::safetensors
 {
 class INdArray
@@ -61,4 +62,5 @@ public:
 };
 
 } // namespace common::safetensors
+
 TRTLLM_NAMESPACE_END

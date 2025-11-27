@@ -21,11 +21,12 @@
 #include <stdexcept>
 #include <string>
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -174,6 +175,7 @@ void Logger::log(Logger::Level const level, int const rank, char const* format, 
     }
 }
 } // namespace common
+
 TRTLLM_NAMESPACE_END
 
 #define TLLM_LOG(level, ...)                                                                                           \
@@ -192,4 +194,3 @@ TRTLLM_NAMESPACE_END
 #define TLLM_LOG_WARNING(...) TLLM_LOG(tensorrt_llm::common::Logger::WARNING, __VA_ARGS__)
 #define TLLM_LOG_ERROR(...) TLLM_LOG(tensorrt_llm::common::Logger::ERROR, __VA_ARGS__)
 #define TLLM_LOG_EXCEPTION(ex, ...) tensorrt_llm::common::Logger::getLogger()->log(ex, ##__VA_ARGS__)
-

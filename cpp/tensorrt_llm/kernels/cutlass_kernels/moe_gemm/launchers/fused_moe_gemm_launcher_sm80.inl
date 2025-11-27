@@ -25,10 +25,11 @@
 
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/fused_moe_kernel.cuh"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels_oss
 {
 template <typename ElementType_, typename CutlassWeightType_, int MaxTileM_, int TileN_, int TileK_, int Stages_,
@@ -96,4 +97,5 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "Fail to execute fused moe kernel, cuda error %d\n", (int) (result));
 }
 } // namespace kernels::cutlass_kernels_oss
+
 TRTLLM_NAMESPACE_END

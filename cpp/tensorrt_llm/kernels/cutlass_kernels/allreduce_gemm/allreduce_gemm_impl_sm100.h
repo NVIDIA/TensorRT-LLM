@@ -36,6 +36,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::opened_cutlass_kernels
 {
 //////////////////////////////////////////////
@@ -377,4 +378,5 @@ private:
 };
 
 } // namespace kernels::opened_cutlass_kernels
+
 TRTLLM_NAMESPACE_END

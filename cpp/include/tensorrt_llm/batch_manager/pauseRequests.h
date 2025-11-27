@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -74,4 +75,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

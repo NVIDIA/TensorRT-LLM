@@ -30,6 +30,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -560,4 +561,5 @@ void EncoderBuffers::insertInputTensors(TensorMap& inputMap)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

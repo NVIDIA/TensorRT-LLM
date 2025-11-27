@@ -34,6 +34,7 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -311,4 +312,5 @@ template class TopPSamplingLayer<float>;
 template class TopPSamplingLayer<half>;
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

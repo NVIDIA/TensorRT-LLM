@@ -115,6 +115,7 @@ bool pluginsInitialized = false;
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins::api
 {
 
@@ -148,6 +149,7 @@ nvinfer1::ILogger* LoggerManager::defaultLogger() noexcept
     return gLogger;
 }
 } // namespace plugins::api
+
 TRTLLM_NAMESPACE_END
 // New Plugin APIs
 

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm.h"
@@ -22,7 +23,6 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
-#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/gemmAllReducePlugin/gemmAllReducePlugin.h"
 
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
@@ -42,6 +42,7 @@ using GemmAllReduceImplInterface = tensorrt_llm::kernels::cutlass_kernels::GemmA
 #include <cstddef>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -405,4 +406,5 @@ template class GemmPluginProfiler<GemmAllReduceImplInterface::LaunchConfig, std:
     GemmIdCore, GemmIdCoreHash>;
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

@@ -28,6 +28,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -358,4 +359,5 @@ __global__ void updatePaddingCountKernel(int* paddingPerSeq, int const* seqLengt
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

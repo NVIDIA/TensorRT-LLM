@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing
 {
 
@@ -16,6 +17,7 @@ std::unordered_map<batch_manager::RequestIdType, std::vector<executor::Response>
     std::chrono::duration<float, std::milli> timeout);
 
 } // namespace testing
+
 TRTLLM_NAMESPACE_END
 
 #endif /* A073F2DA_315E_434B_B811_D420F0A59DF3 */

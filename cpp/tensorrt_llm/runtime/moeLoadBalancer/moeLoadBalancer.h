@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -27,12 +28,12 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceCommon.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -351,4 +352,5 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
     MoePlacementCpuInfo* cpuPlacement);
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

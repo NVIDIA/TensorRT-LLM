@@ -48,6 +48,7 @@ using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInter
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -310,6 +311,7 @@ private:
     FP4GemmType mfp4GemmType;
 };
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

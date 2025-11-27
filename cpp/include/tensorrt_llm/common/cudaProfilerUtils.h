@@ -24,6 +24,7 @@
 #include <unordered_set>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -34,4 +35,5 @@ std::pair<std::unordered_set<int32_t>, std::unordered_set<int32_t>> populateIter
     std::string const& envVarName, std::optional<std::string> const& legacyEnvVarName = std::nullopt);
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

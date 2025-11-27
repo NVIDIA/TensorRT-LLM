@@ -26,6 +26,7 @@
 namespace tle = tensorrt_llm::executor;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::executor
 {
 
@@ -129,4 +130,5 @@ private:
 };
 
 } // namespace pybind::executor
+
 TRTLLM_NAMESPACE_END

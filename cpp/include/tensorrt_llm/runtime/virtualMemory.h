@@ -32,6 +32,7 @@
 class VirtualMemoryManagerTest;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -540,5 +541,5 @@ void setVirtualMemoryAllocator(
 void clearVirtualMemoryAllocator();
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

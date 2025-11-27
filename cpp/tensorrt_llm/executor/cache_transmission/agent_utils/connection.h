@@ -28,6 +28,7 @@
 #include <map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 struct RequestAndBufferInfo
@@ -314,4 +315,5 @@ private:
 };
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

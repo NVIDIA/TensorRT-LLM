@@ -18,10 +18,12 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 #ifdef ENABLE_BF16
 template class MoeGemmRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
 #endif
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

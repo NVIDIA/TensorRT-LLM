@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 #define ENABLE_FP8 1
@@ -662,4 +663,5 @@ __inline__ __device__ T blockReduceSumV2(T* val)
 static bool const kDISABLE_FP32_ACCUMULATION = getenv("TRTLLM_UB_AR_DISABLE_FP32_ACCUMULATION") != nullptr;
 
 } // namespace runtime::ub
+
 TRTLLM_NAMESPACE_END

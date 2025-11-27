@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -46,4 +47,5 @@ void invokeMoeAlignBlockSize(void const* topk_ids, int32_t topk_ids_dtype_size, 
     int32_t max_num_tokens_padded, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

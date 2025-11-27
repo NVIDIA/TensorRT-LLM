@@ -92,4 +92,5 @@ void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* 
     float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

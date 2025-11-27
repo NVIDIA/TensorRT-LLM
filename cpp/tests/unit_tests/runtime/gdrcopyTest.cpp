@@ -12,6 +12,7 @@
 #ifndef _WIN32
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::gdrcopy
 {
 
@@ -149,6 +150,7 @@ TEST_F(GdrCopyTest, HelperLifecycle)
 
 } // namespace
 } // namespace runtime::gdrcopy
+
 TRTLLM_NAMESPACE_END
 
 #endif // _WIN32

@@ -35,6 +35,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 // Helper structure to hold replica information
@@ -1179,4 +1180,5 @@ void MultiThreadWorker::workerLoop(int rank)
 }
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

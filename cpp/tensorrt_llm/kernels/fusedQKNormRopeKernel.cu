@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 // Specialization for packed_as used in this kernel.
@@ -47,8 +48,10 @@ struct packed_as<uint, 4>
     using type = uint4;
 };
 } // namespace common
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -331,4 +334,5 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     }
 }
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

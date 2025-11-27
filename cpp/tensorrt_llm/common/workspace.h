@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cstddef>
 #include <cstdint>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -88,5 +89,5 @@ inline size_t calculateTotalWorkspaceSize(
 }
 
 } // namespace common
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

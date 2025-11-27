@@ -22,12 +22,15 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TllmRuntime;
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -59,4 +62,5 @@ public:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

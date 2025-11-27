@@ -62,6 +62,7 @@ using tensorrt_llm::pg_utils::get_local_pg;
 using tensorrt_llm::pg_utils::PgHelper;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -1275,6 +1276,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

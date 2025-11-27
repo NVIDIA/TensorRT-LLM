@@ -762,9 +762,11 @@ void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& inp
 }
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 template class GptDecoder<float>;
 template class GptDecoder<half>;
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

@@ -22,6 +22,7 @@
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -96,4 +97,5 @@ void GuidedDecodingConfig::validate() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

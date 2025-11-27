@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include "tensorrt_llm/common/config.h"
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -46,4 +47,5 @@ void launchFusedQKNormRope(
     bool is_qk_norm);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

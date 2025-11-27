@@ -32,6 +32,7 @@
 #include <random>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 // TODO verify context + gen mix
@@ -1664,4 +1665,5 @@ TYPED_TEST(FillRandDataTest, BatchInit)
 }
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

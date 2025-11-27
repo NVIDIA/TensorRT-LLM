@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -24,7 +25,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 #include <cuda_fp16.h>
 #ifdef ENABLE_FP8
@@ -35,11 +35,11 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class CudaStream;
 } // namespace runtime
-
 
 namespace executor
 {
@@ -1047,4 +1047,5 @@ static_assert(!DecodingMode::Eagle().isExplicitDraftTokens());
 static_assert(!DecodingMode::Eagle().isExternalDraftTokens());
 static_assert(DecodingMode::Eagle().isEagle());
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -22,6 +22,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 
@@ -82,4 +83,5 @@ void initialize_userbuffers_manager(int64_t tp_size, int64_t pp_size, int64_t cp
     int64_t gpus_per_node, int64_t buffer_size, bool use_nccl_symmetric);
 
 } // namespace runtime::ub
+
 TRTLLM_NAMESPACE_END

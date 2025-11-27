@@ -36,6 +36,7 @@
 #include "tests/unit_tests/layers/randomLlm.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
@@ -870,4 +871,5 @@ INSTANTIATE_TEST_SUITE_P(LookaheadDecodingLayerParamTest, ParamTest,
     generateTestName);
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

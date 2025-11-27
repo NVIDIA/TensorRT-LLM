@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 
@@ -78,4 +79,5 @@ void StaticThreadPool::workerThread()
 }
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

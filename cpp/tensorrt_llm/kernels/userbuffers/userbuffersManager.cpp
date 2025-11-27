@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 
@@ -108,4 +109,5 @@ void initialize_userbuffers_manager(int64_t tp_size, int64_t pp_size, int64_t cp
 }
 
 } // namespace runtime::ub
+
 TRTLLM_NAMESPACE_END

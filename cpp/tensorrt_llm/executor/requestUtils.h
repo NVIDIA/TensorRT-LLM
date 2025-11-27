@@ -22,6 +22,7 @@
 #include <deque>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -33,4 +34,5 @@ void insertRequestInOrder(tensorrt_llm::batch_manager::RequestList& reqList,
 void insertRequestInOrder(std::deque<RequestWithId>& reqWithIdDeque, RequestWithId&& reqWithId);
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

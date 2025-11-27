@@ -36,6 +36,7 @@ PluginFieldCollection QServeGemmPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> QServeGemmPluginCreator::mPluginAttributes;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -416,4 +417,5 @@ IPluginV2* QServeGemmPluginCreator::deserializePlugin(
     return nullptr;
 }
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

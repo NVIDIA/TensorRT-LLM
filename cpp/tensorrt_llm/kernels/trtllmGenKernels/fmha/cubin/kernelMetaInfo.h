@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 // clang-format off
@@ -5639,4 +5640,5 @@ static const TllmGenFmhaKernelMetaInfo sTllmGenFmhaKernelMetaInfos[] = {
 };
 // clang-format on
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

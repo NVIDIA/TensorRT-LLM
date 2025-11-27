@@ -34,6 +34,7 @@
 #include <unordered_set>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -218,4 +219,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END

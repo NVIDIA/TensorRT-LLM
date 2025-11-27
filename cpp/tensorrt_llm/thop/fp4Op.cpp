@@ -28,6 +28,7 @@
 namespace th = torch;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -476,16 +477,17 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
-static auto float_to_e2m1_and_ufp8sf_scale
-    = torch::RegisterOperators("tensorrt_llm::float_to_e2m1_and_ufp8sf_scale", &tensorrt_llm::torch_ext::FloatToE2M1AndUFP8SFScale);
+static auto float_to_e2m1_and_ufp8sf_scale = torch::RegisterOperators(
+    "tensorrt_llm::float_to_e2m1_and_ufp8sf_scale", &tensorrt_llm::torch_ext::FloatToE2M1AndUFP8SFScale);
 
-static auto half_to_e2m1_and_ufp8sf_scale
-    = torch::RegisterOperators("tensorrt_llm::half_to_e2m1_and_ufp8sf_scale", &tensorrt_llm::torch_ext::HalfToE2M1AndUFP8SFScale);
+static auto half_to_e2m1_and_ufp8sf_scale = torch::RegisterOperators(
+    "tensorrt_llm::half_to_e2m1_and_ufp8sf_scale", &tensorrt_llm::torch_ext::HalfToE2M1AndUFP8SFScale);
 
-static auto e2m1_and_ufp8sf_scale_to_float
-    = torch::RegisterOperators("tensorrt_llm::e2m1_and_ufp8sf_scale_to_float", &tensorrt_llm::torch_ext::E2M1AndUFP8SFScaleToFloat);
+static auto e2m1_and_ufp8sf_scale_to_float = torch::RegisterOperators(
+    "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float", &tensorrt_llm::torch_ext::E2M1AndUFP8SFScaleToFloat);
 
 static auto e2m1_and_ufp8sf_scale_to_float_v2 = torch::RegisterOperators(
     "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float_v2", &tensorrt_llm::torch_ext::E2M1AndUFP8SFScaleToFloatV2);

@@ -28,6 +28,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -749,4 +750,5 @@ __device__ inline __nv_fp8_e4m3 cuda_cast<__nv_fp8_e4m3, int8_t>(int8_t val)
 #endif // ENABLE_FP8
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

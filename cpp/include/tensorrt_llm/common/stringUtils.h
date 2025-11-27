@@ -30,6 +30,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 #if ENABLE_BF16
@@ -231,4 +232,5 @@ inline void toUpper(std::string& s)
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

@@ -29,6 +29,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -231,4 +232,5 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

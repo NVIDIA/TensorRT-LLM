@@ -25,6 +25,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace internal_cutlass_kernels
@@ -124,4 +125,3 @@ private:
 }; // namespace internal_cutlass_kernels
 }; // namespace kernels
 TRTLLM_NAMESPACE_END
-

@@ -26,6 +26,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -94,4 +95,5 @@ private:
     std::unordered_map<SizeType32, SizeType32> mModuleOffset;
 };
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

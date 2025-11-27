@@ -21,6 +21,7 @@
 
 #if ENABLE_MULTI_DEVICE
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
@@ -118,9 +119,11 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, si
         stream);
 }
 } // namespace kernels::ub
+
 TRTLLM_NAMESPACE_END
 #else
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config) {}
@@ -187,5 +190,6 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, si
     return 0;
 }
 } // namespace kernels::ub
+
 TRTLLM_NAMESPACE_END
 #endif

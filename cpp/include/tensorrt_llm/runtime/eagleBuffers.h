@@ -183,5 +183,5 @@ private:
 };
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

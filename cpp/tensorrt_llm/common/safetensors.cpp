@@ -27,6 +27,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common::safetensors
 {
 using nvinfer1::DataType;
@@ -167,4 +168,5 @@ std::shared_ptr<ISafeTensor> ISafeTensor::open(char const* filename)
     return std::make_shared<SafeTensor>(filename);
 }
 } // namespace common::safetensors
+
 TRTLLM_NAMESPACE_END

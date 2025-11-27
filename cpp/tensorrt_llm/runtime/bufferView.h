@@ -23,6 +23,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class BufferView : virtual public IBuffer
@@ -101,4 +102,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

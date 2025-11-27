@@ -18,6 +18,7 @@
 #include <cub/cub.cuh>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <int THREADS_PER_BLOCK, int MAX_NUM_PAGES>
@@ -199,4 +200,5 @@ void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, int32_t* output_
         kv_page_offsets, seq_lengths, sparse_params, batch_size, tokens_per_page, max_num_pages_per_seq);
 }
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

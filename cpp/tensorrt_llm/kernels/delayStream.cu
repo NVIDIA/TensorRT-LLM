@@ -20,6 +20,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 __global__ void delayStreamKernel(long long delay_micro_secs)
@@ -37,4 +38,5 @@ void invokeDelayStreamKernel(long long delay_micro_secs, cudaStream_t stream)
     check_cuda_error(cudaGetLastError());
 }
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -29,6 +29,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 // Forward declaration
@@ -150,5 +151,5 @@ inline runtime::ITensor::SharedConstPtr getDefaultBatchSlots(runtime::SizeType32
     return defaultBatchSlots;
 }
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -46,6 +46,7 @@ using IdType = tle::IdType;
 using VecTokenExtraIds = tle::VecTokenExtraIds;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::executor
 {
 
@@ -907,4 +908,5 @@ void initRequestBindings(pybind11::module_& m)
 }
 
 } // namespace pybind::executor
+
 TRTLLM_NAMESPACE_END

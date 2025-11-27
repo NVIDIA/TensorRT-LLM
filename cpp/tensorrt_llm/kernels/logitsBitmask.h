@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,4 +35,5 @@ void invokeContiguousLogitsBitmask(T* logits, uint32_t const* bitmask, int32_t c
     int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

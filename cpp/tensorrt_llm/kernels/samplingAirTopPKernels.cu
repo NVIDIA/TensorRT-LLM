@@ -38,6 +38,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1467,4 +1468,5 @@ template size_t getAirTopPWorkspaceSize<half>(int32_t batchSize, int32_t vocabSi
 template uint32_t calcAirTopPBlockNum<float>(int batchSize, int len, int smCnt, bool isDeterministic);
 template uint32_t calcAirTopPBlockNum<half>(int batchSize, int len, int smCnt, bool isDeterministic);
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

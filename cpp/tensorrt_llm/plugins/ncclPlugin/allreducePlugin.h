@@ -27,6 +27,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 namespace tk = ::tensorrt_llm::kernels;
@@ -114,4 +115,5 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

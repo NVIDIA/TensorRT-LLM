@@ -30,12 +30,12 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class ITensor;
 class CudaStream;
 } // namespace runtime
-
 
 namespace executor
 {
@@ -276,4 +276,5 @@ private:
 };
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

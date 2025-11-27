@@ -313,5 +313,5 @@ private:
     mutable size_t gemm_workspace_size_ = 0;
     size_t calcMaxWorkspaceSize(int num_experts) const;
 };
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

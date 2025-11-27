@@ -33,6 +33,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 size_t invokeScanGenerationLengths(void* __restrict__ scanTempStorage, size_t scanTempStorageBytes,
@@ -640,4 +641,5 @@ template void invokeCopyProbs(PackExplicitDraftTokensParams<__nv_bfloat16> const
 #endif // ENABLE_BF16
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

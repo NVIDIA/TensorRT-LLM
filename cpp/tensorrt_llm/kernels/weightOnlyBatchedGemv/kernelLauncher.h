@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/details.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace weight_only
@@ -112,4 +113,5 @@ inline bool is_supported(int arch, KernelType kernel_type)
 }
 } // namespace weight_only
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

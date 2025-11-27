@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -152,4 +153,5 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

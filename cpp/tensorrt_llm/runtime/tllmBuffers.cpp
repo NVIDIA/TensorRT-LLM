@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
+#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 template <typename TAllocator>
@@ -117,4 +118,5 @@ MemoryType MulticastTensorView::getMemoryType() const
 // explicit instantiations
 template class PoolAllocator<PinnedAllocator>;
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

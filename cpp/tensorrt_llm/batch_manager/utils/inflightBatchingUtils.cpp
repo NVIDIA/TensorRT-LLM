@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 using ITensor = runtime::ITensor;
@@ -399,4 +400,5 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
 }
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

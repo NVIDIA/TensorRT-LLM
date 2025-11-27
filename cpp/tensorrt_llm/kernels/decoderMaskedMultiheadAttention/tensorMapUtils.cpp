@@ -13,14 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 
 #include <cstdint>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -186,4 +187,5 @@ CUtensorMap makeTensorMapForXqaMlaQ(
         xqaParams.num_q_heads * xqaParams.total_num_input_tokens, partElems, xqaParams.num_q_heads);
 }
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -15,10 +15,11 @@
  */
 
 #pragma once
-#include <cstdint>
 #include "tensorrt_llm/common/config.h"
+#include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -46,4 +47,5 @@ template <typename T>
 void invokeWSLayerNorm(WarpSpecializedParam<T> param, bool use_rms_norm, int ctas);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

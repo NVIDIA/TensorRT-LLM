@@ -36,6 +36,7 @@
 #include <tuple>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -464,4 +465,5 @@ template class LookaheadDecodingLayer<float>;
 template class LookaheadDecodingLayer<half>;
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

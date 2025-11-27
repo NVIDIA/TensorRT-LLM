@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::disagg_executor
 {
 
@@ -158,4 +159,5 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 } // namespace executor::disagg_executor
+
 TRTLLM_NAMESPACE_END

@@ -23,6 +23,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -481,4 +482,5 @@ public:
 };
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

@@ -37,6 +37,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -458,5 +459,5 @@ std::string to_string(LoraCache::TaskLayerModuleConfig const& v);
 std::ostream& operator<<(std::ostream& os, LoraCache::TaskLayerModuleConfig const& v);
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

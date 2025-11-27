@@ -22,6 +22,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 ////////////////////////////////////////////////////////////////
@@ -38,5 +39,6 @@ int ncclIpcSocketRecvFd(std::shared_ptr<NcclIpcSocket> handle);
 void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int fd, int rank);
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END
 #endif // ENABLE_MULTI_DEVICE

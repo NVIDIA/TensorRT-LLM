@@ -17,10 +17,11 @@
 #pragma once
 
 #include "../../include/moe_gemm_kernels.h"
-#include <cuda_runtime_api.h>
 #include "tensorrt_llm/common/config.h"
+#include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels_oss
 {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
@@ -34,4 +35,5 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGrou
     cute::Shape<int32_t, int32_t, cute::_1> fallback_cluster_shape);
 
 } // namespace kernels::cutlass_kernels_oss
+
 TRTLLM_NAMESPACE_END

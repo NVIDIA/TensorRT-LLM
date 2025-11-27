@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 struct RuntimeDefaults
@@ -38,5 +39,5 @@ struct RuntimeDefaults
 };
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

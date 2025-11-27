@@ -32,6 +32,7 @@
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 enum class TrtGptModelType
@@ -351,4 +352,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

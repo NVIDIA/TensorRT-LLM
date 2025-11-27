@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace mpi
 {
 
@@ -78,5 +79,5 @@ enum class MpiTag : int
 };
 
 } // namespace mpi
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

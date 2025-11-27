@@ -29,6 +29,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -684,4 +685,5 @@ public:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

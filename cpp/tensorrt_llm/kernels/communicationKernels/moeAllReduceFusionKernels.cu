@@ -21,6 +21,7 @@
 #include <cooperative_groups.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ar_fusion::moe
 {
 template <int NRanks>
@@ -773,5 +774,5 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
 }
 
 }; // namespace kernels::ar_fusion::moe
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

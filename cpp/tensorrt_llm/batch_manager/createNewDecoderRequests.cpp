@@ -43,6 +43,7 @@ namespace te = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -752,4 +753,5 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

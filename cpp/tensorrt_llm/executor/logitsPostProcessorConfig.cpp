@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -61,4 +62,5 @@ void LogitsPostProcessorConfig::setReplicate(bool replicate)
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -28,6 +28,7 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::batch_manager
 {
 
@@ -163,4 +164,5 @@ public:
 };
 
 } // namespace pybind::batch_manager
+
 TRTLLM_NAMESPACE_END

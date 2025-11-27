@@ -25,12 +25,15 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TllmRuntime;
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 
@@ -70,4 +73,5 @@ template <typename T>
 void writeBinArray(std::string const& filename, T const* tensor, const int64_t size, cudaStream_t stream);
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

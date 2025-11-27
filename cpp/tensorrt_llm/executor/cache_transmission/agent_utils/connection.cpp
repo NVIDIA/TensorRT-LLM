@@ -24,6 +24,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -592,4 +593,5 @@ AgentConnectionManager::~AgentConnectionManager()
     m_Agent->deregisterMemory(mRegMemDescs);
 }
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

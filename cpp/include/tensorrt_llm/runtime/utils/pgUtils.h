@@ -77,6 +77,7 @@ inline bool useMPI()
 }
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pg_utils
 {
 
@@ -284,5 +285,5 @@ struct PgHelper
 };
 
 } // namespace pg_utils
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

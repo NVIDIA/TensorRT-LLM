@@ -27,6 +27,7 @@
 namespace fs = std::filesystem;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 using executor::IterationType;
@@ -195,4 +196,5 @@ template void writeBinArray(
 #endif
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

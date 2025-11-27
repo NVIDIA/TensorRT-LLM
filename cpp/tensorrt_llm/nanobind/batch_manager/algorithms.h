@@ -29,5 +29,5 @@ namespace nanobind::batch_manager::algorithms
 void initBindings(nb::module_& m);
 
 } // namespace nanobind::batch_manager::algorithms
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

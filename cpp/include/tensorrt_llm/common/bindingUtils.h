@@ -16,12 +16,13 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/config.h"
 #include "c10/util/intrusive_ptr.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <Python.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -73,4 +74,5 @@ c10::intrusive_ptr<T> get_intrusive_ptr(PyObject* py_obj, std::string pybind11_a
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

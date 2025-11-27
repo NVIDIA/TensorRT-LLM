@@ -37,6 +37,7 @@
 
 // Forward declare TransferSession in the correct global namespace scope
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class TransferSession;
@@ -139,4 +140,5 @@ std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cac
     std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

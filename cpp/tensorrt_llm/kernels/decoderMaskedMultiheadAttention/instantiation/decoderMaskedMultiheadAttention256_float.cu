@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,4 +35,5 @@ INSTANTIATE_MMHA_LAUNCHERS(float, kSizePerHead)
 } // namespace mmha
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

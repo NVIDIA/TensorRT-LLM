@@ -23,6 +23,7 @@
 #include <cstddef>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 
@@ -82,4 +83,5 @@ void insertTensorSlices(
 }
 
 } // namespace runtime::utils
+
 TRTLLM_NAMESPACE_END

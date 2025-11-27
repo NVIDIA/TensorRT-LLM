@@ -20,10 +20,10 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-
 namespace th = torch;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -161,4 +161,5 @@ private:
 };
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END

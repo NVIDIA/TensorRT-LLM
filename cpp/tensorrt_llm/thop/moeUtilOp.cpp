@@ -33,6 +33,7 @@ namespace kernels = tensorrt_llm::kernels;
 namespace cutlass_kernels = tensorrt_llm::kernels::cutlass_kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -329,6 +330,7 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

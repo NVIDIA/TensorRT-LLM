@@ -23,6 +23,7 @@ namespace tc = tensorrt_llm::common;
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::common
 {
 
@@ -67,4 +68,5 @@ void initExceptionsBindings(nb::module_& m)
 }
 
 } // namespace nanobind::common
+
 TRTLLM_NAMESPACE_END

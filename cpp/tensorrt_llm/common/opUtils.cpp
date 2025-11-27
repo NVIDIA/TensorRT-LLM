@@ -274,5 +274,5 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         });
     return creator();
 }
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

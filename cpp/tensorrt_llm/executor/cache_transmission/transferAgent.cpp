@@ -15,13 +15,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/transferAgent.h"
 
 #include <dlfcn.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -61,4 +62,5 @@ DynLibLoader::~DynLibLoader()
 }
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

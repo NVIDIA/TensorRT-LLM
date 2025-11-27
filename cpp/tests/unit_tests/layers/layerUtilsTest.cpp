@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 
@@ -255,4 +256,5 @@ TYPED_TEST(CopyToWorkspaceFixture, MismatchBufferType_Throws)
 }
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

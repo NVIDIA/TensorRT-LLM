@@ -19,11 +19,12 @@
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cmath>
+#include <cuda_runtime_api.h>
 #include <iomanip>
 #include <sstream>
-#include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -563,4 +564,5 @@ FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType,
         sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), inputType, outputType, sm);
 }
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -31,6 +31,7 @@
 using namespace nvinfer1;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -84,4 +85,5 @@ public:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

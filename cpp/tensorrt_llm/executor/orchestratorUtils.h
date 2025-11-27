@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -80,4 +81,5 @@ struct MpiMessage
 };
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

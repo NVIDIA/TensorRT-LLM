@@ -27,6 +27,7 @@
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -225,5 +226,5 @@ void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
 }
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -34,6 +34,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -475,4 +476,5 @@ void invokeSetupTopKTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEn
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

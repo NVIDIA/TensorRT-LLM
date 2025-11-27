@@ -26,6 +26,7 @@ struct ncclComm;
 typedef struct ncclComm* ncclComm_t;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -69,4 +70,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

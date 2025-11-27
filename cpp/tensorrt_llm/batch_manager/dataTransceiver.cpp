@@ -36,6 +36,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -1215,4 +1216,5 @@ bool CacheReceiver::receiveReadySignal(TransferSession& session)
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

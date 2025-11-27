@@ -24,6 +24,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -307,4 +308,5 @@ void DecodingConfig::setEagleConfig(EagleConfig const& eagleConfig)
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 WorkerPool::WorkerPool(std::size_t numWorkers, std::int32_t deviceId)
@@ -71,4 +72,5 @@ WorkerPool::~WorkerPool()
     }
 }
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

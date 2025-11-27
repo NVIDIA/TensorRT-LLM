@@ -37,6 +37,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -1795,4 +1796,5 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
 }
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

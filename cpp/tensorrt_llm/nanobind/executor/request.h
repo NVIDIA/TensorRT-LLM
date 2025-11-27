@@ -23,6 +23,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::executor
 {
 
@@ -30,4 +31,5 @@ namespace nanobind::executor
 void initRequestBindings(nb::module_& m);
 
 } // namespace nanobind::executor
+
 TRTLLM_NAMESPACE_END

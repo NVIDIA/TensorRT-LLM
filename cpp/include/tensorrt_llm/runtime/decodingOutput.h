@@ -28,11 +28,11 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class LookaheadDecodingBuffers;
 } // namespace batch_manager
-
 
 namespace runtime
 {
@@ -129,5 +129,5 @@ public:
 };
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

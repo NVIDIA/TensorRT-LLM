@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -31,4 +32,5 @@ void invokeRecoverFromRA(Tout* accu_output, float* accu_softmax_stats, Tout* out
     int h, int d, int* cu_seqlens, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

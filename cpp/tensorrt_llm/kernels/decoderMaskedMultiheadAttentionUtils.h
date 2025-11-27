@@ -33,6 +33,7 @@ using tensorrt_llm::common::hsub2;
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -4256,4 +4257,5 @@ __device__ __host__ constexpr inline T const& const_max(T const& a, T const& b)
 
 } // namespace mmha
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

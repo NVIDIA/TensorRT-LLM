@@ -41,6 +41,7 @@
 #include <numeric>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 
@@ -986,4 +987,5 @@ std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
 }
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

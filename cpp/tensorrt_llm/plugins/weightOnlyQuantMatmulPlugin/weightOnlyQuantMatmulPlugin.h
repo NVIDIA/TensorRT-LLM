@@ -35,6 +35,7 @@
 #include "cutlass/integer_subbyte.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 enum class WeightTypeId
@@ -175,4 +176,5 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

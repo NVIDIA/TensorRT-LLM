@@ -15,11 +15,11 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <array>
 #include <cuda_runtime_api.h>
 #include <optional>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 #include "cute/tensor.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
@@ -37,6 +37,7 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 
@@ -339,4 +340,5 @@ private:
 };
 
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

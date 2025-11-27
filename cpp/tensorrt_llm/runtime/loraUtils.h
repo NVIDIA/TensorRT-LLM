@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::lora
 {
 
@@ -61,4 +62,5 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
     std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig);
 } // namespace runtime::lora
+
 TRTLLM_NAMESPACE_END

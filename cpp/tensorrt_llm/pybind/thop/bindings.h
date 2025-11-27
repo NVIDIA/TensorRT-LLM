@@ -21,11 +21,12 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::thop
 {
 
 void initBindings(pybind11::module_& m);
 
 } // namespace pybind::thop
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

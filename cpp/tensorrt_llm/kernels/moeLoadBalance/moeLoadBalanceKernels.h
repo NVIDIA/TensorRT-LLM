@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceCommon.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -133,4 +134,5 @@ void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal);
 void moeSetSignalForGpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, int64_t iterId, bool enableStatistic);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

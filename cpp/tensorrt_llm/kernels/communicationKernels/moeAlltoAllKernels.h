@@ -15,12 +15,13 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::moe_comm
 {
 
@@ -180,4 +181,5 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
     int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
 } // namespace kernels::moe_comm
+
 TRTLLM_NAMESPACE_END

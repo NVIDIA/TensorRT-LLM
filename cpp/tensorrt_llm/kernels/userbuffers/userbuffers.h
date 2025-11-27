@@ -47,6 +47,7 @@
 #define REG0_FLAGS (REG0_RECV + MAX_PEERS * MAX_REGIONS * 3)
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 enum req_type
@@ -115,8 +116,10 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
 
 void destroy_communicator(communicator* comm);
 } // namespace runtime::ub
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ub
 {
 using namespace tensorrt_llm::runtime::ub;
@@ -141,4 +144,5 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
     void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 } // namespace kernels::ub
+
 TRTLLM_NAMESPACE_END

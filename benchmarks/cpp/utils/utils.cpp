@@ -1,6 +1,7 @@
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+ *AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,14 +26,15 @@
 #include <fstream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace benchmark
 {
 
 std::vector<std::vector<SizeType32>> parseVectorOfVectors(std::string const& input)
 {
     std::vector<std::vector<SizeType32>> result;
-    std::regex outer_regex(R"(\[(.*?)\])");
-    std::regex inner_regex(R"(\d+)");
+    std::regex outer_regex(R "(\[(.*?)\])");
+    std::regex inner_regex(R "(\d+)");
     auto outer_begin = std::sregex_iterator(input.begin(), input.end(), outer_regex);
     auto outer_end = std::sregex_iterator();
 
@@ -100,7 +102,8 @@ Samples parseWorkloadJson(
     if (samples.size() < maxNumSamples)
     {
         TLLM_LOG_WARNING(
-            "Dataset size %zu is smaller than given max_num_samples %d, max_num_samples will be ignored.\n",
+            "Dataset size %zu is smaller than given max_num_samples "
+            "%d, max_num_samples will be ignored.\n",
             samples.size(), maxNumSamples);
     }
     return samples;
@@ -163,5 +166,5 @@ std::ostream& operator<<(std::ostream& os, RecordBwMetric const& metric)
 }
 
 } // namespace benchmark
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

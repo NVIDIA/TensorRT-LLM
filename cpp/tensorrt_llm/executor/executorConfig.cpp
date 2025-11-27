@@ -21,6 +21,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -385,4 +386,5 @@ void ExecutorConfig::setFailFastOnAttentionWindowTooLarge(bool failFastOnAttenti
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

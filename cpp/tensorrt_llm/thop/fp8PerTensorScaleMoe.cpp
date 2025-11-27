@@ -20,6 +20,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -310,6 +311,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     return output;
 }
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

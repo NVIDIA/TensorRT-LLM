@@ -43,6 +43,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -446,4 +447,5 @@ size_t CutlassFusedGatedGemmRunner<T>::getWorkspaceSize(int const m, int const n
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -30,5 +31,5 @@ void invokeBuildRelativeAttentionBias(T* relative_attention_bias, T const* relat
     cudaStream_t stream);
 
 } // namespace kernels
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

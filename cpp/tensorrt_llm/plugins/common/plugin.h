@@ -33,6 +33,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -110,7 +111,9 @@ protected:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END
+
 // Init with O(n) and retrieve with O(1)
 class PluginFieldParser
 {

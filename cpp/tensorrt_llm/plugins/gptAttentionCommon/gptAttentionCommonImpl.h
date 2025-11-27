@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 template <typename T>
@@ -54,4 +55,5 @@ T* GPTAttentionPluginCreatorCommon::deserializePluginImpl(
     return nullptr;
 }
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

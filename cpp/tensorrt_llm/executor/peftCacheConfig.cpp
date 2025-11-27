@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 PeftCacheConfig::PeftCacheConfig(SizeType32 numHostModuleLayer, SizeType32 numDeviceModuleLayer,
@@ -112,4 +113,5 @@ std::optional<std::string> PeftCacheConfig::getLoraPrefetchDir() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

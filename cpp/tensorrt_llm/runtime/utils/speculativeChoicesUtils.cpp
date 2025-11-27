@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include <stack>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 
@@ -372,4 +373,5 @@ SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDe
     return depth;
 }
 } // namespace runtime::utils
+
 TRTLLM_NAMESPACE_END

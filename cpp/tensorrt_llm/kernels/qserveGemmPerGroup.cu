@@ -21,11 +21,12 @@
 // }
 
 #include "qserveGemm.h"
+#include "tensorrt_llm/common/config.h"
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -662,4 +663,5 @@ size_t QServeGemmRunner::getWorkspaceSize(int const m, int const n, int const k)
 
 } // namespace qserve
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

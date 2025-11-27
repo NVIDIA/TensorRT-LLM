@@ -25,6 +25,7 @@
 #include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 
@@ -530,4 +531,5 @@ size_t CacheTransBufferManager::getSendBufferCount()
 }
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

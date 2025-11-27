@@ -16,10 +16,11 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include "tensorrt_llm/common/config.h"
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -34,4 +35,5 @@ inline __device__ __host__ T divUp(T m, T n)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::causal_conv1d
 {
 
@@ -217,4 +218,5 @@ template <typename input_t, typename weight_t>
 void causal_conv1d_update_cuda(ConvParamsBase& params, cudaStream_t stream);
 
 } // namespace kernels::causal_conv1d
+
 TRTLLM_NAMESPACE_END

@@ -25,6 +25,7 @@
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::moe_comm
 {
 
@@ -967,4 +968,5 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
 }
 
 } // namespace kernels::moe_comm
+
 TRTLLM_NAMESPACE_END

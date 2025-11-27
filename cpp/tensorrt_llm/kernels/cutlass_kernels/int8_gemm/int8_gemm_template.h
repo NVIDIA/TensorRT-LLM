@@ -53,6 +53,7 @@ namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -383,4 +384,5 @@ size_t CutlassInt8GemmRunner<T>::getWorkspaceSize(int const m, int const n, int 
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

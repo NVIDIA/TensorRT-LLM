@@ -21,10 +21,12 @@
 #include <nanobind/nanobind.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::thop
 {
 
 void initBindings(nb::module_& m);
 
 } // namespace nanobind::thop
+
 TRTLLM_NAMESPACE_END

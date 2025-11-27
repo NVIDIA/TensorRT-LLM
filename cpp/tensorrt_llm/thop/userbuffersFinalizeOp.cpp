@@ -23,6 +23,7 @@
 #include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -48,6 +49,7 @@ torch::Tensor userbuffers_allreduce_finalize(torch::Tensor input, bool force_app
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

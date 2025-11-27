@@ -21,6 +21,7 @@
 #include <cuda_fp4.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 // Sort
@@ -408,6 +409,7 @@ torch::Tensor moe_gelu(torch::Tensor const& input, torch::Tensor const& tile_idx
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

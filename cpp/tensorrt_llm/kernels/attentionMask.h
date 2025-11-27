@@ -27,6 +27,7 @@
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -64,4 +65,5 @@ template <typename MaskDataType>
 void invokeBuildAttentionMask(AttentionMaskParams<MaskDataType> const& params, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

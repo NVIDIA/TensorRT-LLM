@@ -21,6 +21,7 @@
 // TODO(oargov): literally zero performance optimization work was put into these kernels and their launch parameters,
 // since they should hopefully be fused to some gemm eventually.
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <typename T>
@@ -92,4 +93,5 @@ template void tokenPerChannelScale<nv_bfloat16>(int64_t const numel, size_t cons
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

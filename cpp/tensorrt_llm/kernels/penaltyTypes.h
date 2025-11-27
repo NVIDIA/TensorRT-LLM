@@ -24,6 +24,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -56,4 +57,5 @@ inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
     return std::make_pair(fltMin, fltMax);
 }
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

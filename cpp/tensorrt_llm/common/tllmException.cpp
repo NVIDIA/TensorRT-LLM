@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/common/tllmException.h"
 
 #include <cinttypes>
 #include <cstdlib>
@@ -28,6 +28,7 @@
 #include <sstream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -131,4 +132,5 @@ RequestErrorCode RequestSpecificException::getErrorCode() const noexcept
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

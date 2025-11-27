@@ -31,6 +31,7 @@ using namespace cute;
 using namespace tensorrt_llm::cutlass_extensions;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 enum GemmAllReduceImpl
@@ -271,5 +272,5 @@ private:
 };
 
 } // namespace kernels::cutlass_kernels
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

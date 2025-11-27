@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -22,11 +23,11 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.h"
-#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -841,4 +842,5 @@ __global__ void __launch_bounds__(TARGET_THREADS, 1) warpSpecializedInvoker(type
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

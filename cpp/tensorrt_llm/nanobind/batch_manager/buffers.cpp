@@ -35,6 +35,7 @@ namespace tr = tensorrt_llm::runtime;
 using tr::SizeType32;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::batch_manager
 {
 
@@ -74,4 +75,5 @@ void Buffers::initBindings(nb::module_& m)
         .def_rw("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
 }
 } // namespace nanobind::batch_manager
+
 TRTLLM_NAMESPACE_END

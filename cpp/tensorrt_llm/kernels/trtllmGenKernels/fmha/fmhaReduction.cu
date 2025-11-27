@@ -22,6 +22,7 @@
 #include <float.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -393,4 +394,5 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

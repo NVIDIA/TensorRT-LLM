@@ -28,6 +28,7 @@
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -284,4 +285,5 @@ void BufferManager::memoryPoolTrimTo(std::size_t size)
     mPool->memoryPoolTrimTo(size);
 }
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

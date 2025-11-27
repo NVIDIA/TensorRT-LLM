@@ -119,4 +119,5 @@ struct BatchStateHash
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

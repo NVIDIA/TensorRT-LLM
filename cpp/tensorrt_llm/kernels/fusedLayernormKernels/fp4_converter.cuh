@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -26,11 +27,11 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <type_traits>
-#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -264,4 +265,5 @@ struct FP4Converter<float, UE8M0_SF>
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

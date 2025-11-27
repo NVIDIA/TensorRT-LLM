@@ -15,13 +15,14 @@
  */
 #pragma once
 
-#include <cuda_fp16.h>
 #include "tensorrt_llm/common/config.h"
+#include <cuda_fp16.h>
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -60,4 +61,5 @@ template <typename T>
 void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<T> const& params);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
 #include "tensorrt_llm/common/config.h"
+#include <NvInferRuntime.h>
 
 #include "cutlass/half.h"
 #include <cuda_fp16.h>
@@ -32,6 +32,7 @@
 #include <cuda_fp4.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -163,4 +164,5 @@ struct CutlassToTllmTypeAdapter<cutlass::float_e2m1_t>
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

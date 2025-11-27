@@ -25,6 +25,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 
@@ -351,4 +352,5 @@ using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>>;
 #endif // ENABLE_BF16
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

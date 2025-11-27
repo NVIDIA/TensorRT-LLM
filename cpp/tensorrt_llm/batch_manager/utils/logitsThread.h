@@ -26,6 +26,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 namespace kv_cache_manager
@@ -37,14 +38,18 @@ class SequenceSlotManager;
 class BasePeftCacheManager;
 class GenerateRequestOptions;
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 struct SpeculativeDecodingFastLogitsInfo;
 } // namespace executor
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 
@@ -58,4 +63,5 @@ void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
     executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype);
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

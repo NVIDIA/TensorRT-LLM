@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ar_fusion
 {
 
@@ -97,5 +98,5 @@ void** Workspace::get_workspace()
     return reinterpret_cast<void**>(m_workspace);
 }
 }; // namespace kernels::ar_fusion
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

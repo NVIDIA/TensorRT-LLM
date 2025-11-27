@@ -28,6 +28,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace cutlass_extensions
 {
 
@@ -535,4 +536,5 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
 }
 
 } // namespace cutlass_extensions
+
 TRTLLM_NAMESPACE_END

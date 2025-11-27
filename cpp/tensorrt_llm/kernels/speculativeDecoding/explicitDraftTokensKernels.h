@@ -24,6 +24,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 
@@ -377,4 +378,5 @@ void invokeConvertMaskToPackedMask(runtime::SizeType32 batchSize,
     runtime::SizeType32 maxGenerationLength, runtime::SizeType32* __restrict__ packedMask, cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

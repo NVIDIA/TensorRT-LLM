@@ -26,6 +26,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -286,4 +287,5 @@ template void invokeBuildPackedMask(PackedMaskParams<__nv_bfloat16> const&, cuda
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -23,6 +23,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 
@@ -33,4 +34,5 @@ namespace runtime::utils
 void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename);
 
 } // namespace runtime::utils
+
 TRTLLM_NAMESPACE_END

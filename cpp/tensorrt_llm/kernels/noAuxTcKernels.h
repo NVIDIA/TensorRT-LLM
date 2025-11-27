@@ -17,13 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -33,4 +34,5 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     double const routed_scaling_factor, cudaStream_t const stream = 0);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

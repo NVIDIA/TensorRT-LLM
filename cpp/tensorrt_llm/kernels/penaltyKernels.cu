@@ -29,6 +29,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -265,4 +266,5 @@ template void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<float> const
 template void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<half> const& params);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

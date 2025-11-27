@@ -21,6 +21,7 @@
 namespace tr = tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -47,9 +48,11 @@ void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
-static auto trtllmNcclCommunicator = torch::jit::class_<tensorrt_llm::torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
-                                         .def(torch::jit::init<int64_t, int64_t>())
-                                         .def("send", &tensorrt_llm::torch_ext::NcclCommunicatorOp::send)
-                                         .def("recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recv);
+static auto trtllmNcclCommunicator
+    = torch::jit::class_<tensorrt_llm::torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
+          .def(torch::jit::init<int64_t, int64_t>())
+          .def("send", &tensorrt_llm::torch_ext::NcclCommunicatorOp::send)
+          .def("recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recv);

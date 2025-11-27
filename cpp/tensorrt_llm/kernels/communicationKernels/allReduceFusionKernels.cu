@@ -21,6 +21,7 @@
 #include <cooperative_groups.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ar_fusion
 {
 template <int NRanks>
@@ -823,4 +824,3 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
 }; // namespace kernels::ar_fusion
 
 TRTLLM_NAMESPACE_END
-

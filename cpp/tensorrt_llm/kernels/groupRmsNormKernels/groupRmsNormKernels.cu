@@ -13,11 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/kernels/groupRmsNormKernels/groupRmsNormKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::group_rms_norm
 {
 // Helper function to calculate the number of warps to launch for GroupRMSNormBase
@@ -879,4 +880,5 @@ INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(1)
 INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(2)
 
 } // namespace kernels::group_rms_norm
+
 TRTLLM_NAMESPACE_END

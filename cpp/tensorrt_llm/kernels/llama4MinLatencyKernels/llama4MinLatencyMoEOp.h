@@ -15,13 +15,14 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency::llama4_moe
 {
 
@@ -40,4 +41,5 @@ void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
     cudaStream_t stream);
 
 } // namespace kernels::llama4_min_latency::llama4_moe
+
 TRTLLM_NAMESPACE_END

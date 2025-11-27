@@ -36,6 +36,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -80,4 +81,5 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::c
 template <typename input_t, typename weight_t>
 void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream);
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

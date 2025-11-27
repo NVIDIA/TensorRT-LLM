@@ -22,6 +22,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class CacheTransceiverBindings
@@ -30,4 +31,5 @@ public:
     static void initBindings(nb::module_& m);
 };
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

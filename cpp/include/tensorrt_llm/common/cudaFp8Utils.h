@@ -32,6 +32,7 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -321,5 +322,6 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
     const int64_t lda, QuantizeMode quantize_mode, cudaStream_t stream);
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END
 #endif // ENABLE_FP8

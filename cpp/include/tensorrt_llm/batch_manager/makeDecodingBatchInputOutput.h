@@ -26,11 +26,11 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::decoder
 {
 class DecoderState;
 } // namespace runtime::decoder
-
 
 namespace batch_manager
 {
@@ -57,4 +57,5 @@ public:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

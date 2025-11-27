@@ -25,6 +25,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 
@@ -98,4 +99,5 @@ void invokeForwardAcceptedTokens(runtime::SizeType32 batchSize, runtime::SizeTyp
     runtime::TokenIdType const* endIds, FinishedState* finishedOutput, cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

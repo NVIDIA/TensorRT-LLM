@@ -26,6 +26,7 @@
 #include <limits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -325,4 +326,5 @@ struct KVLinearBuffer
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -252,4 +253,5 @@ void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::Ru
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

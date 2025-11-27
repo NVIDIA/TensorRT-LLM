@@ -31,6 +31,7 @@
 #pragma once
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace benchmark
 {
 
@@ -240,5 +241,5 @@ std::vector<double> generateRandomExponentialValues(int count, float lambda, int
 std::vector<double> computeTimeDelays(BenchmarkParams const& benchmarkParams, int numDelays);
 
 } // namespace benchmark
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

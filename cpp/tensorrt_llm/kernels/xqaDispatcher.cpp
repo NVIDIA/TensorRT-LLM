@@ -40,6 +40,7 @@ constexpr inline T roundUp(T a, T b)
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -540,4 +541,5 @@ void XqaDispatcher::run(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

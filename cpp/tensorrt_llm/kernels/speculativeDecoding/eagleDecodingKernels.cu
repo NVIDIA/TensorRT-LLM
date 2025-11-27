@@ -35,6 +35,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 namespace
@@ -2325,4 +2326,5 @@ void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 maxDecodingDraf
 }
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

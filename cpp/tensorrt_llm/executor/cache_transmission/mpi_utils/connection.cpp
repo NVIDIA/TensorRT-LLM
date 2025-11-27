@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -80,4 +81,5 @@ CommState const& MpiConnectionManager::getCommState() const
 }
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

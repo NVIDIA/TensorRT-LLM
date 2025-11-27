@@ -29,6 +29,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -323,4 +324,5 @@ SlotDecoderBuffers::SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSe
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

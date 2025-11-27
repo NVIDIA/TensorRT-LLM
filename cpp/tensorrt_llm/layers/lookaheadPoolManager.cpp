@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/layers/lookaheadPoolManager.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
-#include "tensorrt_llm/layers/lookaheadPoolManager.h"
 #include <cstddef>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -118,4 +119,5 @@ void LookaheadPoolManager::update(TensorConstPtr const& keyTokens, TensorConstPt
 }
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

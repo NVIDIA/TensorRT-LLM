@@ -21,6 +21,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -355,4 +356,5 @@ template void printLogProbs<float>(float const* x, int const nBS, int const nBMI
 template void printLogProbs<half>(half const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

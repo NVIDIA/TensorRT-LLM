@@ -25,6 +25,7 @@
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::eviction_policy
 {
 
@@ -107,4 +108,5 @@ private:
 };
 
 } // namespace batch_manager::eviction_policy
+
 TRTLLM_NAMESPACE_END

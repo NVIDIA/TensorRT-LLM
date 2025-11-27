@@ -35,6 +35,7 @@ using tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunner;
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -183,6 +184,7 @@ private:
     at::ScalarType mOutputDtype;
 };
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

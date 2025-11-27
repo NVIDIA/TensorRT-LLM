@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -36,4 +37,5 @@ INSTANTIATE_MMHA_LAUNCHERS_WITH_IMPLICIT_REL_ATTN_BIAS(__nv_bfloat16, kSizePerHe
 } // namespace mmha
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <typename Tout, typename Tin, typename Idx>
@@ -30,4 +31,5 @@ void invokeLookUp(Tout* out, Idx const* input, Tin const* weight, int64_t const 
     Idx const size, Idx const n_embed, Tout const* perTokenScales, cudaStream_t stream = 0);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

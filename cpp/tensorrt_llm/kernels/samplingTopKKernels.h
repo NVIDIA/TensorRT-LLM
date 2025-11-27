@@ -24,6 +24,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -305,4 +306,5 @@ __device__ __host__ inline void setupTopKTopPRuntimeArgOne(runtime::SizeType32 b
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

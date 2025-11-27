@@ -43,6 +43,7 @@ using SizeType32 = tle::SizeType32;
 using RuntimeDefaults = tensorrt_llm::runtime::RuntimeDefaults;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::executor
 {
 
@@ -660,4 +661,5 @@ void initConfigBindings(nb::module_& m)
 }
 
 } // namespace nanobind::executor
+
 TRTLLM_NAMESPACE_END

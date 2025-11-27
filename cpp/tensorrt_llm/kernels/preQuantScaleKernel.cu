@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace
@@ -206,4 +207,5 @@ INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

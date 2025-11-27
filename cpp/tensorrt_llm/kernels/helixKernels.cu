@@ -31,6 +31,7 @@ using namespace tensorrt_llm::common;
 namespace cg = cooperative_groups;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 static constexpr int WARP_SIZE = 32;
@@ -240,4 +241,5 @@ INSTANTIATE_POST_PROC(__half);
 INSTANTIATE_POST_PROC(__nv_bfloat16);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

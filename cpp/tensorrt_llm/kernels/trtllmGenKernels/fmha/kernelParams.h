@@ -33,6 +33,7 @@
 #include "fmhaRunnerParams.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -850,4 +851,5 @@ struct KernelParams
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

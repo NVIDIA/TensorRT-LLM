@@ -37,6 +37,7 @@ class IPluginCreatorInterface;
 } // namespace nvinfer1
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins::api
 {
 
@@ -62,6 +63,7 @@ private:
     std::mutex mMutex;
 };
 } // namespace plugins::api
+
 TRTLLM_NAMESPACE_END
 
 extern "C"

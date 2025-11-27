@@ -33,6 +33,7 @@
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -180,4 +181,5 @@ void DecoderXQARunnerResource::serialize(void* buffer, size_t buffer_size) const
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

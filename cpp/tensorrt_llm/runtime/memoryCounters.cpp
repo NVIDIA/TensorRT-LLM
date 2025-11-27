@@ -45,6 +45,7 @@ std::string doubleBytesToString(double bytes, int precision)
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 std::string MemoryCounters::bytesToString(SizeType32 bytes, int precision)
@@ -93,4 +94,5 @@ MemoryCounters& MemoryCounters::getInstance()
     return mInstance;
 }
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

@@ -80,6 +80,7 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 
@@ -237,4 +238,5 @@ int stallStream(char const* name, std::optional<cudaStream_t> stream, std::optio
 }
 
 } // namespace runtime::utils
+
 TRTLLM_NAMESPACE_END

@@ -18,10 +18,11 @@
 
 #include "cute/tensor.hpp"
 #include "cutlass_extensions/gemm_configs.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -55,4 +56,5 @@ tensorrt_llm::cutlass_extensions::CutlassGemmConfig estimate_best_config_from_oc
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

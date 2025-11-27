@@ -16,12 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass_extensions/interleaved_numeric_conversion.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace weight_only
@@ -79,4 +80,5 @@ struct I2FConverter<AType, WElemBits, false>
 
 } // namespace weight_only
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

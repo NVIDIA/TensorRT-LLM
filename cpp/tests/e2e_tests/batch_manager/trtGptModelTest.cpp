@@ -19,8 +19,8 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/trtGptModel.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
@@ -53,6 +53,7 @@ auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -1270,5 +1271,5 @@ TEST_F(TrtGptModelTest, ClampSeqLenToAttentionWindow)
 }
 
 } // namespace batch_manager
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

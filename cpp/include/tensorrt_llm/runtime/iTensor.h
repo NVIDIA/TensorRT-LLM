@@ -40,6 +40,7 @@ class IExecutionContext;
 }
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -492,5 +493,5 @@ T const* bufferCastOrNull(std::optional<ITensor::SharedConstPtr> const& optional
 }
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

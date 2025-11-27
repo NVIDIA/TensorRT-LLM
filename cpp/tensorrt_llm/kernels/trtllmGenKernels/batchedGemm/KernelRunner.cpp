@@ -29,6 +29,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -680,4 +681,5 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

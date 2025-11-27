@@ -35,6 +35,7 @@ namespace tr = tensorrt_llm::runtime;
 using tr::SizeType32;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::batch_manager
 {
 
@@ -75,4 +76,5 @@ void Buffers::initBindings(pybind11::module_& m)
         .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
 }
 } // namespace pybind::batch_manager
+
 TRTLLM_NAMESPACE_END

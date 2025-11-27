@@ -26,6 +26,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::jit
 {
 
@@ -176,4 +177,5 @@ using CubinObjHasher = XQAKernelFullHasher;
 using CubinObjRegistry = CubinObjRegistryTemplate<CubinObjKey, CubinObjHasher>;
 
 } // namespace kernels::jit
+
 TRTLLM_NAMESPACE_END

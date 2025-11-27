@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::rnn_state_manager
 {
 
@@ -60,4 +61,5 @@ private:
 };
 
 } // namespace batch_manager::rnn_state_manager
+
 TRTLLM_NAMESPACE_END

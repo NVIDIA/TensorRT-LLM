@@ -23,6 +23,7 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -76,4 +77,5 @@ size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

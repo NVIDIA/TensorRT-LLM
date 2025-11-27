@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "mnnvlAllreduceKernels.h"
+#include "tensorrt_llm/common/config.h"
 #include <cooperative_groups.h>
 #include <cstddef>
 #include <cstdint>
@@ -22,7 +23,6 @@
 #include <cuda_pipeline.h>
 #include <tuple>
 #include <type_traits>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -33,6 +33,7 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::mnnvl
 {
 
@@ -1032,4 +1033,5 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 }
 
 } // namespace kernels::mnnvl
+
 TRTLLM_NAMESPACE_END

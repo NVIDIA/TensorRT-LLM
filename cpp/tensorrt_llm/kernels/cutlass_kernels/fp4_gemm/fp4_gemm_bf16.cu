@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -84,4 +85,5 @@ template class CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A8_MXFP4_MXFP8
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

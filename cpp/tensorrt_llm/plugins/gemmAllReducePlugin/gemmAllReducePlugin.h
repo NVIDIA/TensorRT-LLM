@@ -40,6 +40,7 @@ namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;
 using LaunchConfig = typename cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 struct GemmAllReducePluginOptions
@@ -190,4 +191,5 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

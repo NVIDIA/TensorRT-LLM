@@ -27,6 +27,7 @@ namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace
@@ -712,4 +713,5 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

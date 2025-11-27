@@ -23,11 +23,12 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::batch_manager
 {
 
 void initBindings(nb::module_& m);
 
 } // namespace nanobind::batch_manager
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

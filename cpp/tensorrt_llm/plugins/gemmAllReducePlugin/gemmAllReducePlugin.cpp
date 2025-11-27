@@ -27,6 +27,7 @@ template <nvinfer1::DataType T>
 using CutlassType = ::tensorrt_llm::kernels::cutlass_kernels::CutlassType<T>;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 template <typename K, typename V, DataType ElementA, DataType ElementB, DataType ElementD>
@@ -721,4 +722,5 @@ IPluginV2* GemmAllReducePluginCreator::deserializePlugin(
 }
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

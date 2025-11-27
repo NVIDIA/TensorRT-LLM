@@ -37,6 +37,7 @@ namespace tle = tensorrt_llm::executor;
 using SizeType32 = tle::SizeType32;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::executor
 {
 
@@ -265,4 +266,5 @@ void initBindings(pybind11::module_& m)
 }
 
 } // namespace pybind::executor
+
 TRTLLM_NAMESPACE_END

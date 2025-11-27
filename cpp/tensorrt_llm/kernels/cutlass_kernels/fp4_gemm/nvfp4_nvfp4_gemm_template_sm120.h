@@ -30,16 +30,17 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/util/packed_stride.hpp"
 
-#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
 #endif // #ifndef _WIN32
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -244,8 +245,7 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
                 + std::string(cutlass::cutlassGetStatusString(initStatus)) + " " + cudaErrMsg;                         \
             throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);                               \
         }                                                                                                              \
-        auto runStatus                                                                                                 \
-            = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());       \
+        auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());          \
         if (runStatus != cutlass::Status::kSuccess)                                                                    \
         {                                                                                                              \
             std::string errMsg                                                                                         \
@@ -259,4 +259,5 @@ size_t genericFp4GemmKernelLauncherSm120(void* D, void const* A, void const* B, 
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

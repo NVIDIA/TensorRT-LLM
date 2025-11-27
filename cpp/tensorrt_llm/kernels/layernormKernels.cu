@@ -23,6 +23,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -340,4 +341,5 @@ INSTANTIATE_GENERAL_LAYERNORM(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

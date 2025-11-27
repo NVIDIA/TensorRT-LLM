@@ -34,6 +34,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -138,4 +139,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

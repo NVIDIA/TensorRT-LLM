@@ -25,6 +25,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -140,4 +141,5 @@ public:
     }
 };
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

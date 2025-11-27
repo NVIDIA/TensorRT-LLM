@@ -21,6 +21,7 @@
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -48,4 +49,5 @@ std::optional<std::string> GuidedDecodingParams::getGuide() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -25,6 +25,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 
@@ -303,4 +304,5 @@ public:
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

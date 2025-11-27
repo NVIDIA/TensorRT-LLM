@@ -50,8 +50,8 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
@@ -67,6 +67,7 @@
 #include <sstream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels_oss
 {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
@@ -514,4 +515,5 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
 }
 
 } // namespace kernels::cutlass_kernels_oss
+
 TRTLLM_NAMESPACE_END

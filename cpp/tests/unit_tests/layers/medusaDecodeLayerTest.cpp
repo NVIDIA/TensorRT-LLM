@@ -22,6 +22,7 @@
 #include <algorithm>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 
@@ -520,4 +521,5 @@ TYPED_TEST(MedusaDecodingLayerTest, SimpleTestEndIdSelected)
     this->runTest(expectedOutTokens, expectedDraftTokens, finished, params);
 }
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

@@ -17,12 +17,13 @@
 
 #pragma once
 
-#include <nanobind/nanobind.h>
 #include "tensorrt_llm/common/config.h"
+#include <nanobind/nanobind.h>
 
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::executor
 {
 
@@ -30,4 +31,5 @@ namespace nanobind::executor
 void initConfigBindings(nb::module_& m);
 
 } // namespace nanobind::executor
+
 TRTLLM_NAMESPACE_END

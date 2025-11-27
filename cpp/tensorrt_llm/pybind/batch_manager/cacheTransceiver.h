@@ -22,6 +22,7 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class CacheTransceiverBindings
@@ -30,4 +31,5 @@ public:
     static void initBindings(pybind11::module_& m);
 };
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

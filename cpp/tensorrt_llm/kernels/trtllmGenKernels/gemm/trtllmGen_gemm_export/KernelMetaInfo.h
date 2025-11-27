@@ -24,6 +24,7 @@ namespace gemm
 {
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 // clang-format off
@@ -7894,5 +7895,6 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 };
 // clang-format on
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 } // namespace gemm

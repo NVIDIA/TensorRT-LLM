@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cute_dsl
 {
 template <typename InputType, typename SFType>
@@ -41,4 +42,5 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     int32_t const interm_size, int32_t const tile_size, cudaStream_t stream);
 
 } // namespace kernels::cute_dsl
+
 TRTLLM_NAMESPACE_END

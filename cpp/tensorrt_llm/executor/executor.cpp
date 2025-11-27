@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <tensorrt_llm/executor/executor.h>
 #include <tensorrt_llm/executor/executorImpl.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -144,4 +145,5 @@ KVCacheEvent::KVCacheEvent(
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

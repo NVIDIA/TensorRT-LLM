@@ -26,6 +26,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -161,6 +162,7 @@ torch::Tensor fp8_per_tensor_scaling_tllmg_gemm(torch::Tensor const& mat1, torch
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

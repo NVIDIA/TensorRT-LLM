@@ -99,6 +99,7 @@ public:
 };
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::runtime
 {
 
@@ -413,4 +414,5 @@ void initBindingsEarly(nb::module_& m)
         .def_prop_ro("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
 } // namespace nanobind::runtime
+
 TRTLLM_NAMESPACE_END

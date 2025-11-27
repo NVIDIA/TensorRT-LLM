@@ -16,9 +16,9 @@
 
 #pragma once
 
-
 #include "tensorrt_llm/common/config.h"
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 
@@ -30,4 +30,5 @@ enum class CacheType
 };
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

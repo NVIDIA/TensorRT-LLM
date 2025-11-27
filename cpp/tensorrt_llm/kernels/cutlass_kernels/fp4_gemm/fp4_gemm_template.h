@@ -45,6 +45,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -528,4 +529,5 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSize(
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

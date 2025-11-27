@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -41,4 +42,5 @@ Tensor SpeculativeDecodingFastLogitsInfo::toTensor() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

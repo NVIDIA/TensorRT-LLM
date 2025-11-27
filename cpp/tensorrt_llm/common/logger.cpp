@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -73,4 +74,5 @@ Logger* Logger::getLogger()
     return &instance;
 }
 } // namespace common
+
 TRTLLM_NAMESPACE_END

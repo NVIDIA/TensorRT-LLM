@@ -39,6 +39,7 @@
 #include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -299,4 +300,5 @@ CUresult CUDADriverWrapper::cuOccupancyMaxActiveClusters(
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

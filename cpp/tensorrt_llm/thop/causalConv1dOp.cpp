@@ -25,6 +25,7 @@
 #include <torch/all.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -289,6 +290,7 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

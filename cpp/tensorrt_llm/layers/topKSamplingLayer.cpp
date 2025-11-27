@@ -32,6 +32,7 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -200,4 +201,5 @@ template class TopKSamplingLayer<float>;
 template class TopKSamplingLayer<half>;
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

@@ -16,17 +16,18 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 #include <map>
 #include <memory>
 #include <set>
-#include "tensorrt_llm/common/config.h"
 
 #include "cutlass/layout/layout.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::opened_cutlass_kernels
 {
 using namespace cute;
@@ -251,4 +252,5 @@ private:
 };
 
 } // namespace kernels::opened_cutlass_kernels
+
 TRTLLM_NAMESPACE_END

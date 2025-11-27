@@ -31,6 +31,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers::sampling
 {
 
@@ -181,5 +182,5 @@ public:
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
 } // namespace tests::layers::sampling
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

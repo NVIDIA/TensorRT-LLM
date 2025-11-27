@@ -28,6 +28,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -270,4 +271,5 @@ void sm90_dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B,
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

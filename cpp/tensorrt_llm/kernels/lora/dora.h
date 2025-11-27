@@ -20,6 +20,7 @@
 #include <NvInferRuntime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 class DoraImpl
@@ -43,4 +44,5 @@ private:
     nvinfer1::DataType mType;
 };
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

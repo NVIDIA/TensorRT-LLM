@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -47,6 +47,7 @@ using tensorrt_llm::pg_utils::get_world_pg;
 using tensorrt_llm::pg_utils::PgHelper;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -701,4 +702,5 @@ std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> makeUcxConn
 #pragma clang diagnostic pop
 #endif
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

@@ -27,6 +27,7 @@
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1635,4 +1636,5 @@ void customLowPrecisionAllReduce(
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

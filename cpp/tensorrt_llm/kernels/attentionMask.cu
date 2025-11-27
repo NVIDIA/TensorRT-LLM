@@ -26,6 +26,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -231,4 +232,5 @@ template void invokeBuildAttentionMask(AttentionMaskParams<__nv_fp8_e4m3> const&
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -29,6 +29,7 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::kernels
 {
 
@@ -485,4 +486,5 @@ void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftT
 }
 
 } // namespace runtime::kernels
+
 TRTLLM_NAMESPACE_END

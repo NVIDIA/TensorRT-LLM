@@ -31,6 +31,7 @@
 #include <random> //@todo check the usage of this
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::kernels::routing
 {
 
@@ -524,5 +525,5 @@ protected:
 };
 
 } // namespace tests::kernels::routing
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -23,6 +23,7 @@
 #include <cassert>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -293,4 +294,5 @@ AlignedPointersUnpacker inline calcAlignedPointers(
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

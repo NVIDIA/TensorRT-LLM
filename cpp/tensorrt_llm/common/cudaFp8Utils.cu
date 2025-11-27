@@ -26,6 +26,7 @@
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 #ifdef ENABLE_FP8
@@ -466,4 +467,5 @@ DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_bfloat16, float, __nv_fp8_e4m3);
 
 #endif // ENABLE_FP8
 } // namespace common
+
 TRTLLM_NAMESPACE_END

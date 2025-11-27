@@ -22,6 +22,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -104,4 +105,5 @@ private:
 };
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

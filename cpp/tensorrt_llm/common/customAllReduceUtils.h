@@ -27,6 +27,7 @@ using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace utils::customAllReduceUtils
 {
 
@@ -296,4 +297,5 @@ inline const std::unordered_map<int, AllReduceBestStrategyTableType> AllReduceBe
     {100, AllReduceBestStrategyTableSM100},
 };
 } // namespace utils::customAllReduceUtils
+
 TRTLLM_NAMESPACE_END

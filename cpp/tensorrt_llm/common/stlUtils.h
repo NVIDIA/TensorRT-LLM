@@ -16,13 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <functional>
 #include <numeric>
 #include <optional>
 #include <sstream>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common::stl_utils
 {
 
@@ -123,4 +124,5 @@ std::string toString(std::optional<T> const& t, typename std::enable_if_t<HasOpe
 }
 
 } // namespace common::stl_utils
+
 TRTLLM_NAMESPACE_END

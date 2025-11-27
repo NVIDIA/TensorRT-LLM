@@ -28,6 +28,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -342,4 +343,5 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

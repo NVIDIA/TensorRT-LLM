@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 #define UB_ONESHOT_DEFAULT_VALUE 1
@@ -436,4 +437,5 @@ error:
     return comm->free_region++;
 }
 } // namespace runtime::ub
+
 TRTLLM_NAMESPACE_END

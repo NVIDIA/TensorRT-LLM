@@ -22,6 +22,7 @@
 #include "tensorrt_llm/layers/penaltyLayer.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -88,4 +89,5 @@ private:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

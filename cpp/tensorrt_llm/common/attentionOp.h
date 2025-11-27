@@ -38,6 +38,7 @@
 #endif // ENABLE_MULTI_DEVICE
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common::op
 {
 
@@ -546,4 +547,5 @@ private:
 };
 
 } // namespace common::op
+
 TRTLLM_NAMESPACE_END

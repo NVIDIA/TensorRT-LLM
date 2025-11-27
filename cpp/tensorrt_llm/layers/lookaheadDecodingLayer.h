@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -94,4 +95,5 @@ private:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

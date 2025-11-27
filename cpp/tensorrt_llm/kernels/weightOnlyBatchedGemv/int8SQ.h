@@ -27,6 +27,7 @@
 #include <iostream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace smooth_quant
@@ -60,4 +61,5 @@ template <typename>
 void int8_sq_launcher(Params& params, cudaStream_t s);
 } // namespace smooth_quant
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

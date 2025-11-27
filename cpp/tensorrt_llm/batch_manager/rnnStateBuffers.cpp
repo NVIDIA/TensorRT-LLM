@@ -27,6 +27,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -78,4 +79,5 @@ void RnnStateBuffers::getBuffers(TensorMap& inputBuffers) const
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

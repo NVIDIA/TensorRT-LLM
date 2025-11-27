@@ -30,6 +30,7 @@ using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;
 /// See tensorrt_llm/_torch/pyexecutor/connector.py for details on the Connector API.
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_connector
 {
 
@@ -46,4 +47,5 @@ public:
 };
 
 } // namespace batch_manager::kv_connector
+
 TRTLLM_NAMESPACE_END

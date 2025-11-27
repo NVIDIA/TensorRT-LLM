@@ -46,6 +46,7 @@ void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, 
 } // anonymous namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -133,4 +134,5 @@ CompileEngine::CompileEngine(int SM, XQAParams const& xqaParams)
 
 } // namespace jit
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

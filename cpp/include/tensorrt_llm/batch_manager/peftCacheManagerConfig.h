@@ -23,6 +23,7 @@
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -96,4 +97,5 @@ struct PeftCacheManagerConfig
     std::optional<std::string> loraPrefetchDir;
 };
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

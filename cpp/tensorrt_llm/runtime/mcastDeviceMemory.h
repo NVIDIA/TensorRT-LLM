@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -122,4 +123,5 @@ private:
 constexpr size_t kSIGNAL_PAD_SIZE = 2048;
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

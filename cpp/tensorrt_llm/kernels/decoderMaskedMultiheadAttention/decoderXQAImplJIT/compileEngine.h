@@ -21,6 +21,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -43,4 +44,5 @@ private:
 
 } // namespace jit
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

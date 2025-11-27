@@ -25,6 +25,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -138,4 +139,5 @@ INSTANTIATE_RECOVER_RA(half);
 INSTANTIATE_RECOVER_RA(__nv_bfloat16);
 #endif
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

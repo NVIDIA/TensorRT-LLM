@@ -15,13 +15,14 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <sstream>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <int HeadSize, int paddedHeadSize, int BlockSizeQ, int BlockSizeK, int BlockSizeV, typename T, typename TQuant,
@@ -48,4 +49,5 @@ void unpadding(
     void* output, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

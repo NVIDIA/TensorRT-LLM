@@ -27,6 +27,7 @@
 #include <cute/numeric/numeric_types.hpp>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cute_dsl
 {
 namespace
@@ -460,4 +461,5 @@ INSTANTIATE_MOE_ACTIVATION(__nv_bfloat16, __nv_fp4_e2m1, uint8_t);
 #undef INSTANTIATE_MOE_ACTIVATION
 
 } // namespace kernels::cute_dsl
+
 TRTLLM_NAMESPACE_END

@@ -21,6 +21,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::dsv3MinLatencyKernels
 {
 
@@ -242,4 +243,5 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
 } // namespace kernels::dsv3MinLatencyKernels
+
 TRTLLM_NAMESPACE_END

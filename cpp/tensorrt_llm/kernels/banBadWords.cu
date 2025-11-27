@@ -22,6 +22,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -130,4 +131,5 @@ template void invokeBanBadWords(float* logits, TokenIdType const** output_ids_pt
     SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

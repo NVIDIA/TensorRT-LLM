@@ -35,6 +35,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -560,4 +561,5 @@ void DecoderXQAImplPrecompiled::runWithKVBlockArray(
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

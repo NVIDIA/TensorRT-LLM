@@ -30,6 +30,7 @@
 #include <unordered_set>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 using tensorrt_llm::common::op::AttentionOp;
@@ -959,6 +960,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

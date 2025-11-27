@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -24,11 +25,11 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.cuh"
-#include "tensorrt_llm/common/config.h"
 
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -336,4 +337,5 @@ struct LowLatencyLayerNorm
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

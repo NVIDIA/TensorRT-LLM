@@ -16,11 +16,12 @@
  * This file contains constants that decoderXQA*.{h,cpp} need.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <optional>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 inline constexpr int kMinHistoryTokensPerBlock = 128;
@@ -40,4 +41,5 @@ inline constexpr int getXqaMaxNumSubSeq(bool isMLA)
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

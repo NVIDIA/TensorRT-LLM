@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -48,4 +49,5 @@ template <typename input_t>
 void invokeMambaConv1dGeneration(MambaConv1dParamsBase& params, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

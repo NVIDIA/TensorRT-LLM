@@ -36,6 +36,7 @@
 #include <future>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 
@@ -672,4 +673,5 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     return true;
 }
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

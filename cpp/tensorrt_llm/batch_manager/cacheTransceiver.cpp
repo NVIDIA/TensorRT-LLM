@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include <cstdint>
 #include <limits>
 #include <sstream>
@@ -56,6 +56,7 @@
 #include <unordered_set>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -699,4 +700,5 @@ bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

@@ -27,6 +27,7 @@
 namespace tr = tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -88,4 +89,5 @@ bool LogitsPostProcessor::operator()(DecoderInputBuffers& inputBuffers, bool rep
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

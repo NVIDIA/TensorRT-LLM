@@ -25,6 +25,7 @@
 #include <unordered_set>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -75,4 +76,5 @@ private:
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

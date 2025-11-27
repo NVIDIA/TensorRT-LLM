@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/dynamicBatchTuner.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/dynamicBatchTuner.h"
 #include <cmath>
 
 namespace
@@ -37,6 +37,7 @@ void updateStats(SizeType32 value, std::deque<SizeType32>& stats, int64_t& sum, 
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -113,4 +114,5 @@ SizeType32 DynamicBatchTuner::getRuntimeMaxNumTokens(SizeType32 maxRuntimeBatchS
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

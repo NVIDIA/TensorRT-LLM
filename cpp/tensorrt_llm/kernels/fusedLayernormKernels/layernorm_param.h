@@ -16,11 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -44,4 +45,5 @@ struct GeneralFP4AddBiasResidualPreLayerNormParam
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

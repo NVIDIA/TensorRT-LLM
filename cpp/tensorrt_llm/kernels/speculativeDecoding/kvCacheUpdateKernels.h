@@ -23,6 +23,7 @@
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 
@@ -208,4 +209,5 @@ void updateKVBlockArrayDraftTokenLocation(runtime::SizeType32 const* seqAccepted
     bool canUseOneMoreBlock, cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

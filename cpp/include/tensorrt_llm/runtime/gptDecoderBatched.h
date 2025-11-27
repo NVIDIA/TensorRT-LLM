@@ -30,11 +30,11 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class LlmRequest;
 } // namespace batch_manager
-
 
 namespace runtime
 {
@@ -92,5 +92,5 @@ private:
     GptDecoderPtr mDecoder;
 };
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

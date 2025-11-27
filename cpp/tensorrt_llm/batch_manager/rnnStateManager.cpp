@@ -23,6 +23,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::rnn_state_manager
 {
 
@@ -116,4 +117,5 @@ void RnnStateManager::fillSlotMapping(
 }
 
 } // namespace batch_manager::rnn_state_manager
+
 TRTLLM_NAMESPACE_END

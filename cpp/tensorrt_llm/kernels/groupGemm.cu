@@ -30,6 +30,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -258,4 +259,5 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

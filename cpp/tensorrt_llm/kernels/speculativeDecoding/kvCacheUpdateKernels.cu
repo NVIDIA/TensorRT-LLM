@@ -24,6 +24,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 
@@ -337,4 +338,5 @@ void updateKVBlockArrayDraftTokenLocationSeparateRewind(SizeType32 const* seqAcc
 }
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

@@ -21,6 +21,7 @@
 #include <NvInferRuntime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -35,5 +36,5 @@ public:
 };
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

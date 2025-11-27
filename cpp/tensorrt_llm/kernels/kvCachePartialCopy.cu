@@ -20,6 +20,7 @@
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace
@@ -133,4 +134,5 @@ void kvCacheBlockPartialCopy(IBuffer& dst, IBuffer const& src, unsigned int numL
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

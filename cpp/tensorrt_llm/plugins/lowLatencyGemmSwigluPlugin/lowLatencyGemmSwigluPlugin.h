@@ -30,6 +30,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 using LowLatencyGemmSwigluRunnerPtr
@@ -140,4 +141,5 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

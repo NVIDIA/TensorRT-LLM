@@ -23,6 +23,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 struct IpcNvlsHandle
@@ -108,5 +109,5 @@ private:
     IpcNvlsHandle* _handle;
 };
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

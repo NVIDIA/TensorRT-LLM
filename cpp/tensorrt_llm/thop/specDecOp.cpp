@@ -27,6 +27,7 @@ namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -337,6 +338,7 @@ void extract_real_draft_tokens_op(th::Tensor newDraftTokens, th::Tensor draftTok
 }
 
 } // end namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -366,7 +368,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mtp_sampling_and_accepted_draft_tokens_op", &tensorrt_llm::torch_ext::mtp_sampling_and_accepted_draft_tokens_op);
+    m.impl("mtp_sampling_and_accepted_draft_tokens_op",
+        &tensorrt_llm::torch_ext::mtp_sampling_and_accepted_draft_tokens_op);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////

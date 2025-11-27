@@ -28,6 +28,7 @@
 #include <cute/arch/util.hpp>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::fp8_blockscale_gemm
 {
 
@@ -143,4 +144,5 @@ __device__ uint64_t mbarrier_arrive_1_expect_tx_cta(void* smem_ptr, uint32_t tx_
 }
 
 } // namespace kernels::fp8_blockscale_gemm
+
 TRTLLM_NAMESPACE_END

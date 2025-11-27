@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include <tuple>
 #include "tensorrt_llm/common/config.h"
+#include <tuple>
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/fp4_converter.cuh"
@@ -27,6 +27,7 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <typename _Param, typename _InputType, typename _OutputType, typename _AccumulatorType, bool _RMS_NORM,
@@ -320,4 +321,5 @@ void invokeWSLayerNorm<GeneralFP4AddBiasResidualPreLayerNormParam<__nv_bfloat16>
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

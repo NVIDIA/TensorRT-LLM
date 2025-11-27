@@ -56,6 +56,7 @@
 #define ROUND_UP(n, multiple) (((n + multiple - 1) / multiple) * multiple)
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 using namespace tensorrt_llm::mpi;
@@ -540,4 +541,5 @@ void ipcNvlsFree(IpcNvlsHandle* handle)
 }
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

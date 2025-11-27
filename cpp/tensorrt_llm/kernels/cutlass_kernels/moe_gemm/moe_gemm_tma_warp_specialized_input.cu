@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
@@ -169,4 +170,5 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
     return ss.str();
 }
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

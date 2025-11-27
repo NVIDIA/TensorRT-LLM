@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -327,4 +328,5 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

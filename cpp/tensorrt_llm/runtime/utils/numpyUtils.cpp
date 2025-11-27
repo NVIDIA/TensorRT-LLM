@@ -33,6 +33,7 @@
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 
@@ -265,4 +266,5 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
 }
 
 } // namespace runtime::utils
+
 TRTLLM_NAMESPACE_END

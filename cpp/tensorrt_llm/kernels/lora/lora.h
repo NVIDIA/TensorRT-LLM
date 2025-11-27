@@ -25,6 +25,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -73,4 +74,5 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
     void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -31,6 +31,7 @@ using namespace tensorrt_llm::kernels::speculative_decoding;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -313,4 +314,5 @@ template class EagleDecodingLayer<float>;
 template class EagleDecodingLayer<half>;
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

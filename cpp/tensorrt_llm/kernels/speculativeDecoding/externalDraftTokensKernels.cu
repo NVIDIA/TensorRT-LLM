@@ -34,6 +34,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 namespace
@@ -318,4 +319,5 @@ void invokeForwardAcceptedTokens(SizeType32 batchSize, SizeType32 const* batchSl
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

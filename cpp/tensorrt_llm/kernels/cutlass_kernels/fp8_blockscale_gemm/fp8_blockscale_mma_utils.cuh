@@ -22,6 +22,7 @@
 #include <cute/arch/util.hpp>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::fp8_blockscale_gemm
 {
 
@@ -615,4 +616,5 @@ struct Fp8MmaSelector
 };
 
 } // namespace kernels::fp8_blockscale_gemm
+
 TRTLLM_NAMESPACE_END

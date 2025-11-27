@@ -25,6 +25,7 @@
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <array>
 #include <cuda_runtime_api.h>
@@ -32,9 +33,9 @@
 #include <optional>
 #include <random>
 #include <utility>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 // Change to following declarations must sync with lora.h in public repo
@@ -1019,4 +1020,5 @@ void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

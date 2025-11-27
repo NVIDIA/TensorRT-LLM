@@ -23,6 +23,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 OrchestratorConfig::OrchestratorConfig(bool isOrchestrator, std::string workerExecutablePath,
@@ -80,4 +81,5 @@ void OrchestratorConfig::setSpawnProcesses(bool spawnProcesses)
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

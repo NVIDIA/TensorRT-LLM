@@ -15,10 +15,11 @@
  *
  * Common utils to be shared between Precompiled and JIT implementation.
  */
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -62,4 +63,5 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

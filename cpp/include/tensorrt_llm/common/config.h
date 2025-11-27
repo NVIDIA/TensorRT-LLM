@@ -30,7 +30,7 @@
  * This macro should not be used with any other TRTLLM namespace macros.
  */
 #ifdef TRTLLM_WRAPPED_NAMESPACE
-#define TRTLLM_NAMESPACE_PREFIX                                                                                               \
+#define TRTLLM_NAMESPACE_PREFIX                                                                                        \
     namespace TRTLLM_WRAPPED_NAMESPACE                                                                                 \
     {
 #define TRTLLM_NAMESPACE_POSTFIX }
@@ -95,7 +95,7 @@
  */
 #define TRTLLM_NAMESPACE_BEGIN                                                                                         \
     TRTLLM_NAMESPACE_PREFIX                                                                                            \
-    namespace tensorrt_llm                                                                                                      \
+    namespace tensorrt_llm                                                                                             \
     {                                                                                                                  \
     TRTLLM_ABI_NAMESPACE_BEGIN
 
@@ -107,7 +107,7 @@
  */
 #define TRTLLM_NAMESPACE_END                                                                                           \
     TRTLLM_ABI_NAMESPACE_END                                                                                           \
-    } /* end namespace tensorrt_llm */                                                                                          \
+    } /* end namespace tensorrt_llm */                                                                                 \
     TRTLLM_NAMESPACE_POSTFIX
 
 #endif // TRTLLM_CONFIG_H

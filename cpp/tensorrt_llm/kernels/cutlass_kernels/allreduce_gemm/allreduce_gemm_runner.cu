@@ -24,6 +24,7 @@
 #include "cutlass/half.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::opened_cutlass_kernels
 {
 /////////////////////////////////////////////////
@@ -296,4 +297,5 @@ template class GemmAllReduceImplRunner<GemmTypes<cutlass::float_e2m1_t, cutlass:
     cutlass::layout::ColumnMajor, cutlass::layout::RowMajor, cutlass::layout::RowMajor>>;
 
 } // namespace kernels::opened_cutlass_kernels
+
 TRTLLM_NAMESPACE_END

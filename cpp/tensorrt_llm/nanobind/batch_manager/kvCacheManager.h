@@ -23,6 +23,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 class KVCacheManagerBindings
@@ -31,8 +32,10 @@ public:
     static void initBindings(nb::module_& m);
 };
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class BasePeftCacheManagerBindings
@@ -41,4 +44,5 @@ public:
     static void initBindings(nb::module_& m);
 };
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

@@ -16,12 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -170,4 +171,5 @@ inline __device__ void convertToFloatAndAccumulate<__nv_bfloat16, 8>(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

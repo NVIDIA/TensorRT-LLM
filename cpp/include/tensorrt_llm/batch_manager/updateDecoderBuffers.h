@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class BufferManager;
@@ -51,4 +52,5 @@ public:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

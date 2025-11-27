@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -87,4 +88,5 @@ std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() 
     return mKvTransferSenderFutureTimeoutMs;
 }
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

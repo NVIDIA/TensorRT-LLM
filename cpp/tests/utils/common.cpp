@@ -34,6 +34,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing
 {
 namespace fs = std::filesystem;
@@ -684,5 +685,5 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
 }
 
 } // namespace testing
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

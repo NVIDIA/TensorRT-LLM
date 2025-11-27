@@ -28,6 +28,7 @@
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -2017,4 +2018,5 @@ void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, c
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

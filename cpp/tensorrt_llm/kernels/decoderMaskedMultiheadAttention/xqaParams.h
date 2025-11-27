@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -206,4 +207,5 @@ struct XQAParams
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

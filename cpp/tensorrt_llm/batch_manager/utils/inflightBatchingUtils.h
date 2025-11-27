@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 using SizeType32 = runtime::SizeType32;
@@ -126,4 +127,5 @@ private:
     std::unordered_map<BatchState, GraphExecutorLruCache::iterator, BatchStateHash> mMap;
 };
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

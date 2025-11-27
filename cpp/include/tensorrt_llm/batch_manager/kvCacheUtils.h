@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 
@@ -311,4 +312,5 @@ inline BlockIterator BlockRangeForWindow::begin() const
 }
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

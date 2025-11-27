@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::decoder
 {
 
@@ -243,5 +244,5 @@ private:
 };
 
 } // namespace runtime::decoder
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -34,4 +35,5 @@ void invokeCumsumLastDim(SizeType32 batchSize, SizeType32 inputLength, void cons
     void* __restrict__ output, void* workspace, size_t tempStorageBytes, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

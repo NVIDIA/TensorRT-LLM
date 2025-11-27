@@ -32,14 +32,13 @@
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers::sampling
 {
 
@@ -192,5 +191,5 @@ public:
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
 } // namespace tests::layers::sampling
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

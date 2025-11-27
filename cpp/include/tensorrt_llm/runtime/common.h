@@ -24,6 +24,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -66,5 +67,5 @@ template <typename T>
 using StringPtrMap = std::unordered_map<std::string, std::shared_ptr<T>>;
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

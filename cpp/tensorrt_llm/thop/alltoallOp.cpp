@@ -31,6 +31,7 @@
 #endif // ENABLE_MULTI_DEVICE
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 #if ENABLE_MULTI_DEVICE
@@ -115,6 +116,7 @@ std::vector<torch::Tensor> alltoall_helix(
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

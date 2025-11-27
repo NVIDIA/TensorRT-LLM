@@ -21,6 +21,7 @@
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace mmha
@@ -176,4 +177,5 @@ INSTANTIATE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16, false)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

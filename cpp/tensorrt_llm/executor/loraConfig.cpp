@@ -22,6 +22,7 @@
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 LoraConfig::LoraConfig(IdType taskId, std::optional<Tensor> weights, std::optional<Tensor> config)
@@ -74,4 +75,5 @@ std::optional<Tensor> LoraConfig::getConfig() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

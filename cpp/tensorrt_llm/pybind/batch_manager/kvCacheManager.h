@@ -22,6 +22,7 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 class KVCacheManagerBindings
@@ -30,8 +31,10 @@ public:
     static void initBindings(pybind11::module_& m);
 };
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class BasePeftCacheManagerBindings
@@ -40,4 +43,5 @@ public:
     static void initBindings(pybind11::module_& m);
 };
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

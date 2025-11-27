@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 
@@ -32,5 +33,5 @@ int stallStream(
     char const* name, std::optional<cudaStream_t> stream = std::nullopt, std::optional<int> delay = std::nullopt);
 
 } // namespace runtime::utils
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

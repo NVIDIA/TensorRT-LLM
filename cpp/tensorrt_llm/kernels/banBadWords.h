@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,4 +35,5 @@ void invokeBanBadWords(T* logits, runtime::TokenIdType const** output_ids_ptr,
     cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

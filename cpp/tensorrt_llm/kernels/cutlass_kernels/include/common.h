@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 
@@ -38,4 +39,5 @@ enum class ActivationType
 };
 
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

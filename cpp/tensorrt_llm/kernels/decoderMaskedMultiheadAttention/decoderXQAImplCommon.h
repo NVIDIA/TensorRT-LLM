@@ -32,6 +32,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -482,4 +483,5 @@ inline int computeMultiBlockCountSpecDecGMMA(
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

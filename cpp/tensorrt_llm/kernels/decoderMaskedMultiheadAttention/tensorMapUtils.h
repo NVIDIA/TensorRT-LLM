@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,4 +35,5 @@ CUtensorMap makeTensorMapForXqaMlaQ(
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, XQAParams const& xqaParams, void const* q);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

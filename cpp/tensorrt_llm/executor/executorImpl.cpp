@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/executorImpl.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
 #include "tensorrt_llm/common/assert.h"
@@ -26,7 +27,6 @@
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/executor/executorImpl.h"
 #include "tensorrt_llm/executor/orchestratorUtils.h"
 #include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/serialization.h"
@@ -48,6 +48,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -2773,4 +2774,5 @@ void Executor::Impl::checkParallelApiUsage(std::string const& methodName) const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -16,17 +16,19 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <typename InputT, typename OutputT, typename IdxT, bool DoSoftmaxBeforeTopK>
 void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -27,6 +27,7 @@
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 // self: [M, K], fp16/bf16/fp8_quantized
@@ -232,6 +233,7 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
     return globalScale;
 }
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

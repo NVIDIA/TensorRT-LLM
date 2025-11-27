@@ -25,12 +25,12 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TllmRuntime;
 class MulticastTensor;
 } // namespace runtime
-
 
 namespace batch_manager
 {
@@ -146,4 +146,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

@@ -25,6 +25,7 @@ namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -135,6 +136,7 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 static auto gather_tree = torch::RegisterOperators("tensorrt_llm::gather_tree", &tensorrt_llm::torch_ext::gatherTree);

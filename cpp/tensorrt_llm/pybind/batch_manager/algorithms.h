@@ -22,11 +22,12 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::batch_manager::algorithms
 {
 
 void initBindings(pybind11::module_& m);
 
-} // namespace pybind11::batch_manager::algorithms
-TRTLLM_NAMESPACE_END
+} // namespace pybind::batch_manager::algorithms
 
+TRTLLM_NAMESPACE_END

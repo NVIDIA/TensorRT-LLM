@@ -22,6 +22,7 @@
 #include <algorithm>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -174,4 +175,5 @@ std::vector<RetentionPriorityAndDuration> KvCacheRetentionConfig::getPerBlockRet
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

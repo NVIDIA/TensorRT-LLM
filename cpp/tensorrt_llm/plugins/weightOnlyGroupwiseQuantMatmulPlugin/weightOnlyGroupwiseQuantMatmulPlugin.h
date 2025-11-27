@@ -39,6 +39,7 @@
 #include "cutlass/integer_subbyte.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -186,4 +187,5 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

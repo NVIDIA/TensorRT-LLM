@@ -16,8 +16,8 @@
  */
 
 #include "bindings.h"
-#include <nanobind/stl/string.h>
 #include "tensorrt_llm/common/bindingUtils.h"
+#include <nanobind/stl/string.h>
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
@@ -25,6 +25,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::process_group
 {
 
@@ -43,4 +44,5 @@ void initBindings(nb::module_& m)
 }
 
 } // namespace nanobind::process_group
+
 TRTLLM_NAMESPACE_END

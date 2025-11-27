@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -32,4 +33,5 @@ bool supportConfigTllmGen(
 
 } // namespace jit
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

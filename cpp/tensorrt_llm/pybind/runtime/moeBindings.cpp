@@ -31,6 +31,7 @@ namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::runtime
 {
 
@@ -136,4 +137,5 @@ void initMoeBindings(pybind11::module_& m)
 }
 
 } // namespace pybind::runtime
+
 TRTLLM_NAMESPACE_END

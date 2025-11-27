@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -122,4 +123,5 @@ static constexpr int kIdxScaleSoftmaxPtr = 0;
 static constexpr int kIdxScaleSoftmaxLog2Ptr = 1;
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

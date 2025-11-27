@@ -21,17 +21,18 @@
 #else
 #include <cooperative_groups.h>
 #endif
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <float.h>
 #include <type_traits>
-#include "tensorrt_llm/common/config.h"
 
 namespace cg = cooperative_groups;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -423,4 +424,5 @@ __device__ __forceinline__ half clamp_inf_for_half(float const input)
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

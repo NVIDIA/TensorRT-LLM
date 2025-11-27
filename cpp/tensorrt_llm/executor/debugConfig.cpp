@@ -21,6 +21,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -81,4 +82,5 @@ void DebugConfig::setDebugTensorsMaxIterations(SizeType32 debugTensorsMaxIterati
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

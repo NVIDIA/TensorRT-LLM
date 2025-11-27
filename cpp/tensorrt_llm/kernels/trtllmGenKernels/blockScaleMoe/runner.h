@@ -28,6 +28,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -396,4 +397,5 @@ private:
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

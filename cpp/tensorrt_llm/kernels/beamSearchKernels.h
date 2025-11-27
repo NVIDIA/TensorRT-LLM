@@ -24,6 +24,7 @@
 #define BEAM_SEARCH_DEBUG 0
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 static size_t constexpr kMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
@@ -219,4 +220,5 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

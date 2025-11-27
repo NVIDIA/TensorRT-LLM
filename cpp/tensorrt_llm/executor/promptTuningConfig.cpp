@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 PromptTuningConfig::PromptTuningConfig(Tensor embeddingTable, std::optional<VecTokenExtraIds> inputTokenExtraIds)
@@ -41,4 +42,5 @@ std::optional<VecTokenExtraIds> PromptTuningConfig::getInputTokenExtraIds() cons
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -26,6 +26,7 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 
@@ -106,4 +107,5 @@ constexpr bool isValidAmpereMOESpecialisation()
 }
 
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

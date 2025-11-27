@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include <utility>
 #include "tensorrt_llm/common/config.h"
+#include <utility>
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, SamplingConfig const& samplingConfig,
@@ -425,4 +426,5 @@ void Request::setCacheSaltID(CacheSaltIDType cacheSaltID)
     return mImpl->setCacheSaltID(cacheSaltID);
 }
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

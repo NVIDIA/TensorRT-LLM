@@ -66,6 +66,7 @@ namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 

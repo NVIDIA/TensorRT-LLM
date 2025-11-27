@@ -25,6 +25,7 @@
 #include <tensorrt_llm/kernels/qserveGemm.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -112,4 +113,5 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

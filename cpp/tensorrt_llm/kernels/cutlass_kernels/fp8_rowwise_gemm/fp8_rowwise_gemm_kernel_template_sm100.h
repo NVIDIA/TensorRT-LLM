@@ -45,6 +45,7 @@
 #endif          // __GNUC__
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 using namespace cute;
@@ -180,4 +181,5 @@ struct DeviceGemmFp8RowwiseSm100
 };
 
 } // namespace kernels::cutlass_kernels
+
 TRTLLM_NAMESPACE_END

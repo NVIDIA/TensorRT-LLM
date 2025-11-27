@@ -21,6 +21,7 @@
 #include "ub_allocator.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config);
@@ -31,10 +32,12 @@ void ub_deallocate(void* addr);
 UBBuffer ub_get(int idx);
 communicator* ub_comm();
 bool ub_supported();
-}; // namespace tensorrt_llm::runtime::ub
+}; // namespace runtime::ub
+
 TRTLLM_NAMESPACE_END
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ub
 {
 using namespace tensorrt_llm::runtime::ub;
@@ -58,4 +61,5 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, si
     size_t const elements, int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor,
     void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 } // namespace kernels::ub
+
 TRTLLM_NAMESPACE_END

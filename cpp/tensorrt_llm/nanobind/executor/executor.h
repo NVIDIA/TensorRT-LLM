@@ -26,6 +26,7 @@ namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::executor
 {
 
@@ -129,4 +130,5 @@ private:
 };
 
 } // namespace nanobind::executor
+
 TRTLLM_NAMESPACE_END

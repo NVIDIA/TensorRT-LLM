@@ -25,6 +25,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 
@@ -208,4 +209,5 @@ size_t getTypicalAcceptanceWorkspaceSize(
     runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 vocabSizePadded);
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

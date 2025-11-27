@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaPackedMask.h"
 #include "tensorrt_llm/thop/thUtils.h"
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 using torch::Tensor;
@@ -178,14 +179,15 @@ Tensor pack_fmha_mask_by_input(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Utility methods.
-static auto pack_fmha_mask_by_type
-    = torch::RegisterOperators("tensorrt_llm::pack_fmha_mask_by_type", &tensorrt_llm::torch_ext::pack_fmha_mask_by_type);
+static auto pack_fmha_mask_by_type = torch::RegisterOperators(
+    "tensorrt_llm::pack_fmha_mask_by_type", &tensorrt_llm::torch_ext::pack_fmha_mask_by_type);
 
 // Utility methods.
-static auto pack_fmha_mask_by_input
-    = torch::RegisterOperators("tensorrt_llm::pack_fmha_mask_by_input", &tensorrt_llm::torch_ext::pack_fmha_mask_by_input);
+static auto pack_fmha_mask_by_input = torch::RegisterOperators(
+    "tensorrt_llm::pack_fmha_mask_by_input", &tensorrt_llm::torch_ext::pack_fmha_mask_by_input);

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -80,4 +81,5 @@ Result const& Response::getResult() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
@@ -31,6 +31,7 @@ namespace tr = tensorrt_llm::runtime;
 namespace tru = tensorrt_llm::runtime::utils;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -176,4 +177,5 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

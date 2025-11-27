@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TensorView : virtual public ITensor, public BufferView
@@ -86,4 +87,5 @@ private:
     nvinfer1::Dims mDims{};
 };
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

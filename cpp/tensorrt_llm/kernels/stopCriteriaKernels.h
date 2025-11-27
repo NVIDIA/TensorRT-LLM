@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 //! \brief Sets finished state to FinishedState::FINISHED_STOP_WORDS if any of the stopWords is met.
@@ -95,4 +96,5 @@ void invokeExplicitEOSCriterion(runtime::TokenIdType const** outputIds, runtime:
     runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
     runtime::SizeType32 maxTokensPerStep, cudaStream_t stream);
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

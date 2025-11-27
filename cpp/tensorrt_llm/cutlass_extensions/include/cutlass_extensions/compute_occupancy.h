@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace cutlass_extensions
 {
 
@@ -85,4 +86,5 @@ inline int compute_occupancy_for_kernel()
 }
 
 } // namespace cutlass_extensions
+
 TRTLLM_NAMESPACE_END

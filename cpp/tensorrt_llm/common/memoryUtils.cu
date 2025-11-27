@@ -27,6 +27,7 @@
 #include <sanitizer/asan_interface.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -961,4 +962,5 @@ void calcAlignedPointers(
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

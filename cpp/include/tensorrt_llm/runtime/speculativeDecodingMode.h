@@ -21,6 +21,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -195,5 +196,5 @@ static_assert(!SpeculativeDecodingMode::Eagle().isExplicitDraftTokens());
 static_assert(!SpeculativeDecodingMode::Eagle().isLookaheadDecoding());
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

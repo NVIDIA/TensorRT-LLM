@@ -112,6 +112,7 @@ tle::Tensor numpyToTensor(nb::object const& object)
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::executor
 {
 
@@ -225,4 +226,5 @@ void Executor::initBindings(nb::module_& m)
 }
 
 } // namespace nanobind::executor
+
 TRTLLM_NAMESPACE_END

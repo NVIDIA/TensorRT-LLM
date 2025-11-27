@@ -292,6 +292,7 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -351,4 +352,5 @@ INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(half);
 INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(float);
 INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(__nv_bfloat16);
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

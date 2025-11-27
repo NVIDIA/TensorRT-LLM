@@ -22,6 +22,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -177,4 +178,5 @@ INVOKE_BAN_REPEAT_NGRAM(__nv_bfloat16)
 #undef INVOKE_BAN_REPEAT_NGRAM
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

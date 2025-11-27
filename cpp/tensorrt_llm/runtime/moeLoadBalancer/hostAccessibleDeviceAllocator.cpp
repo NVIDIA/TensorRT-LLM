@@ -32,6 +32,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -419,4 +420,5 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
 }
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

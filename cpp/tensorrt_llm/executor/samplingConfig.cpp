@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -455,4 +456,5 @@ void SamplingConfig::updateNumReturnBeams()
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

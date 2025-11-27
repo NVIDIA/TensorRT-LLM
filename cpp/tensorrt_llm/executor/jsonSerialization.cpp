@@ -24,6 +24,7 @@
 using json = nlohmann::json;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -69,4 +70,5 @@ std::string JsonSerialization::toJsonStr(RequestStats const& requestStats)
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -23,6 +23,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::utils
 {
 struct TreeNode
@@ -41,5 +42,5 @@ SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDe
     std::optional<SizeType32> maxNonLeafNodesPerLayer = std::nullopt);
 
 } // namespace runtime::utils
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

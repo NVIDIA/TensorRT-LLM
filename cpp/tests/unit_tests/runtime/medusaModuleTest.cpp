@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 #include <NvInferRuntime.h>
@@ -30,6 +30,7 @@
 #include <algorithm>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 using TensorPtr = ITensor::SharedPtr;
@@ -173,5 +174,5 @@ TEST_F(MedusaModuleTest, mcSim7663Choices)
 }
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -32,6 +32,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TllmRuntime
@@ -243,4 +244,5 @@ private:
     std::vector<SizeType32> mCurrentBeamWidths;
 };
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

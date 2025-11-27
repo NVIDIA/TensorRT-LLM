@@ -31,6 +31,7 @@ using ncclWindow_t = void*;
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 static auto constexpr tensor_prefix = "allreduce_ub_";
@@ -135,6 +136,6 @@ private:
 #else
 using communicator = void;
 #endif
-}; // namespace tensorrt_llm::runtime::ub
-TRTLLM_NAMESPACE_END
+}; // namespace runtime::ub
 
+TRTLLM_NAMESPACE_END

@@ -25,6 +25,7 @@
 using torch::Tensor;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -121,6 +122,7 @@ Tensor cuda_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& sc
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

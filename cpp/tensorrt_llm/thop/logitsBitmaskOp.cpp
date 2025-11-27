@@ -19,6 +19,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -95,6 +96,7 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

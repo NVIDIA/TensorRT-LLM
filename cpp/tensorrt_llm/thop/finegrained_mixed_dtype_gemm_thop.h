@@ -18,11 +18,12 @@
 
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -46,4 +47,5 @@ private:
 };
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END

@@ -56,6 +56,7 @@ auto const TEST_MODEL_CONFIG = TEST_RESOURCE_PATH / "test_model_lora_config.json
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 using TensorPtr = ITensor::SharedPtr;
@@ -364,4 +365,5 @@ TEST_P(LoraManagerTest, fillInputTensors)
 INSTANTIATE_TEST_SUITE_P(LoraManagerTest, LoraManagerTest, testing::Values(false, true));
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

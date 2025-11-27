@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include <numeric>
 #include <unordered_set>
-#include "tensorrt_llm/common/assert.h"
 
 #include "tensorrt_llm/common/config.h"
 
@@ -40,6 +40,7 @@
 static_assert(std::is_same<tensorrt_llm::runtime::SizeType32, std::int32_t>::value);
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace mpi
 {
 
@@ -657,4 +658,5 @@ void MpiWaitThread::notifyStop()
 }
 
 } // namespace mpi
+
 TRTLLM_NAMESPACE_END

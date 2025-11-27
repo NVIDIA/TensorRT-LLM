@@ -26,6 +26,7 @@
 namespace cg = cooperative_groups;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -377,4 +378,5 @@ size_t getMoePrepareWorkspaceSize(int epSize)
 } // namespace moe_prepare
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

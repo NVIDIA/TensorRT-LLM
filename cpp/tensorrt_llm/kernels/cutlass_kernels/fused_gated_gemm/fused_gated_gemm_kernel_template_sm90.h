@@ -44,6 +44,7 @@
 #endif          // __GNUC__
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -118,4 +119,5 @@ struct DeviceGemmGatedSm90
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

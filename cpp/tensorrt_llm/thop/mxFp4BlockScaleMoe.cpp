@@ -26,6 +26,7 @@
 #include <optional>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 namespace btg = batchedGemm::trtllm::gen;
@@ -664,6 +665,7 @@ private:
 };
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 // Accepts CUDA tensor only

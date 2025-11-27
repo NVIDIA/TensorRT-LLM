@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "tests/unit_tests/layers/baseSamplingLayerTest.h"
+#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers::sampling
 {
 
@@ -374,5 +375,5 @@ template class BaseSamplingLayerTest<float>;
 template class BaseSamplingLayerTest<half>;
 
 } // namespace tests::layers::sampling
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

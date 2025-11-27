@@ -29,6 +29,7 @@ class GrammarCompiler;
 } // namespace xgrammar
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class DecoderInputBuffers;
@@ -67,4 +68,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

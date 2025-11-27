@@ -16,14 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda.h>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -126,4 +127,5 @@ private:
     std::vector<int64_t> mPassingConfigIndices;
 };
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

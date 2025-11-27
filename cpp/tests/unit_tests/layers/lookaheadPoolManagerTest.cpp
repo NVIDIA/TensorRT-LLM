@@ -21,6 +21,7 @@
 #include "tests/unit_tests/layers/randomLlm.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
@@ -174,4 +175,5 @@ TEST(LookaheadPoolManagerTest, fillAndUpdate)
 }
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

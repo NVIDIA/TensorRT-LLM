@@ -41,6 +41,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -1105,4 +1106,5 @@ using UVMTensor = GenericTensor<UVMAllocator>;
 using VirtualAddressDeviceTensor = GenericTensor<CudaVirtualMemoryAllocatorAdaptor>;
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

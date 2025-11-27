@@ -27,6 +27,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -168,6 +169,7 @@ void checkDriverExitSafe(T result, char const* const func, char const* const fil
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END
 /*
  * Macros compliant with TensorRT coding conventions

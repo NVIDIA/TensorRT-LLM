@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include <string>
 #include "tensorrt_llm/common/config.h"
+#include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -25,4 +26,5 @@ namespace common
 std::string getCurrentTimestamp();
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

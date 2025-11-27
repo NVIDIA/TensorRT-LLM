@@ -16,15 +16,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <queue>
 #include <unordered_map>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -63,4 +64,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

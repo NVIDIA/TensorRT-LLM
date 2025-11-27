@@ -27,6 +27,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -132,4 +133,5 @@ namespace runtime::kernels
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
     SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
 } // namespace runtime::kernels
+
 TRTLLM_NAMESPACE_END

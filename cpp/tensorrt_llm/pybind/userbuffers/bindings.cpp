@@ -24,6 +24,7 @@ namespace py = pybind11;
 namespace tub = tensorrt_llm::runtime::ub;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::userbuffers
 {
 
@@ -50,4 +51,5 @@ void UserBufferBindings::initBindings(pybind11::module_& m)
         py::call_guard<py::gil_scoped_release>());
 }
 } // namespace kernels::userbuffers
+
 TRTLLM_NAMESPACE_END

@@ -24,6 +24,7 @@
 #include <cassert>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 class CumsumLastDimPlugin : public BasePlugin
@@ -100,5 +101,6 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END
 #endif

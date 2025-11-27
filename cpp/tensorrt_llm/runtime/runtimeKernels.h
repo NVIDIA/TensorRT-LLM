@@ -23,12 +23,15 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 class KVCacheIndex;
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::kernels
 {
 
@@ -63,4 +66,5 @@ void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftT
     SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock, bool canUseOneMoreBlock, cudaStream_t stream);
 
 } // namespace runtime::kernels
+
 TRTLLM_NAMESPACE_END

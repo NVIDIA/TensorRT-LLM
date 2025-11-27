@@ -15,14 +15,15 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -78,4 +79,5 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

@@ -77,6 +77,7 @@ tle::Tensor numpyToTensor(py::array const& array)
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::executor
 {
 
@@ -191,4 +192,5 @@ void Executor::initBindings(py::module_& m)
 }
 
 } // namespace pybind::executor
+
 TRTLLM_NAMESPACE_END

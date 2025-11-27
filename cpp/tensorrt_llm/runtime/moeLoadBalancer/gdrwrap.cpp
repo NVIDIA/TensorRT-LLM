@@ -25,6 +25,7 @@
 #include <pthread.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 namespace gdrcopy
@@ -264,5 +265,6 @@ void gdrCudaFree(GdrMemDesc* memDesc, gdr_t handle)
 
 } // namespace gdrcopy
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END
 #endif // _WIN32

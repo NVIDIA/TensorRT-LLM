@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -167,5 +168,6 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END
 #endif // TRT_GEMM_PLUGIN_H

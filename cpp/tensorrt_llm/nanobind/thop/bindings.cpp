@@ -15,17 +15,18 @@
  */
 
 #include "bindings.h"
+#include "tensorrt_llm/common/config.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
-#include "tensorrt_llm/common/config.h"
 
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::thop
 {
 
@@ -74,4 +75,5 @@ void initBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace nanobind::thop
+
 TRTLLM_NAMESPACE_END

@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1779,4 +1780,5 @@ void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFie
 } // namespace fused_moe_comm_tests
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

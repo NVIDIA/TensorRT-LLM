@@ -47,6 +47,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -1029,4 +1030,5 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

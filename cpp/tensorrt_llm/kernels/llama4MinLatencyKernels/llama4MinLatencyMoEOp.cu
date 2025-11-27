@@ -35,6 +35,7 @@
 #define ENABLE_PREEXIT 1
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency::llama4_moe
 {
 
@@ -354,4 +355,5 @@ void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
 }
 
 } // namespace kernels::llama4_min_latency::llama4_moe
+
 TRTLLM_NAMESPACE_END

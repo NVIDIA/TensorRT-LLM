@@ -22,6 +22,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 template <typename T>
@@ -191,4 +192,5 @@ void invokeSetTopPRuntimeArgs(runtime::SizeType32 batchSize, ScatterDecodingPara
     runtime::SizeType32 const* batchSlotsPtr, bool onDevice, cudaStream_t stream = nullptr);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ar_fusion
 {
 
@@ -44,4 +45,5 @@ private:
 
 void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
 } // namespace kernels::ar_fusion
+
 TRTLLM_NAMESPACE_END

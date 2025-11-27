@@ -29,6 +29,7 @@ using tensorrt_llm::testing::QuantMethod;
 using tensorrt_llm::testing::OutputContentType;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::testing
 {
 
@@ -87,4 +88,5 @@ void initBindings(nb::module_& m)
 }
 
 } // namespace nanobind::testing
+
 TRTLLM_NAMESPACE_END

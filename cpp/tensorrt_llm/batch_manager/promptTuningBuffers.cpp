@@ -15,13 +15,14 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -323,4 +324,5 @@ void PromptTuningBuffers::clearBufferStartPositions(size_t index)
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

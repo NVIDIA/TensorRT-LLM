@@ -29,6 +29,7 @@
 namespace py = pybind11;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::runtime
 {
 
@@ -115,4 +116,5 @@ void initHostFuncBindings(pybind11::module_& m)
     m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
 }
 } // namespace pybind::runtime
+
 TRTLLM_NAMESPACE_END

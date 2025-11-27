@@ -28,6 +28,7 @@
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 // Given the rowIdx and colIdx in the unswizzled SFMatrix, compute the 1D offset in the swizzled SFMatrix.
@@ -85,4 +86,5 @@ torch::Tensor symmetric_dequantize_activation(torch::Tensor activation, torch::T
 torch::Tensor symmetric_dequantize_per_tensor(torch::Tensor input, torch::Tensor scales);
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END

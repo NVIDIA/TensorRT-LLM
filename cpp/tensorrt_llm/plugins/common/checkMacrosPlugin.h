@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -29,4 +30,5 @@ void logError(char const* msg, char const* file, char const* fn, int line);
 void caughtError(std::exception const& e);
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

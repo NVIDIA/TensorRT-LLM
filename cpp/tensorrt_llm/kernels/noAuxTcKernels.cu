@@ -28,6 +28,7 @@ namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 static constexpr int WARP_SIZE = 32;
@@ -337,4 +338,5 @@ INSTANTIATE_NOAUX_TC(__nv_bfloat16, half, __nv_bfloat16, int32_t);
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

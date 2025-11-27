@@ -23,6 +23,7 @@
 namespace th = torch;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -40,4 +41,5 @@ private:
 };
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END

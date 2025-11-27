@@ -25,6 +25,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 
@@ -785,4 +786,5 @@ void invokeCopyFinalDraftTokens(runtime::SizeType32 batchSize, runtime::SizeType
     runtime::TokenIdType* pluginOutputDraftTokenIds, runtime::SizeType32* pluginOutputDraftLens, cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

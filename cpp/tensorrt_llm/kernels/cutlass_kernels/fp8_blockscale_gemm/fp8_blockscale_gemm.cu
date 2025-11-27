@@ -16,10 +16,11 @@
 
 #include "fp8_blockscale_gemm.h"
 #include "fp8_blockscale_gemm_kernel.cuh"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::fp8_blockscale_gemm
 {
 
@@ -313,4 +314,5 @@ template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_bfloat16, __nv
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 
 } // namespace kernels::fp8_blockscale_gemm
+
 TRTLLM_NAMESPACE_END

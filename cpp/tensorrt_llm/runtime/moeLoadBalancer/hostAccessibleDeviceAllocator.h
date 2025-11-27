@@ -16,16 +16,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
-#include "tensorrt_llm/common/config.h"
 
 #include "gdrwrap.h"
 #include "topologyDetector.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -178,4 +179,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

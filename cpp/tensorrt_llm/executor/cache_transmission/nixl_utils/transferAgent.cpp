@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -36,6 +36,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -692,4 +693,5 @@ extern "C"
 #endif
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

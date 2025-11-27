@@ -22,6 +22,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -294,5 +295,5 @@ inline std::ostream& operator<<(std::ostream& output, LoraModule const& module)
                   << "outTpSplitDim=" << module.outTpSplitDim() << ")";
 }
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

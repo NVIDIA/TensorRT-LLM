@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include <cstdint>
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
+#include <cstdint>
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
@@ -34,6 +34,7 @@ namespace tk = tensorrt_llm::kernels;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 
@@ -253,4 +254,5 @@ void KVCacheTransferManager::syncTransfers()
 }
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

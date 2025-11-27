@@ -30,6 +30,7 @@
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 
@@ -167,4 +168,5 @@ void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
 }
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include <utility>
 #include "tensorrt_llm/common/config.h"
+#include <utility>
 
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -109,4 +110,5 @@ protected:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

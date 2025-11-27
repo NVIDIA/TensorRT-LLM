@@ -29,6 +29,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -2428,4 +2429,5 @@ INSTANTIATE_invokeCpTransposeToSeqMajor2(__nv_fp8_e4m3);
 #undef INSTANTIATE_invokeCpTransposeToSeqMajor2
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

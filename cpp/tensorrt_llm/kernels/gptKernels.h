@@ -24,6 +24,7 @@
 #include <sstream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -275,4 +276,5 @@ template <typename T>
 void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

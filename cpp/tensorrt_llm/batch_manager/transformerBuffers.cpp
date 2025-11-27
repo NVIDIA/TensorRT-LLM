@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
@@ -37,6 +37,7 @@ using namespace tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -679,4 +680,5 @@ void TransformerBuffers::copySkipCrossAttnBlocks(bool const& _skipCrossAttnBlock
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

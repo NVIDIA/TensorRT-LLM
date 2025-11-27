@@ -19,8 +19,8 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
@@ -66,6 +66,7 @@ auto const TEST_PREFETCH = TEST_RESOURCE_PATH / "lora_prefetch";
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -631,5 +632,5 @@ TEST_F(PeftCacheManagerPrefetchTest, prefetch)
 }
 
 } // namespace batch_manager
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

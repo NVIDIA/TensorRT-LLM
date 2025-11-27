@@ -48,11 +48,11 @@
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::eviction_policy
 {
 class BaseEvictionPolicy;
 } // namespace batch_manager::eviction_policy
-
 
 namespace batch_manager::kv_cache_manager
 {
@@ -2034,4 +2034,5 @@ private:
 };
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

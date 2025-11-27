@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers
 {
 
@@ -337,4 +338,5 @@ void LookaheadRandomLlm::maskToPosIds(TensorPtr const& posIds, TensorConstPtr co
 }
 
 } // namespace tests::layers
+
 TRTLLM_NAMESPACE_END

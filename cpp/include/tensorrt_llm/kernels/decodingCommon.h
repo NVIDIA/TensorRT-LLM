@@ -23,6 +23,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -311,4 +312,5 @@ void invokeScatterDecodingParams(
     T const* src, T scalar, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

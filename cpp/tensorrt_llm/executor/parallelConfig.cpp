@@ -24,6 +24,7 @@
 #include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 ParallelConfig::ParallelConfig(CommunicationType commType, CommunicationMode commMode,
@@ -104,4 +105,5 @@ void ParallelConfig::setNumNodes(SizeType32 numNodes)
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

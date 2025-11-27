@@ -33,6 +33,7 @@
 #include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -71,4 +72,5 @@ private:
 };
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

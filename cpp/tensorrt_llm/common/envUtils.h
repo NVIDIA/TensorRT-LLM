@@ -24,6 +24,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 // Useful when you want to inject some debug code controllable with env var.
@@ -156,4 +157,5 @@ bool getEnvKVCacheTransferAllBlocksForWindow();
 bool getEnvEplbForceGdrcopy();
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

@@ -18,8 +18,8 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/loraCache.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -66,6 +66,7 @@ auto const TEST_KEYS_DORA_TP2_PAGES_RANK1 = TEST_RESOURCE_PATH / "lora-test-weig
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -625,4 +626,5 @@ TEST_P(LoraCacheTest, copyToPages_tp2_rank1)
 INSTANTIATE_TEST_SUITE_P(LoraCacheTest, LoraCacheTest, testing::Values(false, true));
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

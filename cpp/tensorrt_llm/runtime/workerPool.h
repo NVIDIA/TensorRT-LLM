@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cassert>
 #include <condition_variable>
 #include <functional>
@@ -26,9 +27,9 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -85,4 +86,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

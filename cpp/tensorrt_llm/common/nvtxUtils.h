@@ -30,6 +30,7 @@
 #include <array>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common::nvtx
 {
 inline nvtx3::color nextColor()
@@ -49,6 +50,7 @@ inline nvtx3::color nextColor()
 }
 
 } // namespace common::nvtx
+
 TRTLLM_NAMESPACE_END
 #define NVTX3_SCOPED_RANGE_WITH_NAME(range, name)                                                                      \
     ::nvtx3::scoped_range range(::tensorrt_llm::common::nvtx::nextColor(), name)

@@ -31,6 +31,7 @@
 #include <NvInferRuntimeBase.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -108,4 +109,5 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     runtime::BufferManager const& bufferManager, bool isIndexerKCache = false);
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

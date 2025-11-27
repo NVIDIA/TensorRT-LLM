@@ -29,6 +29,7 @@ namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::runtime
 {
 
@@ -133,4 +134,5 @@ void initMoeBindings(nb::module_& m)
 }
 
 } // namespace nanobind::runtime
+
 TRTLLM_NAMESPACE_END

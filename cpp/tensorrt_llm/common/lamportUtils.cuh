@@ -19,18 +19,19 @@
 #ifndef TRTLLM_CUDA_LAMPORT_UTILS_CUH
 #define TRTLLM_CUDA_LAMPORT_UTILS_CUH
 
+#include "tensorrt_llm/common/config.h"
 #include <array>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
-#include "tensorrt_llm/common/config.h"
 
 #include <cooperative_groups.h>
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -282,5 +283,6 @@ private:
 };
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END
 #endif // TRTLLM_CUDA_LAMPORT_UTILS_CUH

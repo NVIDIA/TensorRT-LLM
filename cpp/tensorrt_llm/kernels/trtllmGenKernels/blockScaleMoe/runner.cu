@@ -25,6 +25,7 @@
 #include <tensorrt_llm/common/assert.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -599,4 +600,5 @@ void Runner::run(
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

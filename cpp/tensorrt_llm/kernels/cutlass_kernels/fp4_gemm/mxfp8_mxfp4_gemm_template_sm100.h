@@ -43,6 +43,7 @@ using namespace cute;
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -291,4 +292,5 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

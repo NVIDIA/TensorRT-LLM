@@ -24,6 +24,7 @@
 namespace py = pybind11;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::runtime
 {
 
@@ -31,4 +32,5 @@ void initBindings(py::module_& m);
 void initBindingsEarly(py::module_& m);
 
 } // namespace pybind::runtime
+
 TRTLLM_NAMESPACE_END

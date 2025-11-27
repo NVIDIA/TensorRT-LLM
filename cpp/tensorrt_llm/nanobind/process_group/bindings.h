@@ -23,8 +23,10 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::process_group
 {
 void initBindings(nb::module_& m);
 } // namespace nanobind::process_group
+
 TRTLLM_NAMESPACE_END

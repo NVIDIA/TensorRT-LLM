@@ -34,6 +34,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::serialize_utils
 {
 
@@ -732,4 +733,5 @@ auto deserializeWithGetterType(std::istream& is)
 }
 
 } // namespace executor::serialize_utils
+
 TRTLLM_NAMESPACE_END

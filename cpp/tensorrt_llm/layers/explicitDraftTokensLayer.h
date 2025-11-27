@@ -25,6 +25,7 @@
 #include <curand_kernel.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -89,4 +90,5 @@ private:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

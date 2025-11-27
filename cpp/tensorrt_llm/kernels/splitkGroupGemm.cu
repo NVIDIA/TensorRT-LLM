@@ -31,6 +31,7 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/splitk_gemm_grouped.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -291,4 +292,5 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -16,16 +16,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
-#include "tensorrt_llm/common/assert.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -195,4 +196,5 @@ bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -55,4 +56,5 @@ private:
 };
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

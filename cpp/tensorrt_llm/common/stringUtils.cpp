@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/common/stringUtils.h"
 
 #include <cerrno>
 #include <cstdarg>
@@ -25,6 +25,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -76,4 +77,5 @@ std::unordered_set<std::string> str2set(std::string const& input, char delimiter
 };
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

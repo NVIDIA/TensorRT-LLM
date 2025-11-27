@@ -93,6 +93,7 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::kv_cache_manager
 {
 std::vector<MmKey> generateBlockHashExtraKeys(
@@ -3000,4 +3001,5 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
 }
 
 } // namespace batch_manager::kv_cache_manager
+
 TRTLLM_NAMESPACE_END

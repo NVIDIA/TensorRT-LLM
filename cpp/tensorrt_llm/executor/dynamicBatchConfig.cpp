@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -61,4 +62,5 @@ std::vector<std::pair<SizeType32, SizeType32>> const DynamicBatchConfig::kDefaul
 };
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

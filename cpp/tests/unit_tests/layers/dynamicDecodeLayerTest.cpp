@@ -22,6 +22,7 @@
 #include <algorithm>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::layers::sampling
 {
 
@@ -2197,5 +2198,5 @@ TYPED_TEST(DynamicDecodeLayerTest, MedusaStopWordsTest)
 }
 
 } // namespace tests::layers::sampling
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

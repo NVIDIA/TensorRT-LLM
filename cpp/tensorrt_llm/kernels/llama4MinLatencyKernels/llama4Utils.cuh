@@ -16,12 +16,13 @@
 
 #pragma once
 
-#include <cuda_fp8.h>
 #include "tensorrt_llm/common/config.h"
+#include <cuda_fp8.h>
 
 #include "tensorrt_llm/common/envUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency
 {
 
@@ -122,4 +123,5 @@ struct __align__(8) aligned_bfloat16x4
 };
 
 } // namespace kernels::llama4_min_latency
+
 TRTLLM_NAMESPACE_END

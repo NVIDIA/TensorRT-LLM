@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -122,4 +123,5 @@ void customLowPrecisionAllReduce(
 
 int32_t max_workspace_size_lowprecision(int32_t tp_size);
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

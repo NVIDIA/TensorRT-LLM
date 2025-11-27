@@ -39,6 +39,7 @@
 #endif // ENABLE_MULTI_BLOCK_OPTION
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -2753,4 +2754,5 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 } // namespace mmha
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

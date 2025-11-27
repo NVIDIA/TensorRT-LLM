@@ -19,13 +19,14 @@
 #include "../include/common.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 #include <vector>
-#include "tensorrt_llm/common/config.h"
 
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -133,4 +134,5 @@ private:
 
 } // namespace cutlass_kernels
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

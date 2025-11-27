@@ -25,6 +25,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TllmRuntime;
@@ -44,4 +45,5 @@ void insertTensorSlices(
 
 } // namespace utils
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

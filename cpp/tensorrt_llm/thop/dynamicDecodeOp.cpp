@@ -34,6 +34,7 @@ namespace tl = tensorrt_llm::layers;
 namespace tk = tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -452,6 +453,7 @@ th::Tensor DynamicDecodeOp::forward(
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 static auto trtllmGptContextDecoderTHS

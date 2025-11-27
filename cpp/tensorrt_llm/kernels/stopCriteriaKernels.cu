@@ -23,6 +23,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -249,4 +250,5 @@ void invokeExplicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

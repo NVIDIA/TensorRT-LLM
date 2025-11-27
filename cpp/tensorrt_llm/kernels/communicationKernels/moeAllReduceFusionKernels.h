@@ -15,10 +15,10 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "tensorrt_llm/common/assert.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ar_fusion::moe
 {
 static constexpr int kElemsPerAccess = 8;
@@ -105,4 +106,5 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
 void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params);
 
 } // namespace kernels::ar_fusion::moe
+
 TRTLLM_NAMESPACE_END

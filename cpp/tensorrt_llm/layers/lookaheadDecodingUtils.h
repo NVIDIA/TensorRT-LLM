@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -432,4 +433,5 @@ private:
 #define PRINT_SHAPE(x) D(x).print_shape()
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

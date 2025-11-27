@@ -28,6 +28,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -429,4 +430,5 @@ template void invokeFP4Quantization<__nv_fp8_e4m3, 32>(int b, int m, int n, __nv
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

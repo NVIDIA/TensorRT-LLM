@@ -26,6 +26,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 enum DecodingLayers_t
@@ -95,4 +96,5 @@ static std::vector<std::unique_ptr<BaseLayer>> createLayers(executor::DecodingMo
     return layers;
 }
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

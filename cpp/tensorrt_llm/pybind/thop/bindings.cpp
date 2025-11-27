@@ -15,17 +15,18 @@
  */
 
 #include "bindings.h"
+#include "tensorrt_llm/common/config.h"
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
-#include "tensorrt_llm/common/config.h"
 
 namespace py = pybind11;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::thop
 {
 
@@ -74,4 +75,5 @@ void initBindings(pybind11::module_& m)
         py::call_guard<py::gil_scoped_release>());
 }
 } // namespace pybind::thop
+
 TRTLLM_NAMESPACE_END

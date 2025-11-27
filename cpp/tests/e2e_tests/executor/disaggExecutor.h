@@ -51,6 +51,7 @@ using namespace tensorrt_llm::executor::disagg_executor;
 namespace su = tensorrt_llm::executor::serialize_utils;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing::disaggexecutor
 {
 
@@ -840,5 +841,5 @@ private:
     }
 };
 } // namespace testing::disaggexecutor
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

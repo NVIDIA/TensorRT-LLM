@@ -23,10 +23,11 @@
 #include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 #include <cub/cub.cuh>
 
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+#define CEILDIV(x, y) (((x) + (y) -1) / (y))
 #define WARP_SIZE 32
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -281,4 +282,5 @@ void invokeMoeAlignBlockSize(void const* topk_ids, int32_t topk_ids_dtype_size, 
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

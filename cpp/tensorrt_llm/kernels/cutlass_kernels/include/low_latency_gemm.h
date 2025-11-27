@@ -17,14 +17,14 @@
 #pragma once
 
 #include "cutlass_extensions/gemm_configs.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cuda_runtime_api.h>
 #include <vector>
 
-
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels

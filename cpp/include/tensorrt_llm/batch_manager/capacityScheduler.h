@@ -25,6 +25,7 @@
 #include <variant>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 namespace kv_cache_manager
@@ -176,4 +177,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

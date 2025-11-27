@@ -16,7 +16,6 @@
 
 #pragma once
 
-
 #include "tensorrt_llm/common/config.h"
 
 #include <cstdint>
@@ -24,6 +23,7 @@
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -506,4 +506,5 @@ private:
 };
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -28,6 +28,7 @@
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -224,4 +225,5 @@ void GuidedDecoder::execute(DecoderInputBuffers const& decoderInputBuffers, Buff
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

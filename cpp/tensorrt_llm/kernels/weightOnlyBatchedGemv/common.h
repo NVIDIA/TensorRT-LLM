@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -23,9 +24,9 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace weight_only
@@ -102,4 +103,5 @@ struct Params
 };
 } // namespace weight_only
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

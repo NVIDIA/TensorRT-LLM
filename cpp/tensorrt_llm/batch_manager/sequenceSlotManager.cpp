@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -110,4 +111,5 @@ void SequenceSlotManager::freeIdleSequenceSlots()
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

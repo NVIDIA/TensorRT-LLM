@@ -33,6 +33,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1129,4 +1130,5 @@ INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

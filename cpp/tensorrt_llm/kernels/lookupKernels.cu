@@ -21,6 +21,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 /* When running with multiple GPUs, we split the embedding lookup table across multiple GPUs to save the memory
@@ -92,4 +93,5 @@ INSTANTIATE_LOOK_UP(__nv_bfloat16, int8_t, int);
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

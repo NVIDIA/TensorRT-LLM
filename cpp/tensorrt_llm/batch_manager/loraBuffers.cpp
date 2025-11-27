@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/loraUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -109,4 +110,5 @@ void LoraBuffers::reshape(SizeType32 numSequences)
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

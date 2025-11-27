@@ -41,6 +41,7 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -462,4 +463,5 @@ std::string TopologyDetector::getCpuArchitecture()
 }
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

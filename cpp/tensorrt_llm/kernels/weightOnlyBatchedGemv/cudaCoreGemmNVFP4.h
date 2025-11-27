@@ -37,6 +37,7 @@
 #include <iostream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cuda_core_gemm_nvfp4
@@ -78,4 +79,5 @@ struct Params
 bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream);
 } // namespace cuda_core_gemm_nvfp4
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

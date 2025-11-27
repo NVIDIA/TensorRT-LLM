@@ -29,6 +29,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -280,6 +281,7 @@ void groupRMSNormHeuristic(torch::TensorList const& inputs, torch::TensorList co
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

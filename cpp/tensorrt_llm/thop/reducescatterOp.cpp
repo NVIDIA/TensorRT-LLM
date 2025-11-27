@@ -35,6 +35,7 @@
 using tensorrt_llm::pg_utils::PgHelper;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 #if ENABLE_MULTI_DEVICE
@@ -287,6 +288,7 @@ extern std::vector<torch::Tensor> reducescatter_list_pg(torch::TensorList input_
 #endif // ENABLE_MULTI_DEVICE
 }
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

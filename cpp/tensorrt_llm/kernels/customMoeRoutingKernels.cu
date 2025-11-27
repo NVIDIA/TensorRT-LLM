@@ -31,6 +31,7 @@ namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -278,4 +279,5 @@ INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

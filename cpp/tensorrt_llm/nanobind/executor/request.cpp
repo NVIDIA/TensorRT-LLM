@@ -50,6 +50,7 @@ using IdType = tle::IdType;
 using VecTokenExtraIds = tle::VecTokenExtraIds;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::executor
 {
 
@@ -968,4 +969,5 @@ void initRequestBindings(nb::module_& m)
 }
 
 } // namespace nanobind::executor
+
 TRTLLM_NAMESPACE_END

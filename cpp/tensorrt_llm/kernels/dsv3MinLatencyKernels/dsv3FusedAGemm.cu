@@ -31,6 +31,7 @@ using bf16_t = __nv_bfloat16;
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::dsv3MinLatencyKernels
 {
 
@@ -684,4 +685,5 @@ template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 } // namespace kernels::dsv3MinLatencyKernels
+
 TRTLLM_NAMESPACE_END

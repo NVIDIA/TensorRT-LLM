@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -141,4 +142,5 @@ private:
 };
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

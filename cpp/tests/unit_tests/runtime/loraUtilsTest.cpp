@@ -33,6 +33,7 @@
 #include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::lora
 {
 using TensorPtr = ITensor::SharedPtr;
@@ -123,5 +124,5 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
 }
 
 } // namespace runtime::lora
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -17,14 +17,16 @@
 
 #pragma once
 
-#include <pybind11/pybind11.h>
 #include "tensorrt_llm/common/config.h"
+#include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::runtime
 {
 
 void initHostFuncBindings(pybind11::module_& m);
 
 } // namespace pybind::runtime
+
 TRTLLM_NAMESPACE_END

@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include <cstdio>
 #include "tensorrt_llm/common/config.h"
+#include <cstdio>
 
 #include "cpSplitPlugin.h"
 

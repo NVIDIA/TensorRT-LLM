@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 
@@ -35,4 +36,5 @@ void logError(char const* msg, char const* file, char const* fn, int line)
 }
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

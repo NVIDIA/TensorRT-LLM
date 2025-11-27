@@ -16,14 +16,15 @@
 
 #pragma once
 
-#include <memory>
 #include "tensorrt_llm/common/config.h"
+#include <memory>
 
 /// @brief Forward declaration of cudaMemPool_t to avoid including "driver_types.h"
 struct CUmemPoolHandle_st;
 using cudaMemPool_t = CUmemPoolHandle_st*;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -70,4 +71,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

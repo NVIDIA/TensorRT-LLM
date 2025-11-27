@@ -50,6 +50,7 @@
 #endif         // WIN32
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -1404,6 +1405,7 @@ DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END
 
 /*
@@ -1412,7 +1414,7 @@ TRTLLM_NAMESPACE_END
 #define TLLM_CUDA_CHECK(stat)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                  \
+        tensorrt_llm::common::check((stat), #stat, __FILE__, __LINE__);                                                \
     } while (0)
 
 // We use singleton memory pool and the order of destructors depends on the compiler implementation. We find that the
@@ -1422,6 +1424,5 @@ TRTLLM_NAMESPACE_END
 #define TLLM_CUDA_CHECK_FREE_RESOURCE(stat)                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
-        tensorrt_llm::common::checkEx(                                                                   \
-            (stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);                               \
+        tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
     } while (0)

@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -49,4 +50,5 @@ struct ExtractRealDraftTokensParam
 void invokeExtractRealDraftTokens(ExtractRealDraftTokensParam& params, cudaStream_t const stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

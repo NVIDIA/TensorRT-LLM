@@ -35,6 +35,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 // batch_size = num_ctx_requests + num_gen_requests * beam_width
@@ -260,4 +261,5 @@ public:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

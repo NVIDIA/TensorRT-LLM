@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/details.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace weight_only
@@ -330,4 +331,5 @@ private:
 };
 } // namespace weight_only
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

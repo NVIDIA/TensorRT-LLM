@@ -84,6 +84,7 @@ namespace tk = tensorrt_llm::kernels;
 using tensorrt_llm::batch_manager::CacheTransceiverFactory;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -2903,4 +2904,5 @@ void TrtGptModelInflightBatching::copyPromptTableToGpuInChunk(std::shared_ptr<Ll
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

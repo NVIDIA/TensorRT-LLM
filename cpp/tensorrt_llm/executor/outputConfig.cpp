@@ -19,6 +19,7 @@
 #include "tensorrt_llm/executor/executor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -47,4 +48,5 @@ bool AdditionalModelOutput::operator==(AdditionalModelOutput const& other) const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

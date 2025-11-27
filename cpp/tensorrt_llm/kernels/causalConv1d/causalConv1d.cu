@@ -19,13 +19,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/kernels/causalConv1d/causalConv1d.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::causal_conv1d
 {
 
@@ -493,4 +494,5 @@ template void causal_conv1d_update_cuda<half, half>(ConvParamsBase& params, cuda
 template void causal_conv1d_update_cuda<nv_bfloat16, nv_bfloat16>(ConvParamsBase& params, cudaStream_t stream);
 
 } // namespace kernels::causal_conv1d
+
 TRTLLM_NAMESPACE_END

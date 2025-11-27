@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -131,4 +132,5 @@ public:
 };
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

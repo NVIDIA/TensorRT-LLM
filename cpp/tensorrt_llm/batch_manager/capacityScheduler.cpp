@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 using kv_cache_manager::VecUniqueTokens;
@@ -539,4 +540,5 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

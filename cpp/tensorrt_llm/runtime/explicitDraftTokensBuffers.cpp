@@ -26,6 +26,7 @@
 namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -379,4 +380,5 @@ void ExplicitDraftTokensBuffers::insertInputTensors(
 }
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

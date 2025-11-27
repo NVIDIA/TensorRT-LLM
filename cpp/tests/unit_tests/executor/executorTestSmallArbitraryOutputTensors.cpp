@@ -29,6 +29,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing
 {
 
@@ -491,5 +492,5 @@ TEST_P(DecoderTopKContextLogitsFloatTest, TestSizeAndValues)
 INSTANTIATE_TEST_SUITE_P(Float, DecoderTopKContextLogitsFloatTest, paramGeneratorGatherContext, nameSuffixGenerator);
 
 } // namespace testing
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

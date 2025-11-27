@@ -20,6 +20,7 @@
 #include "utils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::ub
 {
 using namespace tensorrt_llm::runtime::ub;
@@ -1956,4 +1957,5 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     }
 }
 } // namespace kernels::ub
+
 TRTLLM_NAMESPACE_END

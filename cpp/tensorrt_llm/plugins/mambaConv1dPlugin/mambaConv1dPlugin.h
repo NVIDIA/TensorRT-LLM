@@ -23,6 +23,7 @@
 #include <cassert>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace plugins
 {
 // batch_size = num_ctx_requests or num_gen_requests
@@ -174,5 +175,6 @@ private:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END
 #endif // TRT_MAMBA_CONV1D_PLUGIN_H

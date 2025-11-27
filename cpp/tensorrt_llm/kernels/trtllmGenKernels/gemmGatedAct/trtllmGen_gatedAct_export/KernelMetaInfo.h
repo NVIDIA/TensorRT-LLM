@@ -24,6 +24,7 @@ namespace gemmGatedAct
 {
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 // clang-format off
@@ -995,5 +996,6 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 };
 // clang-format on
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 } // namespace gemmGatedAct

@@ -20,6 +20,7 @@
 namespace th = torch;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLengthsTensor,
@@ -81,7 +82,9 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
-static auto convert_spec_decoding_mask_to_packed_mask = torch::RegisterOperators(
-    "tensorrt_llm::convert_spec_decoding_mask_to_packed_mask", &tensorrt_llm::torch_ext::convertSpecDecodingMaskToPackedMask);
+static auto convert_spec_decoding_mask_to_packed_mask
+    = torch::RegisterOperators("tensorrt_llm::convert_spec_decoding_mask_to_packed_mask",
+        &tensorrt_llm::torch_ext::convertSpecDecodingMaskToPackedMask);

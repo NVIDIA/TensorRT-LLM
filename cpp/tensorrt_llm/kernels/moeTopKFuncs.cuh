@@ -26,6 +26,7 @@
 #include "tensorrt_llm/kernels/archCondition.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -284,5 +285,6 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> con
 
 } // namespace reduce_topk
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 #endif // TRTLLM_MOETOPKFUNCS_CUH_H

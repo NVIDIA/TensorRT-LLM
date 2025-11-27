@@ -16,9 +16,9 @@
 
 #pragma once
 
-
 #include "tensorrt_llm/common/config.h"
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -114,4 +114,5 @@ inline constexpr bool is_compatible_v = is_compatible<Arch>::value;
 } // namespace arch
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

@@ -20,6 +20,7 @@
 #include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::ub
 {
 UserBufferAllocator& UserBufferAllocator::Instance()
@@ -249,5 +250,5 @@ bool NCCLHelper::isLoaded() const
 bool UserBufferAllocator::use_nccl_symmetric = false;
 
 }; // namespace runtime::ub
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

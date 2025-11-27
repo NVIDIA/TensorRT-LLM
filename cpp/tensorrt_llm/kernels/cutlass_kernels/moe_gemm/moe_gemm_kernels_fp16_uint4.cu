@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "moe_gemm_template_dispatch.h"
+#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels
 {
 template class MoeGemmRunner<half, cutlass::uint4b_t, half>;
 }
+
 TRTLLM_NAMESPACE_END

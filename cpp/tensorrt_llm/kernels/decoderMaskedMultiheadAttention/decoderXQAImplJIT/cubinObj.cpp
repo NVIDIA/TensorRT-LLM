@@ -24,6 +24,7 @@
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::jit
 {
 
@@ -187,4 +188,5 @@ CubinObj::~CubinObj()
 }
 
 } // namespace kernels::jit
+
 TRTLLM_NAMESPACE_END

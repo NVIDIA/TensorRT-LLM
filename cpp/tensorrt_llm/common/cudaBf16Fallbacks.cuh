@@ -16,12 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
-#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -291,7 +292,9 @@ inline __device__ __nv_bfloat162 bf16hfma2(__nv_bfloat162 a, __nv_bfloat162 b, _
 #endif // ENABLE_BF16
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END
+
 // Operator definitions intentionally in global namespace
 namespace
 {

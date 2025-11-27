@@ -29,6 +29,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::batch_manager
 {
 
@@ -163,4 +164,5 @@ public:
 };
 
 } // namespace nanobind::batch_manager
+
 TRTLLM_NAMESPACE_END

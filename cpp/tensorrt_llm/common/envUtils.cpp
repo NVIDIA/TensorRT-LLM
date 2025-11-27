@@ -27,6 +27,7 @@
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -531,4 +532,5 @@ bool getEnvEplbForceGdrcopy()
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

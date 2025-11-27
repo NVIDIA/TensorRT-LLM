@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -56,4 +57,5 @@ template <typename T>
 void invokeRGLRUUpdate(lruParams& params, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

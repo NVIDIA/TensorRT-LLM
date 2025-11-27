@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -145,4 +146,5 @@ void MedusaBuffers::insertInputTensors(
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

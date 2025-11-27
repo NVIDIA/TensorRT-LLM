@@ -18,6 +18,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing::utils::engines
 {
 
@@ -354,6 +355,7 @@ std::unique_ptr<nvinfer1::IHostMemory> createConstantTrivialDecoderWithTopKLogit
     return std::unique_ptr<nvinfer1::IHostMemory>(engine);
 }
 } // namespace testing::utils::engines
+
 TRTLLM_NAMESPACE_END
 
 #endif /* CA1B91B5_DF64_4CF8_948F_5AFF243A2555 */

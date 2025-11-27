@@ -34,6 +34,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -732,4 +733,5 @@ void beamSearchKernelLauncher(
         T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

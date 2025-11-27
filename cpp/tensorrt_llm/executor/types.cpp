@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-#include <iostream>
 #include "tensorrt_llm/common/config.h"
+#include <iostream>
 
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy)
@@ -44,4 +45,5 @@ std::ostream& operator<<(std::ostream& os, ContextChunkingPolicy policy)
     return os;
 }
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

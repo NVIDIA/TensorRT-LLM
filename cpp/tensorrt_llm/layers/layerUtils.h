@@ -33,6 +33,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -183,4 +184,5 @@ size_t expandMatchElements(size_t expandSize, std::vector<T>&... vector)
 }
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

@@ -33,6 +33,7 @@
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -561,4 +562,5 @@ template void invokeMTPRelaxedAcceptance<__nv_bfloat16>(MTPRelaxedAcceptancePara
 #endif
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

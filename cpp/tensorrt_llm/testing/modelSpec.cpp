@@ -22,6 +22,7 @@
 #include <numeric>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing
 {
 
@@ -303,5 +304,5 @@ std::string ModelSpec::getDtypeString() const
 }
 
 } // namespace testing
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -24,6 +24,7 @@ namespace py = pybind11;
 namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::common
 {
 
@@ -32,4 +33,5 @@ namespace pybind::common
 void initExceptionsBindings(py::module_& m);
 
 } // namespace pybind::common
+
 TRTLLM_NAMESPACE_END

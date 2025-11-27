@@ -37,6 +37,7 @@
 #include "tensorrt_llm/deep_gemm/fp8_gemm.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernel_utils
 {
 
@@ -1963,4 +1964,5 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
 }
 
 } // namespace kernels::fp8_blockscale_gemm
+
 TRTLLM_NAMESPACE_END

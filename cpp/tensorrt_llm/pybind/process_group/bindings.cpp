@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::process_group
 {
 
@@ -40,4 +41,5 @@ void initBindings(py::module_& m)
 }
 
 } // namespace pybind::process_group
+
 TRTLLM_NAMESPACE_END

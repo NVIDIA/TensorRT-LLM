@@ -29,6 +29,7 @@
 namespace tr = tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -280,4 +281,5 @@ void Tensor::setFrom(Tensor const& other, Tensor::CudaStreamPtr stream)
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

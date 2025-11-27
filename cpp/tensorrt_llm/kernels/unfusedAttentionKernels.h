@@ -27,6 +27,7 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -461,4 +462,5 @@ void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_len
     int64_t partialHeads, int64_t headSize, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

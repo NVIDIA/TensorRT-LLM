@@ -29,6 +29,7 @@ using tensorrt_llm::testing::QuantMethod;
 using tensorrt_llm::testing::OutputContentType;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::testing
 {
 
@@ -85,4 +86,5 @@ void initBindings(py::module_& m)
 }
 
 } // namespace pybind::testing
+
 TRTLLM_NAMESPACE_END

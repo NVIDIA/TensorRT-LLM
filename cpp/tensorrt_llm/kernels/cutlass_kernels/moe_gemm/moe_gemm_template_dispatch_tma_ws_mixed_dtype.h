@@ -48,8 +48,8 @@
 
 #include "../include/moe_gemm_kernels.h"
 #include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 
@@ -59,6 +59,7 @@
 #include <sstream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::cutlass_kernels_oss
 {
 
@@ -247,4 +248,5 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
 }
 
 } // namespace kernels::cutlass_kernels_oss
+
 TRTLLM_NAMESPACE_END

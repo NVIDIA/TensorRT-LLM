@@ -25,13 +25,16 @@
 #include <NvInferRuntime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TllmRuntime;
 class NcclCommunicator;
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 class CapacityScheduler;
@@ -206,4 +209,5 @@ private:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

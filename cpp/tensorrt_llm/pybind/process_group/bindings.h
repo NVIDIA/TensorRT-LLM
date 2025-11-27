@@ -17,14 +17,16 @@
 
 #pragma once
 
-#include <pybind11/pybind11.h>
 #include "tensorrt_llm/common/config.h"
+#include <pybind11/pybind11.h>
 
 namespace py = pybind11;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::process_group
 {
 void initBindings(py::module_& m);
 } // namespace pybind::process_group
+
 TRTLLM_NAMESPACE_END

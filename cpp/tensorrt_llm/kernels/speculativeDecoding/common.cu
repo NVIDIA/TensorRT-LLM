@@ -37,6 +37,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::speculative_decoding
 {
 template <int32_t BLOCK_SIZE>
@@ -488,4 +489,5 @@ template size_t getTypicalAcceptanceWorkspaceSize<half>(
     SizeType32 batchSize, SizeType32 maxDecodingTokens, SizeType32 vocabSizePadded);
 
 } // namespace kernels::speculative_decoding
+
 TRTLLM_NAMESPACE_END

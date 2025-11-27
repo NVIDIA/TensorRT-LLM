@@ -30,6 +30,7 @@
 #include <iostream>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::utils
 {
 
@@ -73,4 +74,5 @@ private:
 };
 
 } // namespace batch_manager::utils
+
 TRTLLM_NAMESPACE_END

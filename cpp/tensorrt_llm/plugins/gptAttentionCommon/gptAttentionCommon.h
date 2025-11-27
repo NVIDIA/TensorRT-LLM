@@ -28,6 +28,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 class DecoderXQARunnerResource;
@@ -112,4 +113,5 @@ protected:
 };
 
 } // namespace plugins
+
 TRTLLM_NAMESPACE_END

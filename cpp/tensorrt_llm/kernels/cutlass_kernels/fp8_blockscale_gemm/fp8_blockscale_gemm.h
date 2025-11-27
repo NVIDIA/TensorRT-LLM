@@ -25,6 +25,7 @@
 
 // non-persistent-cooperative GEMM
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::fp8_blockscale_gemm
 {
 
@@ -151,4 +152,5 @@ private:
 };
 
 } // namespace kernels::fp8_blockscale_gemm
+
 TRTLLM_NAMESPACE_END

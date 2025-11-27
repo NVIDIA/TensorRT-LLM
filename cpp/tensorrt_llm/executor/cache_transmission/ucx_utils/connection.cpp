@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -191,5 +192,6 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 }
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END
 #endif

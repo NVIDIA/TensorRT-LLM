@@ -198,6 +198,7 @@ public:
 };
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace pybind::runtime
 {
 
@@ -510,4 +511,5 @@ void initBindingsEarly(py::module_& m)
         .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
 } // namespace pybind::runtime
+
 TRTLLM_NAMESPACE_END

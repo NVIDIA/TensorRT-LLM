@@ -21,6 +21,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor::kv_cache
 {
 
@@ -71,4 +72,5 @@ public:
 };
 
 } // namespace executor::kv_cache
+
 TRTLLM_NAMESPACE_END

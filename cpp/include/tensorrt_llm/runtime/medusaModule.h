@@ -23,6 +23,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -59,5 +60,5 @@ private:
         {0, 6, 0}, {0, 0, 0, 1}, {1, 6}, {0, 7, 0}};
 };
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

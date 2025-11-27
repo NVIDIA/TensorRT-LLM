@@ -37,6 +37,7 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::mpi;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -615,4 +616,5 @@ bool TrtEncoderModel::getReplicateLogitsPostProcessor() const
 TrtEncoderModel::~TrtEncoderModel() = default;
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

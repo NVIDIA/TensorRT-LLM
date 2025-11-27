@@ -25,6 +25,7 @@
 #include <torch/types.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 class TorchView : virtual public ITensor
@@ -111,4 +112,5 @@ private:
     std::size_t mCapacity;
 };
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

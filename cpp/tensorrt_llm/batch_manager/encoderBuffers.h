@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -140,4 +141,5 @@ public:
 };
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

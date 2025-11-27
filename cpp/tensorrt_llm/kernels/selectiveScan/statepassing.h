@@ -16,9 +16,9 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_fp8.h>
 #include <mma.h>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 
@@ -27,6 +27,7 @@
 #include "Poly.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -265,5 +266,6 @@ static inline StatePassingKernelFunc getStatePassingKernel(int B_, int L_, int H
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 // vim: ts=2 sw=2 sts=2 et sta

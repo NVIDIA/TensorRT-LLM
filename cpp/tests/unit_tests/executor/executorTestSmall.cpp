@@ -15,6 +15,7 @@
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace testing
 {
 
@@ -289,5 +290,5 @@ TEST(TrtInflightBatchingTest, CalculateCacheSizePerTokenForDisagg)
 }
 
 } // namespace testing
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "tests/unit_tests/kernels/sampling/samplingTest.h"
+#include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::kernels::sampling
 {
 
@@ -510,5 +511,5 @@ template class SamplingKernelTest<float>;
 template class SamplingKernelTest<half>;
 
 } // namespace tests::kernels::sampling
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

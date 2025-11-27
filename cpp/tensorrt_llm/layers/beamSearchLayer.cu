@@ -30,6 +30,7 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -421,4 +422,5 @@ template class BeamSearchLayer<float>;
 template class BeamSearchLayer<half>;
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

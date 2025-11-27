@@ -24,6 +24,7 @@
 #include "trtllmGen_gatedAct_export/trtllm/gen/DtypeDecl.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 using namespace gemmGatedAct::gemmGatedAct;
@@ -144,4 +145,5 @@ void TrtllmGenGemmGatedActRunner::selectGemmConfig(int32_t m, int32_t n, int32_t
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

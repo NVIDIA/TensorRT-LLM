@@ -23,6 +23,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime::unit_tests
 {
 
@@ -236,4 +237,5 @@ TEST_F(HostAccessibleDeviceAllocatorTest, GetHostPtrForUnallocated)
 }
 
 } // namespace runtime::unit_tests
+
 TRTLLM_NAMESPACE_END

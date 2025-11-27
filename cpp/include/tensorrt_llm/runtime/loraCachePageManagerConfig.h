@@ -28,6 +28,7 @@
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 /**
@@ -170,5 +171,5 @@ inline std::string to_string(LoraCachePageManagerConfig const& c)
     return sstream.str();
 }
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

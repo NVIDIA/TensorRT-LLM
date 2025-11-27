@@ -31,6 +31,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace tests::kernels::sampling
 {
 
@@ -353,5 +354,5 @@ protected:
 };
 
 } // namespace tests::kernels::sampling
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

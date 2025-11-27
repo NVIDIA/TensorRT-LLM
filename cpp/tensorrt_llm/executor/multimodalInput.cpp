@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
@@ -46,4 +47,5 @@ std::vector<SizeType32> MultimodalInput::getMultimodalLengths() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

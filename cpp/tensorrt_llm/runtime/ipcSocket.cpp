@@ -67,6 +67,7 @@
 #define NCCL_IPC_SOCKNAME_STR "/tmp/ub-socket-%d-%lx"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 struct NcclIpcSocket
@@ -320,5 +321,6 @@ void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int sendFd, int 
 }
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END
 #endif // ENABLE_MULTI_DEVICE

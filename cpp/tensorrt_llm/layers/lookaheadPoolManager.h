@@ -16,14 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <list>
 #include <unordered_map>
-#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -77,4 +78,5 @@ private:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

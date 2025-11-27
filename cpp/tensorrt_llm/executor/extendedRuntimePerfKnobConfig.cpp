@@ -34,6 +34,7 @@ void validateCudaGraphCacheSize(bool cudaGraphMode, tensorrt_llm::executor::Size
 } // namespace
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -89,4 +90,5 @@ void ExtendedRuntimePerfKnobConfig::setCudaGraphCacheSize(SizeType32 cudaGraphCa
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager
 {
 
@@ -57,4 +58,5 @@ void ContextProgress::wait(int layerIdx)
 }
 
 } // namespace batch_manager
+
 TRTLLM_NAMESPACE_END

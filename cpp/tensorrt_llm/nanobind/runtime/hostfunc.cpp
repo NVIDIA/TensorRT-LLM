@@ -29,6 +29,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::runtime
 {
 
@@ -115,4 +116,5 @@ void initHostFuncBindings(nb::module_& m)
     m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
 }
 } // namespace nanobind::runtime
+
 TRTLLM_NAMESPACE_END

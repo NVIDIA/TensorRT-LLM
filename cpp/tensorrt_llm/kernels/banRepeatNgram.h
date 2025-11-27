@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,4 +35,5 @@ void invokeBanRepeatNgram(T* logits, runtime::TokenIdType const** output_ids_buf
     runtime::SizeType32 vocab_size_padded, runtime::SizeType32 max_step, cudaStream_t stream);
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

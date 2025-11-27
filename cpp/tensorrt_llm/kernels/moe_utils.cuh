@@ -17,9 +17,9 @@
 
 #pragma once
 
-
 #include "tensorrt_llm/common/config.h"
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -46,4 +46,5 @@ __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices, i
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

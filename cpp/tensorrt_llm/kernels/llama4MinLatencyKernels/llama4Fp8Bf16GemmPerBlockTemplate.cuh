@@ -16,14 +16,15 @@
 
 #pragma once
 
-#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
 
@@ -300,4 +301,5 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_per_block_ker
     }
 
 } // namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+
 TRTLLM_NAMESPACE_END

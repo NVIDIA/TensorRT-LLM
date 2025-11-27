@@ -26,6 +26,7 @@
 namespace su = tensorrt_llm::executor::serialize_utils;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 
@@ -146,4 +147,5 @@ bool ContextPhaseParams::operator==(ContextPhaseParams const& other) const noexc
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

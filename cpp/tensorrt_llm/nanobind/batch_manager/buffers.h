@@ -23,6 +23,7 @@
 namespace nb = nanobind;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace nanobind::batch_manager
 {
 class Buffers
@@ -31,4 +32,5 @@ public:
     static void initBindings(nb::module_& m);
 };
 } // namespace nanobind::batch_manager
+
 TRTLLM_NAMESPACE_END

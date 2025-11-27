@@ -27,6 +27,7 @@
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -47,4 +48,5 @@ bool contains(std::initializer_list<T> const& c, T const& v)
 }
 
 } // namespace common
+
 TRTLLM_NAMESPACE_END

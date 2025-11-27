@@ -496,6 +496,7 @@ private:
 };
 
 } // namespace mpi
+
 TRTLLM_NAMESPACE_END
 
 #define COMM_SESSION tensorrt_llm::mpi::MpiComm::session()

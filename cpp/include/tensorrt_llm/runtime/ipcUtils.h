@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -79,5 +80,5 @@ void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t
 bool canAccessPeer(WorldConfig const& worldConfig);
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/workerPool.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <gtest/gtest.h>
 #include <random>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -114,5 +115,5 @@ INSTANTIATE_TEST_SUITE_P(WorkerPoolTests, WorkerPoolTest,
         ));
 
 } // namespace runtime
-TRTLLM_NAMESPACE_END
 
+TRTLLM_NAMESPACE_END

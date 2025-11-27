@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include <memory>
 #include "tensorrt_llm/common/config.h"
+#include <memory>
 
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -28,6 +28,7 @@
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace runtime
 {
 
@@ -201,4 +202,5 @@ private:
 };
 
 } // namespace runtime
+
 TRTLLM_NAMESPACE_END

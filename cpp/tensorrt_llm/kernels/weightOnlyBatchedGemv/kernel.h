@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/utility.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace weight_only
@@ -159,4 +160,5 @@ void exec_kernel(Params& params, cudaStream_t s)
 
 } // namespace weight_only
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

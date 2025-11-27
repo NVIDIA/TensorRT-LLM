@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/types.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 MropeConfig::MropeConfig(Tensor mropeRotaryCosSin, SizeType32 mropePositionDeltas)
@@ -39,4 +40,5 @@ SizeType32 MropeConfig::getMRopePositionDeltas() const
 }
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

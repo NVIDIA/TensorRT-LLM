@@ -26,6 +26,7 @@ namespace nb = nanobind;
 namespace tub = tensorrt_llm::runtime::ub;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::userbuffers
 {
 
@@ -52,4 +53,5 @@ void UserBufferBindings::initBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace kernels::userbuffers
+
 TRTLLM_NAMESPACE_END

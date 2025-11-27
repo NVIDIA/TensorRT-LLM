@@ -23,6 +23,7 @@
 #include <ATen/ops/index_select.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 namespace btg = batchedGemm::trtllm::gen;
@@ -576,6 +577,7 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 }
 
 } // namespace torch_ext
+
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -591,4 +593,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 }
 
 // Accepts both CPU and CUDA tensors
-static auto shuffle_matrix = torch::RegisterOperators("trtllm::shuffle_matrix", &tensorrt_llm::torch_ext::shuffleMatrix);
+static auto shuffle_matrix
+    = torch::RegisterOperators("trtllm::shuffle_matrix", &tensorrt_llm::torch_ext::shuffleMatrix);

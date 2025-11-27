@@ -17,14 +17,15 @@
 
 #pragma once
 
-#include <curand_kernel.h>
 #include "tensorrt_llm/common/config.h"
+#include <curand_kernel.h>
 
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace layers
 {
 
@@ -89,4 +90,5 @@ private:
 };
 
 } // namespace layers
+
 TRTLLM_NAMESPACE_END

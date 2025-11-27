@@ -33,6 +33,7 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 __global__ void topPInitialize(TokenIdType* topPIdValBuf, SizeType32* topPOffsetBuf, SizeType32* beginTopPOffsetBuf,
@@ -519,4 +520,5 @@ void invokeSetTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<Si
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END

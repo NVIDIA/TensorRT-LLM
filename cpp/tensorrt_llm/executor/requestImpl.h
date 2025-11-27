@@ -28,6 +28,7 @@
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace executor
 {
 class Request::Impl
@@ -599,4 +600,5 @@ private:
 };
 
 } // namespace executor
+
 TRTLLM_NAMESPACE_END

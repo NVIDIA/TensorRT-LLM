@@ -22,6 +22,7 @@
 #include <pybind11/pybind11.h>
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::userbuffers
 {
 class UserBufferBindings
@@ -30,4 +31,5 @@ public:
     static void initBindings(pybind11::module_& m);
 };
 } // namespace kernels::userbuffers
+
 TRTLLM_NAMESPACE_END

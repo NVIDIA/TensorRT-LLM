@@ -25,6 +25,7 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 // New priority values always override the previous value.
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace batch_manager::eviction_policy
 {
 
@@ -221,4 +222,5 @@ void LRUEvictionPolicy::refresh()
 }
 
 } // namespace batch_manager::eviction_policy
+
 TRTLLM_NAMESPACE_END

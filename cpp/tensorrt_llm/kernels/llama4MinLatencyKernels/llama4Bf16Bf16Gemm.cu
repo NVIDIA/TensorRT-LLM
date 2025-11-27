@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels::llama4_min_latency::llama4_bf16_bf16_gemm
 {
 
@@ -128,4 +129,5 @@ void llama4_bf16_bf16_gemm_op(int num_tokens, void const* A, void const* B, void
 }
 
 } // namespace kernels::llama4_min_latency::llama4_bf16_bf16_gemm
+
 TRTLLM_NAMESPACE_END
