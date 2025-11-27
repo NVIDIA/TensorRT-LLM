@@ -2359,7 +2359,7 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-0")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y cuda-compat-13-0 && export LD_LIBRARY_PATH=/usr/local/cuda/compat:$LD_LIBRARY_PATH")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y cuda-compat-13-0 && export LD_LIBRARY_PATH=/usr/local/cuda/compat:\$LD_LIBRARY_PATH")
                         }
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
