@@ -100,7 +100,7 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
@@ -1259,7 +1259,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
 
 def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false)
 {
-    def targetCould = "kubernetes-cpu"
+    def targetCloud = "kubernetes-cpu"
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/arch: ${arch}
@@ -1271,6 +1271,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    println "Using type: ${type} to create Kubernetes Pod config"
 
     switch(type)
     {
@@ -1350,11 +1351,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def gpuType = KubernetesManager.selectGPU(type)
         nodeLabelPrefix = type
 
-        targetCould = "kubernetes"
+        targetCloud = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
-            if (type == "gb10x_blossom") {
+            if (type == "gb10x") {
                 targetCloud = "nvks-sparks-cloud"
                 selectors = """
                     kubernetes.io/arch: ${arch}
@@ -1451,7 +1452,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     }
 
     def podConfig = [
-        cloud: targetCould,
+        cloud: targetCloud,
         namespace: "sw-tensorrt",
         label: nodeLabel,
         yaml: """
@@ -2790,7 +2791,7 @@ def launchTestJobs(pipeline, testFilter)
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
-        "GB10-PyTorch-1": ["gb10x_blossom", "l0_gb10", 1, 1],
+        "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
 
