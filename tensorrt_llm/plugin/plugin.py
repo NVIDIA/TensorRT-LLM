@@ -738,7 +738,7 @@ class CustomAllReduceHelper:
                 3 * lamport_buffers_size,
             )
         flag_buffer = torch.tensor([0, 0, 0, lamport_buffers_size, 0],
-                                   dtype=torch.int,
+                                   dtype=torch.int64,
                                    device="cuda")
         buffers = [ipc_buffers, ipc_barriers, lamport_buffers, flag_buffer]
 
