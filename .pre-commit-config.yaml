@@ -844,7 +844,6 @@ common-files: &common_files |
         tests/integration/defs/disaggregated/test_auto_scaling.py |
         tests/integration/defs/disaggregated/test_disaggregated_etcd.py |
         tests/integration/defs/disaggregated/test_disaggregated_single_gpu.py |
-        tests/integration/defs/disaggregated/test_disaggregated.py |
         tests/integration/defs/disaggregated/test_workers.py |
         tests/integration/defs/examples/run_llm_fp8_quant_llama_70b.py |
         tests/integration/defs/examples/run_llm_quickstart_atexit.py |
