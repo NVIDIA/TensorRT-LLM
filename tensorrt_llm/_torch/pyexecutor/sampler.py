@@ -747,29 +747,54 @@ class TorchSampler(Sampler):
         if request.py_return_log_probs:
             sampled_tokens = request.get_tokens(beam)[-count:]
 
-            if hasattr(request, 'py_sampled_logprobs') and request.py_sampled_logprobs is not None:
-                # Use the sampled token's logprob computed during sampling
-                sampled_logprobs = request.py_sampled_logprobs[:count]
 
-                token_log_probs = []
-                for step, sampled_token in enumerate(sampled_tokens):
-                    sampled_logprob = sampled_logprobs[step].item()
+            if request.py_num_logprobs == 0:
+                # Return only the sampled token's logprob
+                # Compute at least top-1 to determine rank
+                if hasattr(request, 'py_sampled_logprobs') and request.py_sampled_logprobs is not None:
+                    sampled_logprobs = request.py_sampled_logprobs[:count]
+                    topk_log_probs_vals = request.py_topk_logprobs_vals[:count]  # At least k=1
+                    topk_log_probs_indices = request.py_topk_logprobs_indices[:count]
 
-                    step_dict = {sampled_token: Logprob(logprob=sampled_logprob, rank=1)}
-                    token_log_probs.append(step_dict)
+                    token_log_probs = []
+                    for step, (sampled_token, sampled_logprob, topk_tokens, topk_logprobs) in enumerate(
+                        zip(sampled_tokens, sampled_logprobs, topk_log_probs_indices, topk_log_probs_vals)
+                    ):
+                        topk_tokens_list = topk_tokens.tolist()
+                        if sampled_token in topk_tokens_list:
+                            # Sampled token is in top-K, use its rank
+                            rank = topk_tokens_list.index(sampled_token) + 1
+                        else:
+                            # TODO: fix rank
+                            rank = 2
+
+                        step_dict = {sampled_token: Logprob(logprob=sampled_logprob.item(), rank=rank)}
+                        token_log_probs.append(step_dict)
+                else:
+                    raise ValueError("py_sampled_logprobs not available when py_num_logprobs == 0")
             else:
-                # Fallback: Use top-K logprobs
+                # Return top-K logprobs + logprob of sampled token
+                sampled_logprobs = request.py_sampled_logprobs[:count]
                 topk_log_probs_vals = request.py_topk_logprobs_vals[:count]
                 topk_log_probs_indices = request.py_topk_logprobs_indices[:count]
 
                 token_log_probs = []
-                for step, (topk_token, topk_logprob) in enumerate(zip(topk_log_probs_indices, topk_log_probs_vals)):
-                    step_dict = {
-                        token: Logprob(logprob=logprob, rank=rank + 1)
-                        for rank, (token, logprob) in enumerate(
-                            zip(topk_token.tolist(), topk_logprob.tolist())
+                for step, (sampled_token, sampled_logprob, topk_tokens, topk_logprobs) in enumerate(
+                    zip(sampled_tokens, sampled_logprobs, topk_log_probs_indices, topk_log_probs_vals)
+                ):
+                    step_dict = {}
+                    topk_tokens_list = topk_tokens.tolist()
+                    topk_logprobs_list = topk_logprobs.tolist()
+
+                    for rank_idx, (token, logprob) in enumerate(zip(topk_tokens_list, topk_logprobs_list), start=1):
+                        step_dict[token] = Logprob(logprob=logprob, rank=rank_idx)
+
+                    if sampled_token not in step_dict:
+                        # TODO: fix rank
+                        step_dict[sampled_token] = Logprob(
+                            logprob=sampled_logprob.item(),
+                            rank=len(topk_tokens_list) + 1
                         )
-                    }
                     token_log_probs.append(step_dict)
 
             assert beam == 0, (
@@ -1793,39 +1818,48 @@ class TorchSampler(Sampler):
         # top-k/top-p masking, etc.
         if return_log_probs:
             assert logits_cuda.dim() == 2, "logits should be 2D"
+
             logprobs_req_indices = [
-                req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
+                req_id for req_id, req in enumerate(requests) if req.py_num_logprobs is not None
             ]
-            logprobs_logit_indices = logits_cuda_indexer[logprobs_req_indices]
-            logprobs_logit_indices_cuda = logprobs_logit_indices.to(
-                device=logits_cuda.device, non_blocking=True
-            )
-            logprobs_cuda = F.log_softmax(
-                logits_cuda[logprobs_logit_indices_cuda].to(dtype=torch.float32, non_blocking=True),
-                dim=-1,
-            )
-            topk_vals_cuda, topk_indices_cuda = torch.topk(
-                logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
-            )
-            # Use a single D2H copy to reduce overheads
-            topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
-            topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
-            topk_vals.copy_(topk_vals_cuda, non_blocking=True)
-            topk_indices.copy_(topk_indices_cuda, non_blocking=True)
-            current_offset = 0
-            for req_id, steps in zip(
-                logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
-            ):
-                req = requests[req_id]
-                next_offset = current_offset + steps
-                # NB: Assigning views on memory which is being filled asynchronously
-                req.py_topk_logprobs_vals = topk_vals[
-                    current_offset:next_offset, : req.py_num_logprobs
-                ]
-                req.py_topk_logprobs_indices = topk_indices[
-                    current_offset:next_offset, : req.py_num_logprobs
-                ]
-                current_offset = next_offset
+
+            if logprobs_req_indices:
+                logprobs_logit_indices = logits_cuda_indexer[logprobs_req_indices]
+                logprobs_logit_indices_cuda = logprobs_logit_indices.to(
+                    device=logits_cuda.device, non_blocking=True
+                )
+                logprobs_cuda = F.log_softmax(
+                    logits_cuda[logprobs_logit_indices_cuda].to(dtype=torch.float32, non_blocking=True),
+                    dim=-1,
+                )
+
+                max_k = max(max(1, req.py_num_logprobs) for req in requests if req.py_num_logprobs is not None)
+                topk_vals_cuda, topk_indices_cuda = torch.topk(
+                    logprobs_cuda,
+                    k=max_k,
+                    dim=-1
+                )
+                # Use a single D2H copy to reduce overheads
+                topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
+                topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
+                topk_vals.copy_(topk_vals_cuda, non_blocking=True)
+                topk_indices.copy_(topk_indices_cuda, non_blocking=True)
+                current_offset = 0
+                for req_id, steps in zip(
+                    logprobs_req_indices, req_num_steps[logprobs_req_indices].tolist()
+                ):
+                    req = requests[req_id]
+                    next_offset = current_offset + steps
+                    # Store at least k=1 for all requests (including logprobs=0) to compute ranks
+                    k_for_req = max(1, req.py_num_logprobs)
+                    # NB: Assigning views on memory which is being filled asynchronously
+                    req.py_topk_logprobs_vals = topk_vals[
+                        current_offset:next_offset, : k_for_req
+                    ]
+                    req.py_topk_logprobs_indices = topk_indices[
+                        current_offset:next_offset, : k_for_req
+                    ]
+                    current_offset = next_offset
 
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
@@ -1839,7 +1873,7 @@ class TorchSampler(Sampler):
             token_dtype=new_tokens_cuda.dtype,
         )
 
-        if return_log_probs:
+        if return_log_probs and logprobs_req_indices:
             sampled_tokens_cuda = batched_sampling_result.batch_next_tokens_cuda_int
             logprobs_req_set = set(logprobs_req_indices)
             sampled_logprobs_list = []
