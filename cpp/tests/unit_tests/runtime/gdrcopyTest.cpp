@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/gdrwrap.h"
@@ -10,7 +11,8 @@
 // Skip all tests on Windows
 #ifndef _WIN32
 
-namespace tensorrt_llm::runtime::gdrcopy
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::gdrcopy
 {
 
 namespace
@@ -146,6 +148,7 @@ TEST_F(GdrCopyTest, HelperLifecycle)
 }
 
 } // namespace
-} // namespace tensorrt_llm::runtime::gdrcopy
+} // namespace runtime::gdrcopy
+TRTLLM_NAMESPACE_END
 
 #endif // _WIN32

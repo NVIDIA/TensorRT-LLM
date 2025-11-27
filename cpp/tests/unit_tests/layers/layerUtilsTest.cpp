@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
@@ -24,7 +25,8 @@
 #include <random>
 #include <vector>
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 
 using namespace tensorrt_llm::runtime;
@@ -252,4 +254,5 @@ TYPED_TEST(CopyToWorkspaceFixture, MismatchBufferType_Throws)
     }
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

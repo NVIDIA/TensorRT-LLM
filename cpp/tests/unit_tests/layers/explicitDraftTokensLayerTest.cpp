@@ -15,6 +15,7 @@
  */
 
 #include "tests/unit_tests/layers/explicitDraftTokensLayerTest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
@@ -30,7 +31,8 @@
 #include <cstdint>
 #include <random>
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 // TODO verify context + gen mix
 
@@ -1661,4 +1663,5 @@ TYPED_TEST(FillRandDataTest, BatchInit)
     this->runTest(batchSize, numPaths, draftLength, skipVerification, randomSeed, true);
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

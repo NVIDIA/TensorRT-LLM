@@ -15,6 +15,7 @@
  */
 #include "tests/unit_tests/layers/randomLlm.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -22,7 +23,8 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 
 using namespace tensorrt_llm::layers;
@@ -334,4 +336,5 @@ void LookaheadRandomLlm::maskToPosIds(TensorPtr const& posIds, TensorConstPtr co
     }
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include <tuple>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
@@ -25,7 +26,8 @@
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tests/unit_tests/layers/randomLlm.h"
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
@@ -259,4 +261,5 @@ TEST(LookaheadAlgorithmTest, treeEncodeTest)
         initTensor({21, 22, 23, 24, 25, 26, 27, 21, 22, 23, 24, 21, 22, 23, 24}), 20, 15);
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

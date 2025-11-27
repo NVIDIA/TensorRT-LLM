@@ -19,9 +19,9 @@
 #include "cubin/kernelMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -33,4 +33,4 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

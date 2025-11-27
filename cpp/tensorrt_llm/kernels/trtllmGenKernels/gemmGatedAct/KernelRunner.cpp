@@ -18,12 +18,12 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "trtllmGen_gatedAct_export/GemmGatedActInterface.h"
 #include "trtllmGen_gatedAct_export/GemmOptions.h"
 #include "trtllmGen_gatedAct_export/trtllm/gen/DtypeDecl.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 using namespace gemmGatedAct::gemmGatedAct;
@@ -144,4 +144,4 @@ void TrtllmGenGemmGatedActRunner::selectGemmConfig(int32_t m, int32_t n, int32_t
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

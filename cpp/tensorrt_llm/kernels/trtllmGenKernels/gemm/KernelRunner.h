@@ -17,12 +17,12 @@
 #pragma once
 
 #include <cuda.h>
+#include "tensorrt_llm/common/config.h"
 
 #include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
 #include <optional>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -57,4 +57,4 @@ private:
     std::vector<int32_t> mPassingConfigIndices;
 };
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

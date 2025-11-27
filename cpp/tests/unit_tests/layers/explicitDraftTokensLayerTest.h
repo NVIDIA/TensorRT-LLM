@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -23,7 +24,8 @@
 
 #include <memory>
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 
 class SamplingParams
@@ -348,4 +350,5 @@ using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>, T
 using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>>;
 #endif // ENABLE_BF16
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

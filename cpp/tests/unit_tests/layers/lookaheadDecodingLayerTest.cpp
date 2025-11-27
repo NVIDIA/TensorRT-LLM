@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -34,7 +35,8 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tests/unit_tests/layers/randomLlm.h"
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
@@ -867,4 +869,5 @@ INSTANTIATE_TEST_SUITE_P(LookaheadDecodingLayerParamTest, ParamTest,
             std::make_tuple(3, 2), std::make_tuple(5, 3))),
     generateTestName);
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

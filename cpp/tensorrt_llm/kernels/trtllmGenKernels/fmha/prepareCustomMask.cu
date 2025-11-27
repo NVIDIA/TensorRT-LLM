@@ -18,9 +18,9 @@
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -292,4 +292,4 @@ void runPrepareCustomMask(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

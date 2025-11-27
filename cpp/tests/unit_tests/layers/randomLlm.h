@@ -18,11 +18,13 @@
 #include <gtest/gtest.h>
 #include <list>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -148,4 +150,5 @@ private:
     void maskToPosIds(TensorPtr const& posIds, TensorConstPtr const& mask, runtime::SizeType32 start) const;
 };
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

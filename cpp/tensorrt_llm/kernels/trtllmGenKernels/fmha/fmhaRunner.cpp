@@ -15,14 +15,14 @@
  */
 
 #include "fmhaRunner.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -76,4 +76,4 @@ size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -19,11 +19,11 @@
 #include <cstdint>
 #include <cuda.h>
 #include <vector>
+#include "tensorrt_llm/common/config.h"
 
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -126,4 +126,4 @@ private:
     std::vector<int64_t> mPassingConfigIndices;
 };
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

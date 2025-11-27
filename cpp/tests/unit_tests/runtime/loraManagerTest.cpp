@@ -19,6 +19,7 @@
 #endif
 
 #include "tensorrt_llm/runtime/loraManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -54,7 +55,8 @@ auto const TEST_KEYS_LORA_TP2 = TEST_RESOURCE_PATH / "lora-test-weights-tp2/conf
 auto const TEST_MODEL_CONFIG = TEST_RESOURCE_PATH / "test_model_lora_config.json";
 } // namespace
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 using TensorPtr = ITensor::SharedPtr;
 using PeftTable = LoraManager::PeftTable;
@@ -361,4 +363,5 @@ TEST_P(LoraManagerTest, fillInputTensors)
 
 INSTANTIATE_TEST_SUITE_P(LoraManagerTest, LoraManagerTest, testing::Values(false, true));
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

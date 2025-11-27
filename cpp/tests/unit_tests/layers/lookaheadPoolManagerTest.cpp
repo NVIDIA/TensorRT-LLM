@@ -15,11 +15,13 @@
  */
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/layers/lookaheadPoolManager.h"
 #include "tests/unit_tests/layers/randomLlm.h"
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
@@ -171,4 +173,5 @@ TEST(LookaheadPoolManagerTest, fillAndUpdate)
     EXPECT_TRUE(isTensorEqString(*it, "abc"));
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END

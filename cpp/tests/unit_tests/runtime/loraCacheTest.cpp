@@ -18,6 +18,7 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -64,7 +65,8 @@ auto const TEST_KEYS_DORA_TP2_PAGES_RANK0 = TEST_RESOURCE_PATH / "lora-test-weig
 auto const TEST_KEYS_DORA_TP2_PAGES_RANK1 = TEST_RESOURCE_PATH / "lora-test-weights-tp2/cache_pages_rank1_dora.npy";
 } // namespace
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime
 {
 
 using TensorPtr = ITensor::SharedPtr;
@@ -622,4 +624,5 @@ TEST_P(LoraCacheTest, copyToPages_tp2_rank1)
 
 INSTANTIATE_TEST_SUITE_P(LoraCacheTest, LoraCacheTest, testing::Values(false, true));
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+TRTLLM_NAMESPACE_END

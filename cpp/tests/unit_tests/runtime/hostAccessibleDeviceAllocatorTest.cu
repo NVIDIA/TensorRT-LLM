@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include <cuda_runtime.h>
@@ -21,7 +22,8 @@
 #include <numeric>
 #include <vector>
 
-namespace tensorrt_llm::runtime::unit_tests
+TRTLLM_NAMESPACE_BEGIN
+namespace runtime::unit_tests
 {
 
 // Kernel to verify data written by the host on the device.
@@ -233,4 +235,5 @@ TEST_F(HostAccessibleDeviceAllocatorTest, GetHostPtrForUnallocated)
     EXPECT_EQ(allocator->getHostPtr(devPtr), nullptr);
 }
 
-} // namespace tensorrt_llm::runtime::unit_tests
+} // namespace runtime::unit_tests
+TRTLLM_NAMESPACE_END

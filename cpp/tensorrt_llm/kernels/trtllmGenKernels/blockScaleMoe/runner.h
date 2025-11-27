@@ -18,6 +18,7 @@
 
 #include "DevKernel.h"
 #include "RoutingKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
@@ -26,8 +27,7 @@
 #include <set>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -396,4 +396,4 @@ private:
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

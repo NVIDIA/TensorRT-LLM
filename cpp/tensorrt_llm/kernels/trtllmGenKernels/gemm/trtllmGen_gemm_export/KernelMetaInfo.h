@@ -18,12 +18,12 @@
 #pragma once
 
 #include "GemmOptions.h"
+#include "tensorrt_llm/common/config.h"
 
 namespace gemm
 {
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 // clang-format off
@@ -7894,5 +7894,5 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 };
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 } // namespace gemm

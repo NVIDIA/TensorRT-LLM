@@ -17,11 +17,11 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
@@ -362,4 +362,4 @@ struct TllmGenSelectKernelParams
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

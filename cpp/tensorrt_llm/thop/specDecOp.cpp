@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/draftTokenTreeKernels.h"
@@ -411,5 +412,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("extract_real_draft_tokens_op", &torch_ext::extract_real_draft_tokens_op);
+    m.impl("extract_real_draft_tokens_op", &tensorrt_llm::torch_ext::extract_real_draft_tokens_op);
 }

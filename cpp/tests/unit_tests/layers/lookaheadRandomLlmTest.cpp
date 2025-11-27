@@ -15,13 +15,15 @@
  */
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tests/unit_tests/layers/randomLlm.h"
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+namespace tests::layers
 {
 namespace tk = tensorrt_llm::kernels;
 namespace trk = tensorrt_llm::runtime::kernels;
@@ -238,4 +240,5 @@ TEST(LookaheadRandomllm, gpuSampling)
     }
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+TRTLLM_NAMESPACE_END
