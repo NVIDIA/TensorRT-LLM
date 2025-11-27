@@ -29,12 +29,6 @@ set_value_in_command() {
     echo "$result"
 }
 
-# Only the first process will save the job ID
-if [ $SLURM_PROCID -eq 0 ]; then
-    # Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
-    echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
-fi
-
 if [ $SLURM_LOCALID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
