@@ -1354,9 +1354,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
-            if (type == "gb10x_blossom")
-            {
-                targetCould = "nvks-sparks-cloud"
+            if (type == "gb10x_blossom") {
+                targetCloud = "nvks-sparks-cloud"
                 selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
