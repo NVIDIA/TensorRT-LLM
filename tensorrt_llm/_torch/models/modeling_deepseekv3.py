@@ -426,8 +426,7 @@ class DeepseekV3MTPHead(nn.Module):
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype,
-                            use_cuda_tile=True)
+                            dtype=config.torch_dtype)
 
         self.mapping_lm_head_tp = None
 
@@ -1047,8 +1046,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_cuda_tile=True)
+                                       dtype=config.torch_dtype)
 
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.fusion_config.PRE_MLP_FUSION
@@ -1057,8 +1055,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype,
-                                                use_cuda_tile=True)
+                                                dtype=config.torch_dtype)
         self.layer_idx = layer_idx
         self.next_layer_layernorm: RMSNorm = None
 
@@ -1323,13 +1320,11 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
-                             dtype=config.torch_dtype,
-                             use_cuda_tile=True)
+                             dtype=config.torch_dtype)
 
         self.hnorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
-                             dtype=config.torch_dtype,
-                             use_cuda_tile=True)
+                             dtype=config.torch_dtype)
         if model_config.mapping.enable_attention_dp:
             self.eh_proj = Linear(
                 config.hidden_size * 2,
@@ -1473,8 +1468,7 @@ class DeepseekV3Model(DecoderModel):
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype,
-                            use_cuda_tile=True)
+                            dtype=config.torch_dtype)
 
     def forward(
         self,
