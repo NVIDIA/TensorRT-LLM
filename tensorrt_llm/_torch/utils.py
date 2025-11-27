@@ -370,3 +370,27 @@ def maybe_compile(func=None, **compile_kwargs):
         return wrapper
 
     return decorator(func) if func else decorator
+
+
+def gen_balanced_moe_routing_input(num_tokens: int, num_experts: int,
+                                   top_k: int) -> torch.Tensor:
+    """
+    Generate imbalanced routing input for MoE routing.
+    """
+    token_selected_experts_gen = torch.zeros(num_tokens, top_k)
+    # select k unique experts from num_experts for each token
+    for i in range(num_tokens):
+        token_selected_experts_gen[i] = torch.randperm(num_experts)[:top_k]
+    return token_selected_experts_gen
+
+
+def gen_imbalanced_moe_routing_input(num_tokens: int, num_experts: int,
+                                     top_k: int) -> torch.Tensor:
+    """
+    Generate imbalanced routing input for MoE routing.
+    """
+    token_selected_experts_gen = torch.zeros(num_tokens, top_k)
+    # select k unique experts from num_experts for each token
+    for i in range(num_tokens):
+        token_selected_experts_gen[i] = torch.arange(0, top_k)
+    return token_selected_experts_gen

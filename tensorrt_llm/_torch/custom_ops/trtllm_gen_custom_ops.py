@@ -79,8 +79,8 @@ def prepare_dummy_topk_and_hook(
             routing_logits_for_tuner = routing_logits
 
     # Define hook to recreate dummy tensors when shape changes during profiling
-    def recreate_dummy_topk_if_needed(
-            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def recreate_dummy_topk_if_needed(inputs: List[torch.Tensor],
+                                      **kwargs) -> List[torch.Tensor]:
         """Recreate dummy topk tensors if token count changed during profiling."""
         current_num_tokens = inputs[hidden_states_index].shape[0]
 

@@ -4288,7 +4288,8 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     return out_map;
 }
 
-void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_char, cudaStream_t stream)
+void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_char, cudaStream_t stream,
+    void const* token_selected_experts_customized, bool use_customized_router)
 {
     auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 #define GET_WS_PTR_BASE(type, name)                                                                                    \
@@ -4329,10 +4330,19 @@ void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_cha
         int const start_expert_id = mNumExpertsPerNode * mParallelismConfig.ep_rank;
 
         uint32_t num_threads = 256;
-        dim3 grid_dim{(num_tokens + num_threads - 1) / num_threads, NUM_ROUTING_SAMPLES, 1};
-        prepareFakeRouterBuffers<<<grid_dim, num_threads, 0, stream>>>(
-            token_selected_experts_base, num_tokens, mK, mNumExperts);
-        sync_check_cuda_error(stream);
+        if (use_customized_router)
+        {
+            // copy token selected experts to token_selected_experts_base
+            cudaMemcpyAsync(token_selected_experts_base, token_selected_experts_customized,
+                num_tokens * mK * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+        }
+        else
+        {
+            dim3 grid_dim{(num_tokens + num_threads - 1) / num_threads, NUM_ROUTING_SAMPLES, 1};
+            prepareFakeRouterBuffers<<<grid_dim, num_threads, 0, stream>>>(
+                token_selected_experts_base, num_tokens, mK, mNumExperts);
+            sync_check_cuda_error(stream);
+        }
 
         for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++)
         {
@@ -4539,15 +4549,16 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
     }
 }
 
-void GemmProfilerBackend::prepare(
-    int num_tokens, char* workspace_ptr_char, void const* expert_weights, cudaStream_t stream)
+void GemmProfilerBackend::prepare(int num_tokens, char* workspace_ptr_char, void const* expert_weights,
+    cudaStream_t stream, void const* token_selected_experts_customized, bool use_customized_router)
 {
     mSampleIndex = 0;
 
     auto workspace_size = getWorkspaceSize(num_tokens);
     populateRandomBuffer(workspace_ptr_char, workspace_size, stream);
+    auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 
-    prepareRouting(num_tokens, workspace_ptr_char, stream);
+    prepareRouting(num_tokens, workspace_ptr_char, stream, token_selected_experts_customized, use_customized_router);
     prepareQuantParams(num_tokens, workspace_ptr_char, stream);
     for (auto fusion : {TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE})
