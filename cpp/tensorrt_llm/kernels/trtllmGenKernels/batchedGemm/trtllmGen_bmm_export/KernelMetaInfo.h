@@ -18,13 +18,12 @@
 #pragma once
 
 #include "BatchedGemmOptions.h"
-#include "tensorrt_llm/common/config.h"
 
 namespace batchedGemm
 {
 
-TRTLLM_NAMESPACE_BEGIN
-
+namespace tensorrt_llm
+{
 namespace kernels
 {
 // clang-format off
@@ -44947,6 +44946,5 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 };
 // clang-format on
 } // namespace kernels
-
-TRTLLM_NAMESPACE_END
+} // namespace tensorrt_llm
 } // namespace batchedGemm

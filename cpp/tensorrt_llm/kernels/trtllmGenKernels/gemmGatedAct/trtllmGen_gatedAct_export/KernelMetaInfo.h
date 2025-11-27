@@ -18,13 +18,12 @@
 #pragma once
 
 #include "GemmGatedActOptions.h"
-#include "tensorrt_llm/common/config.h"
 
 namespace gemmGatedAct
 {
 
-TRTLLM_NAMESPACE_BEGIN
-
+namespace tensorrt_llm
+{
 namespace kernels
 {
 // clang-format off
@@ -996,6 +995,5 @@ static const gemmGatedAct::GemmGatedActConfig tllmGenGemmGatedActList[] = {
 };
 // clang-format on
 } // namespace kernels
-
-TRTLLM_NAMESPACE_END
+} // namespace tensorrt_llm
 } // namespace gemmGatedAct
