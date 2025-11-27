@@ -1333,9 +1333,9 @@ class Indexer(nn.Module):
                                         shape[-1]] = topk_indices.to(
                                             dtype=torch.int32)
         elif has_prefill and metadata.skip_indexer_for_gen_reqs:
-            topk_indices_buffer[:
-                                num_ctx_tokens, :] = metadata.topk_indices_buffer[:
-                                                                                  num_ctx_tokens, :]
+            # Fill topk_indices_buffer with pre-defined dense topk indices
+            topk_indices_buffer[:num_ctx_tokens, :] = \
+                metadata.topk_indices_buffer[:num_ctx_tokens, :]
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
@@ -1423,10 +1423,9 @@ class Indexer(nn.Module):
                                     shape[-1]] = topk_indices_decode.to(
                                         dtype=torch.int32)
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
-            # Fill topk_indices_buffer with -1
-            topk_indices_buffer[
-                num_ctx_tokens:num_tokens, :] = metadata.topk_indices_buffer[
-                    num_ctx_tokens:num_tokens, :]
+            # Fill topk_indices_buffer with pre-defined dense topk indices
+            topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
+                metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
         return topk_indices_buffer
 
     def _weight_scale(self, weights: torch.Tensor,
