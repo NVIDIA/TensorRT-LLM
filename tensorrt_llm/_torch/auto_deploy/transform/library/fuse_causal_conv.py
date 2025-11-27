@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Fusion transform for fusing activation functions into causal_conv1d operations."""
 
 from typing import List, Optional, Tuple
@@ -6,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.mamba.cuda_backend_causal_conv import cuda_cached_causal_conv1d_wrapper
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -85,10 +101,12 @@ class FuseCausalConvActivation(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
 
+        target_op = cuda_cached_causal_conv1d_wrapper
+
         # Step 1: Identify causal_conv + activation pattern
         matches = _match_causal_conv_activation_pattern(
             graph,
-            target_op=torch.ops.auto_deploy.cuda_cached_causal_conv1d,
+            target_op=target_op,
         )
 
         # Step 2: Replace matched patterns with fused version
@@ -98,7 +116,7 @@ class FuseCausalConvActivation(BaseTransform):
                 # Replace the last arg (activation=None) with activation_name
                 new_args = list(conv_node.args[:-1]) + [activation_name]
                 fused_node = graph.call_function(
-                    torch.ops.auto_deploy.cuda_cached_causal_conv1d,
+                    target_op,
                     args=tuple(new_args),
                 )
 

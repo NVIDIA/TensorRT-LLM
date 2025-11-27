@@ -826,6 +826,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmWaivesTxtfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
             def resourcePathNode = "/tmp"
@@ -834,13 +835,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
-            def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def outputPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptExecPathLocal = Utils.createTempLocation(pipeline, "./slurm_exec.sh")
             def scriptExecPathNode = "${jobWorkspace}/${jobUID}-slurm_exec.sh"
-            def isAarch64 = config.contains("aarch64")
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("[${stageName}] Initializing Test") {
@@ -985,6 +984,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
+                    export llmWaivesTxtfile=$llmWaivesTxtfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     export perfMode=$perfMode
@@ -1008,7 +1008,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                def scriptExec = """
+                def scriptExec = """#!/bin/bash
+                    set -Eeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     touch ${outputPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
@@ -1424,8 +1426,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
-    if (type.contains("6000d")) {
-        // rtx-pro-6000d nodes are located in Austin DC, we use the FlexCache to speed up the data access.
+    if (type.contains("6000d") || type.contains("gh200")) {
+        // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:

@@ -76,6 +76,7 @@ worker_config:
       - 2048
       - 256
     print_iter_log: true
+    trust_remote_code: true
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
@@ -102,6 +103,7 @@ worker_config:
     enable_attention_dp: true
     pipeline_parallel_size: 1
     print_iter_log: true
+    trust_remote_code: true
     cuda_graph_config: null
     disable_overlap_scheduler: true
     kv_cache_config:
