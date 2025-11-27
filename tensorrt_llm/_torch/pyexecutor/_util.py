@@ -678,8 +678,10 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
+    max_num_sequences = max_batch_size * mapping.pp_size
+
     logger.info(
-        f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
+        f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
     for key, value in llm_args.extra_resource_managers.items():
@@ -763,8 +765,6 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
-
-    max_num_sequences = max_batch_size * mapping.pp_size
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
@@ -965,7 +965,7 @@ def _adjust_torch_mem_fraction():
     #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
     #   or a similar API is available, the warning below should be removed
     #   and the allocator GC threshold be set via the new API instead.
-    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_allocator_config = os.environ.get("PYTORCH_ALLOC_CONF", "")
     torch_mem_threshold_advised = (
         torch.cuda.get_allocator_backend() == "native"
         and "expandable_segments:True" not in torch_allocator_config)
@@ -973,7 +973,7 @@ def _adjust_torch_mem_fraction():
     if torch_mem_threshold_advised and not torch_mem_threshold_set:
         logger.warning(
             "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
-            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+            " or 'expandable_segments:True' in PYTORCH_ALLOC_CONF.")
 
     # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
     #       fraction < 1.0 is beneficial, because

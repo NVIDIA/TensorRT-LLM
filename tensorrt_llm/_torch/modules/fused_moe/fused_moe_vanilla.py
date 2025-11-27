@@ -416,9 +416,12 @@ class VanillaMoE(nn.ModuleList):
         packed_weight = packed_weight.view(len(weights), *weights_data[0].shape)
         getattr(self, f"{module_name}_{weight_name}").data = packed_weight
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         from ...models.modeling_utils import filter_weights
 
+        assert not allow_partial_loading, "Partial loading is not supported for vanilla MoE now"
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]

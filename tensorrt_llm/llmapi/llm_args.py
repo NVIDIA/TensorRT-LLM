@@ -700,6 +700,10 @@ class DecodingBaseConfig(StrictBaseModel):
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        return self.max_draft_len == self.max_total_draft_tokens
+
 
 class KvCacheConnectorConfig(StrictBaseModel):
     """
@@ -3039,8 +3043,7 @@ def update_llm_args_with_extra_dict(
 
     llm_args = llm_args | llm_args_dict
 
-    # For trtllm-bench or trtllm-serve, build_config may be passed for the PyTorch
-    # backend, overwriting the knobs there since build_config always has the highest priority
+    # build_config only works for TensorRT backend, it will be ignored in PyTorch backend
     if "build_config" in llm_args:
         # Ensure build_config is a BuildConfig object, not a dict
         if isinstance(llm_args["build_config"], dict):

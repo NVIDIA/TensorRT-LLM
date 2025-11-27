@@ -28,7 +28,7 @@ FROM base AS devel
 
 #
 # NB: PyTorch requires this to be < 1.0
-ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
+ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 # Copy all installation scripts at once to reduce layers
 COPY docker/common/install.sh \
