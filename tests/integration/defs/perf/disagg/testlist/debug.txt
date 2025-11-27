@@ -1,3 +1,3 @@
 # test_disagg.py::TestDisaggBenchmark::test_benchmark[wideep_perf_deepseek-r1-fp4_1k1k_ctx2_gen1_dep48_bs16_eplb288_mtp3_ccb-DEFAULT]
-test_disagg.py::TestDisaggBenchmark::test_benchmark[Qwen3-235B-A22B-FP8_1k1k_ctx1_gen1_tep8_bs32_eplb0_mtp0_ccb-NIXL]
-test_disagg.py::TestDisaggBenchmark::test_benchmark[Qwen3-235B-A22B-FP8_1k1k_ctx1_gen1_tep8_bs32_eplb0_mtp0_ccb-UCX]
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_Qwen3-235B-A22B-FP8_1k1k_ctx1_gen1_tep8_bs32_eplb0_mtp0_ccb-NIXL]
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_Qwen3-235B-A22B-FP8_1k1k_ctx1_gen1_tep8_bs32_eplb0_mtp0_ccb-UCX]
