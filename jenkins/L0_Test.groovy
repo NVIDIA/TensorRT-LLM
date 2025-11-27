@@ -1009,6 +1009,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 def scriptExec = """
+                    set -Eeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     touch ${outputPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
