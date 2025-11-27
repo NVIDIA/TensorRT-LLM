@@ -4,6 +4,7 @@
 import argparse
 import re
 import sys
+import os
 
 import pandas as pd
 
@@ -45,6 +46,10 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
         DataFrame: Comparison results
     """
     # Read CSV file
+    if not os.path.exists(csv_path):
+        print(f"CSV file not found: {csv_path}")
+        sys.exit(0)
+
     df = pd.read_csv(csv_path)
 
     if len(df) == 0:
