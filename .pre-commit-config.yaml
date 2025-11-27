@@ -18,7 +18,7 @@ repos:
     hooks:
     -   id: check-added-large-files
         exclude: |
-            (?x)^(.*cubin.cpp | .*cubin.h)$
+            (?x)^(.*cubin.cpp | .*cubin.h | ATTRIBUTIONS-.*\.md)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
@@ -66,7 +66,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
