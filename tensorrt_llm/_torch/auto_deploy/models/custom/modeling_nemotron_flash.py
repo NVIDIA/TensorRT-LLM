@@ -13,6 +13,8 @@ from transformers.modeling_outputs import CausalLMOutput, MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
+from tensorrt_llm.inputs.utils import HF_CHAT_TEMPLATE_EXCEPTIONS
+
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
 
 
@@ -26,6 +28,15 @@ class NemotronFlashPreTrainedTokenizerFast(PreTrainedTokenizerFast):
         self.mem_tokens = [f"<mem_{i}>" for i in range(self.num_memory_tokens)]
         self.mem_token_ids = list(range(len(self), len(self) + self.num_memory_tokens))
         self.add_tokens(self.mem_tokens, special_tokens=True)
+
+        if getattr(self, "chat_template", None) is None:
+            self.chat_template = (
+                "{% for m in messages %}"
+                "{{ m['content'] }}"
+                "{% if not loop.last %}\n{% endif %}"
+                "{% endfor %}"
+            )
+        self.model_input_names = ["input_ids"]
 
     def _add_memory_tokens(self, input_ids) -> Union[List[List[int]], torch.Tensor]:
         is_unbatched = True
@@ -1088,3 +1099,4 @@ class NemotronFlashForCausalLM(NemotronFlashPreTrainedModel, GenerationMixin):
 NemotronFlashForCausalLMFactory.register_custom_model_cls(
     "NemotronFlashConfig", NemotronFlashForCausalLM
 )
+HF_CHAT_TEMPLATE_EXCEPTIONS.append("nemotron_flash")
