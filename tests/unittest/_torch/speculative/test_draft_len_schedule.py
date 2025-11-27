@@ -269,8 +269,8 @@ def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dic
     # This matches what the authentic code does: len(executor.active_requests)
     expected_mapping = {
         1: 5,
-        2: 5,
-        3: 5,
+        2: 4,
+        3: 4,
         4: 4,
         5: 3,
         6: 2,

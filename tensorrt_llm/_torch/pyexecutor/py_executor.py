@@ -1062,7 +1062,7 @@ class PyExecutor:
 
                 self.drafter.update_max_total_draft_tokens(
                     self.max_total_draft_tokens)
-
+                self.model_engine.max_total_draft_tokens = self.max_total_draft_tokens
             # Check if draft_len=0 → immediately disable
             # self.max_total_draft_tokens==0 is only possible when draft_len_schedule is provided
             # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
