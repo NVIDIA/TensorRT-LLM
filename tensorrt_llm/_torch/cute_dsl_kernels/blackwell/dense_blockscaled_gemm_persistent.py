@@ -61,8 +61,6 @@ from cutlass.cute.runtime import from_dlpack
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import is_power_of_2
 
-# from testing import benchmark
-
 class Sm100BlockScaledPersistentDenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and Blackwell GPU architectural features, including persistent tile scheduling and warp specialization.
@@ -311,7 +309,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
         self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n
 
-        # TODO: [alel] Currently set prefetch dist to num_ab_stage, we may have more option for prefetch dist auto tuning
+        # TODO: [alel] Currently set prefetch dist to num_ab_stage, we may have more options for prefetch dist auto tuning
         self.prefetch_dist = self.num_ab_stage
 
     @cute.jit
@@ -2143,7 +2141,6 @@ def run(
     iterations: int = 1,
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
-    # use_cupti: bool = False,
     **kwargs,
 ):
     """Runs and benchmarks the persistent batched dense block-scaled GEMM.
@@ -2198,7 +2195,6 @@ def run(
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
-    # print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
 
     # Unpack parameters
     m, n, k, l = mnkl
@@ -2470,15 +2466,6 @@ def run(
         warmup_iterations=warmup_iterations,
         iterations=iterations,
     )
-    # exec_time = benchmark(
-    #     compiled_gemm,
-    #     workspace_generator=generate_tensors,
-    #     workspace_count=workspace_count,
-    #     stream=current_stream,
-    #     warmup_iterations=warmup_iterations,
-    #     iterations=iterations,
-    #     use_cupti=use_cupti,
-    # )
 
     return exec_time  # Return execution time in microseconds
 
@@ -2555,18 +2542,6 @@ if __name__ == "__main__":
         default=False,
         help="Use circular buffer tensor sets to ensure L2 cold cache",
     )
-    # parser.add_argument(
-    #     "--use_cupti",
-    #     action="store_true",
-    #     default=False,
-    #     help="Use CUPTI to measure execution time",
-    # )
-    # parser.add_argument(
-    #     "--print_duration",
-    #     action="store_true",
-    #     default=False,
-    #     help="Print execution time",
-    # )
 
     args = parser.parse_args()
 
@@ -2597,27 +2572,4 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
     )
-
-    # TODO: [alel] Would like to involve cupti testing here, but need to double check how to add cupti wheel in framework
-    # exec_time = run(
-    #     args.mnkl,
-    #     args.ab_dtype,
-    #     args.sf_dtype,
-    #     args.sf_vec_size,
-    #     args.c_dtype,
-    #     args.a_major,
-    #     args.b_major,
-    #     args.c_major,
-    #     args.mma_tiler_mn,
-    #     args.cluster_shape_mn,
-    #     args.use_prefetch,
-    #     args.tolerance,
-    #     args.warmup_iterations,
-    #     args.iterations,
-    #     args.skip_ref_check,
-    #     args.use_cold_l2,
-    #     #args.use_cupti,
-    # )
-    # if args.print_duration:
-    #     print(f"Execution time: {exec_time} us")
     print("PASS")
