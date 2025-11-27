@@ -102,37 +102,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 4),
             ]
             swap_ab_candidates = [True, False]
+            use_prefetch_candidates = [True, False]
 
             valid_tactics = []
-            for swap_ab in swap_ab_candidates:
-                for mma_tiler_mn in mma_tiler_mn_candidates:
-                    for cluster_shape_mn in cluster_shape_mn_candidates:
-                        if swap_ab:
-                            c_major = "m"
-                            kernel_m = n
-                            kernel_n = m
-                        else:
-                            c_major = "n"
-                            kernel_m = m
-                            kernel_n = n
+            for mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    swap_ab_candidates, use_prefetch_candidates):
+                if swap_ab:
+                    c_major = "m"
+                    kernel_m = n
+                    kernel_n = m
+                else:
+                    c_major = "n"
+                    kernel_m = m
+                    kernel_n = n
 
-                        if self.__class__.kernel_class.can_implement(
-                                cutlass.Float4E2M1FN,  # ab_dtype,
-                                cutlass.Float8E4M3FN,  # sf_dtype
-                                sf_vec_size,  # sf_vec_size,
-                                cutlass.BFloat16,  # c_dtype,
-                                mma_tiler_mn,
-                                cluster_shape_mn,
-                                kernel_m,
-                                kernel_n,
-                                real_k,
-                                batch_size,
-                                a_major,
-                                b_major,
-                                c_major,
-                        ):
-                            valid_tactics.append(
-                                (mma_tiler_mn, cluster_shape_mn, swap_ab))
+                if self.__class__.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype,
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        sf_vec_size,  # sf_vec_size,
+                        cutlass.BFloat16,  # c_dtype,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                ):
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
 
             return valid_tactics
 
@@ -161,7 +162,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
                     inputs[4]: Alpha scaling factor. dtype: float32.
                     inputs[5]: Output dtype, expected to be torch.bfloat16.
-                tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn).
+                tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch).
 
             Returns:
                 torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
@@ -169,12 +170,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_vec_size = 16
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, swap_ab = tactic
+                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = tactic
             else:
                 # fallback to default tactic
-                mma_tiler_mn, cluster_shape_mn, swap_ab = [
+                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = [
                     (128, 128),
                     (1, 1),
+                    False,
                     False,
                 ]
 
@@ -211,7 +213,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab)
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
             if swap_ab:
                 kernel_a_ptr = b_ptr
                 kernel_a_sf_ptr = b_sf_ptr
@@ -236,6 +238,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
+                    use_prefetch,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
