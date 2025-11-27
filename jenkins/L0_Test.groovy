@@ -2995,9 +2995,8 @@ def launchTestJobs(pipeline, testFilter)
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
-                            // use https://urm.nvidia.com/artifactory/pytorch-cu128-remote/ instead of https://download.pytorch.org/ to avoid the download timeout issue.
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
-
                         }
 
                         def libEnv = []
