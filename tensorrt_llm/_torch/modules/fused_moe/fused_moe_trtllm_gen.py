@@ -586,6 +586,9 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group,
                 topk_group,
                 intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size_per_partition
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -593,18 +596,13 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
                 topk_weights=token_final_scales,
-                topk_ids=token_selected_experts,
-            )
+                topk_ids=token_selected_experts)
 
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
                 return outputs
             else:
                 final_hidden_states = outputs[0]
-                if final_hidden_states.shape[-1] != self.hidden_size:
-                    final_hidden_states = final_hidden_states[:, :self.
-                                                              hidden_size].contiguous(
-                                                              )
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
             if not post_quant_comm:

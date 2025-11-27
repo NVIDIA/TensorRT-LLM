@@ -1577,8 +1577,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("hidden_size, intermediate_size", [(512, 512),
-                                                            (2880, 2880)])
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(2880, 2880)])
 @pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
 @pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
 @pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],

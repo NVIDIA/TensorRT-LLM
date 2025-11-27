@@ -2084,6 +2084,45 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
+    def post_load_weights(self, module: torch.nn.Module):
+        super().post_load_weights(module)
+        # Create a proxy weight of unpadded size; dtype does not matter
+        w1_weight = torch.empty([module.intermediate_size, module.hidden_size])
+        # Calculate alignment
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, w1_weight.shape[0])
+        # Pad the proxy weight
+        w1_weight = maybe_pad_for_weights(w1_weight,
+                                          self.input_hidden_alignment,
+                                          alignment)
+        # Get the slice range of each tp rank
+        _, w1_weight_shard_slice = load_weight_shard(w1_weight,
+                                                     module.tp_size,
+                                                     module.tp_rank,
+                                                     TensorParallelMode.COLUMN,
+                                                     return_slice_indices=True)
+
+        def slice_stop(slice: slice) -> int:
+            return slice.stop
+
+        def slice_start(slice: slice) -> int:
+            return slice.start or 0
+
+        # Keep the unpadded shape of each shard to be leveraged by kernels to avoid BW waste
+        shard_slice_indices = list(
+            zip(
+                w1_weight_shard_slice,
+                [module.intermediate_size, module.hidden_size],
+            ))
+        # Clamp the unpadded shape after shard
+        w1_weight_shard_shape_lean = [
+            min(dim_bound, slice_stop(dim)) - slice_start(dim)
+            for dim, dim_bound, in shard_slice_indices
+        ]
+        self.intermediate_size_per_partition_lean = w1_weight_shard_shape_lean[
+            0]
+
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
