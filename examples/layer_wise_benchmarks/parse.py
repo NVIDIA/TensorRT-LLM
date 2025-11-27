@@ -17,7 +17,8 @@ parser.add_argument("--profile-dir", type=str, default="profiles")
 parser.add_argument("--world-size", "--np", type=int)
 parser.add_argument("--rank", type=int, default=0)
 parser.add_argument("--warmup-times", type=int)
-group = parser.add_mutually_exclusive_group(required=False)
+parser.add_argument("--query", type=str)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--error-on-unknown-kernel", action="store_true", dest="error_on_unknown_kernel")
 group.add_argument(
     "--no-error-on-unknown-kernel", action="store_false", dest="error_on_unknown_kernel"
@@ -390,6 +391,9 @@ for problem_id, converted_seq in enumerate(converted_seqs):
         merged_data[cur][problem_id] = t
         cur += 1
 
+print("Run args:")
+print(run_args)
+
 print("Problem set:")
 for problem in problem_set:
     print(
@@ -447,3 +451,17 @@ with html_file_path.open("w") as f:
             headerConfig=js_header_config, rawData=js_data, runArgs=json.dumps(run_args, indent=4)
         )
     )
+
+if args.query is not None:
+    print("Query:")
+    for query in args.query.split(","):
+        query = query.strip()
+        query_matched = [0.0] * len(problem_set)
+        for title, time_data in zip(merged_title, merged_data):
+            if query in ".".join(title):
+                for i, x in enumerate(time_data):
+                    query_matched[i] += x
+        print(
+            query + " " * (max_title_len - len(query)),
+            *[f"{x / 1000:-6.1f}" for x in query_matched],
+        )

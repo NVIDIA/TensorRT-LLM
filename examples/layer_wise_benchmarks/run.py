@@ -36,7 +36,7 @@ parser.add_argument("--scaled-from", type=int)
 parser.add_argument("--max-batch-size", type=int)
 parser.add_argument("--tokens-per-block", type=int)
 parser.add_argument("--max-seq-len", type=int)
-group = parser.add_mutually_exclusive_group(required=False)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-attention-dp", action="store_true", dest="enable_attention_dp")
 group.add_argument("--no-enable-attention-dp", action="store_false", dest="enable_attention_dp")
 parser.set_defaults(enable_attention_dp=None)
@@ -44,7 +44,7 @@ parser.set_defaults(enable_attention_dp=None)
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
-group = parser.add_mutually_exclusive_group(required=False)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph")
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
 parser.set_defaults(use_cuda_graph=None)
@@ -86,6 +86,8 @@ if config:
 # Set default values
 if args.max_batch_size is None:
     args.max_batch_size = max(args.batch_size_list)
+if args.max_seq_len is None:
+    args.max_seq_len = max(args.seq_len_q_list) + max(args.seq_len_kv_cache_list)
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
 print(args)
