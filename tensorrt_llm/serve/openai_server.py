@@ -83,7 +83,8 @@ class OpenAIServer:
                  metadata_server_cfg: MetadataServerConfig,
                  disagg_cluster_config: Optional[DisaggClusterConfig] = None,
                  multimodal_server_config: Optional[MultimodalServerConfig] = None,
-                 chat_template: Optional[str] = None):
+                 chat_template: Optional[str] = None,
+                 expose_config_endpoint: bool = False):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.tool_parser = tool_parser
@@ -92,6 +93,9 @@ class OpenAIServer:
         self.multimodal_server_config = multimodal_server_config
         self.chat_template = load_chat_template(chat_template)
         self.server_role = server_role
+        # Enable /config endpoint only when explicitly requested (security: may expose secrets)
+        self.expose_config_endpoint = expose_config_endpoint or os.getenv(
+            "TRTLLM_EXPOSE_CONFIG_ENDPOINT", "0") == "1"
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
@@ -240,7 +244,11 @@ class OpenAIServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/config", self.get_config, methods=["GET"])
+        if self.expose_config_endpoint:
+            self.app.add_api_route("/config", self.get_config, methods=["GET"])
+            logger.warning(
+                "/config endpoint is enabled. This may expose sensitive configuration data."
+            )
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
@@ -340,6 +348,12 @@ class OpenAIServer:
 
         This endpoint exposes all llm.args fields as JSON, serving as
         the source of truth for the server's runtime configuration.
+
+        WARNING: This endpoint is disabled by default for security reasons.
+        It may expose sensitive information including environment variables,
+        secret tokens, and resolved file paths. Enable only when needed
+        for debugging via --expose_config_endpoint flag or
+        TRTLLM_EXPOSE_CONFIG_ENDPOINT=1 environment variable.
         """
         config = self.llm.args.model_dump(mode="json")
         return JSONResponse(content=config)
