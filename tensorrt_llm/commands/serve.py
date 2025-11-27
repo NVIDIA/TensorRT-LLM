@@ -95,6 +95,7 @@ def get_llm_args(
         free_gpu_memory_fraction: float = 0.9,
         num_postprocess_workers: int = 0,
         trust_remote_code: bool = False,
+        revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
         fail_fast_on_attention_window_too_large: bool = False,
         otlp_traces_endpoint: Optional[str] = None,
@@ -129,6 +130,7 @@ def get_llm_args(
         "moe_expert_parallel_size": moe_expert_parallel_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
+        "revision": revision,
         "build_config": build_config,
         "max_batch_size": max_batch_size,
         "max_num_tokens": max_num_tokens,
@@ -317,6 +319,11 @@ class ChoiceWithAlias(click.Choice):
               is_flag=True,
               default=False,
               help="Flag for HF transformers.")
+@click.option("--revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
 @click.option(
     "--extra_llm_api_options",
     type=str,
@@ -381,9 +388,9 @@ def serve(
         ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
+        revision: Optional[str], extra_llm_api_options: Optional[str],
+        reasoning_parser: Optional[str], tool_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
@@ -418,6 +425,7 @@ def serve(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
+        revision=revision,
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
