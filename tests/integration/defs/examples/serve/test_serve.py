@@ -1,9 +1,10 @@
 import os
 import time
+
 import pytest
 import requests
-from defs.conftest import llm_models_root, skip_no_hopper, \
-    skip_pre_hopper, skip_post_blackwell_ultra
+from defs.conftest import (llm_models_root, skip_no_hopper,
+                           skip_post_blackwell_ultra, skip_pre_hopper)
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
@@ -173,7 +174,7 @@ def test_extra_llm_api_options_for_deepseek_r1_fp4(serve_test_root):
         "1",
         "--extra_llm_api_options",
         config_file,
-        "--log_level", 
+        "--log_level",
         "info",
     ]
 
