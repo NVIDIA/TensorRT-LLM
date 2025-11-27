@@ -17,7 +17,7 @@ from ..pyexecutor.sampler import (BEAM, MAX_BEAM_WIDTH, SampleState,
                                   SampleStateTensors, TorchSampler, add_token,
                                   int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata
+from .interface import SpecMetadata, get_force_num_accepted_tokens
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -347,6 +347,7 @@ class MTPWorker(nn.Module):
         self.model_config = model_config
         self.is_thop = False
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
+        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
 
     def forward(
         self,
@@ -894,6 +895,12 @@ class MTPWorker(nn.Module):
                     (draft_tokens == gen_target_tokens[:, :mtp_num_modules]
                      ).int(),
                     dim=-1).sum(1)
+
+        # Check for environment variable override
+        if self.force_num_accepted_tokens != 0:
+            force_num_accepted_tokens = min(self.force_num_accepted_tokens,
+                                            mtp_num_modules + 1)
+            num_accepted_tokens[num_contexts:] = force_num_accepted_tokens
 
         return accepted_tokens, num_accepted_tokens
 

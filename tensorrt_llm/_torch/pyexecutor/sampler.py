@@ -56,6 +56,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..speculative.interface import get_force_num_accepted_tokens
 from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -662,6 +663,9 @@ class TorchSampler(Sampler):
         self._global_seed = 42
         self._generator = None
 
+        # Force number of accepted tokens for speculative decoding testing
+        self._force_num_accepted_tokens = get_force_num_accepted_tokens()
+
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
 
@@ -784,15 +788,24 @@ class TorchSampler(Sampler):
             return 0
         num_accepted = 0
 
-        for draft_token in request.py_draft_tokens:
-            if draft_token != new_token:
-                # Reject.
-                break
+        if self._force_num_accepted_tokens != 0:
+            # Force acceptance of up to force_num_accepted_tokens draft tokens
+            force_limit = min(self._force_num_accepted_tokens, len(request.py_draft_tokens))
+            for _ in request.py_draft_tokens[:force_limit]:
+                num_accepted += 1
+                new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
+                if self.finish_if_reason(request, finish_reasons, step=num_accepted):
+                    break
+        else:
+            for draft_token in request.py_draft_tokens:
+                if draft_token != new_token:
+                    # Reject.
+                    break
 
-            num_accepted += 1
-            new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
-            if self.finish_if_reason(request, finish_reasons, step=num_accepted):
-                break
+                num_accepted += 1
+                new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
+                if self.finish_if_reason(request, finish_reasons, step=num_accepted):
+                    break
         return num_accepted
 
     def _process_draft_tokens_tree(
