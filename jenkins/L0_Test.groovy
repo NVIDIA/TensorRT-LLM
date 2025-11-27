@@ -744,7 +744,7 @@ def getPytestBaseCommandLine(
     List<String> extraArgs = []
 ) {
     def extraInternalEnv = ""
-    def pytestTestTimeout = "7200"
+    def pytestTestTimeout = "3600"
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
@@ -2248,7 +2248,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
         def extraInternalEnv = ""
-        def pytestTestTimeout = "7200"
+        def pytestTestTimeout = "3600"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
