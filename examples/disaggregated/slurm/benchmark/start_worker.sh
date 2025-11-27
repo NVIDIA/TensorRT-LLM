@@ -40,29 +40,27 @@ fi
 
 echo "config_file: ${config_file}"
 
-# save the hostname to a file
-
-# if SLURM_NODEID is 0
+# if SLURM_NODEID is 0, save the hostname to a file
 if [ "${SLURM_NODEID}" = "0" ]; then
     mkdir -p ${log_dir}/hostnames/
     echo $(hostname) > ${log_dir}/hostnames/${role}_${instance_id}.txt
     echo "hostname saved to ${log_dir}/hostnames/${role}_${instance_id}.txt"
 fi
 
-#check if nsys is enabled
+nsys_prefix=""
 if [ "${enable_nsys}" != "true" ]; then
     echo "nsys is not enabled, start normal flow"
-    trtllm-llmapi-launch ${numa_bind_cmd} trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
 else
-    nsys_prefix=""
     nsys_file=${log_dir}/nsys_worker_proc_${role}_${instance_id}_${SLURM_PROCID}
     export TLLM_PROFILE_RECORD_GC=1
     export TLLM_NVTX_DEBUG=1
-    nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
+    export NSYS_MPI_STORE_TEAMS_PER_RANK=1
     export TLLM_PROFILE_START_STOP=${profile_range}
     echo "nsys is enabled on ${role} GPUs, TLLM_PROFILE_START_STOP=${profile_range}"
-    ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
-        trtllm-serve ${model_path} \
-            --host $(hostname) --port ${port} \
-            --extra_llm_api_options ${config_file}
+    nsys_prefix="nsys profile -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
 fi
+
+${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
+    trtllm-serve ${model_path} \
+        --host $(hostname) --port ${port} \
+        --extra_llm_api_options ${config_file}
