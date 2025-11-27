@@ -41,6 +41,8 @@ environment:
 # Profiling Configuration
 profiling:
   nsys_on: false  # Set to true to enable profiling
+  ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
+  gen_profile_range: "200-250"  # Set TLLM_PROFILE_START_STOP for gen workers
 
 # Accuracy Configuration
 accuracy:

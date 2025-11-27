@@ -184,6 +184,8 @@ def submit_job(config):
 
         # Profiling
         str(config['profiling']['nsys_on']).lower(),
+        config['profiling']['ctx_profile_range'],
+        config['profiling']['gen_profile_range'],
 
         # Accuracy evaluation
         str(config['accuracy']['enable_accuracy_test']).lower(),

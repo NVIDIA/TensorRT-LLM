@@ -12,8 +12,9 @@ concurrency=${6}
 numa_bind=${7}
 log_dir=${8}
 enable_nsys=${9}
-config_file=${10}
-worker_env_var=${11}
+profile_range=${10}
+config_file=${11}
+worker_env_var=${12}
 
 unset UCX_TLS
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
@@ -58,13 +59,8 @@ else
     export TLLM_PROFILE_RECORD_GC=1
     export TLLM_NVTX_DEBUG=1
     nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
-    if [ "${role}" = "GEN" ]; then
-        export TLLM_PROFILE_START_STOP=200-250
-        echo "nsys is enabled on gen_gpus"
-    elif [ "${role}" = "CTX" ]; then
-        export TLLM_PROFILE_START_STOP=10-30
-        echo "nsys is enabled on ctx_gpus"
-    fi
+    export TLLM_PROFILE_START_STOP=${profile_range}
+    echo "nsys is enabled on ${role} GPUs, TLLM_PROFILE_START_STOP=${profile_range}"
     ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
         trtllm-serve ${model_path} \
             --host $(hostname) --port ${port} \
