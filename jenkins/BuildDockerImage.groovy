@@ -356,6 +356,7 @@ def buildImage(config, imageKeyToTag)
             sh "env | sort"
             def randomSleep = (Math.random() * 600 + 600).toInteger()
             trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+            return // TODO: Remove this return statement
             try {
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
