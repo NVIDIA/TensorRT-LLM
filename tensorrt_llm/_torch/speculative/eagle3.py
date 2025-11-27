@@ -12,7 +12,7 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata
+from .interface import SpecMetadata, get_force_num_accepted_tokens
 from .mtp import MTPSampler
 from .spec_tree_manager import SpecTreeManager
 
@@ -365,6 +365,7 @@ class Eagle3OneModelWorker(nn.Module):
         self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
+        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -527,6 +528,11 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod(
             (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
             dim=-1).sum(1)
+        # Check for environment variable override
+        if self.force_num_accepted_tokens != 0:
+            force_num_accepted_tokens = min(self.force_num_accepted_tokens,
+                                            self.max_draft_len + 1)
+            num_accepted_tokens[num_contexts:] = force_num_accepted_tokens
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
