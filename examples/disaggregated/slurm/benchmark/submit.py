@@ -135,7 +135,6 @@ def submit_job(config):
     cmd = [
         'sbatch',
         f'--partition={slurm_config["partition"]}',
-        f'--gres=gpu:{hw_config["gpus_per_node"]}',
         f'--account={slurm_config["account"]}',
         f'--time={slurm_config["job_time"]}',
         f'--job-name={slurm_config["job_name"]}',
@@ -143,7 +142,7 @@ def submit_job(config):
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
         f'--segment={total_nodes}',
-        slurm_config['extra_args'],
+        *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
         # Hardware configuration
         str(hw_config['gpus_per_node']),
