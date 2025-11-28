@@ -110,7 +110,7 @@ methods:
       disable_flashinfer_sampling:
         annotation: bool
         default: False
-        status: deprecated
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta

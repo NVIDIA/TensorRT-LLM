@@ -2709,9 +2709,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     disable_flashinfer_sampling: bool = Field(
         default=True,
-        description="Disable the use of FlashInfer.sampling.",
-        status="deprecated",
-        deprecated="This option is likely to be removed in the future.",
+        description=
+        "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
+        status="prototype",
     )
 
     @property
