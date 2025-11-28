@@ -79,7 +79,7 @@ class ShardingTransformConfig(TransformConfig):
         ]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
@@ -250,9 +250,6 @@ class Sharding(BaseTransform):
                 ad_logger.info(
                     f"Running autodeploy sharding heuristics: {transform_container.sharding_dims}"
                 )
-                if ShardingDim.SSM in transform_container.sharding_dims:
-                    info += detect_ssm_shard(gm, transform_container)
-
                 # run TP sharding across ranks
                 if ShardingDim.TP in transform_container.sharding_dims:
                     info += detect_column_row_shard(gm, transform_container)
@@ -929,151 +926,10 @@ def detect_column_row_shard(
     num_simple_shards += _process_simple_shard(
         unprocessed_linear_nodes, rank, world_size, sharding_config
     )
-
+    num_column_row_shards += num_ssm_shards
     ad_logger.info(
-        f"Heuristics found {num_shards} TP shards (simple: {num_simple_shards}, "
-        f"ssm: {num_ssm_shards}, "
-        f"row-col: {num_column_row_shards}, (including attention: {num_attention_shards}))"
-    )
-    return TransformInfo(
-        skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
-    )
-
-
-def detect_column_row_shard(
-    gm: GraphModule,
-    transform_container: ShardingTransformContainer,
-) -> TransformInfo:
-    """A transformation to apply sharding to the model following tensor parallelism.
-
-    The transformation is based on the following steps:
-
-    1. Identify boundary nodes between residual nodes to identify shardable regions.
-    2. Identify the GEMM nodes that can be sharded
-    3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
-    4. Account for each node in the trace to ensure the op is correct even after sharding. This is
-       necessary to ensure that the sharding is correct and we need to be able to account for
-       **all** nodes in the subgraph. The subgraph here is defined as the region between the first
-       linear node to the last linear node of an identified sharding region.
-    # 5. Shard the GEMM nodes or skip accordingly.
-
-    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
-    splitting, e.g., the individual heads into smaller shards.
-    """
-    ad_logger.debug("Before sharding graph: " + str(gm))
-    rank, world_size = transform_container.rank, transform_container.world_size
-
-    assert isinstance(gm, GraphModule), "Expecting GraphModule"
-    ad_logger.info("Running TP sharding detection")
-    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
-    if len(linear_nodes) == 0:
-        ad_logger.warning("Could not find any linear nodes in the graph. Skipping TP sharding.")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-
-    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
-
-    num_shards = 0
-    num_simple_shards = 0
-    num_ssm_shards = 0
-    num_attention_shards = 0
-    num_column_row_shards = 0
-    for opening, layer_subgraph, closing in layer_subgraphs:
-        nodes_linear = opening + [closing]
-        num_shards += 1
-
-        if transform_container.simple_shard_only:
-            ad_logger.debug(f"Forcing Simple Shard on nodes: {nodes_linear}")
-            num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, transform_container
-            )
-            continue
-
-        ssm_nodes = list(filtered_nodes(layer_subgraph, is_any_ssm_op))
-        attention_nodes = list(filtered_nodes(layer_subgraph, is_any_attention_op))
-        min_local_shape = 1
-        layer_type = LayerType.MLP
-
-        if len(ssm_nodes) > 0:
-            # Mamba layers need special handling due to the fused weights for in_proj and conv1d
-            assert len(ssm_nodes) == 1, "Expected exactly one SSM node in layer subgraph"
-            assert len(opening) == 1, "Expected exactly one opening node in Mamba layer"
-            ad_logger.debug(f"Found SSM nodes in layer subgraph: {ssm_nodes}")
-            num_ssm_shards += _process_ssm_sharding(
-                gm, opening[0], transform_container, rank, world_size
-            )
-            continue
-
-        if len(attention_nodes) > 0:
-            layer_type = LayerType.ATTENTION
-            ad_logger.debug(f"Found attention nodes in layer subgraph: {attention_nodes}")
-            if len(attention_nodes) > 1:
-                # Column-row shard boundary region detection is probably wrong - there should be
-                # only one attention operation. Fall back to simple shard.
-                ad_logger.debug(f"More than one attention node: {attention_nodes}")
-                num_simple_shards += _process_simple_shard(
-                    nodes_linear, rank, world_size, transform_container
-                )
-                continue
-            # Extract head dimension. We cannot shard below the head_dim size.
-            # Assume that head_dim is the last (innermost) dimension of the tensor
-            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
-            # if the QKV projection is fused, check if num_kv_heads is divisible by world_size
-            if len(opening) == 1:
-                qkv_proj_node = opening[0]
-                slice_nodes = list(filtered_nodes(qkv_proj_node.users, ops=torch.ops.aten.slice))
-                if len(slice_nodes) > 0:
-                    # extract num_kv_heads * head_dim from the second slice node
-                    assert len(slice_nodes) == 3, "Expecting exactly 3 slice nodes for fused QKV"
-                    num_kv_heads = (
-                        slice_nodes[1].args[3] - slice_nodes[1].args[2]
-                    ) // min_local_shape
-                    if num_kv_heads % world_size != 0:
-                        ad_logger.debug(
-                            f"num_kv_heads {num_kv_heads} is not divisible by world_size {world_size}. "
-                            f"Falling back to simple shard."
-                        )
-                        num_simple_shards += _process_simple_shard(
-                            nodes_linear, rank, world_size, transform_container
-                        )
-                        # TODO: handle the case where num_kv_heads is not divisible by world_size
-                        continue
-            num_attention_shards += 1
-        else:
-            layer_type = LayerType.MLP
-
-        # column-row sharding
-        _process_column_sharding(
-            linear_nodes=opening,
-            subgraph_nodes=layer_subgraph,
-            transform_container=transform_container,
-            rank=rank,
-            world_size=world_size,
-            min_local_shape=min_local_shape,
-        )
-
-        # shard single row node
-        if transform_container.add(
-            WeightShardingInfo.from_node(
-                closing,
-                split_dim=SplitDimension.ROW,
-                rank=rank,
-                world_size=world_size,
-                dist_op="all_reduce",
-                min_local_shape=min_local_shape,
-                layer_type=layer_type,
-            )
-        ):
-            num_column_row_shards += 1
-
-    # simple shard remaining linear nodes
-    num_simple_shards += _process_simple_shard(
-        unprocessed_linear_nodes, rank, world_size, transform_container
-    )
-
-    ad_logger.info(
-        f"Heuristics found {num_shards} TP shards (simple: {num_simple_shards}, "
-        f"ssm: {num_ssm_shards}, "
-        f"row-col: {num_column_row_shards}, (including attention: {num_attention_shards}))"
+        f"Heuristics found {num_shards} TP shards. Simple: {num_simple_shards}, "
+        f"row-col: {num_column_row_shards} (including: ssm: {num_ssm_shards}, attention: {num_attention_shards})"
     )
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
