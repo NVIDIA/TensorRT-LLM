@@ -55,10 +55,10 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     apt-get install -y libffi-dev
     nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
     if [[ $pytestCommand == *--run-ray* ]]; then
-        pip3 install ray[default]
+        pip3 install --retries 10 ray[default]
     fi
-    cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
-    cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+    cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
+    cd $resourcePathNode &&  pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     git config --global --add safe.directory "*"
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
     hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
