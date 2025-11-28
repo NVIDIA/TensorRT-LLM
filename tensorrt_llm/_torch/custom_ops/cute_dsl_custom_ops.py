@@ -213,7 +213,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch)
             if swap_ab:
                 kernel_a_ptr = b_ptr
                 kernel_a_sf_ptr = b_sf_ptr
