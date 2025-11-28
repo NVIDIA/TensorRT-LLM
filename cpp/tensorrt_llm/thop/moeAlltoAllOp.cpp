@@ -511,7 +511,7 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
 }
 
 // Return the size of auxiliary data in workspace
-int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int maxNumTokens)
+int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens)
 {
     MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens));
     return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
