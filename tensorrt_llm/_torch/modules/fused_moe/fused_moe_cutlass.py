@@ -150,14 +150,21 @@ class CutlassFusedMoE(MoE):
                 self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                     model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
-                workspace_mb = int(
-                    os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
+                # Calculate required workspace size
+                ep_size = self.mapping.moe_ep_size
+                max_num_tokens = model_config.max_num_tokens
+                hidden_size = self.hidden_size
+                dtype = self.dtype or torch.float16
+
+                workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+                    ep_size, max_num_tokens, hidden_size, dtype)
+
                 self.moe_a2a = MoeAlltoAll(
                     mapping=self.mapping,
                     max_num_tokens=model_config.max_num_tokens,
                     top_k=self.routing_method.experts_per_token,
                     num_experts=self.num_slots,
-                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                    workspace_size_per_rank=workspace_size,
                 )
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
