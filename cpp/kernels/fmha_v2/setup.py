@@ -185,7 +185,7 @@ generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
                                     'False').lower() == 'true'
 
 ns_open = r"""
-\#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/config.h"
 TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
