@@ -586,13 +586,17 @@ def updateCIImageTag(globalVars) {
             returnStdout: true
         ).trim()
 
-        // Parse the response to get SHA and current content
+        // Parse the response to get SHA
         def fileInfo = readJSON text: getFileResponse
         def currentSha = fileInfo.sha
         echo "Current file SHA: ${currentSha}"
 
-        // Get current content, decode from base64, and update
-        def currentContent = new String(fileInfo.content.decodeBase64())
+        // Get current content and decode from base64 using shell
+        writeFile file: 'current_content_base64.txt', text: fileInfo.content
+        sh "base64 -d current_content_base64.txt > current_content.txt"
+        def currentContent = readFile('current_content.txt')
+
+        // Update content
         def lines = currentContent.split("\n") as List
         def updatedLines = lines.collect { line ->
             def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
@@ -600,8 +604,15 @@ def updateCIImageTag(globalVars) {
         }
         def updatedContent = updatedLines.join("\n") + "\n"
 
-        // 3. Encode updated content to base64
-        def encodedContent = updatedContent.bytes.encodeBase64().toString()
+        // Write updated content and encode to base64 using shell
+        writeFile file: 'updated_content.txt', text: updatedContent
+        def encodedContent = sh(
+            script: 'base64 -w 0 updated_content.txt',
+            returnStdout: true
+        ).trim()
+
+        // Cleanup temporary files
+        sh "rm -f current_content_base64.txt current_content.txt updated_content.txt"
 
         // 4. Create commit message
         def commitMessage = "[auto] Update CI image tags with newly built images\\n\\nSigned-off-by: tensorrt-cicd <90828364+tensorrt-cicd@users.noreply.github.com>"
