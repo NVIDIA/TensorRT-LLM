@@ -84,6 +84,8 @@ worker_config:
       enable_block_reuse: true
       free_gpu_memory_fraction: 0.7
       dtype: fp8
+    moe_config:
+      backend: TRTLLM
     cache_transceiver_config:
       max_tokens_in_buffer: 2048
       backend: UCX
