@@ -576,18 +576,33 @@ def updateCIImageTag(globalVars) {
         echo "Preparing updated content for ${filePath}"
 
         // First, get the current file from the branch via API to get its SHA
+        echo "Fetching current file content from: ${repoPart}/${filePath}@${branchName}"
         def apiUrl = "https://api.github.com/repos/${repoPart}/contents/${filePath}?ref=${branchName}"
+
         def getFileResponse = sh(
             script: """
-            curl -s -H "Authorization: token ${GITHUB_PASSWORD}" \
+            curl -s -w "\\nHTTP_STATUS:%{http_code}" \
+                 -H "Authorization: token ${GITHUB_PASSWORD}" \
                  -H "Accept: application/vnd.github.v3+json" \
                  "${apiUrl}"
             """,
             returnStdout: true
         ).trim()
 
+        // Extract HTTP status code
+        def statusMatch = getFileResponse =~ /HTTP_STATUS:(\d+)$/
+        def httpStatus = statusMatch ? statusMatch[0][1] : "unknown"
+        def responseBody = getFileResponse.replaceAll(/\nHTTP_STATUS:\d+$/, '')
+
+        echo "GET API HTTP Status: ${httpStatus}"
+
+        if (httpStatus != "200") {
+            echo "GET API Response: ${responseBody}"
+            error "Failed to fetch file from GitHub API. HTTP Status: ${httpStatus}"
+        }
+
         // Parse the response to get SHA
-        def fileInfo = readJSON text: getFileResponse
+        def fileInfo = readJSON text: responseBody
         def currentSha = fileInfo.sha
         echo "Current file SHA: ${currentSha}"
 
@@ -618,23 +633,28 @@ def updateCIImageTag(globalVars) {
         def commitMessage = "[auto] Update CI image tags with newly built images\\n\\nSigned-off-by: tensorrt-cicd <90828364+tensorrt-cicd@users.noreply.github.com>"
 
         // 5. Update file via GitHub API
-        echo "Updating ${filePath} via GitHub API"
+        echo "Updating ${filePath} via GitHub API (PUT request)"
         def updateApiUrl = "https://api.github.com/repos/${repoPart}/contents/${filePath}"
-        def updatePayload = """
-{
-  "message": "${commitMessage}",
-  "content": "${encodedContent}",
-  "sha": "${currentSha}",
-  "branch": "${branchName}"
-}
-"""
 
-        // Write payload to temporary file to avoid command line length issues
-        writeFile file: 'update_payload.json', text: updatePayload
+        // Prepare JSON payload (escape special characters properly)
+        def updatePayload = [
+            message: "[auto] Update CI image tags with newly built images\n\nSigned-off-by: tensorrt-cicd <90828364+tensorrt-cicd@users.noreply.github.com>",
+            content: encodedContent,
+            sha: currentSha,
+            branch: branchName
+        ]
+
+        // Convert to JSON string
+        def payloadJson = groovy.json.JsonOutput.toJson(updatePayload)
+        writeFile file: 'update_payload.json', text: payloadJson
+
+        echo "PUT API URL: ${updateApiUrl}"
+        echo "Target branch: ${branchName}"
 
         def updateResponse = sh(
             script: """
-            curl -s -X PUT \
+            curl -s -w "\\nHTTP_STATUS:%{http_code}" \
+                 -X PUT \
                  -H "Authorization: token ${GITHUB_PASSWORD}" \
                  -H "Accept: application/vnd.github.v3+json" \
                  -H "Content-Type: application/json" \
@@ -646,14 +666,37 @@ def updateCIImageTag(globalVars) {
 
         sh "rm -f update_payload.json"
 
+        // Extract HTTP status code
+        def putStatusMatch = updateResponse =~ /HTTP_STATUS:(\d+)$/
+        def putHttpStatus = putStatusMatch ? putStatusMatch[0][1] : "unknown"
+        def putResponseBody = updateResponse.replaceAll(/\nHTTP_STATUS:\d+$/, '')
+
+        echo "PUT API HTTP Status: ${putHttpStatus}"
+
         // Check if update was successful
-        def updateResult = readJSON text: updateResponse
-        if (updateResult.commit) {
-            echo "Successfully updated ${filePath} via GitHub API"
-            echo "Commit SHA: ${updateResult.commit.sha}"
+        if (putHttpStatus == "200" || putHttpStatus == "201") {
+            def updateResult = readJSON text: putResponseBody
+            if (updateResult.commit) {
+                echo "Successfully updated ${filePath} via GitHub API"
+                echo "Commit SHA: ${updateResult.commit.sha}"
+                echo "Commit URL: ${updateResult.commit.html_url}"
+            } else {
+                echo "Unexpected response format: ${putResponseBody}"
+            }
         } else {
-            echo "Update response: ${updateResponse}"
-            error "Failed to update ${filePath} via GitHub API"
+            echo "PUT API failed with status ${putHttpStatus}"
+            echo "Response: ${putResponseBody}"
+
+            // Output helpful debugging information
+            echo "==================== DEBUG INFO ===================="
+            echo "Repository: ${repoPart}"
+            echo "Branch: ${branchName}"
+            echo "File: ${filePath}"
+            echo "SHA: ${currentSha}"
+            echo "Content size: ${encodedContent.length()} bytes (base64)"
+            echo "===================================================="
+
+            error "Failed to update ${filePath} via GitHub API. HTTP Status: ${putHttpStatus}"
         }
     }
 }
