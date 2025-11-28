@@ -103,6 +103,7 @@ MODEL_PATH_DICT = {
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
+    "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
@@ -501,55 +502,91 @@ class ServerConfig:
     Configurations of trtllm-server.
     """
 
-    def __init__(
-        self,
-        name: str,
-        model_name: str,
-        gpus: int,
-        tp: int,
-        ep: int,
-        max_num_tokens: int,
-        attention_backend: str,
-        max_batch_size: int,
-        pp: int = 1,
-        enable_chunked_prefill: bool = False,
-        disable_overlap_scheduler: bool = False,
-        moe_backend: str = "",
-        moe_max_num_tokens: int = 0,
-        stream_interval: int = 10,
-        enable_attention_dp: bool = False,
-        attention_dp_balance: bool = False,
-        batching_wait_iters: int = 10,
-        timeout_iters: int = 50,
-        kv_cache_dtype: str = "fp8",
-        enable_block_reuse: bool = False,
-        free_gpu_memory_fraction: float = 0.8,
-        enable_padding: bool = True,
-    ):
-        self.name = name
-        self.model_name = model_name
-        self.gpus = gpus
-        self.tp = tp
-        self.ep = ep
-        self.pp = pp
-        self.max_num_tokens = max_num_tokens
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.disable_overlap_scheduler = disable_overlap_scheduler
-        self.attention_backend = attention_backend
-        self.moe_backend = moe_backend
-        self.moe_max_num_tokens = moe_max_num_tokens
-        self.stream_interval = stream_interval
-        self.enable_attention_dp = enable_attention_dp
-        self.attention_dp_balance = attention_dp_balance
-        self.batching_wait_iters = batching_wait_iters
-        self.timeout_iters = timeout_iters
-        self.kv_cache_dtype = kv_cache_dtype
-        self.enable_block_reuse = enable_block_reuse
-        self.free_gpu_memory_fraction = free_gpu_memory_fraction
-        self.max_batch_size = max_batch_size
-        self.enable_padding = enable_padding
-
+    def __init__(self, server_config_data: dict):
+        # Extract required fields
+        self.name = server_config_data['name']
+        self.model_name = server_config_data['model_name']
+        self.gpus = server_config_data['gpus']
         self.model_path = ""
+
+        # Extract optional fields with defaults
+        self.tp = server_config_data.get('tensor_parallel_size', self.gpus)
+        self.ep = server_config_data.get('moe_expert_parallel_size', 1)
+        self.pp = server_config_data.get('pipeline_parallel_size', 1)
+        self.gpus_per_node = server_config_data.get('gpus_per_node', self.gpus)
+        self.max_num_tokens = server_config_data.get('max_num_tokens', 2048)
+        self.max_batch_size = server_config_data.get('max_batch_size', 512)
+        self.max_seq_len = server_config_data.get('max_seq_len', 0)
+        self.disable_overlap_scheduler = server_config_data.get(
+            'disable_overlap_scheduler', False)
+        self.num_postprocess_workers = server_config_data.get(
+            'num_postprocess_workers', 0)
+        self.stream_interval = server_config_data.get('stream_interval', 10)
+        self.attn_backend = server_config_data.get('attn_backend', "TRTLLM")
+        self.enable_chunked_prefill = server_config_data.get(
+            'enable_chunked_prefill', False)
+        self.enable_attention_dp = server_config_data.get(
+            'enable_attention_dp', False)
+        self.trust_remote_code = server_config_data.get('trust_remote_code',
+                                                        False)
+
+        # attention_dp_config
+        attention_dp_config = server_config_data.get('attention_dp_config', {})
+        self.attention_dp_balance = attention_dp_config.get(
+            'enable_balance', False)
+        self.batching_wait_iters = attention_dp_config.get(
+            'batching_wait_iters', 0)
+        self.timeout_iters = attention_dp_config.get('timeout_iters', 60)
+
+        # moe_config
+        moe_config = server_config_data.get('moe_config', {})
+        self.moe_backend = moe_config.get('backend', "")
+        self.moe_max_num_tokens = moe_config.get('max_num_tokens', 0)
+
+        # cuda_graph_config
+        cuda_graph_config = server_config_data.get('cuda_graph_config', {})
+        self.enable_padding = cuda_graph_config.get('enable_padding', True)
+        self.cuda_graph_max_batch_size = cuda_graph_config.get(
+            'max_batch_size', self.max_batch_size)
+
+        # kv_cache_config
+        kv_cache_config = server_config_data.get('kv_cache_config', {})
+        self.kv_cache_dtype = kv_cache_config.get('dtype', "fp8")
+        self.enable_block_reuse = kv_cache_config.get('enable_block_reuse',
+                                                      False)
+        self.free_gpu_memory_fraction = kv_cache_config.get(
+            'free_gpu_memory_fraction', 0.8)
+
+        # cache_transceiver_config
+        cache_transceiver_config = server_config_data.get(
+            'cache_transceiver_config', {})
+        self.cache_transceiver_backend = cache_transceiver_config.get(
+            'backend', "")
+        self.cache_transceiver_max_tokens_in_buffer = cache_transceiver_config.get(
+            'max_tokens_in_buffer', 0)
+
+        # speculative_config
+        speculative_config = server_config_data.get('speculative_config', {})
+        self.spec_decoding_type = speculative_config.get('decoding_type', "")
+        self.num_nextn_predict_layers = speculative_config.get(
+            'num_nextn_predict_layers', 0)
+        eagle3_value = speculative_config.get('eagle3_layers_to_capture', [])
+        if isinstance(eagle3_value, int):
+            self.eagle3_layers_to_capture = [eagle3_value]
+        elif isinstance(eagle3_value, list):
+            self.eagle3_layers_to_capture = eagle3_value
+        else:
+            self.eagle3_layers_to_capture = []
+        self.max_draft_len = speculative_config.get('max_draft_len', 0)
+        self.speculative_model_dir = speculative_config.get(
+            'speculative_model_dir', "")
+
+        # Store filtered config for extra_llm_api_config (exclude name, model_name, gpus, client_configs)
+        self.extra_llm_api_config_data = {
+            k: v
+            for k, v in server_config_data.items()
+            if k not in ['name', 'model_name', 'gpus', 'client_configs']
+        }
 
     def to_cmd(self, working_dir: str) -> List[str]:
         model_dir = get_model_dir(self.model_name)
@@ -565,69 +602,100 @@ class ServerConfig:
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to Database data"""
-        return {
-            "s_model_name": self.model_name.lower(),
-            "l_gpus": self.gpus,
-            "l_tp": self.tp,
-            "l_ep": self.ep,
-            "l_pp": self.pp,
-            "l_max_num_tokens": self.max_num_tokens,
-            "b_enable_chunked_prefill": self.enable_chunked_prefill,
-            "b_disable_overlap_scheduler": self.disable_overlap_scheduler,
-            "s_attention_backend": self.attention_backend,
-            "s_moe_backend": self.moe_backend,
-            "l_moe_max_num_tokens": self.moe_max_num_tokens,
-            "l_stream_interval": self.stream_interval,
-            "b_enable_attention_dp": self.enable_attention_dp,
-            "b_attention_dp_balance": self.attention_dp_balance,
-            "l_batching_wait_iters": self.batching_wait_iters,
-            "l_timeout_iters": self.timeout_iters,
-            "s_kv_cache_dtype": self.kv_cache_dtype,
-            "b_enable_block_reuse": self.enable_block_reuse,
-            "d_free_gpu_memory_fraction": self.free_gpu_memory_fraction,
-            "l_max_batch_size": self.max_batch_size,
-            "b_enable_padding": self.enable_padding,
-            "s_server_log_link": "",
+        db_data = {
+            "s_model_name":
+            self.model_name.lower(),
+            "l_gpus":
+            self.gpus,
+            "l_tp":
+            self.tp,
+            "l_ep":
+            self.ep,
+            "l_pp":
+            self.pp,
+            "l_gpus_per_node":
+            self.gpus_per_node,
+            "l_max_num_tokens":
+            self.max_num_tokens,
+            "l_max_batch_size":
+            self.max_batch_size,
+            "l_max_seq_len":
+            self.max_seq_len,
+            "b_disable_overlap_scheduler":
+            self.disable_overlap_scheduler,
+            "l_num_postprocess_workers":
+            self.num_postprocess_workers,
+            "l_stream_interval":
+            self.stream_interval,
+            "s_attn_backend":
+            self.attn_backend,
+            "b_enable_chunked_prefill":
+            self.enable_chunked_prefill,
+            "b_enable_attention_dp":
+            self.enable_attention_dp,
+            "b_trust_remote_code":
+            self.trust_remote_code,
+            # attention_dp_config
+            "b_attention_dp_balance":
+            self.attention_dp_balance,
+            "l_batching_wait_iters":
+            self.batching_wait_iters,
+            "l_timeout_iters":
+            self.timeout_iters,
+            # moe_config
+            "s_moe_backend":
+            self.moe_backend,
+            "l_moe_max_num_tokens":
+            self.moe_max_num_tokens,
+            # cuda_graph_config
+            "b_enable_padding":
+            self.enable_padding,
+            "l_cuda_graph_max_batch_size":
+            self.cuda_graph_max_batch_size,
+            # kv_cache_config
+            "s_kv_cache_dtype":
+            self.kv_cache_dtype,
+            "b_enable_block_reuse":
+            self.enable_block_reuse,
+            "d_free_gpu_memory_fraction":
+            self.free_gpu_memory_fraction,
+            # cache_transceiver_config
+            "s_cache_transceiver_backend":
+            self.cache_transceiver_backend,
+            "l_cache_transceiver_max_tokens_in_buffer":
+            self.cache_transceiver_max_tokens_in_buffer,
+            # speculative_config
+            "s_spec_decoding_type":
+            self.spec_decoding_type,
+            "l_num_nextn_predict_layers":
+            self.num_nextn_predict_layers,
+            "s_eagle3_layers_to_capture":
+            ",".join(map(str, self.eagle3_layers_to_capture)),
+            "l_max_draft_len":
+            self.max_draft_len,
+            "s_speculative_model_dir":
+            self.speculative_model_dir,
+            "s_server_log_link":
+            "",
         }
+        return db_data
 
     def generate_extra_llm_api_config(self) -> str:
         """Generate extra-llm-api-config.yml content"""
-        config_lines = [
-            f"tensor_parallel_size: {self.tp}",
-            f"moe_expert_parallel_size: {self.ep}",
-            f"pipeline_parallel_size: {self.pp}",
-            f"max_num_tokens: {self.max_num_tokens}",
-            f"enable_attention_dp: {str(self.enable_attention_dp).lower()}",
-            f"disable_overlap_scheduler: {str(self.disable_overlap_scheduler).lower()}",
-            f"stream_interval: {self.stream_interval}",
-            f"attn_backend: {self.attention_backend}",
-            f"enable_chunked_prefill: {str(self.enable_chunked_prefill).lower()}",
-            "cuda_graph_config:",
-            f"  enable_padding: {str(self.enable_padding).lower()}",
-            f"  max_batch_size: {self.max_batch_size}",
-            "kv_cache_config:",
-            f"  dtype: {self.kv_cache_dtype}",
-            f"  free_gpu_memory_fraction: {self.free_gpu_memory_fraction}",
-            f"  enable_block_reuse: {str(self.enable_block_reuse).lower()}",
-            "print_iter_log: false",
-        ]
+        # Make a copy to avoid modifying the original
+        config_data = dict(self.extra_llm_api_config_data)
 
-        # Add moe_config if moe_backend is specified
-        if self.moe_backend:
-            config_lines.append("moe_config:")
-            config_lines.append(f"  backend: {self.moe_backend}")
-            if self.moe_max_num_tokens:
-                config_lines.append(
-                    f"  max_num_tokens: {self.moe_max_num_tokens}")
+        # Handle speculative_model_dir path conversion if it exists
+        if 'speculative_config' in config_data and 'speculative_model_dir' in config_data[
+                'speculative_config']:
+            spec_model_dir = config_data['speculative_config'][
+                'speculative_model_dir']
+            if spec_model_dir:
+                config_data['speculative_config'][
+                    'speculative_model_dir'] = os.path.join(
+                        llm_models_root(), spec_model_dir)
 
-        if self.attention_dp_balance:
-            config_lines.append("attention_dp_balance:")
-            config_lines.append("  enable_balance: true")
-            config_lines.append(
-                f"  batching_wait_iters: {self.batching_wait_iters}")
-            config_lines.append(f"  timeout_iters: {self.timeout_iters}")
-
-        return "\n".join(config_lines)
+        return yaml.dump(config_data, default_flow_style=False, sort_keys=False)
 
 
 class ClientConfig:
@@ -635,29 +703,25 @@ class ClientConfig:
     Configurations of benchmark client.
     """
 
-    def __init__(self,
-                 name: str,
-                 model_name: str,
-                 concurrency: int,
-                 iterations: int,
-                 isl: int,
-                 osl: int,
-                 random_range_ratio: float = 0.0):
-        self.name = name
+    def __init__(self, client_config_data: dict, model_name: str):
+        self.name = client_config_data['name']
         self.model_name = model_name
-        self.concurrency = concurrency
-        self.iterations = iterations
-        self.isl = isl
-        self.osl = osl
-        self.random_range_ratio = random_range_ratio
-
+        self.concurrency = client_config_data['concurrency']
+        self.iterations = client_config_data.get('iterations', 1)
+        self.isl = client_config_data.get('isl', 1024)
+        self.osl = client_config_data.get('osl', 1024)
+        self.random_range_ratio = client_config_data.get(
+            'random_range_ratio', 0.0)
+        self.backend = client_config_data.get('backend', "")
+        self.use_chat_template = client_config_data.get('use_chat_template',
+                                                        False)
         self.model_path = ""
 
     def to_cmd(self, working_dir: str) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
-        return [
+        benchmark_cmd = [
             "python", "-m", "tensorrt_llm.serve.scripts.benchmark_serving",
             "--model", self.model_path, "--dataset-name", "random",
             "--random-ids", "--num-prompts",
@@ -668,17 +732,30 @@ class ClientConfig:
             "--percentile-metrics", "ttft,tpot,itl,e2el", "--max-concurrency",
             str(self.concurrency)
         ]
+        if self.backend:
+            benchmark_cmd.append("--backend")
+            benchmark_cmd.append(self.backend)
+        if self.use_chat_template:
+            benchmark_cmd.append("--use-chat-template")
+        return benchmark_cmd
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to Database data"""
-        return {
+        db_data = {
             "l_concurrency": self.concurrency,
             "l_iterations": self.iterations,
             "l_isl": self.isl,
             "l_osl": self.osl,
             "d_random_range_ratio": self.random_range_ratio,
+            "s_backend": self.backend,
+            "b_use_chat_template": self.use_chat_template,
             "s_client_log_link": "",
         }
+        if self.backend:
+            db_data["s_backend"] = self.backend
+        if self.use_chat_template:
+            db_data["b_use_chat_template"] = self.use_chat_template
+        return db_data
 
 
 def parse_select_pattern(select_pattern: str):
@@ -752,39 +829,8 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
         if execution_plan is not None and server_name not in execution_plan:
             continue
 
-        # Create ServerConfig object
-        server_config = ServerConfig(
-            name=server_config_data['name'],
-            model_name=server_config_data['model_name'],
-            gpus=server_config_data['gpus'],
-            tp=server_config_data['tp'],
-            ep=server_config_data['ep'],
-            pp=server_config_data.get('pp', 1),
-            attention_backend=server_config_data.get('attention_backend',
-                                                     'TRTLLM'),
-            moe_backend=server_config_data.get('moe_backend', ''),
-            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', 0),
-            stream_interval=server_config_data.get('stream_interval', 10),
-            enable_attention_dp=server_config_data.get('enable_attention_dp',
-                                                       False),
-            attention_dp_balance=server_config_data.get('attention_dp_balance',
-                                                        False),
-            batching_wait_iters=server_config_data.get('batching_wait_iters',
-                                                       10),
-            timeout_iters=server_config_data.get('timeout_iters', 50),
-            enable_chunked_prefill=server_config_data.get(
-                'enable_chunked_prefill', False),
-            max_num_tokens=server_config_data.get('max_num_tokens', 2048),
-            disable_overlap_scheduler=server_config_data.get(
-                'disable_overlap_scheduler', False),
-            kv_cache_dtype=server_config_data.get('kv_cache_dtype', 'fp8'),
-            enable_block_reuse=server_config_data.get('enable_block_reuse',
-                                                      False),
-            free_gpu_memory_fraction=server_config_data.get(
-                'free_gpu_memory_fraction', 0.8),
-            max_batch_size=server_config_data.get('max_batch_size', 256),
-            enable_padding=server_config_data.get('enable_padding', True))
-
+        # Create ServerConfig object directly from dict
+        server_config = ServerConfig(server_config_data)
         server_id = len(server_configs)
         server_configs.append(server_config)
 
@@ -802,15 +848,8 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
                 if client_name not in selected_client_names:
                     continue
 
-            client_config = ClientConfig(
-                name=client_config_data['name'],
-                model_name=server_config_data['model_name'],
-                concurrency=client_config_data['concurrency'],
-                iterations=client_config_data.get('iterations', 1),
-                isl=client_config_data.get('isl', 1024),
-                osl=client_config_data.get('osl', 1024),
-                random_range_ratio=client_config_data.get(
-                    'random_range_ratio', 0.0))
+            client_config = ClientConfig(client_config_data,
+                                         server_config_data['model_name'])
             client_configs.append(client_config)
 
         server_client_configs[server_id] = client_configs
@@ -1974,7 +2013,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Run through the commands and parse multiple perf metrics from the logs.
         """
         #print info to separate cases
-        print_info(f"Running perf test for case: {self._short_test_name}")
         self._current_cmd_idx = 0
         metrics = self._get_metrics()
         outputs = {}
@@ -2112,7 +2150,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
             # Get history data for each cmd_idx
             history_baseline_dict, history_data_dict = get_history_data(
-                new_data_dict)
+                new_data_dict, self._config.gpu_type)
             # Prepare regressive test cases
             regressive_data_list = prepare_regressive_test_cases(
                 history_baseline_dict, new_data_dict)
