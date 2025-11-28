@@ -6,20 +6,24 @@ import threading
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import (
+    ChatTokenCounter,
     MCPWorker,
     NativeGenerationController,
     ScaffoldingLlm,
+    TaskTimer,
     TRTOpenaiWorker,
 )
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
-from tensorrt_llm.scaffolding.load_generation_strategy import PoissonRateStrategy
+from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
 
 # Global lock for thread-safe printing
 print_lock = threading.Lock()
 
 
-def print_benchmark_results(benchmark_type, results, requests_execution_time, total_time):
+def print_benchmark_results(
+    benchmark_type, results, requests_start_time, requests_execution_time, total_time
+):
     avg_all = sum(requests_execution_time) / len(requests_execution_time)
 
     with print_lock:
@@ -27,8 +31,12 @@ def print_benchmark_results(benchmark_type, results, requests_execution_time, to
         print(f"{benchmark_type} Benchmark Results:")
         print("=" * 60)
 
-        for i, execution_time in enumerate(requests_execution_time):
-            print(f"{benchmark_type} request {i} execution time = {execution_time:.3f}s")
+        for i, (start_time, execution_time) in enumerate(
+            zip(requests_start_time, requests_execution_time)
+        ):
+            print(
+                f"{benchmark_type} request {i}: start time = {start_time:.3f}s, execution time = {execution_time:.3f}s"
+            )
 
         print(f"\n{benchmark_type} total requests number: {len(results)}")
         print(f"{benchmark_type} total execution time: {total_time:.3f}s")
@@ -70,16 +78,10 @@ def parse_arguments():
         "--times", type=int, default=1, help="Number of times to run the benchmark (default: 1)"
     )
     parser.add_argument(
-        "--agent_rate",
-        type=float,
-        default=10.0,
-        help="Request rate for Poisson strategy for agent benchmark (req/s, default: 10.0)",
-    )
-    parser.add_argument(
-        "--chat_rate",
-        type=float,
-        default=1.0,
-        help="Request rate for Poisson strategy for chat benchmark (req/s, default: 1.0)",
+        "--concurrency",
+        type=int,
+        default=40,
+        help="Number of concurrent requests for Concurrent strategy (default: 40)",
     )
     parser.add_argument(
         "--max_tokens",
@@ -93,6 +95,7 @@ def parse_arguments():
         default=1024,
         help="Maximum number of parallel requests (default: 1024)",
     )
+    parser.add_argument("--enable_statistics", action="store_true")
 
     return parser.parse_args()
 
@@ -110,6 +113,7 @@ async def async_agent_benchmark(args):
         mcp_worker,
         args.max_tokens,
         args.max_parallel_requests,
+        args.enable_statistics,
     )
 
     prompt = """
@@ -127,7 +131,7 @@ async def async_agent_benchmark(args):
     requests = [
         ScaffoldingBenchRequest(prompt=str(i) + ". " + prompt) for i in range(args.agent_prompt_num)
     ]
-    strategy = PoissonRateStrategy(rate=args.agent_rate)
+    strategy = ConcurrentStrategy(concurrency=args.concurrency)
 
     for i in range(args.times):
         (
@@ -139,7 +143,16 @@ async def async_agent_benchmark(args):
             llm, task_collection_types, requests, strategy=strategy
         )
 
-        print_benchmark_results("Agent", results, requests_execution_time, total_time)
+        print_benchmark_results(
+            "Agent", results, requests_start_time, requests_execution_time, total_time
+        )
+
+        with print_lock:
+            if args.enable_statistics:
+                token_counting_info = ChatTokenCounter.get_global_info()
+                print("token counting info: " + str(token_counting_info))
+                timer_info = TaskTimer.get_global_info()
+                print("timer info: " + str(timer_info))
 
     # Graceful shutdown
     await mcp_worker.async_shutdown()
@@ -181,7 +194,7 @@ async def async_chat_benchmark(args):
     requests = [
         ScaffoldingBenchRequest(prompt=f"{i}. {chat_prompt}") for i in range(args.chat_prompt_num)
     ]
-    strategy = PoissonRateStrategy(rate=args.chat_rate)
+    strategy = ConcurrentStrategy(concurrency=args.concurrency)
 
     (
         results,
@@ -192,7 +205,9 @@ async def async_chat_benchmark(args):
         chat_llm, task_collection_types, requests, strategy=strategy
     )
 
-    print_benchmark_results("Chat", results, requests_execution_time, total_time)
+    print_benchmark_results(
+        "Chat", results, requests_start_time, requests_execution_time, total_time
+    )
 
     # Graceful shutdown
     chat_llm.shutdown()

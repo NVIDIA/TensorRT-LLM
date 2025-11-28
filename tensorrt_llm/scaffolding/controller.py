@@ -233,8 +233,8 @@ class ChatWithMCPController(Controller):
             yield from self.generation_controller.process([chat_task])
             response_message = chat_task.messages[-1]
             assert isinstance(
-                response_message,
-                AssistantMessage), "response is not AssistantMessage"
+                response_message, AssistantMessage
+            ), f"response is not AssistantMessage, {type(response_message)=}"
             if response_message.tool_calls is not None:
                 tool_calls = response_message.tool_calls
                 mcp_tasks = [
