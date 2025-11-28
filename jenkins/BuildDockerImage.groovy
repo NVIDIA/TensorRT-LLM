@@ -568,48 +568,82 @@ def updateCIImageTag(globalVars) {
         if (parts.size() != 2) {
             error "Invalid GITHUB_SOURCE_REPO_AND_BRANCH format: '${srcRepoAndBranch}'. Expected 'owner/repo:branch'"
         }
-        def repoPart = parts[0]
-        def branchPart = parts[1]
-        // Include credentials in the URL for authentication
-        def githubRepoUrl = "https://${GITHUB_USERNAME}:${GITHUB_PASSWORD}@github.com/${repoPart}.git"
-        def githubBranch = branchPart
-        echo "Using GitHub repo: https://github.com/${repoPart}.git, branch: ${githubBranch}"
+        def repoPart = parts[0]  // e.g., "ZhanruiSunCh/TensorRT-LLM"
+        def branchName = parts[1]  // e.g., "user/zhanruis/feature_branch"
+        echo "Using GitHub repo: ${repoPart}, branch: ${branchName}"
 
-        // 2. Clone the repository (create a temporary working directory)
-        def workDir = "update_ci_image_tag_workspace"
-        sh "rm -rf ${workDir}"
-        sh "mkdir -p ${workDir}"
-        sh "cd ${workDir} && git clone --depth 1 -b ${githubBranch} ${githubRepoUrl} repo"
+        // 2. Prepare updated content
+        echo "Preparing updated content for ${filePath}"
 
-        dir("${workDir}/repo") {
-            // 3. Configure Git user
-            echo "Configuring git user as tensorrt-cicd"
-            sh """
-            git config user.name "tensorrt-cicd"
-            git config user.email "90828364+tensorrt-cicd@users.noreply.github.com"
-            """
+        // First, get the current file from the branch via API to get its SHA
+        def apiUrl = "https://api.github.com/repos/${repoPart}/contents/${filePath}?ref=${branchName}"
+        def getFileResponse = sh(
+            script: """
+            curl -s -H "Authorization: token ${GITHUB_PASSWORD}" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 "${apiUrl}"
+            """,
+            returnStdout: true
+        ).trim()
 
-            // 4. Update the file
-            echo "Updating ${filePath} with new image tags"
-            def lines = readFile(filePath).split("\n") as List
-            def updatedLines = lines.collect { line ->
-                def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
-                matchedKey ? "${matchedKey}=${newImageTags[matchedKey]}" : line
-            }
-            writeFile file: filePath, text: updatedLines.join("\n") + "\n"
+        // Parse the response to get SHA and current content
+        def fileInfo = readJSON text: getFileResponse
+        def currentSha = fileInfo.sha
+        echo "Current file SHA: ${currentSha}"
 
-            // 5. Commit and push changes
-            sh """
-            git add ${filePath}
-            git commit -s -m "[auto] Update CI image tags with newly built images" || echo "No changes to commit"
-            git push origin HEAD:${githubBranch}
-            """
-
-            echo "Successfully committed and pushed updated ${filePath} to branch: ${githubBranch}"
+        // Get current content, decode from base64, and update
+        def currentContent = new String(fileInfo.content.decodeBase64())
+        def lines = currentContent.split("\n") as List
+        def updatedLines = lines.collect { line ->
+            def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
+            matchedKey ? "${matchedKey}=${newImageTags[matchedKey]}" : line
         }
+        def updatedContent = updatedLines.join("\n") + "\n"
 
-        // Cleanup
-        sh "rm -rf ${workDir}"
+        // 3. Encode updated content to base64
+        def encodedContent = updatedContent.bytes.encodeBase64().toString()
+
+        // 4. Create commit message
+        def commitMessage = "[auto] Update CI image tags with newly built images\\n\\nSigned-off-by: tensorrt-cicd <90828364+tensorrt-cicd@users.noreply.github.com>"
+
+        // 5. Update file via GitHub API
+        echo "Updating ${filePath} via GitHub API"
+        def updateApiUrl = "https://api.github.com/repos/${repoPart}/contents/${filePath}"
+        def updatePayload = """
+{
+  "message": "${commitMessage}",
+  "content": "${encodedContent}",
+  "sha": "${currentSha}",
+  "branch": "${branchName}"
+}
+"""
+
+        // Write payload to temporary file to avoid command line length issues
+        writeFile file: 'update_payload.json', text: updatePayload
+
+        def updateResponse = sh(
+            script: """
+            curl -s -X PUT \
+                 -H "Authorization: token ${GITHUB_PASSWORD}" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 -H "Content-Type: application/json" \
+                 -d @update_payload.json \
+                 "${updateApiUrl}"
+            """,
+            returnStdout: true
+        ).trim()
+
+        sh "rm -f update_payload.json"
+
+        // Check if update was successful
+        def updateResult = readJSON text: updateResponse
+        if (updateResult.commit) {
+            echo "Successfully updated ${filePath} via GitHub API"
+            echo "Commit SHA: ${updateResult.commit.sha}"
+        } else {
+            echo "Update response: ${updateResponse}"
+            error "Failed to update ${filePath} via GitHub API"
+        }
     }
 }
 
