@@ -538,7 +538,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
 def updateCIImageTag(globalVars) {
     echo "Update CI Image Tag"
-    // Update jenkins/current_image_tags.properties with newly built image tags and create a commit to the current PR
+    // Update jenkins/current_image_tags.properties with newly built image tags and push to PR branch
 
     def imageTagKeys = [
         "LLM_DOCKER_IMAGE",
@@ -554,64 +554,65 @@ def updateCIImageTag(globalVars) {
         "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python312)"],
     ]
 
-
     def filePath = "jenkins/current_image_tags.properties"
 
     withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_PASSWORD')]) {
         // 1. Validate and parse source repo and branch
         def srcRepoAndBranch = globalVars[GITHUB_SOURCE_REPO_AND_BRANCH]
         if (!srcRepoAndBranch || !srcRepoAndBranch.contains(":")) {
-            error "No GitHub source repo and branch found in globalVars. Cannot update ${filePath}."
+            echo "WARNING: No GitHub source repo and branch found. Skipping update."
+            return
         }
 
-        def parts = srcRepoAndBranch.split(":", 2)  // Split into max 2 parts to handle branch names with ':'
+        def parts = srcRepoAndBranch.split(":", 2)
         if (parts.size() != 2) {
             error "Invalid GITHUB_SOURCE_REPO_AND_BRANCH format: '${srcRepoAndBranch}'. Expected 'owner/repo:branch'"
         }
         def repoPart = parts[0]  // e.g., "ZhanruiSunCh/TensorRT-LLM"
         def branchName = parts[1]  // e.g., "user/zhanruis/feature_branch"
-        echo "Using GitHub repo: ${repoPart}, branch: ${branchName}"
+        echo "Target fork repo: ${repoPart}, branch: ${branchName}"
 
-        // 2. Prepare updated content
-        echo "Preparing updated content for ${filePath}"
+        // 2. Setup workspace with upstream repo
+        def workDir = "update_ci_image_tag_workspace"
 
-        // First, get the current file from the branch via API to get its SHA
-        echo "Fetching current file content from: ${repoPart}/${filePath}@${branchName}"
-        def apiUrl = "https://api.github.com/repos/${repoPart}/contents/${filePath}?ref=${branchName}"
+        // Extract repo path from LLM_REPO (e.g., "https://github.com/NVIDIA/TensorRT-LLM" -> "NVIDIA/TensorRT-LLM")
+        def upstreamRepoPath = 'NVIDIA/TensorRT-LLM'
+        def upstreamRepoUrl = "https://${GITHUB_PASSWORD}@github.com/${upstreamRepoPath}.git"
+        def forkRepoUrl = "https://${GITHUB_PASSWORD}@github.com/${repoPart}.git"
 
-        def getFileResponse = sh(
-            script: """
-            curl -s -w "\\nHTTP_STATUS:%{http_code}" \
-                 -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 "${apiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
+        echo "Setting up workspace with upstream repo: ${upstreamRepoPath}"
+        echo "Fork repo: ${repoPart}"
 
-        // Extract HTTP status code
-        def statusMatch = getFileResponse =~ /HTTP_STATUS:(\d+)$/
-        def httpStatus = statusMatch ? statusMatch[0][1] : "unknown"
-        def responseBody = getFileResponse.replaceAll(/\nHTTP_STATUS:\d+$/, '')
+        sh """
+        rm -rf ${workDir}
+        mkdir -p ${workDir}
+        cd ${workDir}
 
-        echo "GET API HTTP Status: ${httpStatus}"
+        # Clone upstream repository
+        export GIT_LFS_SKIP_SMUDGE=1
+        git clone --depth 20 ${upstreamRepoUrl} repo
+        cd repo
 
-        if (httpStatus != "200") {
-            echo "GET API Response: ${responseBody}"
-            error "Failed to fetch file from GitHub API. HTTP Status: ${httpStatus}"
-        }
+        # Add contributor's fork as remote
+        git remote add contributor ${forkRepoUrl}
 
-        // Parse the response to get SHA
-        def fileInfo = readJSON text: responseBody
-        def currentSha = fileInfo.sha
-        echo "Current file SHA: ${currentSha}"
+        # Fetch PR branch from contributor's fork
+        git fetch contributor ${branchName}
 
-        // Get current content and decode from base64 using shell
-        writeFile file: 'current_content_base64.txt', text: fileInfo.content
-        sh "base64 -d current_content_base64.txt > current_content.txt"
-        def currentContent = readFile('current_content.txt')
+        # Checkout the PR branch
+        git checkout -b pr-branch contributor/${branchName}
 
-        // Update content
+        # Configure Git user
+        git config user.name "tensorrt-cicd"
+        git config user.email "90828364+tensorrt-cicd@users.noreply.github.com"
+
+        # Disable LFS for this operation
+        git lfs uninstall --local || true
+        """
+
+        // 3. Read current file and update content
+        echo "Reading and updating ${filePath}"
+        def currentContent = readFile("${workDir}/repo/${filePath}")
         def lines = currentContent.split("\n") as List
         def updatedLines = lines.collect { line ->
             def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
@@ -619,194 +620,26 @@ def updateCIImageTag(globalVars) {
         }
         def updatedContent = updatedLines.join("\n") + "\n"
 
-        // Write updated content and encode to base64 using shell
-        writeFile file: 'updated_content.txt', text: updatedContent
-        def encodedContent = sh(
-            script: 'base64 -w 0 updated_content.txt',
-            returnStdout: true
-        ).trim()
+        // Write updated content
+        writeFile file: "${workDir}/repo/${filePath}", text: updatedContent
 
-        // Cleanup temporary files
-        sh "rm -f current_content_base64.txt current_content.txt updated_content.txt"
+        // 4. Commit and push back to contributor's fork
+        echo "Committing and pushing changes"
+        sh """
+        cd ${workDir}/repo
+        export GIT_LFS_SKIP_SMUDGE=1
 
-        // 4. Create commit message
-        def commitMessage = "[auto] Update CI image tags with newly built images\\n\\nSigned-off-by: tensorrt-cicd <90828364+tensorrt-cicd@users.noreply.github.com>"
+        git add ${filePath}
+        git commit -s -m "[auto] Update CI image tags with newly built images"
 
-        // 5. Create commit using Git Data API (more flexible for PR maintainer permissions)
-        echo "Creating commit via GitHub Git Data API"
+        # Push to contributor's fork branch (maintainer permission allows this)
+        git push contributor HEAD:${branchName}
+        """
 
-        // Step 5.1: Get reference (branch HEAD)
-        echo "Getting current HEAD of branch ${branchName}"
-        def refApiUrl = "https://api.github.com/repos/${repoPart}/git/ref/heads/${branchName}"
-        def refResponse = sh(
-            script: """
-            curl -s -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 "${refApiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
+        echo "✅ Successfully updated ${filePath} and pushed to ${repoPart}/${branchName}"
 
-        def refInfo = readJSON text: refResponse
-        if (!refInfo.object || !refInfo.object.sha) {
-            echo "Failed to get branch ref: ${refResponse}"
-            error "Cannot get HEAD SHA for branch ${branchName}"
-        }
-        def headSha = refInfo.object.sha
-        echo "Branch HEAD SHA: ${headSha}"
-
-        // Step 5.2: Create blob with new content
-        echo "Creating blob with updated content"
-        def blobApiUrl = "https://api.github.com/repos/${repoPart}/git/blobs"
-        def blobPayload = groovy.json.JsonOutput.toJson([
-            content: encodedContent,
-            encoding: "base64"
-        ])
-        writeFile file: 'blob_payload.json', text: blobPayload
-
-        def blobResponse = sh(
-            script: """
-            curl -s -X POST \
-                 -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 -H "Content-Type: application/json" \
-                 -d @blob_payload.json \
-                 "${blobApiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
-        sh "rm -f blob_payload.json"
-
-        def blobInfo = readJSON text: blobResponse
-        if (!blobInfo.sha) {
-            echo "Failed to create blob: ${blobResponse}"
-            error "Cannot create blob for updated content"
-        }
-        def blobSha = blobInfo.sha
-        echo "Created blob SHA: ${blobSha}"
-
-        // Step 5.3: Get base tree
-        echo "Getting base tree from HEAD commit"
-        def commitApiUrl = "https://api.github.com/repos/${repoPart}/git/commits/${headSha}"
-        def commitResponse = sh(
-            script: """
-            curl -s -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 "${commitApiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
-
-        def commitInfo = readJSON text: commitResponse
-        def baseTreeSha = commitInfo.tree.sha
-        echo "Base tree SHA: ${baseTreeSha}"
-
-        // Step 5.4: Create new tree with updated file
-        echo "Creating new tree"
-        def treeApiUrl = "https://api.github.com/repos/${repoPart}/git/trees"
-        def treePayload = groovy.json.JsonOutput.toJson([
-            base_tree: baseTreeSha,
-            tree: [
-                [
-                    path: filePath,
-                    mode: "100644",
-                    type: "blob",
-                    sha: blobSha
-                ]
-            ]
-        ])
-        writeFile file: 'tree_payload.json', text: treePayload
-
-        def treeResponse = sh(
-            script: """
-            curl -s -X POST \
-                 -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 -H "Content-Type: application/json" \
-                 -d @tree_payload.json \
-                 "${treeApiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
-        sh "rm -f tree_payload.json"
-
-        def treeInfo = readJSON text: treeResponse
-        if (!treeInfo.sha) {
-            echo "Failed to create tree: ${treeResponse}"
-            error "Cannot create tree"
-        }
-        def treeSha = treeInfo.sha
-        echo "Created tree SHA: ${treeSha}"
-
-        // Step 5.5: Create commit
-        echo "Creating commit"
-        def newCommitApiUrl = "https://api.github.com/repos/${repoPart}/git/commits"
-        def commitPayload = groovy.json.JsonOutput.toJson([
-            message: "[auto] Update CI image tags with newly built images\n\nSigned-off-by: tensorrt-cicd <90828364+tensorrt-cicd@users.noreply.github.com>",
-            tree: treeSha,
-            parents: [headSha]
-        ])
-        writeFile file: 'commit_payload.json', text: commitPayload
-
-        def newCommitResponse = sh(
-            script: """
-            curl -s -X POST \
-                 -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 -H "Content-Type: application/json" \
-                 -d @commit_payload.json \
-                 "${newCommitApiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
-        sh "rm -f commit_payload.json"
-
-        def newCommitInfo = readJSON text: newCommitResponse
-        if (!newCommitInfo.sha) {
-            echo "Failed to create commit: ${newCommitResponse}"
-            error "Cannot create commit"
-        }
-        def newCommitSha = newCommitInfo.sha
-        echo "Created commit SHA: ${newCommitSha}"
-
-        // Step 5.6: Update reference (move branch to new commit)
-        echo "Updating branch reference to new commit"
-        def updateRefApiUrl = "https://api.github.com/repos/${repoPart}/git/refs/heads/${branchName}"
-        def updateRefPayload = groovy.json.JsonOutput.toJson([
-            sha: newCommitSha,
-            force: false
-        ])
-        writeFile file: 'ref_payload.json', text: updateRefPayload
-
-        def updateRefResponse = sh(
-            script: """
-            curl -s -w "\\nHTTP_STATUS:%{http_code}" \
-                 -X PATCH \
-                 -H "Authorization: token ${GITHUB_PASSWORD}" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 -H "Content-Type: application/json" \
-                 -d @ref_payload.json \
-                 "${updateRefApiUrl}"
-            """,
-            returnStdout: true
-        ).trim()
-        sh "rm -f ref_payload.json"
-
-        // Extract status
-        def refStatusMatch = updateRefResponse =~ /HTTP_STATUS:(\d+)$/
-        def refHttpStatus = refStatusMatch ? refStatusMatch[0][1] : "unknown"
-        def refResponseBody = updateRefResponse.replaceAll(/\nHTTP_STATUS:\d+$/, '')
-
-        echo "Update reference HTTP Status: ${refHttpStatus}"
-
-        if (refHttpStatus == "200") {
-            echo "✅ Successfully updated ${filePath} and pushed to branch ${branchName}"
-            echo "Commit SHA: ${newCommitSha}"
-        } else {
-            echo "Failed to update branch reference. HTTP Status: ${refHttpStatus}"
-            echo "Response: ${refResponseBody}"
-            error "Cannot update branch ${branchName} to commit ${newCommitSha}"
-        }
+        // Cleanup
+        sh "rm -rf ${workDir}"
     }
 }
 
