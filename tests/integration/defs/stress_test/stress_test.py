@@ -698,7 +698,6 @@ def test_disaggregated_stress_test(model_config, test_mode,
     print_info("=" * 80)
     print_info(f"Starting Disaggregated Serving Stress Test for {model_name}")
     print_info(f"Test Mode: {test_mode}")
-    print_info(f"Capacity Scheduler Policy: {capacity_scheduler_policy}")
     print_info(f"Context Server: TP={ctx_tp}, PP={ctx_pp}")
     print_info(f"Generation Server: TP={gen_tp}, PP={gen_pp}")
     print_info("=" * 80)
