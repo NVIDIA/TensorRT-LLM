@@ -96,6 +96,14 @@ def llm_models_root() -> str:
 
     return str(root)
 
+def llm_model_name() -> str:
+    '''return LLM_MODELS_NAME if it is set in env, assert when it's set but not a valid path
+    '''
+    DEFAULT_LLM_MODEL_NAME = "Qwen2-0.5B"
+    LLM_MODELS_NAME = os.environ.get("LLM_MODELS_NAME", DEFAULT_LLM_MODEL_NAME)
+
+    return LLM_MODELS_NAME
+
 
 def tests_path() -> Path:
     return (Path(os.path.dirname(__file__)) / "../..").resolve()
