@@ -9,8 +9,6 @@ from torch import nn
 
 from tensorrt_llm._torch.autotuner import autotune
 
-from ..distributed import common as dist
-from ..distributed import trtllm as trtllm_dist
 from .torch_libs.float8_python_api import addmm_float8_unwrapped
 
 TRTLLM_FP4_OP_AVAILABLE = True
@@ -238,39 +236,6 @@ def fp8_linear_fake(
     weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
-
-
-@torch.library.custom_op("auto_deploy::torch_quant_fused_fp8_linear_all_reduce", mutates_args=())
-@torch.compile(dynamic=True)
-def fused_fp8_linear_all_reduce(
-    input: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    strategy: str,
-    bias: Optional[torch.Tensor] = None,
-    input_scale: Optional[torch.Tensor] = None,
-    weight_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    out = torch.ops.auto_deploy.torch_quant_fp8_linear(
-        input, weight_fp8, bias, input_scale, weight_scale
-    )
-    if trtllm_dist.is_trtllm_op_available():
-        return trtllm_dist.trtllm_allreduce(out, op=dist.ReduceOp.SUM, strategy=strategy)
-    dist.all_reduce(out, op=dist.ReduceOp.SUM)
-    return out
-
-
-@fused_fp8_linear_all_reduce.register_fake
-def fused_fp8_linear_all_reduce_fake(
-    input: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    strategy: str,
-    bias: Optional[torch.Tensor] = None,
-    input_scale: Optional[torch.Tensor] = None,
-    weight_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_quant_fp8_linear(
-        input, weight_fp8, bias, input_scale, weight_scale
-    )
 
 
 class FP8Linear(nn.Linear):

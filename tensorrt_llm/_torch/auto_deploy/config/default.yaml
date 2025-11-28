@@ -80,6 +80,7 @@ transforms:
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     allreduce_strategy: 'AUTO'
+    dist_backend: auto
     requires_shape_prop: true
   sharding_transform_executor:
     stage: sharding
