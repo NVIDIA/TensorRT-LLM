@@ -51,5 +51,6 @@ srun -l \
         trtllm-llmapi-launch python3 $script \
             --model_dir $LOCAL_MODEL \
             --prompt 'Hello, how are you?' \
-            --tp_size 2
+            --tp_size 2 \
+            --max_batch_size 256
     "
