@@ -45,8 +45,8 @@ class Result(GenerationResultBase):
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 # TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
-DEFAULT_TEST_TIMEOUT = 3600
-DEFAULT_SERVER_WAITING_TIMEOUT = 3600
+DEFAULT_TEST_TIMEOUT = 180
+DEFAULT_SERVER_WAITING_TIMEOUT = 180
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -353,11 +353,13 @@ def launch_disaggregated_llm(
                         print(line.strip())
 
         tokenizer = load_hf_tokenizer(model_name)
-        yield DuckLLM(args, tokenizer, generate_async)
-
-        if enable_perf:
-            _get_perf_metrics()
-            _show_kvcache_time(kv_cache_perf_dir)
+        try:
+            yield DuckLLM(args, tokenizer, generate_async)
+        finally:
+            print("---- here!!! ----")
+            if enable_perf:
+                _get_perf_metrics()
+                _show_kvcache_time(kv_cache_perf_dir)
 
 
 def run_parallel_test(model_name: str,
