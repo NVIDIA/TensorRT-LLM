@@ -561,69 +561,57 @@ def updateCIImageTag(globalVars) {
         // 1. Validate and parse source repo and branch
         def srcRepoAndBranch = globalVars[GITHUB_SOURCE_REPO_AND_BRANCH]
         if (!srcRepoAndBranch || !srcRepoAndBranch.contains(":")) {
-            error "No GitHub source repo and branch found in globalVars, skipping update of ${filePath}"
+            error "No GitHub source repo and branch found in globalVars. Cannot update ${filePath}."
         }
-        def (repoPart, branchPart) = srcRepoAndBranch.tokenize(":")
+
+        def parts = srcRepoAndBranch.split(":", 2)  // Split into max 2 parts to handle branch names with ':'
+        if (parts.size() != 2) {
+            error "Invalid GITHUB_SOURCE_REPO_AND_BRANCH format: '${srcRepoAndBranch}'. Expected 'owner/repo:branch'"
+        }
+        def repoPart = parts[0]
+        def branchPart = parts[1]
         def githubRepoUrl = "https://github.com/${repoPart}.git"
         def githubBranch = branchPart
         echo "Using GitHub repo: ${githubRepoUrl}, branch: ${githubBranch}"
 
-        // 2. Setup Git remote and checkout branch
+        // 2. Clone the repository (create a temporary working directory)
+        def workDir = "update_ci_image_tag_workspace"
         sh """
-        git remote remove fork || true
-        git remote add fork ${githubRepoUrl}
-        git fetch fork ${githubBranch}
-        git checkout -B ${githubBranch} fork/${githubBranch}
+        rm -rf ${workDir}
+        mkdir -p ${workDir}
+        cd ${workDir}
+        git clone --depth 1 -b ${githubBranch} ${githubRepoUrl} repo
         """
 
-        // 3. Configure Git user from Signed-off-by or use default
-        def lastSignedBy = sh(
-            script: "git log -1 --pretty=format:'%B' | grep -i '^Signed-off-by:' | tail -1 | sed 's/^Signed-off-by:[ ]*//'",
-            returnStdout: true
-        ).trim()
-
-        def gitConfigSet = false
-        if (lastSignedBy) {
-            def matcher = lastSignedBy =~ /(.*)<(.+)>/
-            if (matcher.matches()) {
-                def signedName = matcher[0][1].trim()
-                def signedEmail = matcher[0][2].trim()
-                if (signedName && signedEmail) {
-                    echo "Setting git config from Signed-off-by: '${signedName}' <${signedEmail}>"
-                    sh """
-                    git config user.name "${signedName}"
-                    git config user.email "${signedEmail}"
-                    """
-                    gitConfigSet = true
-                }
-            }
-        }
-
-        if (!gitConfigSet) {
-            echo "Using default ci-bot for git config"
+        dir("${workDir}/repo") {
+            // 3. Configure Git user
+            echo "Configuring git user as tensorrt-cicd"
             sh """
-            git config user.name "ci-bot"
-            git config user.email "ci-bot@nvidia.com"
+            git config user.name "tensorrt-cicd"
+            git config user.email "90828364+tensorrt-cicd@users.noreply.github.com"
             """
+
+            // 4. Update the file
+            echo "Updating ${filePath} with new image tags"
+            def lines = readFile(filePath).split("\n") as List
+            def updatedLines = lines.collect { line ->
+                def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
+                matchedKey ? "${matchedKey}=${newImageTags[matchedKey]}" : line
+            }
+            writeFile file: filePath, text: updatedLines.join("\n") + "\n"
+
+            // 5. Commit and push changes
+            sh """
+            git add ${filePath}
+            git commit -s -m "[auto] Update CI image tags with newly built images" || echo "No changes to commit"
+            git push origin HEAD:${githubBranch}
+            """
+
+            echo "Successfully committed and pushed updated ${filePath} to branch: ${githubBranch}"
         }
 
-        // 4. Update the file (AFTER checkout to avoid being overwritten)
-        echo "Updating ${filePath} with new image tags"
-        def lines = readFile(filePath).split("\n") as List
-        def updatedLines = lines.collect { line ->
-            def matchedKey = imageTagKeys.find { key -> line.startsWith(key + "=") }
-            matchedKey ? "${matchedKey}=${newImageTags[matchedKey]}" : line
-        }
-        writeFile file: filePath, text: updatedLines.join("\n") + "\n"
-
-        // 5. Commit and push changes
-        sh """
-        git add ${filePath}
-        git commit -s -m "[auto] Update CI image tags with newly built images" || echo "No changes to commit"
-        git push fork HEAD:${githubBranch}
-        """
-
-        echo "Successfully committed and pushed updated ${filePath} to branch: ${githubBranch}"
+        // Cleanup
+        sh "rm -rf ${workDir}"
     }
 }
 
