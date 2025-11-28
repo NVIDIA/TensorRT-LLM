@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from copy import copy
-from typing import Any, Dict, List, Literal, Optional, OrderedDict, Tuple, Union
+from typing import Any, Literal, Optional, OrderedDict, Tuple, Union
 
 # yapf: disable
 from openai.types.responses import (ResponseCompletedEvent,
@@ -95,7 +95,7 @@ def _get_encoding():
 
 
 def _decode_tokens(
-    tokens: List[int],
+    tokens: list[int],
     tokenizer: Optional[Union[TransformersTokenizer,
                               TokenizerBase]] = None) -> str:
     if tokenizer is not None:
@@ -109,7 +109,7 @@ def get_steady_clock_now_in_seconds() -> float:
 
 def _parse_response_input(
     input_msg: ResponseInputOutputItem,
-    prev_responses: List[Union[ResponseOutputItem, ResponseReasoningItem]]
+    prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]]
 ) -> Message:
     if not isinstance(input_msg, dict):
         input_msg = input_msg.model_dump()
@@ -184,7 +184,7 @@ class ConversationHistoryStore:
         self.conversations_lock = asyncio.Lock()
         # Conversations store, conversations stored more than conversation_capacity will be removed in LRU policy.
         self.conversations: OrderedDict[str, Union[
-            List[Message], List[ChatCompletionMessageParam]]] = OrderedDict()
+            list[Message], list[ChatCompletionMessageParam]]] = OrderedDict()
 
         # Map from response id to conversation id. 1 to 1 mapping.
         self.response_to_conversation: dict[str, str] = {}
@@ -202,8 +202,8 @@ class ConversationHistoryStore:
     async def store_response(self,
                              resp: ResponsesResponse,
                              resp_msgs: Optional[
-                                 Union[List[Message],
-                                       List[ChatCompletionMessageParam]]] = [],
+                                 Union[list[Message],
+                                       list[ChatCompletionMessageParam]]] = [],
                              prev_resp_id: Optional[str] = None) -> None:
         """
         Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
@@ -211,7 +211,7 @@ class ConversationHistoryStore:
 
         Args:
             resp: ResponsesResponse
-            resp_msgs: Optional[Union[List[Message], List[ChatCompletionMessageParam]]]
+            resp_msgs: Optional[Union[list[Message], list[ChatCompletionMessageParam]]]
             prev_resp_id: Optional[str]
 
         Returns:
@@ -258,8 +258,8 @@ class ConversationHistoryStore:
             self._update_visited_conversation(conversation_id)
 
     async def store_messages(self, resp_id: str,
-                             msgs: Union[List[Message],
-                                         List[ChatCompletionMessageParam]],
+                             msgs: Union[list[Message],
+                                         list[ChatCompletionMessageParam]],
                              prev_resp_id: Optional[str]) -> None:
         """
         Store the messages in the conversation store.
@@ -268,7 +268,7 @@ class ConversationHistoryStore:
 
         Args:
             resp_id: str
-            msgs: Union[List[Message], List[ChatCompletionMessageParam]]: The messages to store.
+            msgs: Union[list[Message], list[ChatCompletionMessageParam]]: The messages to store.
             prev_resp_id: Optional[str]: The previous response id. If not provided, a new conversation will be created.
 
         Returns:
@@ -299,7 +299,7 @@ class ConversationHistoryStore:
 
     async def get_conversation_history(
             self, resp_id: str
-    ) -> Union[List[Message], List[ChatCompletionMessageParam]]:
+    ) -> Union[list[Message], list[ChatCompletionMessageParam]]:
         _responses_debug_log(f"ConversationHistoryStore getting prev_msgs:")
         _responses_debug_log(f" -> prev_resp_id: {resp_id}")
         async with self.conversations_lock:
@@ -424,7 +424,7 @@ def _get_system_message(
 
 
 def _get_developer_message(instructions: Optional[str] = None,
-                           tools: Optional[List[Tool]] = None) -> Message:
+                           tools: Optional[list[Tool]] = None) -> Message:
     dev_msg_content = DeveloperContent.new()
     if instructions is not None:
         dev_msg_content = dev_msg_content.with_instructions(instructions)
@@ -459,10 +459,10 @@ def _get_user_message(content: str) -> Message:
 def _construct_harmony_messages(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
-    prev_msgs: List[Message] = [],
-) -> List[Message]:
+    prev_msgs: list[Message] = [],
+) -> list[Message]:
     """Construct messages from request input, includes conversation history messages if exists."""
-    messages: List[Message] = []
+    messages: list[Message] = []
     if prev_response is None:
         # New conversation.
         reasoning_effort = (request.reasoning.effort
@@ -495,7 +495,7 @@ def _construct_harmony_messages(
     return messages
 
 
-def _render_for_completion(messages: List[Message]) -> List[int]:
+def _render_for_completion(messages: list[Message]) -> list[int]:
     conversation = Conversation.from_messages(messages)
     _responses_debug_log("Rendering conversation:")
     _responses_debug_log(conversation.to_json())
@@ -504,12 +504,12 @@ def _render_for_completion(messages: List[Message]) -> List[int]:
     return token_ids
 
 
-def _parse_output_tokens(tokens: List[int]) -> List[Message]:
+def _parse_output_tokens(tokens: list[int]) -> list[Message]:
     return _get_encoding().parse_messages_from_completion_tokens(
         tokens, role=Role.ASSISTANT)
 
 
-def _parse_output_message_harmony(message: Message) -> List[ResponseOutputItem]:
+def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
     """
     Parse a Harmony message into a list of output response items.
     """
@@ -519,7 +519,7 @@ def _parse_output_message_harmony(message: Message) -> List[ResponseOutputItem]:
         # OpenAI's behavior on models like o4-mini.
         return []
 
-    output_items: List[ResponseOutputItem] = []
+    output_items: list[ResponseOutputItem] = []
     recipient = message.recipient
     if recipient is not None and recipient.startswith("browser."):
         if len(message.content) != 1:
@@ -621,7 +621,7 @@ def finish_reason_mapping(finish_reason: str) -> str:
 
 
 def _response_output_item_to_chat_completion_message(
-        item: Union[Dict,
+        item: Union[dict,
                     ResponseInputOutputItem]) -> ChatCompletionMessageParam:
     if not isinstance(item, dict):
         item = item.model_dump()
@@ -662,9 +662,9 @@ def _response_output_item_to_chat_completion_message(
 
 async def _create_input_messages(
     request: ResponsesRequest,
-    prev_msgs: List[ChatCompletionMessageParam],
-) -> List[ChatCompletionMessageParam]:
-    messages: List[ChatCompletionMessageParam] = []
+    prev_msgs: list[ChatCompletionMessageParam],
+) -> list[ChatCompletionMessageParam]:
+    messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
         messages.append({
             "role": "system",
@@ -690,22 +690,22 @@ async def _create_input_messages(
 
 
 def _create_output_messages(
-        output_contents: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
+        output_contents: dict[str, Any]) -> list[ChatCompletionMessageParam]:
     """
     Convert output contents to chat completion messages for conversation store.
 
     Reasoning content is not included in the output messages to reduce the token usage.
 
     Input:
-        output_contents: Dict[str, str]
+        output_contents: dict[str, str]
         - text_content: Optional[str]
         - reasoning_content: Optional[str]
-        - tool_calls: Optional[List[ToolCall]]
+        - tool_calls: Optional[list[ToolCall]]
 
     Returns:
-        List[ChatCompletionMessageParam]: Chat completion messages for conversation store.
+        list[ChatCompletionMessageParam]: Chat completion messages for conversation store.
     """
-    messages: List[ChatCompletionMessageParam] = []
+    messages: list[ChatCompletionMessageParam] = []
 
     text_content = output_contents.get("text_content", None)
     if text_content:
@@ -740,8 +740,8 @@ def _create_output_messages(
 
 
 def _get_chat_completion_function_tools(
-        tools: Optional[List[Tool]]) -> List[ChatCompletionToolsParam]:
-    function_tools: List[ChatCompletionToolsParam] = []
+        tools: Optional[list[Tool]]) -> list[ChatCompletionToolsParam]:
+    function_tools: list[ChatCompletionToolsParam] = []
     if tools is None:
         return function_tools
 
@@ -767,18 +767,18 @@ def _get_chat_completion_function_tools(
 async def _create_input_tokens(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
-    prev_msgs: List[ChatCompletionMessageParam],
+    prev_msgs: list[ChatCompletionMessageParam],
     conversation_store: ConversationHistoryStore,
     enable_store: bool,
     tokenizer: Union[TransformersTokenizer, TokenizerBase],
     model_config: PretrainedConfig,
     processor: AutoProcessor,
-) -> Tuple[List[int], Optional[Dict[str, List[Any]]]]:
+) -> Tuple[list[int], Optional[dict[str, list[Any]]]]:
     """
     Create input tokens for the model. Also return the mm data if the model is multimodal.
 
     Returns:
-        Tuple[List[int], Optional[Dict[str, List[Any]]]]: Input tokens and mm data.
+        Tuple[list[int], Optional[dict[str, list[Any]]]]: Input tokens and mm data.
 
     """
     messages = await _create_input_messages(
@@ -815,10 +815,10 @@ async def _create_input_tokens(
 async def _create_input_tokens_harmony(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
-    prev_msgs: List[Message],
+    prev_msgs: list[Message],
     conversation_store: ConversationHistoryStore,
     enable_store: bool,
-) -> List[int]:
+) -> list[int]:
     messages = _construct_harmony_messages(request,
                                            prev_response,
                                            prev_msgs=prev_msgs)
@@ -842,7 +842,7 @@ async def request_preprocess(
     tokenizer: Optional[Union[TransformersTokenizer, TokenizerBase]] = None,
     model_config: Optional[PretrainedConfig] = None,
     processor: Optional[AutoProcessor] = None,
-) -> tuple[List[int], SamplingParams]:
+) -> tuple[list[int], SamplingParams]:
 
     sampling_params = request.to_sampling_params(
         default_sampling_params={
@@ -898,7 +898,7 @@ def _apply_reasoning_parser(
     output_index: int,
     text: str,
     streaming: bool,
-    reasoning_parser_dict: Optional[Dict[int, BaseReasoningParser]] = None,
+    reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
 ) -> Tuple[str, str]:
     reasoning_parser: Optional[BaseReasoningParser] = None
     if reasoning_parser_id is not None:
@@ -927,12 +927,12 @@ def _apply_reasoning_parser(
 
 def _apply_tool_parser(
     tool_parser_id: Optional[str],
-    tools: Optional[List[Tool]],
+    tools: Optional[list[Tool]],
     output_index: int,
     text: str,
     streaming: bool,
-    tool_parser_dict: Optional[Dict[int, BaseToolParser]] = None,
-) -> Tuple[str, List[ToolCallItem]]:
+    tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
+) -> Tuple[str, list[ToolCallItem]]:
     tool_parser: Optional[BaseToolParser] = None
     if tool_parser_id is not None and tools is not None:
         if tool_parser_dict is not None:
@@ -961,10 +961,10 @@ async def _create_output_content(
     final_res: RequestOutput,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
-    tools: Optional[List[Tool]] = None,
-) -> Tuple[List[ResponseOutputItem], List[ChatCompletionMessageParam]]:
-    output_items: List[ResponseOutputItem] = []
-    output_messages: List[ChatCompletionMessageParam] = []
+    tools: Optional[list[Tool]] = None,
+) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam]]:
+    output_items: list[ResponseOutputItem] = []
+    output_messages: list[ChatCompletionMessageParam] = []
     available_tools = _get_chat_completion_function_tools(tools)
 
     for output in final_res.outputs:
@@ -1037,7 +1037,7 @@ async def _create_output_content(
 
 async def _create_output_content_harmony(
         final_res: RequestOutput
-) -> Tuple[List[ResponseOutputItem], List[Message]]:
+) -> Tuple[list[ResponseOutputItem], list[Message]]:
     output_messages = _parse_output_tokens(final_res.outputs[0].token_ids)
     output_content = []
 
@@ -1195,7 +1195,7 @@ class ResponsesStreamingEventsHelper:
         )
 
     def get_text_done_event(self, text: str,
-                            logprobs: List[float]) -> ResponseTextDoneEvent:
+                            logprobs: list[float]) -> ResponseTextDoneEvent:
         return ResponseTextDoneEvent(
             type="response.output_text.done",
             sequence_number=-1,
@@ -1247,7 +1247,7 @@ class ResponsesStreamingEventsHelper:
         )
 
     def get_text_delta_event(self, delta: str,
-                             logprobs: List[float]) -> ResponseTextDeltaEvent:
+                             logprobs: list[float]) -> ResponseTextDeltaEvent:
         return ResponseTextDeltaEvent(
             type="response.output_text.delta",
             sequence_number=-1,
@@ -1271,13 +1271,13 @@ class ResponsesStreamingEventsHelper:
 
     def _get_output_added_events(
         self, output_item: ResponseOutputMessage | ResponseReasoningItem
-    ) -> List[StreamingResponsesResponse]:
+    ) -> list[StreamingResponsesResponse]:
         """
         Get item added event and content part added event for a message item which is starting
         to be generated.
 
         Returns:
-            List[StreamingResponsesResponse]: A list of streaming responses responses
+            list[StreamingResponsesResponse]: A list of streaming responses responses
         """
         if not self.is_output_item_added_sent:
             self.is_output_item_added_sent = True
@@ -1302,7 +1302,7 @@ class ResponsesStreamingEventsHelper:
             yield self.get_content_part_added_event(content_part)
 
     def get_message_output_added_events(
-            self) -> List[StreamingResponsesResponse]:
+            self) -> list[StreamingResponsesResponse]:
         return self._get_output_added_events(output_item=ResponseOutputMessage(
             id=self.item_id,
             type="message",
@@ -1312,7 +1312,7 @@ class ResponsesStreamingEventsHelper:
         ))
 
     def get_reasoning_output_added_events(
-            self) -> List[StreamingResponsesResponse]:
+            self) -> list[StreamingResponsesResponse]:
         return self._get_output_added_events(output_item=ResponseReasoningItem(
             id=self.item_id,
             type="reasoning",
@@ -1326,9 +1326,9 @@ def _should_send_done_events(
     output_index: int,
     reasoning_parser_id: Optional[str] = None,
     tool_parser_id: Optional[str] = None,
-    tools: Optional[List[Tool]] = None,
-    reasoning_parser_dict: Optional[Dict[int, BaseReasoningParser]] = None,
-    tool_parser_dict: Optional[Dict[int, BaseToolParser]] = None,
+    tools: Optional[list[Tool]] = None,
+    reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
+    tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
     streaming_events_helper: Optional[ResponsesStreamingEventsHelper] = None,
     finished_generation: bool = False,
 ) -> Tuple[bool, bool, Optional[str], Optional[str]]:
@@ -1416,8 +1416,8 @@ def _generate_streaming_event(
     streaming_events_helper: ResponsesStreamingEventsHelper,
     reasoning_parser_id: Optional[str] = None,
     tool_parser_id: Optional[str] = None,
-    reasoning_parser_dict: Optional[Dict[int, BaseReasoningParser]] = None,
-    tool_parser_dict: Optional[Dict[int, BaseToolParser]] = None,
+    reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
+    tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
 ):
     available_tools = _get_chat_completion_function_tools(request.tools)
     output_idx = output.index
@@ -1425,7 +1425,7 @@ def _generate_streaming_event(
     calls = []
 
     def check_parser(parser_id: Optional[str],
-                     parser_dict: Optional[Dict[int, BaseReasoningParser]]):
+                     parser_dict: Optional[dict[int, BaseReasoningParser]]):
         if parser_id is not None:
             if parser_dict is None:
                 raise RuntimeError(
@@ -1660,8 +1660,8 @@ async def process_streaming_events(
     response_creation_time = create_time if create_time is not None else int(
         time.time())
     final_res: Optional[RequestOutput] = None
-    reasoning_parser_dict: Dict[int, BaseReasoningParser] = {}
-    tool_parser_dict: Dict[int, BaseToolParser] = {}
+    reasoning_parser_dict: dict[int, BaseReasoningParser] = {}
+    tool_parser_dict: dict[int, BaseToolParser] = {}
 
     def _send_event(event: OpenAIBaseModel):
         nonlocal sequence_number
