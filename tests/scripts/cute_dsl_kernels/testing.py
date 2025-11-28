@@ -9,30 +9,15 @@
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
-import functools
-import inspect
-import logging
-import os
-from itertools import product
-from time import time
-from typing import Type, Union, Callable, Optional, Dict, List, Any
+from functools import partial
+from typing import Callable, Optional, Union
 
 import cuda.bindings.driver as cuda_driver
 import cuda.bindings.runtime as cuda_runtime
-
 import cutlass.base_dsl.jit_executor
-from cutlass.cutlass_dsl import Constexpr, CuTeDSL, T, dsl_user_op
-
-from cutlass.cute.typing import Numeric, Int8, Boolean
-
-import cutlass.cute as cute
-from cutlass.cute import nvgpu
-
-from cutlass._mlir.dialects import builtin, cf, nvvm, vector
-from functools import partial
-
-from cutlass.cute.testing import JitArguments
 from cupti import cupti
+from cutlass.cute.testing import JitArguments
+
 
 class CuptiProfiler:
     """A class for managing CUPTI profiling measurements with start, stop, and duration methods.
@@ -72,7 +57,8 @@ class CuptiProfiler:
             start = activity.start if hasattr(activity, "start") else "nil"
             end = activity.end if hasattr(activity, "end") else "nil"
             duration = end - start if start != "nil" and end != "nil" else "nil"
-            name = activity.name[:100] if hasattr(activity, "name") else "unknown"
+            name = activity.name[:100] if hasattr(activity,
+                                                  "name") else "unknown"
             # Convert to milliseconds
             if duration != "nil":
                 self.timings.append((name, duration / 1e6))
@@ -104,9 +90,8 @@ class CuptiProfiler:
         self._buffer_requested_callback = self._buffer_requested
         self._buffer_completed_callback = partial(self._buffer_completed)
 
-        cupti.activity_register_callbacks(
-            self._buffer_requested_callback, self._buffer_completed_callback
-        )
+        cupti.activity_register_callbacks(self._buffer_requested_callback,
+                                          self._buffer_completed_callback)
 
         self._is_active = True
 
@@ -134,9 +119,9 @@ class CuptiProfiler:
         """
         return sum(timing[1] for timing in self.timings)
 
-def _cuda_success(
-    err: Union[tuple, cuda_runtime.cudaError_t, cuda_driver.CUresult], message: str
-):
+
+def _cuda_success(err: Union[tuple, cuda_runtime.cudaError_t,
+                             cuda_driver.CUresult], message: str):
     """
     Helper function to check CUDA API errors.
     """
@@ -155,9 +140,9 @@ def _cuda_success(
             f"{err} is an unexpected type : it should be a cudaError_t or CUresult"
         )
 
-def _does_kernel_use_stream(
-    kernel: Callable, stream: cuda_driver.CUstream, *args, **kwargs
-):
+
+def _does_kernel_use_stream(kernel: Callable, stream: cuda_driver.CUstream,
+                            *args, **kwargs):
     """
     This function checks if the kernel uses the provided non-default stream.
     It does this by capturing the stream and then checking if any kernels were launched.
@@ -170,12 +155,11 @@ def _does_kernel_use_stream(
     """
 
     assert int(stream) != int(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT), (
-        "Stream must be a non-default stream"
-    )
+        "Stream must be a non-default stream")
 
     err = cuda_runtime.cudaStreamBeginCapture(
-        stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
-    )
+        stream,
+        cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal)
     _cuda_success(err, "Error on stream capture")
 
     kernel(*args, **kwargs)
@@ -187,6 +171,7 @@ def _does_kernel_use_stream(
     err, _, num_nodes = cuda_runtime.cudaGraphGetNodes(graph)
     _cuda_success(err, "Error on querying graph")
     return num_nodes > 0
+
 
 def benchmark(
     callable: Callable,
@@ -268,22 +253,23 @@ def benchmark(
     """
 
     if stream is None:
-        stream = cuda_driver.CUstream(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
+        stream = cuda_driver.CUstream(
+            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
 
     if workspace_count < 1:
         raise ValueError("workspace_count must be at least 1")
 
-    time_us = float("nan")
+    float("nan")
     if workspace_generator == None:
         # If no workspace generator is provided, we need a single workspace
         if workspace_count != 1:
-            raise ValueError("Need a single workspace if not providing a generator")
+            raise ValueError(
+                "Need a single workspace if not providing a generator")
 
         # If no workspace generator is provided, we need a kernel_argument
         if kernel_arguments == None:
             raise ValueError(
-                "Please pass a kernel argument if not providing a generator"
-            )
+                "Please pass a kernel argument if not providing a generator")
         workspace_generator = lambda: kernel_arguments
 
     workspaces = [workspace_generator() for _ in range(workspace_count)]
@@ -303,12 +289,10 @@ def benchmark(
 
     # Create CUDA events for timing
     err, start_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT
-    )
+        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT)
     _cuda_success(err, "Error on creating event")
     err, end_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT
-    )
+        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT)
     _cuda_success(err, "Error on creating event")
 
     elapsed_time = float("nan")
@@ -321,7 +305,8 @@ def benchmark(
             cutlass.base_dsl.jit_executor.JitExecutor,
         )
         if not isinstance(callable, compiled_types):
-            raise TypeError("Function must be precompiled to be used with CUDA Graphs")
+            raise TypeError(
+                "Function must be precompiled to be used with CUDA Graphs")
 
         # Check if the stream is a non-default stream
         if int(stream) == int(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT):
@@ -333,8 +318,8 @@ def benchmark(
 
         # Capture warmup graph
         err = cuda_runtime.cudaStreamBeginCapture(
-            stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
-        )
+            stream,
+            cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal)
         _cuda_success(err, "Error on stream capture")
 
         workspace_index = _loop_and_call_kernel(warmup_iterations)
@@ -352,8 +337,8 @@ def benchmark(
 
         # Capture profiling graph
         err = cuda_runtime.cudaStreamBeginCapture(
-            stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
-        )
+            stream,
+            cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal)
         _cuda_success(err, "Error on stream capture")
         _loop_and_call_kernel(iterations, workspace_index)
         err, gprofile = cuda_runtime.cudaStreamEndCapture(stream)
@@ -384,7 +369,8 @@ def benchmark(
         _cuda_success(err, "Error on synchronizing event")
 
         # Get elapsed time
-        err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
+        err, elapsed_time = cuda_driver.cuEventElapsedTime(
+            start_event, end_event)
         _cuda_success(err, "Error on querying event")
 
         # Destroy graphs
@@ -392,7 +378,6 @@ def benchmark(
         _cuda_success(err, "Error on destroying graph")
         err = cuda_runtime.cudaGraphExecDestroy(gprofile)
         _cuda_success(err, "Error on destroying graph")
-
 
     elif use_cupti:
         # Use the new CuptiProfiler class
@@ -413,10 +398,9 @@ def benchmark(
 
     else:
         if int(stream) != int(
-            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
-        ) and not _does_kernel_use_stream(
-            callable, stream, *workspaces[0].args, **workspaces[0].kwargs
-        ):
+                cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
+        ) and not _does_kernel_use_stream(callable, stream, *workspaces[0].args,
+                                          **workspaces[0].kwargs):
             raise ValueError(
                 "CUDA stream passed to benchmark does not match the stream the kernel was launched in"
             )
@@ -434,7 +418,8 @@ def benchmark(
         # Synchronize end event
         err = cuda_driver.cuEventSynchronize(end_event)
         _cuda_success(err, "Error on synchronizing event")
-        err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
+        err, elapsed_time = cuda_driver.cuEventElapsedTime(
+            start_event, end_event)
         _cuda_success(err, "Error on querying event")
 
     # Destroy events
