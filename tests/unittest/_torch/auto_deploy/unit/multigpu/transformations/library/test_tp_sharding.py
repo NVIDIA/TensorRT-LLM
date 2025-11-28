@@ -257,6 +257,7 @@ def _run_pattern_detection_job(
     config = ShardingTransformConfig(
         rank=rank,
         world_size=world_size,
+        stage="sharding",
         allreduce_strategy=AllReduceStrategy.AUTO,
     )
     gm = torch_export_to_gm(model, args=(x,), clone=True)
