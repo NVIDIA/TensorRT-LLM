@@ -43,13 +43,11 @@
 
 # This file is copied and modified from cutlass example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py
 
-
 import argparse
 import sys
 from pathlib import Path
 from typing import Tuple, Type
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
@@ -57,9 +55,12 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import dense_blockscaled_gemm_persistent as kernel_module
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import \
+        dense_blockscaled_gemm_persistent as kernel_module
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
+    sys.path.insert(
+        0,
+        str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
     from blackwell import dense_blockscaled_gemm_persistent as kernel_module
 
 Sm100BlockScaledPersistentDenseGemmKernel = kernel_module.Sm100BlockScaledPersistentDenseGemmKernel
@@ -432,7 +433,8 @@ if __name__ == "__main__":
                 "Invalid format. Expected comma-separated integers.")
 
     parser = argparse.ArgumentParser(
-        description="Performance test for Sm100 Dense Persistent BlockScaled GEMM.")
+        description=
+        "Performance test for Sm100 Dense Persistent BlockScaled GEMM.")
 
     parser.add_argument(
         "--mnkl",
@@ -540,4 +542,3 @@ if __name__ == "__main__":
     if args.print_duration:
         print(f"Execution time: {exec_time} us")
     print("PASS")
-
