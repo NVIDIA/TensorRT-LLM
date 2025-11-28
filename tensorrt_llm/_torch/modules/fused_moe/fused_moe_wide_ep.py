@@ -1,5 +1,4 @@
 import os
-from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -124,7 +123,7 @@ class WideEPMoE(MoE):
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1")
             self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
@@ -150,7 +149,7 @@ class WideEPMoE(MoE):
                                             hidden_size, self.num_slots)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
@@ -206,9 +205,14 @@ class WideEPMoE(MoE):
             num_rdma_nodes = num_ranks // mpi_size
             return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
 
-        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
-        if all2all_method_type is not None:
-            return AlltoallMethodType[all2all_method_type]
+        all2all_method_type_env = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if all2all_method_type_env is not None:
+            alltoall_method_type = AlltoallMethodType[all2all_method_type_env]
+            if alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                raise NotImplementedError(
+                    "NVLinkOneSided is not supported for WideEPMoE. Please use NVLinkTwoSided or switch to CutlassFusedMoE."
+                )
+            return alltoall_method_type
 
         if not mapping.enable_attention_dp:
             return AlltoallMethodType.NotEnabled
@@ -216,14 +220,11 @@ class WideEPMoE(MoE):
         if mapping.tp_size == 1:
             return AlltoallMethodType.NotEnabled
 
-        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return AlltoallMethodType.NotEnabled
-
         if mapping.moe_ep_size <= top_k:
             return AlltoallMethodType.NotEnabled
 
         if MnnvlMemory.supports_mnnvl():
-            return AlltoallMethodType.MNNVL
+            return AlltoallMethodType.NVLinkTwoSided
 
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
@@ -246,19 +247,13 @@ class WideEPMoE(MoE):
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
-    @cached_property
-    def moe_alltoall_backend(self):
-        # "NVLINK_TWO_SIDED" (default) or "NVLINK_ONE_SIDED"
-        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "NVLINK_TWO_SIDED").strip().upper()
-
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens -
                 1) // self.moe_max_num_tokens
 
     def can_use_alltoall(self, all_rank_num_tokens, all_rank_max_num_tokens):
-        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
             return True
 
         # Disable alltoall when chunking is used
@@ -377,7 +372,7 @@ class WideEPMoE(MoE):
     def is_post_quant_all2all_supported(self):
         if not self.use_postquant_alltoall:
             return False
-        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
             return True
         elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
             return self.has_nvfp4
@@ -407,7 +402,7 @@ class WideEPMoE(MoE):
 
         self._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.MNNVL:
+        if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.NVLinkTwoSided:
             alltoall_result_do_sum = True
 
         weight_dtype = self.w3_w1_weight.dtype
@@ -436,7 +431,7 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
+            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
             self._load_balancer_update_statistic(token_selected_experts,
                                                  is_first_call, is_last_call,
                                                  ignore_allreduce)
@@ -470,7 +465,7 @@ class WideEPMoE(MoE):
             tuner_top_k = None
         alltoall_info = None
         if use_all_to_all:
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
                 token_count = x.shape[0]
@@ -561,14 +556,14 @@ class WideEPMoE(MoE):
         w2_weight = self.w2_weight
         quant_scales = self.quant_scales
 
-        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
             top_k = self.routing_method.experts_per_token
             x, x_sf, token_selected_slots, token_final_scales = self.alltoall_dispatch(
                 x, x_sf, token_selected_slots, token_final_scales,
                 all_rank_max_num_tokens, top_k, alltoall_info)
 
         if use_postquant_alltoall:
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 pass
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 assert self.has_nvfp4, "DeepEP postquant alltoall should have nvfp4"
@@ -629,7 +624,7 @@ class WideEPMoE(MoE):
                     x, x_sf, recv_expert_count, token_final_scales.dtype)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         final_hidden_states = self.moe_op_impl.run_moe(
@@ -659,7 +654,7 @@ class WideEPMoE(MoE):
         final_hidden_states = final_hidden_states[0]
 
         if use_all_to_all:
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
@@ -692,7 +687,7 @@ class WideEPMoE(MoE):
                         deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         self._load_balancer_done_set_cpu_stage(is_last_call)

@@ -26,12 +26,14 @@ class MoEWeightLoadingMode(Enum):
 class AlltoallMethodType(IntEnum):
     # Not available
     NotEnabled = 0
-    # MNNVL
-    MNNVL = 1
+    # NVLink One-Sided
+    NVLinkOneSided = 1
+    # NVLink Two-Sided
+    NVLinkTwoSided = 2
     # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 2
+    DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 3
+    DeepEPLowLatency = 4
 
 
 def extract_extra_attrs(layer_idx: str):

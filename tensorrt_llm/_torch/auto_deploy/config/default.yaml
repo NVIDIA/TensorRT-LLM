@@ -152,6 +152,9 @@ transforms:
   insert_cached_causal_conv:
     stage: cache_init
     backend: cuda_causal_conv
+  insert_cached_delta_rule:
+    stage: cache_init
+    backend: fla_delta
   initialize_cache:
     stage: cache_init
     run_per_gm: false

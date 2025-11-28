@@ -74,7 +74,7 @@ def torch_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
     input = input.to(torch.float32)
     variance = input.pow(2).mean(-1, keepdim=True)
     input = input * torch.rsqrt(variance + eps)
-    return weight * input.to(input_dtype)
+    return (weight * input.to(input_dtype)).contiguous()
 
 
 @torch_rmsnorm.register_fake
