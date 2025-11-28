@@ -63,6 +63,7 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
+      max_tokens_in_buffer: 2048
       backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
@@ -84,4 +85,5 @@ worker_config:
       free_gpu_memory_fraction: 0.7
       dtype: fp8
     cache_transceiver_config:
+      max_tokens_in_buffer: 2048
       backend: NIXL
