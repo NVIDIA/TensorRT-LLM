@@ -7,7 +7,7 @@ server_configs:
     pipeline_parallel_size: 1
     max_batch_size: 512
     max_num_tokens: 8192
-    attention_backend: "TRTLLM"
+    attn_backend: "TRTLLM"
     enable_attention_dp: true
     attention_dp_config:
       batching_wait_iters: 0
@@ -42,7 +42,7 @@ server_configs:
     pipeline_parallel_size: 1
     max_batch_size: 64
     max_num_tokens: 8192
-    attention_backend: "TRTLLM"
+    attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
       backend: 'DEEPGEMM'
@@ -73,7 +73,7 @@ server_configs:
     pipeline_parallel_size: 1
     max_batch_size: 8
     max_num_tokens: 8192
-    attention_backend: "TRTLLM"
+    attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
       backend: 'TRTLLM'
@@ -104,7 +104,7 @@ server_configs:
     pipeline_parallel_size: 1
     max_batch_size: 512
     max_num_tokens: 8192
-    attention_backend: "TRTLLM"
+    attn_backend: "TRTLLM"
     enable_attention_dp: true
     attention_dp_config:
       batching_wait_iters: 0
@@ -139,7 +139,7 @@ server_configs:
     pipeline_parallel_size: 1
     max_batch_size: 32
     max_num_tokens: 8192
-    attention_backend: "TRTLLM"
+    attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
       backend: 'TRTLLM'
@@ -170,7 +170,7 @@ server_configs:
     pipeline_parallel_size: 1
     max_batch_size: 4
     max_num_tokens: 8192
-    attention_backend: "TRTLLM"
+    attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
       backend: 'TRTLLM'
