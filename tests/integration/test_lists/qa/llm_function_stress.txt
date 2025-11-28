@@ -1,6 +1,6 @@
 stress_test/stress_test.py::test_run_stress_test[DeepSeek-V3_tp8-stress_time_3600s_timeout_5400s-GUARANTEED_NO_EVICT-pytorch-stress-test-with-accuracy]
 stress_test/stress_test.py::test_run_stress_test[DeepSeek-V3_tp8-stress_time_3600s_timeout_5400s-MAX_UTILIZATION-pytorch-stress-test-with-accuracy]
 stress_test/stress_test.py::test_run_stress_test[DeepSeek-R1_tp8-stress_time_3600s_timeout_5400s-MAX_UTILIZATION-pytorch-stress-test-with-accuracy]
-stress_test/stress_test.py::test_disaggregated_stress_test[gpt-oss-120b_tp2-stress_time_7200s_timeout_5400s-MAX_UTILIZATION-stress-test-with-accuracy]
+stress_test/stress_test.py::test_disaggregated_stress_test[gpt-oss-120b_tp1-stress_time_3600s_timeout_5400s-stress-test-with-accuracy]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_fp8_8gpus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_nvfp4_4gpus

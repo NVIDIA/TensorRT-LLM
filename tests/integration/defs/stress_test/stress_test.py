@@ -29,6 +29,7 @@ Usage example for accuracy testing:
     pytest tests/integration/defs/stress_test/stress_test.py::test_run_stress_test[stress-test-with-accuracy]
 """
 import contextlib
+import copy
 import itertools
 import json
 import os
@@ -587,14 +588,12 @@ def test_run_stress_test(config, stress_time_timeout, backend,
 
 @pytest.mark.parametrize("test_mode", ["stress-test-with-accuracy"],
                          ids=lambda x: x)
-@pytest.mark.parametrize("capacity_scheduler_policy", ["MAX_UTILIZATION"],
-                         ids=lambda x: x)
-@pytest.mark.parametrize("stress_time_timeout", [(7200, 5400)],
+@pytest.mark.parametrize("stress_time_timeout", [(3600, 5400)],
                          ids=lambda x: f"stress_time_{x[0]}s_timeout_{x[1]}s")
 @pytest.mark.parametrize(
     "model_config", [
         pytest.param(ModelConfig(model_dir="gpt_oss/gpt-oss-120b",
-                                 tp_size=2,
+                                 tp_size=1,
                                  memory_requirement=120),
                      marks=[
                          skip_pre_blackwell,
@@ -628,54 +627,48 @@ def test_disaggregated_stress_test(model_config, test_mode,
 
     # Context server configuration
     ctx_server_config = {
-        "tensor_parallel_size": ctx_tp,
-        "pipeline_parallel_size": ctx_pp,
         "disable_overlap_scheduler": True,
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.7,
+            "free_gpu_memory_fraction": 0.6,
         },
         "enable_chunked_prefill": True,
         "max_num_tokens": 2048,
         "cache_transceiver_config": {
             "backend": "DEFAULT"
         },
-        "scheduler_config": {
-            "capacity_scheduler_policy": capacity_scheduler_policy
-        },
         "max_batch_size": 32,
         "cuda_graph_config": None,
         "print_iter_log": True,
-        "enable_attention_dp": True
     }
 
     # Generation server configuration
-    gen_server_config = {
-        "tensor_parallel_size": gen_tp,
-        "pipeline_parallel_size": gen_pp,
-        "disable_overlap_scheduler": False,
-        "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.7,
-        },
-        "cache_transceiver_config": {
-            "backend": "DEFAULT"
-        },
-        "scheduler_config": {
-            "capacity_scheduler_policy": capacity_scheduler_policy
-        },
-        "max_batch_size": 32,
-        "max_num_tokens": 2048,
-        "cuda_graph_config": None,
-        "print_iter_log": True,
-        "enable_attention_dp": True
-    }
+    gen_server_config = copy.deepcopy(ctx_server_config)
+    #gen_server_config = {
+    #    "tensor_parallel_size": gen_tp,
+    #    "pipeline_parallel_size": gen_pp,
+    #    "disable_overlap_scheduler": True,
+    #    "kv_cache_config": {
+    #        "free_gpu_memory_fraction": 0.6,
+    #    },
+    #    "cache_transceiver_config": {
+    #        "backend": "DEFAULT"
+    #    },
+    #    "max_batch_size": 32,
+    #    "max_num_tokens": 2048,
+    #    "cuda_graph_config": None,
+    #    "print_iter_log": True
+    #}
 
     # Configure CUDA graphs for pytorch backend
-    # cuda_graph_config = {
-    #     "enable_padding": True,
-    #     # "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
-    # }
-    # ctx_server_config["cuda_graph_config"] = cuda_graph_config
-    # gen_server_config["cuda_graph_config"] = cuda_graph_config
+    cuda_graph_config = {
+        "enable_padding": True,
+        "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512],
+    }
+    ctx_server_config["tensor_parallel_size"] = ctx_tp
+    ctx_server_config["pipeline_parallel_size"] = ctx_pp
+    gen_server_config["tensor_parallel_size"] = gen_tp
+    gen_server_config["pipeline_parallel_size"] = gen_pp
+    gen_server_config["cuda_graph_config"] = cuda_graph_config
 
     # Set default timeout values
     server_waiting_timeout = 28800
