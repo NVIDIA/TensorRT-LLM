@@ -1055,7 +1055,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         ctx_server_config["kv_cache_config"] = {
-            "enable_block_reuse": False,
             "free_gpu_memory_fraction": 0.7,
             "tokens_per_block": 64,
             "dtype": "fp8"
@@ -1072,7 +1071,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
         ctx_server_config["enable_attention_dp"] = True
         ctx_server_config["enable_autotuner"] = False
         gen_server_config["kv_cache_config"] = {
-            "enable_block_reuse": False,
             "tokens_per_block": 64,
             "free_gpu_memory_fraction": 0.7,
             "dtype": "fp8"
