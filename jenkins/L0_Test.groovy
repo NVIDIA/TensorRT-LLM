@@ -1946,19 +1946,41 @@ def generateRerunReport(stageName, llmSrc) {
     def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
     def regularRerunDir = "${rerunBaseDir}/regular"
 
-    // Check if regular rerun directory exists
-    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+    // Check if regular rerun directory has rerun_results_*.xml files
+    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && find '${regularRerunDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
 
-    // Find all isolated rerun directories (isolated_0, isolated_1, etc.)
-    def isolatedRerunDirs = []
-    def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
-    if (isolatedDirsOutput) {
-        isolatedRerunDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+    // Check if any isolated rerun directories have rerun_results_*.xml files
+    def hasIsolatedReruns = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' -exec find {} -name 'rerun_results_*.xml' \\; 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+    // Find isolated tests that have actual rerun results and build mapping
+    def isolatedTestsWithReruns = []
+    if (hasIsolatedReruns) {
+        def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
+        if (isolatedDirsOutput) {
+            def isolatedDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+            isolatedDirs.each { isolatedDir ->
+                // Extract the isolated number from directory name (e.g., isolated_0 -> 0)
+                def isolatedNum = isolatedDir.split('/').last().replace('isolated_', '')
+
+                // Check if this isolated directory has any rerun results
+                def hasRerunResults = sh(script: "find '${isolatedDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+                if (hasRerunResults) {
+                    isolatedTestsWithReruns.add([
+                        dir: isolatedDir,
+                        num: isolatedNum,
+                        originalResult: "${WORKSPACE}/${stageName}/results_isolated_${isolatedNum}.xml"
+                    ])
+                }
+            }
+        }
     }
-    def hasIsolatedReruns = isolatedRerunDirs.size() > 0
+
+    // Collect rerun result files and corresponding original result files
+    def rerunResultFiles = []
 
     echo "Found regular reruns: ${hasRegularReruns}"
-    echo "Found isolated rerun directories: ${isolatedRerunDirs}"
+    echo "Found isolated tests with reruns: ${isolatedTestsWithReruns.collect { "isolated_${it.num}" }}"
 
     if (!hasRegularReruns && !hasIsolatedReruns) {
         echo "No rerun results found, skipping rerun report generation"
@@ -1974,14 +1996,32 @@ def generateRerunReport(stageName, llmSrc) {
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
+        // Add to rerunResultFiles only if it has reruns
+        if (hasRegularReruns) {
+            rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
+        }
     }
 
-    // Add isolated test results
+    // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
         isolatedResults.split('\n').each { file ->
             if (file.trim()) {
                 allInputFiles.add(file.trim())
+            }
+        }
+        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
+        isolatedTestsWithReruns.each { isolatedTest ->
+            if (fileExists(isolatedTest.originalResult)) {
+                rerunResultFiles.add(isolatedTest.originalResult)
+                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+            }
+            for (times in [1, 2]) {
+                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
+                if (fileExists(rerunFile)) {
+                    allInputFiles.add(rerunFile)
+                    rerunResultFiles.add(rerunFile)
+                }
             }
         }
     }
@@ -1992,19 +2032,7 @@ def generateRerunReport(stageName, llmSrc) {
             def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
-            }
-        }
-    }
-
-    // Add isolated rerun results from all isolated directories
-    if (hasIsolatedReruns) {
-        isolatedRerunDirs.each { isolatedDir ->
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedDir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    echo "Added isolated rerun result: ${rerunFile}"
-                }
+                rerunResultFiles.add(rerunFile)
             }
         }
     }
@@ -2014,14 +2042,14 @@ def generateRerunReport(stageName, llmSrc) {
         return
     }
 
-    echo "Generating rerun report with input files: ${allInputFiles.join(',')}"
+    echo "Generating rerun report with input files: ${rerunResultFiles.join(',')}"
 
     // Generate comprehensive rerun report
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
-        --input-files=${allInputFiles.join(",")}
+        --input-files=${rerunResultFiles.join(",")}
     """
 
     // Update original results xml file with all rerun results for junit
