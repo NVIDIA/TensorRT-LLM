@@ -991,11 +991,20 @@ Used to defer possibly unnecessary host-tensor construction until update_request
 
 @dataclass(kw_only=True)
 class SamplingRequestsMetadata:
+    """Metadata for the sampling requests."""
+
     req_num_generated_tokens: torch.Tensor
+    """The number of generated tokens for each sampling request.
+    In beam search, this is uses the incoming beam width."""
     req_num_generated_tokens_output: torch.Tensor
+    """The number of generated tokens for each sampling request.
+    In beam search, this is uses the outgoing beam width."""
     req_num_beams: torch.Tensor
+    """The number of beams for each sampling request."""
     req_num_steps: torch.Tensor
+    """The number of generation steps for each sampling request."""
     req_offsets: torch.Tensor
+    """The start offsets of the sampling requests in the raw logits."""
 
 
 @dataclass(kw_only=True)
@@ -2992,6 +3001,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         *,
         num_context_logits_prefix_sum: list[int],
     ) -> tuple[list[LlmRequest], SamplingRequestsMetadata, torch.Tensor]:
+        """Select the sampling requests and the corresponding logits from the raw logits.
+
+        Args:
+            scheduled_requests: The scheduled requests. Sampling requests will be selected from this list.
+            raw_logits_cuda: The raw logits corresponding to the scheduled requests.
+            num_context_logits_prefix_sum: The prefix sum of the number of logits for each context request.
+
+        Returns:
+            A tuple containing the following:
+            - sampling requests: The requests that are selected for sampling.
+            - sampling requests metadata: The metadata for the sampling requests.
+            - logits: The logits for the sampling requests.
+        """
         assert len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
         finished_context_requests = []
         finished_context_req_offsets = []
