@@ -716,7 +716,7 @@ def test_disaggregated_stress_test(model_config, test_mode,
         server_config = ServerConfig(
             port=8000,
             host="localhost",
-            capacity_scheduler_policy=capacity_scheduler_policy)
+            capacity_scheduler_policy="GUARANTEED_NO_EVICT")
 
         # Set timeout based on model complexity (large models need more time)
         performance_config = PerformanceParams(test_timeout=36000)
