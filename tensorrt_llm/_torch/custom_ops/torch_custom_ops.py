@@ -44,6 +44,7 @@ class MoERunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
         tune_max_num_tokens=8192,
         inputs_pre_hook=inputs_pre_hook,
     )
