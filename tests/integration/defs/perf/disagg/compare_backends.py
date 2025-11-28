@@ -2,9 +2,9 @@
 """Compare performance test results between different backends (UCX vs NIXL)."""
 
 import argparse
+import os
 import re
 import sys
-import os
 
 import pandas as pd
 
