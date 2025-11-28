@@ -1525,13 +1525,13 @@ test = ["flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.11.28"
+version = "0.11.30"
 description = "Orbax Checkpoint"
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "orbax_checkpoint-0.11.28-py3-none-any.whl", hash = "sha256:094273495fca331da88ec845053a96a7f0152b0223c6b51b82a6c1b32f373c3b"},
-    {file = "orbax_checkpoint-0.11.28.tar.gz", hash = "sha256:a72075411c8aa4b48ddd9f2b247348bdfcf7b72f633b4d9c99541648089e90e9"},
+    {file = "orbax_checkpoint-0.11.30-py3-none-any.whl", hash = "sha256:56b15d07af7a4ff655f18d219de850d86944b1552e5143e81f5b15480f240a46"},
+    {file = "orbax_checkpoint-0.11.30.tar.gz", hash = "sha256:5395e9fc80b750ee3644ee19f969923c7e3c83369133da5ea256a86d9bb838a6"},
 ]
 
 [package.dependencies]
@@ -1547,12 +1547,12 @@ protobuf = "*"
 psutil = "*"
 pyyaml = "*"
 simplejson = ">=3.16.0"
-tensorstore = ">=0.1.71"
+tensorstore = ">=0.1.74"
 typing_extensions = "*"
 
 [package.extras]
-docs = ["aiofiles", "flax", "google-cloud-logging", "grain", "opencv-python", "safetensors", "tensorflow_datasets"]
-testing = ["aiofiles", "chex", "flax", "google-cloud-logging", "mock", "pytest", "pytest-xdist", "safetensors"]
+docs = ["aiofiles", "clu", "flax", "google-cloud-logging", "grain", "opencv-python", "safetensors", "tensorflow_datasets"]
+testing = ["aiofiles", "chex", "clu", "flax", "google-cloud-logging", "mock", "pytest", "pytest-xdist", "safetensors", "tensorflow", "torch"]
 
 [[package]]
 name = "packaging"
