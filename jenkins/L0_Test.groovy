@@ -129,13 +129,12 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             sh "mkdir -p ${stageName}"
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
-            def downloadTimeoutTestCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/"
-            def downloadTimeoutTestSucceed = sh(script: downloadTimeoutTestCmd, returnStatus: true) == 0
+            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
                 sh "ls ${stageName}"
                 def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
-                    sh "echo '${timeoutTestXml}' > ${stageName}/results-timeout.xml"
+                    writeFile file: "${stageName}/results-timeout.xml", text: timeoutTestXml
                     hasTimeoutTest = true
                 }
             }
@@ -1279,7 +1278,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed) {
                 def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
-                    sh "echo '${timeoutTestXml}' > ${stageName}/results-timeout.xml"
+                    writeFile file: "${stageName}/results-timeout.xml", text: timeoutTestXml
                 }
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
@@ -1642,6 +1641,10 @@ def launchTestListCheck(pipeline)
 }
 
 def generateTimeoutTestResultXml(stageName, testFilePath) {
+    if (!fileExists("${stageName}/${testFilePath}")) {
+        echo "No ${testFilePath} found in ${stageName}, skipping timeout XML generation"
+        return null
+    }
     String timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
     echo "timeoutTests: ${timeoutTests}"
 
