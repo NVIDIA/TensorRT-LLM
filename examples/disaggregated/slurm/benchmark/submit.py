@@ -130,8 +130,10 @@ def submit_job(config, log_dir):
 
     # Remove existing directory if it exists
     if os.path.exists(log_dir):
+        print(f"[WARNING] Removing existing log directory: {log_dir}")
         shutil.rmtree(log_dir)
     os.makedirs(log_dir)
+    print(f"Log will be saved to: {log_dir}")
 
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
@@ -236,11 +238,11 @@ def main():
 
     # Process each config file
     for config_file in config_files:
-        print(f"\nProcessing: {config_file}")
+        print(f"Processing: {config_file}")
         try:
             config = load_config(config_file)
             submit_job(config, args.log_dir)
-            print(f"Successfully submitted job for: {config_file}")
+            print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
             print(f"Error processing {config_file}: {e}", file=sys.stderr)
             # Continue processing other files even if one fails
