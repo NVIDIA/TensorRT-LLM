@@ -40,6 +40,7 @@ def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
             env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
         case KVCacheType.MOONCAKE:
             env["TRTLLM_USE_MOONCAKE_KVCACHE"] = "1"
+            env["MC_FORCE_TCP"] = "1"
         case KVCacheType.NONE:
             pass
         case _:
