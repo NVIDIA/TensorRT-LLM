@@ -405,8 +405,8 @@ class MPIDist(Distributed):
     def pp_allgather(self, obj):
         return self.pp_comm.allgather(obj)
 
-    def pp_gather(self, obj):
-        return self.pp_comm.gather(obj)
+    def pp_gather(self, obj, root=0):
+        return self.pp_comm.gather(obj, root=root)
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
@@ -766,8 +766,7 @@ class TorchDist(Distributed):
             return ret[0]
 
 
-# TODO: rename to PPCommNCCL
-class PPComm:
+class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
@@ -820,7 +819,7 @@ def init_pp_comm(mapping):
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
     else:
-        _pp_comm = PPComm(mapping)
+        _pp_comm = PPCommNCCL(mapping)
 
 
 @TorchDist.log_op

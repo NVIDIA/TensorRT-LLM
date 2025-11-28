@@ -18,11 +18,10 @@ from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
-from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, logger_debug,
+from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue, logger_debug,
                             print_traceback_on_error)
 from ..sampling_params import BatchedLogitsProcessor
-from .base_worker import BaseWorker
+from .base_worker import BaseWorker, _init_hf_modules
 from .executor import IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
@@ -243,16 +242,11 @@ def worker_main(
     llm_args: Optional[BaseLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
-    logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
-    pid = os.getpid()
-    cpus = os.sched_getaffinity(pid)
-    if cpus:
-        logger.warning(
-            f"Found worker process {pid} was bound to {cpus}, this may harm "
-            "performance.", )
-        logger.warning(f"Will clear the cpu affinity")
-        clear_sched_affinity(pid)
+    if llm_args is not None and llm_args.trust_remote_code:
+        _init_hf_modules()
+
+    logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None

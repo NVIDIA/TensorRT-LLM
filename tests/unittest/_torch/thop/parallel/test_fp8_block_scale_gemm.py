@@ -22,6 +22,7 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0)
 from utils.util import getSMVersion, isSM100Family
 
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import autotune
 
 
@@ -86,8 +87,18 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
 
-    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
-    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+    if getSMVersion() == 120:
+        act_a_fp8, act_a_sf = fp8_utils.per_token_quant_and_transform(a)
+        act_b_fp8, act_b_sf = fp8_utils.per_block_cast_to_fp8_e8m0(b)
+        act_b_sf = fp8_utils.transform_sf_into_required_layout(
+            act_b_sf,
+            mn=act_b_fp8.shape[0],
+            k=act_b_fp8.shape[1],
+            recipe=(1, 128, 128),
+            is_sfa=False)
+    else:
+        act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+        act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
 
     output_expected = a @ b.t()
 

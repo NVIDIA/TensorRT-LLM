@@ -13,7 +13,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (fp4_scale_infer_shape,
+from ..utils import (ActivationType, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -52,6 +52,7 @@ class MoERunner(TunableRunner):
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
         use_fused_finalize: bool,
+        activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
     ):
         self.x_dtype = x_dtype
@@ -72,6 +73,7 @@ class MoERunner(TunableRunner):
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
+        self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
@@ -117,6 +119,7 @@ class MoERunner(TunableRunner):
             gemm_idx,
             tactic,
             do_preparation,
+            self.activation_type,
             self.unpadded_hidden_size,
         )
 
@@ -153,12 +156,12 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
+    activation_type: int = int(ActivationType.Swiglu),
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
     if enable_alltoall:
@@ -189,6 +192,7 @@ def fused_moe(
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         use_fused_finalize=use_fused_finalize,
+        activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
     )
 
@@ -223,8 +227,8 @@ def fused_moe(
                      swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
                      tp_size, tp_rank, ep_size, ep_rank, cluster_size,
                      cluster_rank, enable_alltoall, min_latency_mode,
-                     [gemm_tactic_1, gemm_tactic_2], unpadded_hidden_size,
-                     tuner_num_tokens, out_tensor)
+                     [gemm_tactic_1, gemm_tactic_2], activation_type,
+                     unpadded_hidden_size, tuner_num_tokens, out_tensor)
 
     return output if min_latency_mode else [output]
 
@@ -260,6 +264,7 @@ def _(input: torch.Tensor,
       tune_max_num_tokens: int = 8192,
       tuner_num_tokens: Optional[int] = None,
       tuner_top_k: Optional[int] = None,
+      activation_type: ActivationType = ActivationType.Swiglu,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]

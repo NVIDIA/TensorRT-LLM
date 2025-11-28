@@ -49,6 +49,7 @@ class MappingBase:
             cp_config=None,
             tp_size=1,
             pp_size=1,
+            pp_partition=None,
             moe_cluster_size=-1,  # -1 means no moe
             moe_tp_size=-1,  # -1 means no moe
             moe_ep_size=-1,  # -1 means no moe
@@ -126,6 +127,7 @@ class MappingBase:
         self.cp_size = cp_size
         self.cp_config = cp_config if cp_config is not None else {}
         self.pp_size = pp_size
+        self.pp_partition = pp_partition
         self.moe_tp_size = moe_tp_size
         self.moe_ep_size = moe_ep_size
         self.moe_cluster_size = moe_cluster_size
@@ -156,6 +158,7 @@ class MappingBase:
                 and self.tp_size == other.tp_size
                 and self.moe_cluster_size == other.moe_cluster_size
                 and self.pp_size == other.pp_size
+                and self.pp_partition == other.pp_partition
                 and self.moe_tp_size == other.moe_tp_size
                 and self.moe_ep_size == other.moe_ep_size
                 and self.attn_tp_size == other.attn_tp_size
@@ -177,6 +180,7 @@ class MappingBase:
             self.attn_cp_size,
             # note: we do not allow updating cp_config after initialization
             tuple(sorted(self.cp_config.items())),
+            tuple(self.pp_partition) if self.pp_partition is not None else (),
         ))
 
     @property
@@ -299,9 +303,20 @@ class MappingBase:
         return self.moe_ep_size > 1
 
     def pp_layers(self, num_layers: int) -> List[int]:
-        # If num_layers % pp_size = n != 0, first n ranks get one extra layer
-        return torch.tensor_split(torch.arange(num_layers),
-                                  self.pp_size)[self.pp_rank].tolist()
+        if self.pp_partition is not None:
+            if len(self.pp_partition) != self.pp_size:
+                raise ValueError(
+                    f"{len(self.pp_partition)=} does not match {self.pp_size=}."
+                )
+            if sum(self.pp_partition) != num_layers:
+                raise ValueError(
+                    f"{sum(self.pp_partition)=} does not match {num_layers=}.")
+            return torch.arange(num_layers).split(
+                self.pp_partition)[self.pp_rank].tolist()
+        else:
+            # If num_layers % pp_size = n != 0, first n ranks get one extra layer
+            return torch.tensor_split(torch.arange(num_layers),
+                                      self.pp_size)[self.pp_rank].tolist()
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
@@ -446,6 +461,7 @@ class Mapping(MappingBase):
             cp_config=None,
             tp_size=1,
             pp_size=1,
+            pp_partition=None,
             moe_cluster_size=-1,  # -1 means no moe
             moe_tp_size=-1,  # -1 means no moe
             moe_ep_size=-1,  # -1 means no moe
@@ -460,6 +476,7 @@ class Mapping(MappingBase):
                          cp_config=cp_config,
                          tp_size=tp_size,
                          pp_size=pp_size,
+                         pp_partition=pp_partition,
                          moe_cluster_size=moe_cluster_size,
                          moe_tp_size=moe_tp_size,
                          moe_ep_size=moe_ep_size,

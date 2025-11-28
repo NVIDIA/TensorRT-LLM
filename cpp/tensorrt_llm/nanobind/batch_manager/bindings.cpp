@@ -103,6 +103,7 @@ void initBindings(nb::module_& m)
         .def("get_last_tokens", nb::overload_cast<>(&GenLlmReq::getLastTokens))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, nb::arg("for_next_iteration") = false)
         .def_prop_ro("max_num_generated_tokens", &GenLlmReq::getMaxNumGeneratedTokens)
+        .def("will_complete_next_iteration", &GenLlmReq::willCompleteNextIteration)
         .def("add_new_token", &GenLlmReq::addNewToken, nb::arg("token"), nb::arg("beam"))
         .def("add_new_tokens", &GenLlmReq::addNewTokens, nb::arg("beam_tokens"))
         .def_prop_ro("num_draft_tokens", &GenLlmReq::getNumDraftTokens)
@@ -397,39 +398,6 @@ void initBindings(nb::module_& m)
         .def(nb::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
             nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"));
 
-    nb::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
-        .def(nb::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), nb::arg("max_batch_size"),
-            nb::arg("max_tokens_per_engine_step"), nb::arg("manager"))
-        .def_rw("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
-        .def_rw("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
-        .def_rw("fill_values", &tb::DecoderInputBuffers::fillValues)
-        .def_rw("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
-        .def_rw("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
-        .def_rw("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
-        .def_rw("logits", &tb::DecoderInputBuffers::logits)
-        .def_rw("decoder_requests", &tb::DecoderInputBuffers::decoderRequests);
-
-    nb::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
-        .def_rw("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)
-        .def_rw("finished_sum_host", &tb::DecoderOutputBuffers::finishedSumHost)
-        .def_prop_ro("new_output_tokens_host",
-            [](tb::DecoderOutputBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_rw("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
-        .def_rw("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
-        .def_rw("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
-
-    nb::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
-        .def(nb::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),
-            nb::arg("max_beam_width"), nb::arg("max_seq_len"), nb::arg("buffer_manager"))
-        .def_rw("output_ids", &tb::SlotDecoderBuffers::outputIds)
-        .def_rw("output_ids_host", &tb::SlotDecoderBuffers::outputIdsHost)
-        .def_rw("sequence_lengths_host", &tb::SlotDecoderBuffers::sequenceLengthsHost)
-        .def_rw("cum_log_probs", &tb::SlotDecoderBuffers::cumLogProbs)
-        .def_rw("cum_log_probs_host", &tb::SlotDecoderBuffers::cumLogProbsHost)
-        .def_rw("log_probs", &tb::SlotDecoderBuffers::logProbs)
-        .def_rw("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
-        .def_rw("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
     m.def(
         "add_new_tokens_to_requests",
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,
@@ -448,10 +416,10 @@ void initBindings(nb::module_& m)
 
     m.def(
         "make_decoding_batch_input",
-        [](std::vector<std::shared_ptr<tb::LlmRequest>>& contextRequests,
-            std::vector<std::shared_ptr<tb::LlmRequest>>& genRequests, tr::ITensor::SharedPtr logits, int beamWidth,
-            std::vector<int> const& numContextLogitsPrefixSum, tb::DecoderInputBuffers const& decoderInputBuffers,
-            runtime::decoder::DecoderState& decoderState, tr::BufferManager const& manager)
+        [](tb::DecoderInputBuffers& decoderInputBuffers, runtime::decoder::DecoderState& decoderState,
+            std::vector<std::shared_ptr<tb::LlmRequest>> const& contextRequests,
+            std::vector<std::shared_ptr<tb::LlmRequest>> const& genRequests, tr::ITensor::SharedPtr const& logits,
+            int beamWidth, std::vector<int> const& numContextLogitsPrefixSum, tr::BufferManager const& manager)
         {
             std::vector<int> activeSlots;
             std::vector<int> generationSteps;
@@ -509,8 +477,7 @@ void initBindings(nb::module_& m)
                 batchSlotsRange[i] = activeSlots[i];
             }
 
-            auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, 1);
-            decodingInput->batchSlots = batchSlots;
+            decoderInputBuffers.batchLogits = logitsVec;
 
             auto const maxBeamWidth = decoderState.getMaxBeamWidth();
             if (maxBeamWidth > 1)
@@ -518,12 +485,10 @@ void initBindings(nb::module_& m)
                 // For Variable-Beam-Width-Search
                 decoderState.getJointDecodingInput().generationSteps = generationSteps;
             }
-
-            return decodingInput;
         },
-        nb::arg("context_requests"), nb::arg("generation_requests"), nb::arg("logits"), nb::arg("beam_width"),
-        nb::arg("num_context_logits_prefix_sum"), nb::arg("decoder_input_buffers"), nb::arg("decoder_state"),
-        nb::arg("buffer_manager"), "Make decoding batch input.");
+        nb::arg("decoder_input_buffers"), nb::arg("decoder_state"), nb::arg("context_requests"),
+        nb::arg("generation_requests"), nb::arg("logits"), nb::arg("beam_width"),
+        nb::arg("num_context_logits_prefix_sum"), nb::arg("buffer_manager"), "Make decoding batch input.");
 }
 
 } // namespace tensorrt_llm::nanobind::batch_manager

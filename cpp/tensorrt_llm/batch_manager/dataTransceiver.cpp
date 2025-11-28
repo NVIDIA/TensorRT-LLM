@@ -834,12 +834,14 @@ public:
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-        std::optional<size_t> cacheBufferId = std::nullopt;
+        std::vector<std::optional<size_t>> cacheBufferIds;
         if (agentConnectionManager)
         {
-            cacheBufferId = agentConnectionManager->getCacheTransBufferManager()->assignBufferIndexForRecv();
-            TLLM_CHECK(cacheBufferId.has_value());
-            // memory Desp , validSegmentIdx send
+            for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
+            {
+                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
+            }
+            TLLM_CHECK(!cacheBufferIds.empty());
         }
         auto counterParts = mFormatter->getCounterparts(
             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
@@ -864,9 +866,9 @@ public:
                 auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
-                TLLM_CHECK(cacheBufferId.has_value());
+                TLLM_CHECK(!cacheBufferIds.empty());
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, validConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferIds, validConnectionIdx);
             }
             else
             {

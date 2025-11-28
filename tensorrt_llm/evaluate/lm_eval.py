@@ -219,7 +219,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             else:
                 text = text.replace(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER, "")
 
-            conv = ConversationMessage(role="user", content=text)
+            conv = ConversationMessage(role=content.get("role", "user"),
+                                       content=text)
             mm_data_tracker = MultimodalDataTracker(self.model_type)
 
             # NOTE: Since we already have loaded images, for the placeholder purpose, we add data here.

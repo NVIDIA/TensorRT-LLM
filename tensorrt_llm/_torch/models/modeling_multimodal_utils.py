@@ -17,7 +17,7 @@
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -291,7 +291,7 @@ def fuse_input_embeds(
     text_token_indices: Optional[torch.IntTensor] = None,
     mm_token_indices: Optional[torch.IntTensor] = None,
     **kwargs,
-) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
+) -> Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor]]:
     """
     Fuse text and multimodal embeddings. input_ids is [text_total_length + mm_total_length] and mm_embed is [mm_total_length, hidden_dim]. We just need to fuse them into [text_total_length + mm_total_length, hidden_dim] by slice-and-assign to the corresponding entries.
 
@@ -337,7 +337,7 @@ def fuse_input_embeds(
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
 
-    return None, input_embeds
+    return None, cast(torch.FloatTensor, input_embeds)
 
 
 #region VILA utils

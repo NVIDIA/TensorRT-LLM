@@ -73,7 +73,8 @@ public:
         BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
 
-        auto poolNum = cacheManager.getNumPools();
+        auto poolNum = cacheManager.getBlockManager().getNumPools(
+            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         TLLM_CHECK_WITH_INFO(poolNum == 1, "Reuse tree is not supported for multiple pools or variable window size");
 
         auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
@@ -136,13 +137,21 @@ public:
         return blockHashesPerWindow;
     }
 
-    BlockRangeForWindow getBlockRangeForWindow(SizeType32 windowSize) const
+    BlockRangeForWindow getBlockRangeForWindow(SizeType32 windowSize, bool useIndexerKCache = false) const
     {
         TLLM_CHECK_WITH_INFO(
             mPoolsPerWindow.find(windowSize) != mPoolsPerWindow.end(), "Window size %d not found", windowSize);
         auto pool = mPoolsPerWindow.at(windowSize).front();
         auto blockIds = mBlockIdsPerWindow.at(windowSize);
-        return BlockRangeForWindow(mManager, windowSize, std::move(blockIds), std::move(pool));
+        if (useIndexerKCache)
+        {
+            TLLM_CHECK(mIndexerKCachePool);
+            return BlockRangeForWindow(mManager, windowSize, std::move(blockIds), mIndexerKCachePool);
+        }
+        else
+        {
+            return BlockRangeForWindow(mManager, windowSize, std::move(blockIds), std::move(pool));
+        }
     }
 
     std::vector<SizeType32> getWindowSizes() const
@@ -167,9 +176,8 @@ private:
         , mRequestId(requestId)
         , mBlockIdsPerWindow(std::move(blockIdsPerWindow))
     {
-
-        // cacheManager.getBlockManager.getPrimaryPool(0);
-        auto poolNum = mManager->getNumPools();
+        auto poolNum = mManager->getBlockManager().getNumPools(
+            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         for (SizeType32 poolIdx = 0; poolIdx < poolNum; ++poolIdx)
         {
             auto windowSize = cacheManager.getBlockManager().getPoolWindowSize(poolIdx);
@@ -181,13 +189,18 @@ private:
         : mManager(&cacheManager)
         , mRequestId(requestId)
     {
-        auto poolNum = mManager->getNumPools();
+        auto poolNum = mManager->getBlockManager().getNumPools(
+            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         for (SizeType32 poolIdx = 0; poolIdx < poolNum; ++poolIdx)
         {
             auto windowSize = cacheManager.getBlockManager().getPoolWindowSize(poolIdx);
             mPoolsPerWindow[windowSize].push_back(cacheManager.getBlockManager().getPrimaryPool(poolIdx));
             mBlockIdsPerWindow[windowSize]
                 = cacheManager.getSequence(mRequestId).getCacheBlockIds(windowSize).at(kFIRST_AND_ONLY_BEAM);
+        }
+        if (cacheManager.isEnableIndexerKCache())
+        {
+            mIndexerKCachePool = cacheManager.getIndexerKCachePool();
         }
     }
 
@@ -196,6 +209,7 @@ private:
     LlmRequest::RequestIdType const mRequestId;
     std::unordered_map<SizeType32, std::vector<SizeType32>> mBlockIdsPerWindow;
     std::unordered_map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> mPoolsPerWindow;
+    runtime::ITensor::SharedPtr mIndexerKCachePool;
 
     static constexpr SizeType32 kFIRST_AND_ONLY_BEAM = 0;
     static constexpr SizeType32 kFIRST_POOL_INDEX = 0;

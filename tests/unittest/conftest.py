@@ -25,6 +25,7 @@ import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
+from utils.cpp_paths import llm_root  # noqa: F401
 from utils.util import get_current_process_gpu_memory
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

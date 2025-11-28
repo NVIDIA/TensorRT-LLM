@@ -14,6 +14,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
@@ -53,6 +54,56 @@ class QwenAttention(Attention):
         )
 
 
+# TODO this is a workaround to support yarn on Qwen2.
+# We need refactor the codes to merge QwenYarnAttention and QwenAttention.
+class QwenYarnAttention(QKNormRoPEAttention):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen2Config],
+        layer_idx: Optional[int] = None,
+        fuse_qk_norm_rope: bool = True,
+    ):
+        config = model_config.pretrained_config
+
+        if getattr(config, "rope_scaling", None) is not None:
+            if "type" in config.rope_scaling:
+                pos_type = config.rope_scaling["type"]
+            elif "rope_type" in config.rope_scaling:
+                pos_type = config.rope_scaling["rope_type"]
+            else:
+                raise ValueError(
+                    "rope_scaling must have type or rope_type field")
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.from_string(pos_type),
+                rope=RopeParams.from_config(config),
+            )
+        else:
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            )
+
+        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
+        # and https://nvbugspro.nvidia.com/bug/5505402)
+        disable_deep_gemm = True
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=True,
+            pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=fuse_qk_norm_rope,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=False,
+            config=model_config,
+            disable_deep_gemm=disable_deep_gemm,
+            is_qk_norm=False,
+        )
+
+
 class QwenDecoderLayer(DecoderLayer):
 
     def __init__(
@@ -63,10 +114,18 @@ class QwenDecoderLayer(DecoderLayer):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
-        self.self_attn = QwenAttention(
-            model_config,
-            layer_idx=layer_idx,
-        )
+
+        if getattr(config, "rope_scaling", None) is not None and getattr(
+                config.rope_scaling, "rope_type", None) == "yarn":
+            self.self_attn = QwenYarnAttention(
+                model_config,
+                layer_idx=layer_idx,
+            )
+        else:
+            self.self_attn = QwenAttention(
+                model_config,
+                layer_idx=layer_idx,
+            )
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,

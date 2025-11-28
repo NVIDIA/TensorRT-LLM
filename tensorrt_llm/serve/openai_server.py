@@ -34,7 +34,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.serve.chat_utils import (check_multiple_response,
+from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
@@ -82,13 +82,15 @@ class OpenAIServer:
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
                  disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-                 multimodal_server_config: Optional[MultimodalServerConfig] = None):
+                 multimodal_server_config: Optional[MultimodalServerConfig] = None,
+                 chat_template: Optional[str] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        self.chat_template = load_chat_template(chat_template)
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -484,7 +486,6 @@ class OpenAIServer:
             return chat_response
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -512,7 +513,7 @@ class OpenAIServer:
                     mm_placeholder_counts=mm_placeholder_counts,
                     tools=tool_dicts,
                     documents=request.documents,
-                    chat_template=request.chat_template,
+                    chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
             prompt = prompt_inputs(prompt)
@@ -595,7 +596,6 @@ class OpenAIServer:
             )
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -730,7 +730,6 @@ class OpenAIServer:
             yield "data: [DONE]\n\n"
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]

@@ -21,11 +21,9 @@ benchmark:
   benchmark_ratio: 0.8  # Benchmark ratio
   streaming: true  # Enable streaming mode
   concurrency_list: "1024"
-
-# Sequence Configuration
-sequence:
   input_length: 8196  # Input sequence length
   output_length: 1024  # Output sequence length
+  dataset_file: "<dataset_file>"
 
 # Environment Configuration
 environment:
@@ -34,12 +32,21 @@ environment:
   model_path: "<model_path>"
   trtllm_repo: "<trtllm_repo>"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
-  dataset_file: "<dataset_file>"
+  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "<full_path_to_work_dir>"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1"  # Environment variables for workers
+  server_env_var: ""  # Environment variables for server
 
 # Profiling Configuration
 profiling:
   nsys_on: false  # Set to true to enable profiling
+
+# Accuracy Configuration
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  model: "local-completions"  # Model type for lm_eval
+  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
+  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=False,timeout=1200,max_gen_toks=256,max_length=512"  # Extra model arguments for lm_eval
 
 # Worker Configuration
 worker_config:

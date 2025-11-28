@@ -185,10 +185,7 @@ llm_perf_core:
   #mixtral_8x7b_v0.1_fp8 pytorch backend
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:2]
-  #phi_3_mini_128k_instruct
-  #pytorch backend
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-pytorch-float16-maxbs:128-input_output_len:1000,1000-tp:2]
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-pytorch-float16-maxbs:128-input_output_len:500,2000-tp:2]
+
 
 - condition:
     terms:
@@ -277,15 +274,14 @@ llm_perf_core:
 
 - condition:
     ranges:
+      compute_capability:
+        gte: 9.0
+        lt: 12.0
       system_gpu_count:
         gte: 8
       gpu_memory:
         gt: 80000
-    wildcards:
-      gpu:
-      - '*h100*'
-      - '*h200*'
-      - '*h20*'
+
   tests:
   # E2E trtllm-bench
   #mixtral_8x7b_v0.1_instruct
@@ -312,7 +308,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:3000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-ep:8-tp:8-gpus:8]
-  #rcca case
+  # chunked attention case
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.6-input_output_len:20000,2000-reqs:1000-ep:8-tp:8-gpus:8]
 
   #llama_v4_scout_17b_16e_instruct_fp8
@@ -400,6 +396,8 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
   #deepseek_v3_lite
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:10000-con:3072-ep:8-tp:8-gpus:8] TIMEOUT(120) #max throughput test
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-input_output_len:128,128]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128]
   #mixtral_8x7b_v0.1
@@ -407,3 +405,18 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-kv_cache_dtype:fp8-tp:2-gpus:2]
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+    wildcards:
+      gpu:
+      - '*6000*'
+      linux_distribution_name: '*'
+  tests:
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:4-gpus:4]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:10000-con:3072-ep:8-tp:8-gpus:8] TIMEOUT(120) #max throughput test
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000-reqs:512-ep:8-tp:8-gpus:8]

@@ -1,242 +1,161 @@
 {
     "templates": {
-        "BatchedGemm": {
+        "BatchedGemmDefault": {
             "smVersion": "100f",
+            "mmaN": 8,
+            "tileN": 8,
+            "epilogueTileN": 8,
+            "numStages": 4,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
             "sliceK": false,
-            "transposeMmaOutput": true,
             "useTmaStore": true,
             "useCustomMmaSchedule": true,
-            "gridTriggerSecondaryA": false,
             "gridTriggerSecondaryB": true,
             "gridWaitForPrimaryA": false,
             "gridWaitForPrimaryB": true,
-            "useTwoTmaLoadWarps": true,
             "batch": "N",
             "numExperts": 128,
             "useCudaGraph": true,
             "clampLimit": 2,
+            "numTokens": 2,
+            "topK": 2,
             "useTmaOobOpt": true
         },
-        "BatchedGemmFp4": {
-            "_template": "BatchedGemm",
+        "BatchedGemmNonDsBase": {
+            "_template": "BatchedGemmDefault",
+            "tileM": 128,
+            "epilogueTileM": 128,
+            "numStagesMma": 1,
+            "transposeMmaOutput": true,
+            "useShuffledMatrixA": true,
+            "useDeepSeekFp8": false
+        },
+
+        "BatchedGemmFp4Base": {
+            "_template": "BatchedGemmNonDsBase",
             "dtypeA": "e2m1",
             "dtypeC": "e2m1",
             "mmaK": 64,
-            "numStages": 4,
-            "numStagesMma": 1,
-            "numSlicesForSplitK": 1,
-            "useDeepSeekFp8": false,
-            "useShuffledMatrixA": true
+            "tileK": 512,
+            "biasType": "m"
         },
         "BatchedGemmFp4LowLatency": {
-            "_template": "BatchedGemmFp4",
+            "_template": "BatchedGemmFp4Base",
             "mmaM": 128,
-            "mmaN": 8,
-            "tileM": 128,
-            "tileN": 8,
-            "tileK": 512,
-            "epilogueTileM": 128,
-            "epilogueTileN": 8,
             "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
             "sfLayoutB": "8x4",
             "sfLayoutC": "8x4"
         },
         "BatchedGemmFp4HighThroughput": {
-            "_template": "BatchedGemmFp4",
+            "_template": "BatchedGemmFp4Base",
             "mmaM": 256,
-            "mmaN": 64,
-            "tileM": 128,
-            "tileN": 64,
-            "tileK": 512,
-            "epilogueTileM": 128,
-            "epilogueTileN": 64,
             "clusterDimX": 2,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
             "sfLayoutB": "128x4",
-            "sfLayoutC": "128x4",
-            "numTokens": 2
+            "sfLayoutC": "128x4"
+        },
+
+        "BatchedGemmPerTensorScalingFp8Base": {
+            "_template": "BatchedGemmNonDsBase",
+            "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaK": 32,
+            "tileK": 512
         },
         "BatchedGemmPerTensorScalingFp8LowLatency": {
-            "_template": "BatchedGemm",
-            "dtypeA": "e4m3",
-            "dtypeC": "e4m3",
+            "_template": "BatchedGemmPerTensorScalingFp8Base",
             "mmaM": 128,
-            "mmaN": 8,
-            "mmaK": 32,
-            "tileM": 128,
-            "tileN": 8,
-            "tileK": 512,
-            "epilogueTileM": 128,
-            "epilogueTileN": 8,
-            "numStages": 3,
-            "numStagesMma": 1,
-            "numSlicesForSplitK": 1,
-            "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
-            "useShuffledMatrixA": true,
-            "useDeepSeekFp8": false
+            "clusterDimX": 1
         },
+        "BatchedGemmPerTensorScalingFp8HighThroughput": {
+            "_template": "BatchedGemmPerTensorScalingFp8Base",
+            "mmaM": 256,
+            "clusterDimX": 2
+        },
+
         "BatchedGemmDeepSeekFp8LowLatency": {
-            "_template": "BatchedGemm",
+            "_template": "BatchedGemmDefault",
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
-            "mmaM": 64,
-            "mmaN": 8,
             "mmaK": 32,
+            "mmaM": 64,
             "tileM": 128,
-            "tileN": 8,
             "tileK": 128,
             "epilogueTileM": 64,
-            "epilogueTileN": 8,
-            "numStages": 3,
-            "numSlicesForSplitK": 1,
             "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
+            "transposeMmaOutput": true,
             "useShuffledMatrixA": false,
             "useDeepSeekFp8": true,
             "numStagesMmaWithinWorkTile": 2,
             "hoistMmaTaskTryWaits": true,
             "numStagesMma": 4
         },
+
         "BatchedGemmMxE2m1E4m3LowLatency": {
-            "_template": "BatchedGemm",
+            "_template": "BatchedGemmNonDsBase",
+            "mmaM": 128,
+            "clusterDimX": 1,
             "dtypeA": "mxe2m1",
             "dtypeB": "e4m3",
             "dtypeC": "e4m3",
             "dtypeMmaB": "mxe4m3",
-            "mmaM": 128,
-            "mmaN": 8,
             "mmaK": 32,
-            "tileM": 128,
-            "tileN": 8,
             "tileK": 512,
-            "epilogueTileM": 128,
-            "epilogueTileN": 8,
-            "numStages": 3,
-            "numStagesMma": 1,
-            "numSlicesForSplitK": 1,
-            "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
-            "useShuffledMatrixA": true,
-            "useDeepSeekFp8": false,
             "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
             "biasType": "m",
-            "act": "swiglu",
-            "numTokens": 2
+            "act": "swiglu"
         },
-        "BatchedGemmMxE2m1MxE4m3": {
-            "_template": "BatchedGemm",
+
+        "BatchedGemmMxE2m1MxE4m3Base": {
+            "_template": "BatchedGemmNonDsBase",
             "dtypeA": "mxe2m1",
             "dtypeB": "mxe4m3",
             "dtypeC": "mxe4m3",
             "mmaK": 32,
-            "numStages": 3,
-            "numStagesMma": 1,
-            "numSlicesForSplitK": 1,
-            "useShuffledMatrixA": true,
-            "useDeepSeekFp8": false,
-            "biasType": "m",
-            "act": "swiglu",
-            "numTokens": 2
-        },
-        "BatchedGemmMxE2m1MxE4m3LowLatency": {
-            "_template": "BatchedGemmMxE2m1MxE4m3",
-            "mmaM": 128,
-            "mmaN": 8,
-            "tileM": 128,
-            "tileN": 8,
             "tileK": 512,
-            "epilogueTileM": 128,
-            "epilogueTileN": 8,
-            "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
             "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
-            "numRegsPerThreadNonEpilogueWarp": 48,
-            "numRegsPerThreadEpilogueWarp": 168
+            "biasType": "m",
+            "act": "swiglu"
+        },
+        "BatchedGemmMxE2m1MxE4m3LowLatency": {
+            "_template": "BatchedGemmMxE2m1MxE4m3Base",
+            "mmaM": 128,
+            "clusterDimX": 1
         },
         "BatchedGemmMxE2m1MxE4m3HighThroughput": {
-            "_template": "BatchedGemmMxE2m1MxE4m3",
+            "_template": "BatchedGemmMxE2m1MxE4m3Base",
             "mmaM": 256,
-            "mmaN": 256,
-            "tileM": 128,
-            "tileN": 256,
-            "tileK": 512,
-            "epilogueTileM": 128,
-            "epilogueTileN": 256,
             "clusterDimX": 2,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
-            "sfLayoutB": "128x4",
-            "sfLayoutC": "128x4",
             "numRegsPerThreadNonEpilogueWarp": 96,
             "numRegsPerThreadEpilogueWarp": 168
         },
+
         "BatchedGemmMxE2m1Bf16LowLatency": {
-            "_template": "BatchedGemm",
+            "_template": "BatchedGemmNonDsBase",
+            "mmaM": 128,
+            "clusterDimX": 1,
             "dtypeA": "mxe2m1",
             "dtypeB": "bf16",
             "dtypeC": "bf16",
             "dtypeMmaA": "bf16",
             "dtypeMmaB": "bf16",
-            "mmaM": 128,
-            "mmaN": 8,
             "mmaK": 16,
-            "tileM": 128,
-            "tileN": 8,
             "tileK": 256,
-            "epilogueTileM": 128,
-            "epilogueTileN": 8,
-            "numStages": 3,
-            "numStagesMma": 1,
-            "numSlicesForSplitK": 1,
-            "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
-            "useShuffledMatrixA": true,
-            "useDeepSeekFp8": false,
             "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
             "biasType": "m",
             "act": "swiglu",
-            "patchF2fp": false,
-            "numTokens": 2
+            "patchF2fp": false
         },
         "BatchedGemmE2m1E4m3LowLatency": {
-            "_template": "BatchedGemm",
-            "dtypeA": "e2m1",
+            "_template": "BatchedGemmFp4LowLatency",
             "dtypeB": "e4m3",
-            "dtypeC": "e4m3",
             "dtypeMmaA": "e4m3",
             "sfBlockSizeA": 32,
-            "mmaM": 128,
-            "mmaN": 8,
-            "mmaK": 32,
-            "tileM": 128,
-            "tileN": 8,
-            "tileK": 256,
-            "epilogueTileM": 128,
-            "epilogueTileN": 8,
-            "numStages": 3,
-            "numStagesMma": 1,
-            "numSlicesForSplitK": 1,
-            "clusterDimX": 1,
-            "clusterDimY": 1,
-            "clusterDimZ": 1,
-            "useShuffledMatrixA": true,
-            "useDeepSeekFp8": false,
-            "sfLayoutB": "8x4",
-            "sfLayoutC": "8x4",
-            "numTokens": 2,
-            "biasType": "m",
             "act": "swiglu"
         }
     },
@@ -248,6 +167,7 @@
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": ["bf16", "fp16", "e2m1"],
             "listN": "8,8",
+            "numExperts": 2,
             "numStagesMma": 1,
             "tileScheduler": "static"
         },
@@ -257,7 +177,10 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": ["bf16", "fp16", "e4m3"],
+            "tileK": 512,
+            "numStages": 3,
             "listN": "8,8",
+            "numExperts": 2,
             "numStagesMma": 1,
             "tileScheduler": "static"
         },
@@ -268,70 +191,133 @@
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "listN": "8,8",
+            "numExperts": 2,
             "numStagesMma": 2,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "useShuffledMatrixA": false,
+            "layoutA": "T"
         },
         {
-            "_comment": "FP4_FC1",
+            "_comment": "FP4_FC1_LowLatency",
             "_template": "BatchedGemmFp4LowLatency",
-            "routeAct": true,
+            "routeAct": "tma",
             "fusedAct": true,
+            "act": ["swiglu", "geglu"],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e2m1",
-            "numTokens": 2,
-            "mmaN,tileN,epilogueTileN,tileK,numStages": [
-                [8, 8, 8, 512, 4],
-                [16, 16, 16, 512, 4],
-                [32, 32, 32, 512, 4],
-                [64, 64, 64, 256, 6]
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages,routeSfsAct": [
+                [128,  8,  8,  8, 512, 1, 1, 1, 5, "tma"],
+                [128,  8,  8,  8, 256, 1, 1, 1, 9, "ldgsts"],
+                [256, 16, 16, 16, 512, 1, 2, 1, 5, "tma"],
+                [128, 16, 16, 16, 256, 1, 1, 1, 9, "ldgsts"],
+                [256, 32, 32, 32, 512, 1, 2, 1, 5, "tma"],
+                [128, 32, 32, 32, 256, 1, 1, 1, 9, "ldgsts"]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 1],
                 ["persistent", 2]
             ]
+        },
+        {
+            "_comment": "FP4_FC1_GeGlu_SplitK_LowLatency",
+            "_template": "BatchedGemmFp4LowLatency",
+            "act": "geglu",
+            "routeAct": "tma",
+            "routeSfsAct": "tma",
+            "fusedAct": true,
+            "sfLayoutA": "128x4",
+            "sfLayoutB": "linear",
+            "dtypeC": "e2m1",
+            "layoutA": "T",
+            "mmaN,tileN,epilogueTileN,numSlicesForSplitK,clusterDimZ,numStages": [
+                [8, 8, 8, 2, 2, 5],
+                [8, 8, 8, 3, 3, 5],
+                [8, 8, 8, 4, 4, 5],
+                [16, 16, 16, 3, 3, 4],
+                [16, 16, 16, 4, 4, 4],
+                [32, 32, 32, 2, 2, 3]
+            ],
+            "numStagesMma": 2,
+            "tileScheduler": "persistent"
         },
         {
             "_comment": "FP4_FC1_HighThroughput",
             "_template": "BatchedGemmFp4HighThroughput",
             "routeAct": "tma",
             "fusedAct": true,
+            "act": ["swiglu", "geglu"],
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
+            "numRegsPerThreadNonEpilogueWarp": 48,
             "dtypeC": "e2m1",
-            "numRegsPerThreadNonEpilogueWarp": 56,
-            "numRegsPerThreadEpilogueWarp": 112,
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC": [
-                [32, 32, 32, 512, 5, "8x4"],
-                [64, 64, 32, 512, 4, "8x4"],
-                [128, 128, 32, 256, 7, "128x4"],
-                [128, 128, 32, 512, 3, "128x4"]
-            ],
             "tileScheduler": "persistent",
-            "numStagesMma": 2
+            "numStagesMma": 2,
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC,routeSfsAct": [
+                [64, 64, 32, 512, 4, "8x4", "tma"],
+                [64, 64, 64, 256, 6, "8x4", "ldgsts"],
+                [128, 128, 32, 256, 6, "128x4", "ldgsts"]
+            ]
         },
         {
-            "_comment": "FP4_FC2",
+            "_comment": "FP4_FC1_HighThroughputTile256",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "routeAct": "tma",
+            "fusedAct": true,
+            "act": ["swiglu", "geglu"],
+            "sfLayoutB": "linear",
+            "useUnrollLoop2xForMma": false,
+            "dtypeC": "e2m1",
+            "tileScheduler": "persistent",
+            "numStagesMma": 1,
+            "routeSfsAct": "ldgPlusSts",
+            "fuseUtccpWithUtcmma": true,
+            "useMaxTmemOverlap": true,
+            "numEpilogueWarps": 8,
+            "numWarpsLoadB": 8,
+            "numWarpsLoadSfB": 4,
+            "numRegsPerThreadNonEpilogueWarp": 88,
+            "numRegsPerThreadEpilogueWarp": 144,
+            "numRegsPerThreadLoadB": 32,
+            "numRegsPerThreadLoadSfB": 40,
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC": [
+                [256, 256, 64, 256, 4, "128x4"]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_LowLatency",
             "_template": "BatchedGemmFp4LowLatency",
             "routeAct": false,
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "numTokens": 2,
-            "tileN,epilogueTileN,mmaN,tileK,numStages": [
-                [8, 8, 8, 512, 4],
-                [16, 16, 16, 512, 4],
-                [32, 32, 32, 512, 4],
-                [64, 64, 64, 512, 3],
-                [8, 8, 8, 256, 6],
-                [16, 16, 16, 256, 6],
-                [32, 32, 32, 256, 6],
-                [64, 64, 64, 256, 6]
+            "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
+                [128,  8,  8,  8, 512, 1, 1, 1, 5],
+                [128,  8,  8,  8, 256, 1, 1, 1, 9],
+                [256, 16, 16, 16, 512, 1, 2, 1, 5],
+                [128, 16, 16, 16, 256, 1, 1, 1, 9],
+                [256, 32, 32, 32, 512, 1, 2, 1, 5],
+                [128, 32, 32, 32, 256, 1, 1, 1, 9]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 1],
                 ["persistent", 2]
             ]
+        },
+        {
+            "_comment": "FP4_FC2_SplitK_LowLatency",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "sfLayoutA": "128x4",
+            "dtypeC": "bf16",
+            "layoutA": "T",
+            "mmaN,tileN,epilogueTileN,numSlicesForSplitK,clusterDimZ,numStagesMma,numStages": [
+                [8, 8, 8, 2, 2, 1, 5],
+                [8, 8, 8, 3, 3, 1, 5],
+                [8, 8, 8, 4, 4, 1, 5]
+            ],
+            "tileScheduler": "persistent"
         },
         {
             "_comment": "FP4_FC2_HighThroughput",
@@ -340,35 +326,49 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "tileN,epilogueTileN,mmaN,tileK,numStages,sfLayoutB": [
-                [32, 32, 32, 512, 5, "8x4"],
-                [64, 32, 64, 512, 4, "8x4"],
-                [128, 32, 128, 256, 5, "128x4"],
-                [128, 32, 128, 512, 3, "128x4"]
-            ],
-            "numRegsPerThreadNonEpilogueWarp": 64,
-            "numRegsPerThreadEpilogueWarp": 112,
             "tileScheduler": "persistent",
-            "numStagesMma": 2
+            "numStagesMma": 2,
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,": [
+                [64, 64, 64, 512, 4, "8x4"],
+                [128, 128, 128, 256, 6, "128x4"]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_HighThroughputTile256",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": false,
+            "dtypeC": "bf16",
+            "tileScheduler": "persistent",
+            "numStagesMma": 1,
+            "fuseUtccpWithUtcmma": true,
+            "useMaxTmemOverlap": true,
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB": [
+                [256, 256, 64, 256, 5, "128x4"]
+            ]
         },
         {
             "_comment": "DS_FP8_FC1",
             "_template": "BatchedGemmDeepSeekFp8LowLatency",
-            "routeAct": true,
+            "routeAct": "tma",
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
+            "numRegsPerThreadNonEpilogueWarp": 80,
             "dtypeC": "e4m3",
-            "numTokens": 2,
-            "mmaN,tileN,epilogueTileN,numStages": [
-                [8, 8, 8, 8],
-                [16, 16, 16, 6],
-                [32, 32, 32, 4],
-                [64, 64, 64, 4]
+            "mmaN,tileN,epilogueTileN,numStages,numWarpsLoadB,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
+                [8, 8, 8, 8, 2, 160, 48],
+                [16, 16, 16, 6, 2, 160, 48],
+                [32, 32, 32, 6, 2, 160, 48],
+                [64, 64, 64, 6, 4, 160, 48],
+                [128, 128, 128, 5, 4, 152, 80]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 2],
                 ["persistent", 4]
-            ]
+            ],
+            "useShuffledMatrixA": false,
+            "layoutA": "T"
         },
         {
             "_comment": "DS_FP8_FC2",
@@ -377,42 +377,95 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "numTokens": 2,
-            "mmaN,tileN,epilogueTileN,numStages": [
-                [8, 8, 8, 8],
-                [16, 16, 16, 6],
-                [32, 32, 32, 4],
-                [64, 64, 64, 4]
+            "mmaN,tileN,epilogueTileN,numStages,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
+                [8, 8, 8, 8, 160, 48],
+                [16, 16, 16, 6, 160, 48],
+                [32, 32, 32, 6, 160, 48],
+                [64, 64, 64, 6, 160, 48],
+                [128, 128, 128, 5, 160, 64]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 2],
                 ["persistent", 4]
-            ]
+            ],
+            "useShuffledMatrixA": false,
+            "layoutA": "T"
         },
         {
-            "_comment": "Llama4_FP8_FC1",
+            "_comment": "PerTensor_FP8_FC1_LowLatency",
             "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
-            "routeAct": true,
+            "routeAct": "tma",
             "fusedAct": true,
             "usePerTokenSfB": true,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e4m3",
-            "numTokens": 2,
-            "numStages": 3,
-            "numStagesMma": 1,
-            "tileScheduler": "static"
+            "layoutA": "T",
+            "mmaN,tileN,epilogueTileN,tileK,numStages": [
+                [8, 8, 8, 256, 6],
+                [16, 16, 16, 256, 6],
+                [32, 32, 32, 256, 5]
+            ],
+            "tileScheduler,numStagesMma": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
         },
         {
-            "_comment": "Llama4_FP8_FC2",
+            "_comment": "PerTensor_FP8_FC1_HighThroughput",
+            "_template": "BatchedGemmPerTensorScalingFp8HighThroughput",
+            "routeAct": "tma",
+            "fusedAct": true,
+            "usePerTokenSfB": true,
+            "numRegsPerThreadNonEpilogueWarp": 56,
+            "numRegsPerThreadEpilogueWarp": 128,
+            "numWarpsLoadB": 8,
+            "useUnrollLoop2xForMma": [true, false],
+            "layoutA": "T",
+            "dtypeC": "e4m3",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,numEpilogueWarps": [
+                [64, 64, 64, 256, 5, 4],
+                [128, 128, 64, 128, 8, 4],
+                [192, 192, 32, 128, 7, 4],
+                [256, 256, 64, 128, 6, 8]
+            ],
+            "numStagesMma": 2,
+            "tileScheduler": "persistent"
+        },
+        {
+            "_comment": "PerTensor_FP8_FC2_LowLatency",
             "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
+            "layoutA": "T",
             "routeAct": false,
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "numTokens": 2,
-            "numStages": 3,
+            "mmaN,tileN,epilogueTileN,tileK,numStages": [
+                [8, 8, 8, 256, 6],
+                [16, 16, 16, 256, 6],
+                [32, 32, 32, 256, 5]
+            ],
             "tileScheduler,numStagesMma": [
                 ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "PerTensor_FP8_FC2_HighThroughput",
+            "_template": "BatchedGemmPerTensorScalingFp8HighThroughput",
+            "numRegsPerThreadNonEpilogueWarp": 48,
+            "numRegsPerThreadEpilogueWarp": 128,
+            "layoutA": "T",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,numEpilogueWarps": [
+                [64, 64, 64, 128, 8, 4],
+                [128, 128, 32, 128, 7, 4],
+                [192, 192, 32, 128, 7, 4],
+                [256, 256, 32, 128, 6, 8]
+            ],
+            "tileScheduler,numStagesMma": [
                 ["persistent", 2]
             ]
         },
@@ -455,10 +508,10 @@
             ]
         },
         {
-            "_comment": "MxFp4xMxFp8_FC1",
+            "_comment": "MxFp4xMxFp8_FC1_LowLatency",
             "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
-            "routeSfsAct": "ldgsts",
             "routeAct": "tma",
+            "routeSfsAct": "ldgsts",
             "fusedAct": true,
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
@@ -478,29 +531,45 @@
             ]
         },
         {
-            "_comment": "MxFp4xMxFp8_FC1",
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughput",
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
             "routeAct": "tma",
             "routeSfsAct": "ldgsts",
             "fusedAct": true,
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC,numRegsPerThreadNonEpilogueWarp,numStagesMma": [
-                [64, 64, 64, 256, 4, "8x4", 48, 2],
-                [64, 64, 64, 128, 7, "8x4", 48, 2],
-                [128, 128, 64, 256, 4, "128x4", 48, 2],
-                [128, 128, 64, 128, 7, "128x4", 48, 2]
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp,numStagesMma,numWarpsLoadB,numWarpsLoadSfB,numRegsPerThreadLoadB,numRegsPerThreadLoadSfB": [
+                [64, 64, 64, 256, 4, "8x4", 168, 48, 2, 1, 1, 48, 48],
+                [64, 64, 64, 128, 7, "8x4", 168, 48, 2, 1, 1, 48, 48],
+                [128, 128, 32, 256, 4, "128x4", 152, 48, 2, 8, 4, 48, 48],
+                [128, 128, 32, 128, 7, "128x4", 152, 48, 2, 8, 4, 48, 48]
             ],
             "tileScheduler": "persistent"
         },
         {
-            "_comment": "MxFp4xMxFp8_FC2",
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughput_tileN_256",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "routeAct": "tma",
+            "routeSfsAct": "ldgsts",
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "fuseUtccpWithUtcmma": true,
+            "useMaxTmemOverlap": true,
+            "useUnrollLoop2xForMma": false,
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutC,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp,numWarpsLoadB,numWarpsLoadSfB,numRegsPerThreadLoadB,numRegsPerThreadLoadSfB": [
+                [256, 256, 64, 128, 6, "128x4", 144, 88, 8, 4, 56, 56],
+                [256, 256, 64, 256, 3, "128x4", 144, 88, 8, 4, 56, 56]
+            ],
+            "tileScheduler": "persistent",
+            "numStagesMma": 1
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_LowLatency",
             "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
             "routeAct": false,
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "numRegsPerThreadNonEpilogueWarp": 96,
             "mmaM,mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimX,clusterDimZ,numStages": [
                 [128,  8,  8,  8, 512, 1, 1, 1, 3],
                 [128,  8,  8,  8, 512, 2, 1, 2, 3],
@@ -517,12 +586,12 @@
             ]
         },
         {
-            "_comment": "MxFp4xMxFp8_FC2",
+            "_comment": "MxFp4xMxFp8_FC2_HighThroughput",
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
             "routeAct": false,
             "fusedAct": false,
-            "dtypeC": "bf16",
             "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
             "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp,numStagesMma": [
                 [64, 64, 64, 256, 4, "8x4", 168, 96, 2],
                 [64, 64, 64, 128, 7, "8x4", 168, 96, 2],
@@ -532,6 +601,21 @@
             "tileScheduler": "persistent"
         },
         {
+            "_comment": "MxFp4xMxFp8_FC2_HighThroughput_tileN_256",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "routeAct": false,
+            "fusedAct": false,
+            "fuseUtccpWithUtcmma": true,
+            "useMaxTmemOverlap": true,
+            "useUnrollLoop2xForMma": false,
+            "dtypeC": "bf16",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
+                [256, 256, 64, 128, 5, "128x4", 144, 96]
+            ],
+            "tileScheduler": "persistent",
+            "numStagesMma": 1
+        },
+        {
             "_comment": "MxFp4xBf16_FC1",
             "_template": "BatchedGemmMxE2m1Bf16LowLatency",
             "routeAct": "ldgsts",
@@ -539,12 +623,15 @@
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
-            "tileK": 256,
-            "mmaN,tileN,epilogueTileN,numStages": [
-                [8, 8, 8, 3],
-                [16, 16, 16, 3],
-                [32, 32, 32, 3],
-                [64, 64, 64, 3]
+            "mmaN,tileN,epilogueTileN,tileK,numStages": [
+                [8, 8, 8, 128, 5],
+                [8, 8, 8, 256, 3],
+                [16, 16, 16, 128, 5],
+                [16, 16, 16, 256, 3],
+                [32, 32, 32, 128, 5],
+                [32, 32, 32, 256, 3],
+                [64, 64, 64, 128, 5],
+                [64, 64, 64, 256, 3]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 1],
@@ -576,6 +663,7 @@
             "fusedAct": true,
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "e4m3",
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
                 [8, 8, 8, 512, 3],
                 [8, 8, 8, 256, 5],

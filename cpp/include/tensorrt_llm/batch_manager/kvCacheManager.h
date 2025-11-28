@@ -595,6 +595,21 @@ public:
 
     ~WindowBlockManager();
 
+    [[nodiscard]] bool isEnableIndexerKCache() const
+    {
+        return mEnableIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
+    {
+        return mIndexerKCacheIndexHeadDim;
+    }
+
     void allocatePools(bool useUvm);
 
     void releasePools();
@@ -1021,6 +1036,21 @@ public:
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
 
+    [[nodiscard]] bool isEnableIndexerKCache() const
+    {
+        return mIsEnableIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
+    {
+        return mIndexerKCacheIndexHeadDim;
+    }
+
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
 
@@ -1398,6 +1428,10 @@ private:
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
     // Record what sequences are currently managed by the block manager
     std::set<LlmRequest::RequestIdType> mManagedSequences;
+
+    bool mIsEnableIndexerKCache{false};
+    SizeType32 mIndexerKCacheQuantBlockSize{0};
+    SizeType32 mIndexerKCacheIndexHeadDim{0};
 };
 
 struct OffsetTableDimensions
@@ -1499,6 +1533,10 @@ public:
         = 0;
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
+
+    [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
+    [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
+    [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
 
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
@@ -1832,6 +1870,21 @@ public:
     [[nodiscard]] bool isEnableBlockReuse() const override
     {
         return mEnableBlockReuse;
+    }
+
+    [[nodiscard]] bool isEnableIndexerKCache() const override
+    {
+        return mBlockManager.isEnableIndexerKCache();
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const override
+    {
+        return mBlockManager.getIndexerKCacheIndexHeadDim();
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const override
+    {
+        return mBlockManager.getIndexerKCacheQuantBlockSize();
     }
 
     void removeToken(LlmRequest::RequestIdType requestId);

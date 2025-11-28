@@ -17,51 +17,14 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+                                          MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
-
-
-@dataclass
-class MoeLoadBalancerConfig:
-    num_slots: Optional[int] = None
-    initial_global_assignments: Optional[Dict[int,
-                                              List[int]]] = field(default=None,
-                                                                  repr=False)
-    layer_updates_per_iter: int = 0
-
-    ep_rank: Optional[int] = field(default=None, init=False)
-    ep_size: Optional[int] = field(default=None, init=False)
-
-    def setup(self, ep_rank: int, ep_size: int) -> None:
-        self.ep_rank = ep_rank
-        self.ep_size = ep_size
-        assert self.num_slots is not None
-
-    @property
-    def num_local_slots(self) -> int:
-        return self.num_slots // self.ep_size
-
-    @property
-    def slot_start(self) -> int:
-        return self.ep_rank * self.num_local_slots
-
-    @property
-    def slot_end(self) -> int:
-        return self.slot_start + self.num_local_slots
-
-    def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
-        if self.initial_global_assignments is not None:
-            assert layer_idx in self.initial_global_assignments
-            assert len(
-                self.initial_global_assignments[layer_idx]) == self.num_slots
-            return self.initial_global_assignments[layer_idx]
-        else:
-            return None
 
 
 @contextlib.contextmanager
@@ -642,5 +605,12 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
+        elif hasattr(
+                self.pretrained_config, "architectures"
+        ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
+                0] in ["Qwen3NextForCausalLM"]:
+            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
+            # we need to calculate the number of fullattention layers
+            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
         else:
             return self.pretrained_config.num_hidden_layers

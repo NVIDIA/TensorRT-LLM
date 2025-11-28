@@ -681,8 +681,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
         hidden_states,
         attn_metadata,
         position_ids,
-        None,  # indexer_k
-        None,  # indexer_weights
+        indexer_k=mla.mqa.indexer.wk(hidden_states),  # indexer_k
     )
 
     # Validate indexer output against expected causal indices (since seq_len < topk=2048)

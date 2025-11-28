@@ -318,6 +318,28 @@ std::string getEnvNixlInterface()
     return nixlInterface;
 }
 
+std::string getEnvNixlBackend()
+{
+    static std::once_flag flag;
+    static std::string nixlBackend;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* nixl_backend = std::getenv("TRTLLM_NIXL_KVCACHE_BACKEND");
+            if (nixl_backend)
+            {
+                nixlBackend = nixl_backend;
+            }
+            else
+            {
+                // Default to UCX if not specified
+                nixlBackend = "UCX";
+            }
+        });
+    return nixlBackend;
+}
+
 bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");

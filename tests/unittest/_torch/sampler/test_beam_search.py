@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
+from utils.llm_data import llm_models_root
+from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
@@ -31,6 +33,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.models.modeling_utils import (
     ModelConfig, register_auto_model, register_checkpoint_weight_loader,
     register_config_loader)
+from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
@@ -263,11 +266,21 @@ def fixed_params():
 
 
 @pytest.fixture(scope="module")
-def llm(fixed_params, input_prompts):
+def model_kwargs(fixed_params) -> dict[str, Any]:
     assert fixed_params[
         "max_beam_width"] == 2, "This test only works for a beam width of 2"
-    return LLM(
+    return dict(
         model=_pl.Path("dummy_path"),
+        checkpoint_loader=HfCheckpointLoader(
+            weight_loader=DummyWeightLoader(),
+            config_loader=DummyConfigLoader(),
+        ),
+    )
+
+
+def _build_llm(fixed_params, input_prompts, model_kwargs):
+    return LLM(
+        **model_kwargs,
         kv_cache_config=KvCacheConfig(max_tokens=10000),
         max_batch_size=fixed_params["max_beam_width"] * len(
             input_prompts
@@ -276,16 +289,18 @@ def llm(fixed_params, input_prompts):
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
-        checkpoint_loader=HfCheckpointLoader(weight_loader=DummyWeightLoader(),
-                                             config_loader=DummyConfigLoader()))
+    )
 
 
 @pytest.fixture(scope="module")
-def llm_cuda_graph(fixed_params, input_prompts):
-    assert fixed_params[
-        "max_beam_width"] == 2, "This test only works for a beam width of 2"
+def llm(fixed_params, input_prompts, model_kwargs):
+    return _build_llm(fixed_params, input_prompts, model_kwargs)
+
+
+@pytest.fixture(scope="module")
+def llm_cuda_graph(fixed_params, input_prompts, model_kwargs):
     return LLM(
-        model=_pl.Path("dummy_path"),
+        **model_kwargs,
         kv_cache_config=KvCacheConfig(max_tokens=10000),
         max_batch_size=fixed_params["max_beam_width"] * len(
             input_prompts
@@ -295,8 +310,7 @@ def llm_cuda_graph(fixed_params, input_prompts):
         disable_overlap_scheduler=False,
         cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
                                           enable_padding=True),
-        checkpoint_loader=HfCheckpointLoader(weight_loader=DummyWeightLoader(),
-                                             config_loader=DummyConfigLoader()))
+    )
 
 
 def check_generation_logits(beam: CompletionOutput,
@@ -471,6 +485,111 @@ def test_beam_search_output_shapes_cuda_graph_and_overlap(
     )
     validate_outputs(llm_cuda_graph, input_prompts[:num_prompts],
                      sampling_params)
+
+
+@force_ampere  # Save H100 resource
+class TestParameterValidation:
+    """Ensure that unsupported request parameters do not crash/hang the engine."""
+
+    @pytest.fixture(scope="module")
+    @staticmethod
+    def fixed_params():
+        return {"max_tokens": 8, "max_beam_width": 4}
+
+    @pytest.fixture(scope="module")
+    @staticmethod
+    def model_kwargs() -> dict[str, Any]:
+        root = llm_models_root()
+        assert root is not None
+        return dict(model=root / "llama-models-v2" /
+                    "TinyLlama-1.1B-Chat-v1.0", )
+
+    # NB: Class-level fixture overrides do not work without this
+    @pytest.fixture(scope="module")
+    @staticmethod
+    def llm(fixed_params, input_prompts, model_kwargs):
+        return _build_llm(fixed_params, input_prompts, model_kwargs)
+
+    def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
+                               fixed_params: dict):
+        _ = llm.generate(input_prompts,
+                         sampling_params=SamplingParams(
+                             max_tokens=fixed_params["max_tokens"],
+                             n=1,
+                             best_of=fixed_params["max_beam_width"],
+                             use_beam_search=True,
+                             end_id=-1,
+                         ))
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.threadleak(enabled=False)
+    def test_use_beam_search_false(
+        self,
+        llm: LLM,
+        input_prompts: list[str],
+        fixed_params: dict,
+    ):
+        assert fixed_params["max_beam_width"] > 2
+        with pytest.raises(
+                ValueError,
+                match=
+                ".*Greedy decoding in the LLM API does not allow multiple returns.*"
+        ):
+            _ = llm.generate(input_prompts,
+                             sampling_params=SamplingParams(
+                                 max_tokens=fixed_params["max_tokens"],
+                                 n=1,
+                                 best_of=fixed_params["max_beam_width"],
+                                 use_beam_search=False,
+                                 end_id=-1,
+                             ))
+        self._check_engine_responds(llm, input_prompts, fixed_params)
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.threadleak(enabled=False)
+    def test_use_beam_search_ommitted(
+        self,
+        llm: LLM,
+        input_prompts: list[str],
+        fixed_params: dict,
+    ):
+        assert fixed_params["max_beam_width"] > 2
+        with pytest.raises(
+                ValueError,
+                match=
+                ".*Greedy decoding in the LLM API does not allow multiple returns.*"
+        ):
+            _ = llm.generate(input_prompts,
+                             sampling_params=SamplingParams(
+                                 max_tokens=fixed_params["max_tokens"],
+                                 n=1,
+                                 best_of=fixed_params["max_beam_width"],
+                                 end_id=-1,
+                             ))
+        self._check_engine_responds(llm, input_prompts, fixed_params)
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.threadleak(enabled=False)
+    def test_smaller_beam_width(
+        self,
+        llm: LLM,
+        input_prompts: list[str],
+        fixed_params: dict,
+    ):
+        assert fixed_params["max_beam_width"] > 2
+        with pytest.raises(
+                RequestError,
+                match=".*Request beam width 2 is not equal to max_beam_width 4*"
+        ):
+            _ = llm.generate(input_prompts,
+                             sampling_params=SamplingParams(
+                                 max_tokens=fixed_params["max_tokens"],
+                                 n=1,
+                                 best_of=2,
+                                 use_beam_search=True,
+                                 end_id=-1,
+                             ))
+        self._check_engine_responds(llm, input_prompts, fixed_params)
 
 
 if __name__ == "__main__":

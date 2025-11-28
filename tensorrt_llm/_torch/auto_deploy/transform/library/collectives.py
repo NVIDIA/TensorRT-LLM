@@ -28,7 +28,7 @@ def _allreduce_residual_rmsnorm_pattern(
     """
 
     input_dtype = x.dtype
-    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x, "AUTO")
     add = residual + hidden_states
 
     hidden_states = add.to(torch.float32)
@@ -52,7 +52,7 @@ def _allreduce_residual_rmsnorm_pattern2(
     """
 
     input_dtype = x.dtype
-    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x, "AUTO")
     add = hidden_states + residual
 
     hidden_states = add.to(torch.float32)
@@ -112,6 +112,9 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         num_matches = patterns.apply(gm.graph)
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
         return gm, info

@@ -81,7 +81,7 @@ def generate()
             echo "No update that needs to be checked in"
         } else {
             sh "git status"
-            sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' \\))"
+            sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' -o -name 'metadata.json' \\))"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
             withCredentials([string(credentialsId: CREDENTIAL_ID, variable: 'API_TOKEN')]) {
                 def authedUrl = LLM_REPO.replaceFirst('https://', "https://svc_tensorrt:${API_TOKEN}@")
@@ -109,6 +109,12 @@ pipeline {
         skipDefaultCheckout()
         // to better analyze the time for each step/test
         timestamps()
+    }
+
+    triggers {
+        parameterizedCron('''
+            H 2 * * * %branchName=main;repoUrlKey=tensorrt_llm_github
+        ''')
     }
 
     stages {

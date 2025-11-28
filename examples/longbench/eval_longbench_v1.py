@@ -356,7 +356,6 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
             cuda_graph_config=cuda_graph_config,
-            torch_compile_config=None,
             print_iter_log=args.print_iter_log,
             moe_config=MoeConfig(backend=args.moe_backend),
         )

@@ -230,15 +230,22 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
 
             int const global_token_offset = cu_q_seqlens[batch_idx];
             int const cache_seq_len = kv_cache_lengths[batch_idx];
-            int token_idx_in_kv_cache = local_token_idx;
-            bool const valid_token = token_idx_in_kv_cache < cache_seq_len;
+
+            // Derive cached offset and current input length
+            int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
+            int const cached_offset = cache_seq_len - current_seq_len;
+
+            int token_idx_in_kv_cache = local_token_idx + cached_offset;
+            // Check against BOTH total cache length (valid slot) AND input length (valid read)
+            bool const valid_token = (token_idx_in_kv_cache < cache_seq_len) && (local_token_idx < current_seq_len);
+
             // Limit the token_idx to cache seq length (we need all threads in this block to be involved).
             token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
-            local_token_idx = std::min(local_token_idx, cache_seq_len - 1);
-            int const global_token_idx = local_token_idx + global_token_offset;
+            int const safe_local_token_idx = std::min(local_token_idx, current_seq_len - 1);
+            int const global_token_idx = safe_local_token_idx + global_token_offset;
 
             auto const position_id
-                = helix_position_offsets ? helix_position_offsets[global_token_idx] : local_token_idx;
+                = helix_position_offsets ? helix_position_offsets[global_token_idx] : token_idx_in_kv_cache;
             float2 const* rotary_coef_cache_buffer
                 = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
@@ -317,12 +324,19 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
 
             int const global_token_offset = cu_q_seqlens[batch_idx];
             int const cache_seq_len = kv_cache_lengths[batch_idx];
-            int token_idx_in_kv_cache = local_token_idx;
-            bool const valid_token = token_idx_in_kv_cache < cache_seq_len;
+
+            // Derive cached offset and current input length (same as first loop)
+            int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
+            int const cached_offset = cache_seq_len - current_seq_len;
+
+            int token_idx_in_kv_cache = local_token_idx + cached_offset;
+            // Check against BOTH total cache length (valid slot) AND input length (valid read)
+            bool const valid_token = (token_idx_in_kv_cache < cache_seq_len) && (local_token_idx < current_seq_len);
+
             // Limit the token_idx to cache seq length (we need all threads in this block to be involved).
             token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
-            local_token_idx = std::min(local_token_idx, cache_seq_len - 1);
-            int const global_token_idx = local_token_idx + global_token_offset;
+            int const safe_local_token_idx = std::min(local_token_idx, current_seq_len - 1);
+            int const global_token_idx = safe_local_token_idx + global_token_offset;
 
             if (valid_token)
             {

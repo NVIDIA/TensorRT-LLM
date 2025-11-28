@@ -19,6 +19,8 @@ cache_transceiver_config:
   # KV cache transfer timeout in milliseconds
   # For requests, if they do not send/receive the KV cache in time they are cancelled and cleaned up
   kv_transfer_timeout_ms: <int>
+  # Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+  kv_transfer_sender_future_timeout_ms: <int>
 ```
 
 The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.
@@ -203,6 +205,63 @@ srun -A <account> -p <partition> -t <time> \
 
 Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/simple_example/).
 
+## Mixed Precision Context and Generation
+
+In disaggregated serving, the context workers and generation workers have different performance characteristics: context workers are compute-bound while generation workers are memory-bound. Therefore, it may be beneficial to run context workers and generation workers in different precisions.
+
+### Prerequisites
+
+To enable mixed precision serving, you will need:
+1. A quantized checkpoint created with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+2. The original unquantized checkpoint (Can also be quantized)
+3. Both checkpoints must use the same KV cache dtype to ensure compatibility during transfer
+
+### Example (BF 16 Ctx, FP 8 Gen)
+
+A quantized checkpoint can be created using `--kv_cache_qformat none`.
+
+```bash
+python $MODELOPT_ROOT/examples/llm_ptq/hf_ptq.py \
+    --pyt_ckpt_path=meta-llama/Llama-3.1-8B-Instruct \
+    --export_path=./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
+    --sparsity_fmt=dense \
+    --qformat=fp8 \
+    --calib_size=512 \
+    --batch_size=8 \
+    --inference_tensor_parallel=1 \
+    --inference_pipeline_parallel=1 \
+    --kv_cache_qformat none \
+    --export_fmt=hf
+```
+
+Verify both checkpoints have the same KV cache dtype by checking `hf_quant_config.json`.
+
+```bash
+# Start context servers with original BF16 checkpoint
+CUDA_VISIBLE_DEVICES=0 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+    --host localhost --port 8001 \
+    --server_role CONTEXT \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+    --host localhost --port 8002 \
+    --server_role CONTEXT \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
+
+# Start generation server with FP8 quantized checkpoint
+CUDA_VISIBLE_DEVICES=2 trtllm-serve ./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
+    --host localhost --port 8003 \
+    --server_role GENERATION \
+    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
+
+# Start disaggregated server
+trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
+```
+
+You can also run FP8 for context and BF16 for generation, as long as the KV-cache dtype is consistent across all workers.
 
 ## Dynamic scaling 
   

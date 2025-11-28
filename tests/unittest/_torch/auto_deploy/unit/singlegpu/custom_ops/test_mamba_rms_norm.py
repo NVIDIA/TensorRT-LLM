@@ -24,7 +24,7 @@ def test_custom_op_matches_ref(B, T, H, group, use_gate, dtype):
     )
 
     # Custom op (currently returns fp32). Cast it back to x.dtype for apples-to-apples with ref.
-    y_op_fp32 = torch.ops.auto_deploy.torch_rmsnorm_gated(x, w, z, 1e-5, group, False)
+    y_op_fp32 = torch.ops.auto_deploy.triton_rmsnorm_gated(x, w, z, 1e-5, group, False)
     y_op = y_op_fp32.to(x.dtype)
 
     assert y_ref.dtype == x.dtype and y_op.dtype == x.dtype

@@ -37,7 +37,6 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "cutlass/array.h"
-#include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
 
@@ -52,6 +51,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"
 #include "tensorrt_llm/kernels/moe_utils.cuh"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
@@ -1344,7 +1344,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
     return converter(input);
 }
 
-// Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with finalizing routing.
+// Duplicated and permutes rows for MoE.
 
 // "expanded_x_row" simply means that the number of values is num_rows x k. It is "expanded" since we will have to
 // duplicate some rows in the input matrix to match the dimensions. Duplicates will always get routed to separate
@@ -1937,56 +1937,6 @@ INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
 #endif
 
-// ============================== Activation Adaptors =================================
-template <template <class> class ActFn>
-struct IdentityAdaptor
-{
-    constexpr static bool IS_GLU = false;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& x) const
-    {
-        ActFn<T> fn{};
-        return fn(x);
-    }
-};
-
-template <template <class> class ActFn>
-struct GLUAdaptor
-{
-    constexpr static bool IS_GLU = true;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& gate, T const& linear) const
-    {
-        ActFn<T> fn{};
-        return fn(gate) * linear;
-    }
-};
-
-struct SwigluBiasAdaptor
-{
-    constexpr static bool IS_GLU = true;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& gate, T const& linear) const
-    {
-        cutlass::epilogue::thread::Sigmoid<T> fn{};
-        T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
-        T gate_clamped = cutlass::minimum<T>{}(gate, limit);
-        return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
-    }
-};
-
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2292,26 +2242,41 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 
     auto fn = [&]()
     {
-        auto fn = [&](auto block_scaling_type)
+        // IMPORTANT: Keep the order of the activation functions in the same order as the ActivationType enum in
+        // common.h
+        auto fn
+            = [&](auto block_scaling_type) -> void (*)(T*, GemmOutputType const*, float const*, ScaleBiasType const*,
+                                               bool, int64_t const*, int, int64_t, float const*, bool,
+                                               TmaWarpSpecializedGroupedGemmInput::ElementSF*, ActivationParams)
         {
-            auto fn_list = std::array{
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::GELU>,
-                    decltype(block_scaling_type)::value>, // Gelu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-                    decltype(block_scaling_type)::value>, // Relu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
-                    decltype(block_scaling_type)::value>, // Silu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-                    decltype(block_scaling_type)::value>, // Swiglu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::GELU>,
-                    decltype(block_scaling_type)::value>, // Geglu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                    decltype(block_scaling_type)::value>, // SwigluBias
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                    IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                    decltype(block_scaling_type)::value> // Identity
-            };
-            return fn_list[static_cast<int>(activation_type.activation_type)];
+            switch (activation_type.activation_type)
+            {
+            case ActivationType::Identity:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::Identity>, decltype(block_scaling_type)::value>;
+            case ActivationType::Gelu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value>;
+            case ActivationType::Relu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::ReLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Silu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Swiglu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    GLUAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Geglu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    GLUAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value>;
+            case ActivationType::SwigluBias:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
+                    decltype(block_scaling_type)::value>;
+            case ActivationType::Relu2:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value>;
+            default: TLLM_CHECK_WITH_INFO(false, "Invalid activation type"); return nullptr;
+            }
         };
         auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
             TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};

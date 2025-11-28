@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import Qwen2_5_VLConfig
 from transformers import \
@@ -13,7 +13,6 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -187,10 +186,8 @@ class TestQwen2_5_VL(TestModelingMultimodal):
             trtllm_inputs["attn_metadata"].prepare()
             return self.trtllm_model.forward(**trtllm_inputs)
         else:
-            mock_engine = create_mock_engine(1)
             # NOTE: Qwen2.5-VL model uses mrope
-            mock_engine.use_mrope = True
-            graph_runner = CUDAGraphRunner(mock_engine)
+            graph_runner = create_mock_cuda_graph_runner(1, True)
             trtllm_inputs["attn_metadata"] = trtllm_inputs[
                 "attn_metadata"].create_cuda_graph_metadata(1)
 

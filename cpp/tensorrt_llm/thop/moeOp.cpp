@@ -259,8 +259,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -328,6 +328,9 @@ public:
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
 
+        ActivationType base_activation_type = activation_type.has_value()
+            ? static_cast<ActivationType>(activation_type.value())
+            : ActivationType::Swiglu;
         if (mUseINT8WoqPerChannel)
         {
             // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
@@ -337,8 +340,16 @@ public:
         }
         else
         {
-            TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
-                "fc1_expert_weights inter size must be fc2_expert_weights inter size.");
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
         }
 
         int experts_per_token = token_selected_experts.sizes()[1];
@@ -375,7 +386,7 @@ public:
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-        ActivationType base_activation_type = ActivationType::Swiglu;
+
         if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
@@ -474,8 +485,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -541,7 +552,9 @@ public:
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
             = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
-        ActivationType base_activation_type = ActivationType::Swiglu;
+        ActivationType base_activation_type = activation_type.has_value()
+            ? static_cast<ActivationType>(activation_type.value())
+            : ActivationType::Swiglu;
         if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
@@ -652,7 +665,8 @@ public:
         torch::optional<torch::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
         int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
         int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation, int64_t const unpadded_hidden_size)
+        int64_t const profile_id, bool const do_preparation, int64_t const activation_type_int,
+        int64_t const unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -661,6 +675,7 @@ public:
         {
             return;
         }
+        ActivationType activation_type = static_cast<ActivationType>(activation_type_int);
 
         int64_t const num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
@@ -715,14 +730,14 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size, inter_size, group_size,
-                ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config, enable_alltoall);
 #else
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                hidden_size, inter_size, group_size, activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config);
 #endif
 

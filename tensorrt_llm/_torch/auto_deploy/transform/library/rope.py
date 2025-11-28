@@ -219,7 +219,10 @@ class MatchRopePattern(BaseTransform):
         num_matches = patterns.apply(graph)
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
         )
 
         return gm, info
@@ -349,8 +352,8 @@ class MatchRopeLayout(BaseTransform):
         info = TransformInfo(
             skipped=False,
             num_matches=num_rope_layout_matches,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=num_rope_layout_matches == 0,
+            has_valid_shapes=num_rope_layout_matches == 0,
         )
 
         return gm, info
@@ -386,10 +389,13 @@ class OptimizeRope(BaseTransform):
                 continue
             num_rope_optimizations += 1
 
+        skipped = num_rope_optimizations == 0
         info = TransformInfo(
-            skipped=False, num_matches=num_rope_optimizations, is_clean=False, has_valid_shapes=True
+            skipped=skipped,
+            num_matches=num_rope_optimizations,
+            is_clean=skipped,
+            has_valid_shapes=True,
         )
-
         return gm, info
 
 

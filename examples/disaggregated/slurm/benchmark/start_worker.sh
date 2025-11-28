@@ -14,14 +14,17 @@ numa_bind=${8}
 log_dir=${9}
 enable_nsys=${10}
 config_file=${11}
+worker_env_var=${12}
 
 unset UCX_TLS
 echo "enable_pdl: ${enable_pdl}, log_dir: ${log_dir}"
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 
-export TLLM_LOG_LEVEL=INFO
-export TRTLLM_SERVER_DISABLE_GC=1
-export TRTLLM_WORKER_DISABLE_GC=1
+# Export worker environment variables from config
+for env_var in ${worker_env_var}; do
+    export "${env_var}"
+    echo "Exported: ${env_var}"
+done
 
 if [ "${enable_pdl}" = "true" ]; then
     export TRTLLM_ENABLE_PDL=1

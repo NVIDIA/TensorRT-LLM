@@ -74,7 +74,7 @@ def torch_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
     input = input.to(torch.float32)
     variance = input.pow(2).mean(-1, keepdim=True)
     input = input * torch.rsqrt(variance + eps)
-    return weight * input.to(input_dtype)
+    return (weight * input.to(input_dtype)).contiguous()
 
 
 @torch_rmsnorm.register_fake
@@ -83,8 +83,8 @@ def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.empty_like(input)
 
 
-@torch.library.custom_op("auto_deploy::torch_rmsnorm_gated", mutates_args=())
-def torch_rmsnorm_gated(
+@torch.library.custom_op("auto_deploy::triton_rmsnorm_gated", mutates_args=())
+def triton_rmsnorm_gated(
     x: torch.Tensor,
     weight: torch.Tensor,
     gate: torch.Tensor | None,
@@ -113,21 +113,20 @@ def torch_rmsnorm_gated(
 
     # Flatten to (M, H), ensure last-dim contiguous, and run in fp32
     x_shape = x.shape
-    x2 = x.to(torch.float32).reshape(-1, H)
+    x2 = x.reshape(-1, H)
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
 
     z2 = None
     if gate is not None:
-        z2 = gate.to(torch.float32).reshape(-1, H)
+        z2 = gate.reshape(-1, H)
         if z2.stride(-1) != 1:
             z2 = z2.contiguous()
-
-    w = weight.to(torch.float32).contiguous()
+    assert weight.is_contiguous(), "weight must be contiguous"
 
     out2, _, _ = _layer_norm_fwd(
         x2,
-        w,
+        weight,
         None,  # bias
         eps,
         z=z2,
@@ -140,8 +139,8 @@ def torch_rmsnorm_gated(
     return out2.reshape(x_shape)
 
 
-@torch_rmsnorm_gated.register_fake
-def _torch_rmsnorm_gated_meta(
+@triton_rmsnorm_gated.register_fake
+def _triton_rmsnorm_gated_meta(
     x,
     weight,
     gate,

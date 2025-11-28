@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pytest
-from utils.cpp_paths import llm_root  # noqa: F401
 from utils.llm_data import llm_models_root
 
 # Constants for test configuration

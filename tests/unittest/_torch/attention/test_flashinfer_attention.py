@@ -227,7 +227,10 @@ class TestFlashInferAttention(unittest.TestCase):
                              sum(context_sequence_lengths) + num_gens)
 
             # validate kv cache was updated expectedly
-            cache_buf = kv_cache_manager.get_buffers(flashinfer_attn.layer_idx)
+            cache_buf = kv_cache_manager.get_buffers(
+                flashinfer_attn.layer_idx, kv_layout=attn_metadata.kv_layout)
+            if attn_metadata.kv_layout == "HND":
+                cache_buf = cache_buf.transpose(2, 3).contiguous()
             assert cache_buf is not None
             num_kv_heads = cache_buf.size(-2)
 

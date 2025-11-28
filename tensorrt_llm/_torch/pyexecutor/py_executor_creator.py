@@ -1,4 +1,5 @@
 import copy
+import gc
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -33,7 +35,6 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config import PyTorchConfig
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -216,7 +217,7 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 def create_py_executor(
     llm_args: TorchLlmArgs,
-    checkpoint_dir: str = None,
+    checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
@@ -224,10 +225,6 @@ def create_py_executor(
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
-
-    pytorch_backend_config = llm_args.get_pytorch_backend_config()
-    if pytorch_backend_config is None:
-        pytorch_backend_config = PyTorchConfig()
 
     scheduler_config = llm_args.scheduler_config
 
@@ -257,23 +254,19 @@ def create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-    if pytorch_backend_config.attn_backend == "VANILLA":
+    if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
 
-    if pytorch_backend_config.attn_backend in [
-            "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
-    ]:
+    if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention
         if kv_cache_config.enable_block_reuse:
             logger.warning(
-                f"Disabling block reuse for {pytorch_backend_config.attn_backend} backend"
-            )
+                f"Disabling block reuse for {llm_args.attn_backend} backend")
             kv_cache_config.enable_block_reuse = False
 
-    if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
+    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
         logger.warning(
-            f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
-        )
+            f"Disabling chunked context for {llm_args.attn_backend} backend")
         enable_chunked_context = False
 
     spec_config = llm_args.speculative_config
@@ -281,28 +274,22 @@ def create_py_executor(
         from tensorrt_llm._torch.speculative import suggest_spec_config
         spec_config = suggest_spec_config(max_batch_size)
 
-    if not pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
+    if not llm_args.disable_overlap_scheduler and spec_config is not None:
         if not spec_config.spec_dec_mode.support_overlap_scheduler():
             logger.warning(
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
-            # TODO(qijun): clean up pytorch_backend_config later
-            pytorch_backend_config.disable_overlap_scheduler = True
-
             llm_args.disable_overlap_scheduler = True
 
     if mm_encoder_only:
-        # TODO(qijun): clean up pytorch_backend_config later
-        pytorch_backend_config.mm_encoder_only = True
+        llm_args.mm_encoder_only = True
+        llm_args.disable_overlap_scheduler = True
+
         # Disable overlap scheduler for multimodal encoder-only mode
         logger.warning(
             "Disabling overlap scheduler for multimodal encoder-only mode. "
             "The overlap scheduler is designed for generation models and is not needed "
             "when only processing vision encoder inputs.")
-        pytorch_backend_config.disable_overlap_scheduler = True
-
-        llm_args.mm_encoder_only = True
-        llm_args.disable_overlap_scheduler = True
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     if mpi_disabled():
@@ -311,7 +298,7 @@ def create_py_executor(
         dist = MPIDist(mapping=mapping)
 
     vm_pools = {}
-    enable_sleep = pytorch_backend_config.enable_sleep
+    enable_sleep = llm_args.enable_sleep
 
     cache_transceiver_config = llm_args.cache_transceiver_config
 
@@ -357,8 +344,7 @@ def create_py_executor(
             spec_config=spec_config,
         )
 
-    validate_feature_combination(llm_args, model_engine,
-                                 pytorch_backend_config.sampler_type)
+    validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
@@ -369,26 +355,35 @@ def create_py_executor(
                 guided_decoding_config is None
                 and draft_spec_config._allow_chain_drafter
                 and draft_spec_config._allow_greedy_draft_tokens
-                and pytorch_backend_config.attn_backend == "TRTLLM")
+                and llm_args.attn_backend == "TRTLLM"
+                and draft_spec_config.draft_len_schedule is None)
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import \
-                        ChainDrafter
+                    from tensorrt_llm._torch.speculative.drafting_loops import (
+                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                    from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    return ChainDrafter(spec_config.max_draft_len,
-                                        spec_config.max_total_draft_tokens,
-                                        model)
+                    use_tree_drafter = isinstance(
+                        draft_spec_config, EagleDecodingConfig
+                    ) and not draft_spec_config.is_linear_tree
+
+                    if use_tree_drafter:
+                        return TreeDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            model)
+                    else:
+                        return LinearDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, model)
             else:
                 drafting_loop_wrapper = None
 
-            # TODO(qijun): clean up pytorch_backend_config later
-            draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
             draft_llm_args = copy.copy(llm_args)
             if spec_config.load_format == "dummy":
-                draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
@@ -404,16 +399,25 @@ def create_py_executor(
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
             if spec_config.spec_dec_mode.is_mtp_eagle():
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
-            draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
     else:
         draft_model_engine = None
 
+    # TODO: Overlap scheduler is not supported for below cases:
+    # 1. non-CDL is used
+    # 2. non-TrtllmAttention attention backend is used
+    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
+            draft_model_engine.attn_backend, TrtllmAttention)):
+        logger.warning(
+            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
+        )
+        llm_args.disable_overlap_scheduler = True
+
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
-    if not pytorch_backend_config.disable_overlap_scheduler:
+    if not llm_args.disable_overlap_scheduler:
         model_engine_max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
             model_engine_max_seq_len += spec_config.max_total_draft_tokens
@@ -421,6 +425,11 @@ def create_py_executor(
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.max_total_draft_tokens
+
+    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
+        logger.warning(
+            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
+        )
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -513,16 +522,19 @@ def create_py_executor(
                     )
 
     with allocation_scope(ExecutorMemoryType.SAMPLER, RestoreMode.PINNED):
-        sampler = instantiate_sampler(model_engine,
-                                      pytorch_backend_config,
-                                      mapping,
-                                      max_batch_size=max_batch_size,
-                                      max_beam_width=max_beam_width,
-                                      max_seq_len=max_seq_len,
-                                      mm_encoder_only=mm_encoder_only,
-                                      speculative_config=spec_config,
-                                      decoding_config=decoding_config,
-                                      kv_cache_config=kv_cache_config)
+        sampler = instantiate_sampler(
+            model_engine,
+            llm_args,
+            mapping,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_seq_len=max_seq_len,
+            mm_encoder_only=mm_encoder_only,
+            speculative_config=spec_config,
+            decoding_config=decoding_config,
+            kv_cache_config=kv_cache_config,
+            disable_flash_infer_sampling=llm_args._disable_flash_infer_sampling,
+        )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
@@ -592,7 +604,7 @@ def create_py_executor(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
-            pytorch_backend_config=pytorch_backend_config,
+            llm_args=llm_args,
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
@@ -634,7 +646,7 @@ def create_py_executor(
             dist=dist,
             resources=resources,
             mapping=mapping,
-            pytorch_backend_config=pytorch_backend_config,
+            llm_args=llm_args,
             ctx_chunk_config=ctx_chunk_config,
             model_engine=model_engine,
             start_worker=False,
@@ -681,17 +693,20 @@ def create_py_executor(
                 if eng is None:
                     continue
                 if eng.attn_metadata is not None:
-                    if pytorch_backend_config.use_cuda_graph:
+                    if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
+
+            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
                 mapping=mapping,
-                pytorch_backend_config=pytorch_backend_config,
+                llm_args=llm_args,
                 ctx_chunk_config=ctx_chunk_config,
                 model_engine=model_engine,
                 start_worker=False,
@@ -712,7 +727,10 @@ def create_py_executor(
                 virtual_memory_pools=vm_pools,
             )
 
-    _adjust_torch_mem_fraction(pytorch_backend_config)
+    _adjust_torch_mem_fraction()
+
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
 
     py_executor.start_worker()
     return py_executor

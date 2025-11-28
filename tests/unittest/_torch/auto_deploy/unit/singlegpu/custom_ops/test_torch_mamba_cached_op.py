@@ -191,15 +191,9 @@ def test_prepare_metadata(mamba_env):
     pages_per_seq = torch.ones(b, device=device, dtype=torch.int32)
     slot_idx = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32)
     page_size = 128
-
+    chunk_size = 128
     out = torch.ops.auto_deploy.torch_ssm_prepare_metadata(
-        position_ids,
-        seq_len,
-        input_pos,
-        cache_loc,
-        pages_per_seq,
-        slot_idx,
-        page_size,
+        position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
     )
     # Returns a list of tensors from custom op API
     assert len(out) == 4

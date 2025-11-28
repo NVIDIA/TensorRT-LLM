@@ -31,6 +31,19 @@ For GB200 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup,
 
 For more information on NVIDIA IMEX service for NVLink networks, refer to https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html.
 
+#### Coherent Driver-Based Memory Management (CDMM)
+
+Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-65-06/index.html#hardware-software-support) for GB200 platforms is introduced. With CDMM, the driver manages GPU memory instead of the OS. CDMM avoids OS onlining of the GPU memory and the exposing of the GPU memory as a NUMA node to the OS. In Wide-EP, online EPLB need host threads be able to access the GPU memory to do the weights update.
+
+When CDMM mode is off, GPU memory are exposed as NUMA nodes, so no additional prerequisites is required.
+
+When CDMM mode is on, GPU memory doesn't exist in NUMA nodes, in that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed. 
+
+When GDRCopy is installed and the kernel module is loaded, you should be able to see the device file `/dev/gdrdrv` and kernel module `gdrdrv` by `lsmod`. The device file needs to be mapped into the container.
+
+* For docker, this can be done by adding a device mapping like `--device=/dev/gdrdrv:/dev/gdrdrv`.
+* For slurm with enroot, `--container-mounts="/dev/gdrdrv:/dev/gdrdrv"` needs to be added when starting containers and environment variable `export ENROOT_ALLOW_DEV=yes` needs to be set.
+
 ### Configurations
 
 An example yaml file to enable wide EP:

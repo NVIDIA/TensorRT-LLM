@@ -107,6 +107,7 @@ void initBindings(pybind11::module_& m)
         .def("get_last_tokens", py::overload_cast<>(&GenLlmReq::getLastTokens))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, py::arg("for_next_iteration") = false)
         .def_property_readonly("max_num_generated_tokens", &GenLlmReq::getMaxNumGeneratedTokens)
+        .def("will_complete_next_iteration", &GenLlmReq::willCompleteNextIteration)
         .def("add_new_token", &GenLlmReq::addNewToken, py::arg("token"), py::arg("beam"))
         .def("add_new_tokens", &GenLlmReq::addNewTokens, py::arg("beam_tokens"))
         .def_property_readonly("num_draft_tokens", &GenLlmReq::getNumDraftTokens)
@@ -403,39 +404,6 @@ void initBindings(pybind11::module_& m)
         .def(py::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
             py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
 
-    py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),
-            py::arg("max_tokens_per_engine_step"), py::arg("manager"))
-        .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
-        .def_readwrite("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
-        .def_readwrite("fill_values", &tb::DecoderInputBuffers::fillValues)
-        .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
-        .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
-        .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
-        .def_readwrite("logits", &tb::DecoderInputBuffers::logits)
-        .def_readwrite("decoder_requests", &tb::DecoderInputBuffers::decoderRequests);
-
-    py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
-        .def_readwrite("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)
-        .def_readwrite("finished_sum_host", &tb::DecoderOutputBuffers::finishedSumHost)
-        .def_property_readonly("new_output_tokens_host",
-            [](tb::DecoderOutputBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
-
-    py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),
-            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"))
-        .def_readwrite("output_ids", &tb::SlotDecoderBuffers::outputIds)
-        .def_readwrite("output_ids_host", &tb::SlotDecoderBuffers::outputIdsHost)
-        .def_readwrite("sequence_lengths_host", &tb::SlotDecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("cum_log_probs", &tb::SlotDecoderBuffers::cumLogProbs)
-        .def_readwrite("cum_log_probs_host", &tb::SlotDecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::SlotDecoderBuffers::logProbs)
-        .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
     m.def(
         "add_new_tokens_to_requests",
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,
@@ -454,10 +422,10 @@ void initBindings(pybind11::module_& m)
 
     m.def(
         "make_decoding_batch_input",
-        [](std::vector<std::shared_ptr<tb::LlmRequest>>& contextRequests,
-            std::vector<std::shared_ptr<tb::LlmRequest>>& genRequests, tr::ITensor::SharedPtr logits, int beamWidth,
-            std::vector<int> const& numContextLogitsPrefixSum, tb::DecoderInputBuffers const& decoderInputBuffers,
-            runtime::decoder::DecoderState& decoderState, tr::BufferManager const& manager)
+        [](tb::DecoderInputBuffers& decoderInputBuffers, runtime::decoder::DecoderState& decoderState,
+            std::vector<std::shared_ptr<tb::LlmRequest>> const& contextRequests,
+            std::vector<std::shared_ptr<tb::LlmRequest>> const& genRequests, tr::ITensor::SharedPtr const& logits,
+            int beamWidth, std::vector<int> const& numContextLogitsPrefixSum, tr::BufferManager const& manager)
         {
             std::vector<int> activeSlots;
             std::vector<int> generationSteps;
@@ -515,8 +483,7 @@ void initBindings(pybind11::module_& m)
                 batchSlotsRange[i] = activeSlots[i];
             }
 
-            auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, 1);
-            decodingInput->batchSlots = batchSlots;
+            decoderInputBuffers.batchLogits = logitsVec;
 
             auto const maxBeamWidth = decoderState.getMaxBeamWidth();
             if (maxBeamWidth > 1)
@@ -524,12 +491,10 @@ void initBindings(pybind11::module_& m)
                 // For Variable-Beam-Width-Search
                 decoderState.getJointDecodingInput().generationSteps = generationSteps;
             }
-
-            return decodingInput;
         },
-        py::arg("context_requests"), py::arg("generation_requests"), py::arg("logits"), py::arg("beam_width"),
-        py::arg("num_context_logits_prefix_sum"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
-        py::arg("buffer_manager"), "Make decoding batch input.");
+        py::arg("decoder_input_buffers"), py::arg("decoder_state"), py::arg("context_requests"),
+        py::arg("generation_requests"), py::arg("logits"), py::arg("beam_width"),
+        py::arg("num_context_logits_prefix_sum"), py::arg("buffer_manager"), "Make decoding batch input.");
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

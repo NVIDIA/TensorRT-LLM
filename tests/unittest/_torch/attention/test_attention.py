@@ -438,12 +438,13 @@ def test_attention_backend(s: Scenario):
     flashinfer_kv_cache = torch.randn(num_layers,
                                       s.max_num_pages,
                                       2,
-                                      page_size,
                                       num_kv_heads,
+                                      page_size,
                                       head_dim,
                                       device="cuda").to(s.kvcache_dtype)
-    ref_kv_cache = flashinfer_kv_cache.transpose(1, 2).contiguous().view(
-        num_layers, 2, batch_size, kv_cache_len, num_kv_heads, head_dim)
+    ref_kv_cache = flashinfer_kv_cache.transpose(1, 2).transpose(
+        3, 4).contiguous().view(num_layers, 2, batch_size, kv_cache_len,
+                                num_kv_heads, head_dim)
     kv = torch.randn(num_layers,
                      2,
                      nnz_kv,
@@ -588,12 +589,13 @@ def test_attention_backend_ifb(s: PagedScenario):
     flashinfer_kv_cache = torch.randn(num_layers,
                                       s.max_num_pages,
                                       2,
-                                      page_size,
                                       num_kv_heads,
+                                      page_size,
                                       head_dim,
                                       device="cuda").to(s.kvcache_dtype)
-    ref_kv_cache = flashinfer_kv_cache.transpose(1, 2).contiguous().view(
-        num_layers, 2, batch_size, kv_cache_len, num_kv_heads, head_dim)
+    ref_kv_cache = flashinfer_kv_cache.transpose(1, 2).transpose(
+        3, 4).contiguous().view(num_layers, 2, batch_size, kv_cache_len,
+                                num_kv_heads, head_dim)
     vanilla_kv_cache = ref_kv_cache.transpose(1, 2).contiguous()
     kv = torch.randn(num_layers,
                      2,

@@ -52,6 +52,11 @@ class CleanupInputConstraints(BaseTransform):
             object.__setattr__(vr, "upper", max_total)
 
         # store info object about the transform
-        info = TransformInfo(skipped=False, num_matches=len(vrs))
+        info = TransformInfo(
+            skipped=False,
+            num_matches=len(vrs),
+            is_clean=len(vrs) == 0,
+            has_valid_shapes=len(vrs) == 0,
+        )
 
         return gm, info

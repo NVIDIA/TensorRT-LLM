@@ -6,7 +6,6 @@ import pytest
 import yaml
 from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
-from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm.commands.bench import main
 
@@ -32,12 +31,19 @@ def run_benchmark(
             "_autodeploy",
             "--dataset",
             dataset_path,
+            "--iteration_log",
+            "iteration_log.log",
             "--extra_llm_api_options",
             f"{extra_llm_api_options_path}",
         ]
     )
     result = runner.invoke(main, args, catch_exceptions=False)
     assert result.exit_code == 0
+
+    with open("iteration_log.log", "r") as f:
+        lines = f.readlines()
+    assert len(lines) > 0
+    # TODO: add more checks
 
 
 def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
