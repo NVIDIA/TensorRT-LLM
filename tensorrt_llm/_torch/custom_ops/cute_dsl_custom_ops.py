@@ -242,8 +242,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Allocate output tensor from UserBuffers or regular CUDA memory
             if self.to_userbuffers:
-                from tensorrt_llm.bindings import torch_ext
-                c_tensor, _ = torch_ext.create_userbuffers_tensor(
+                c_tensor, _ = torch.ops.trtllm.create_userbuffers_tensor(
                     [m, n], self.output_dtype)
             else:
                 c_tensor = torch.empty(*(m, n),
