@@ -50,9 +50,10 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from ..modules.mamba.layernorm_gated import RMSNorm as RMSNormGated
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, EventType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
@@ -387,6 +388,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.mapping = model_config.mapping
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
+        self.aux_stream = aux_stream
 
         self.gate = Qwen3NextGate(
             hidden_size=self.hidden_dim,
@@ -425,6 +427,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                          dtype=config.torch_dtype,
                                          quant_config=None)
 
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -450,21 +457,32 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                           dim=0,
                                           sizes=all_rank_num_tokens)
 
-        router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states,
-            router_logits,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-            do_finalize=do_finalize,
-        )
-
-        if not do_finalize:
+        def _compute_routed_output():
+            router_logits = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states,
+                router_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+                do_finalize=do_finalize,
+            )
             return final_hidden_states
 
-        shared_expert_output = self.shared_expert(hidden_states)
-        shared_expert_output = F.sigmoid(
-            self.shared_expert_gate(hidden_states)) * shared_expert_output
+        def _compute_shared_output():
+            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = F.sigmoid(
+                self.shared_expert_gate(hidden_states)) * shared_expert_output
+            return shared_expert_output
+
+        final_hidden_states, shared_expert_output = maybe_execute_in_parallel(
+            _compute_routed_output,
+            _compute_shared_output,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+        )
+        if not do_finalize:
+            return final_hidden_states
 
         final_hidden_states = final_hidden_states + shared_expert_output
 
@@ -543,22 +561,28 @@ def fused_qkvzba_split_reshape_cat(
 ):
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-    mixed_qkv = torch.empty(
-        [batch * seq_len, qkv_dim_t],
+
+    # Allocate contiguous buffer for mixed_qkv and z (same dtype)
+    batch_seq = batch * seq_len
+    size_qkv = batch_seq * qkv_dim_t
+    size_z = batch_seq * num_heads_v * head_v
+    buffer_qkvz = torch.empty(
+        size_qkv + size_z,
         dtype=mixed_qkvz.dtype,
         device=mixed_qkvz.device,
     )
-    z = torch.empty(
-        [batch * seq_len, num_heads_v, head_v],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    b = torch.empty(
-        [batch * seq_len, num_heads_v],
+    mixed_qkv = buffer_qkvz[:size_qkv].view(batch_seq, qkv_dim_t)
+    z = buffer_qkvz[size_qkv:].view(batch_seq, num_heads_v, head_v)
+
+    # Allocate contiguous buffer for b and a (same dtype)
+    size_ba = batch_seq * num_heads_v
+    buffer_ba = torch.empty(
+        size_ba * 2,
         dtype=mixed_ba.dtype,
         device=mixed_ba.device,
     )
-    a = torch.empty_like(b)
+    b = buffer_ba[:size_ba].view(batch_seq, num_heads_v)
+    a = buffer_ba[size_ba:].view(batch_seq, num_heads_v)
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_kernel[grid](
         mixed_qkv,
@@ -831,15 +855,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             conv_state_indices=cache_indices,
         )
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim // self.attn_tp_size,
-                self.key_dim // self.attn_tp_size,
-                self.value_dim // self.attn_tp_size,
-            ],
-            dim=-1,
-        )
+        # Direct slicing instead of torch.split for better performance
+        key_size = self.key_dim // self.attn_tp_size
+        query = mixed_qkv[..., :key_size]
+        key = mixed_qkv[..., key_size:key_size * 2]
+        value = mixed_qkv[..., key_size * 2:]
         # Reshape from [l, h*d] to [1, l, h, d]
         seq_len = query.shape[0]
         num_heads = query.shape[1] // self.head_k_dim
@@ -1038,8 +1058,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
         else:
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba)
             query, key, value = map(lambda x: x.reshape(x.shape[0], -1),
                                     (query, key, value))
             mixed_qkv = torch.cat((query, key, value), dim=-1)
@@ -1061,25 +1079,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "num_decode": num_decodes,
         }
 
-        new_implementation = True
-        if new_implementation:
-            if num_prefills > 0:
-                attn_out = self.forward_extend(conv_states, ssm_states,
-                                               **kwargs)
-            else:
-                attn_out = self.forward_decode(conv_states, ssm_states,
-                                               num_decodes,
-                                               mamba_metadata.cu_seqlens,
-                                               **kwargs)
+        if num_prefills > 0:
+            attn_out = self.forward_extend(conv_states, ssm_states, **kwargs)
+        else:
+            attn_out = self.forward_decode(conv_states, ssm_states, num_decodes,
+                                           mamba_metadata.cu_seqlens, **kwargs)
 
-        z_shape_og = z.shape
-        # reshape input data into 2D tensor
+        # reshape input data into 2D tensor for norm
+        batch_size = z.shape[0]
+        final_dim = z.shape[1] * z.shape[2]
         attn_out = attn_out.reshape(-1, attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         attn_out = self.norm(attn_out, z)
-        attn_out = attn_out.reshape(z_shape_og)
-        attn_out = attn_out.reshape(*attn_out.shape[:-2], -1)
-
+        # directly reshape to final output shape [batch, num_heads_v * head_v]
+        attn_out = attn_out.reshape(batch_size, final_dim)
         output = self.out_proj(attn_out, all_reduce_params=all_reduce_params)
         return output
 
@@ -1125,7 +1138,7 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
             "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        self.mapping.has_tp()
+        # has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
@@ -1284,7 +1297,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        self.mapping.has_tp()
+        # has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
