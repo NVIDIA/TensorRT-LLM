@@ -1019,7 +1019,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
     return status
 }
 
-def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, onlyBuildImage = false)
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release Check": {
@@ -1265,7 +1265,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, o
         echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
     }
 
-    if (onlyBuildImage) {
+    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         stages = stages.findAll { key, value -> key.contains("Release Check") } + dockerBuildJob
         echo "Only execute Build-Docker-Images and Release Check stages, build and update docker images and tags"
     }
@@ -1332,18 +1332,6 @@ pipeline {
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
                     echo "Check the passed GitLab bot testFilter parameters."
-                }
-            }
-        }
-        stage("Build Docker Images and update Image Tags") {
-            when {
-                expression {
-                    testFilter[(DISABLE_MULTI_GPU_TEST)] == true
-                }
-            }
-            steps {
-                script {
-                    launchStages(this, false, testFilter, enableFailFast, globalVars, true)
                 }
             }
         }
