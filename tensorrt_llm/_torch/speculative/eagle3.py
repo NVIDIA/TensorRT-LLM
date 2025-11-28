@@ -65,7 +65,8 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.spec_tree_manager = None
 
         if isinstance(config,
-                      EagleDecodingConfig) and config.eagle_choices is not None:
+                      EagleDecodingConfig) and (config.eagle_choices is not None
+                                                or config.use_dynamic_tree):
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
                 use_dynamic_tree=config.use_dynamic_tree,
