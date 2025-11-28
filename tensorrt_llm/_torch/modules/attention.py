@@ -2060,9 +2060,10 @@ class MLA(nn.Module):
 
         # [seq, num_heads, kv_lora_rank], account for padding
         attn_out_latent = attn_out_latent[:, :self.num_heads_tp, :]
-        # TODO: seems we need .contiguous() here when padding enabled before pass to bmm?
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp, self.kv_lora_rank])
+        if self.num_heads_tp != padding:
+            attn_out_latent = attn_out_latent.contiguous()
 
         assert (attn_out_latent.shape[0] == q.shape[0]
                 and attn_out_latent.shape[1] == self.num_heads_tp)

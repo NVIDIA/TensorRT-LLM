@@ -1104,6 +1104,41 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 disable_overlap_scheduler=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip(
+        reason=
+        "Currently failing due to accuracy drop, https://nvbugspro.nvidia.com/bug/5674665"
+    )
+    def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 disable_overlap_scheduler=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def test_auto_dtype_vswa_reuse_partial_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -2409,8 +2444,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
             (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
+        ids=[
+            "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
+            "latency_default"
+        ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
@@ -4194,6 +4233,86 @@ class TestQwen3NextThinking(LlmapiAccuracyTestHarness):
                  cuda_graph_config=cuda_graph_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/Qwen3-Next"
+    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
+
+    # Default setting of `256` is too small
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        [
+            (4, 1, 4, True, True),
+        ],
+        ids=[
+            "tp4ep4_cudagraph_overlap",
+        ],
+    )
+    def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
+                       overlap_scheduler, mocker):
+        model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512) if cuda_graph else None)
+
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                max_num_tokens=16384,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
+                             ids=["cutlass", "trtllm"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, True, True), (4, 1, 1, True, True), (4, 1, 4, True, True),
+         (4, 1, 4, False, False)],
+        ids=["tp1", "tp4ep1", "tp4ep4", "no_cuda_graph_overlap"])
+    def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
+                   overlap_scheduler, mocker):
+        model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512) if cuda_graph else None)
+        moe_config = MoeConfig(backend=moe_backend)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_num_tokens=16384,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 moe_config=moe_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
