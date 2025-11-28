@@ -1305,6 +1305,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages.remove("SBSA-Linux")
         echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
     }
+    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
+        stages = stages.findAll { key, value -> key.contains("Release Check") } + dockerBuildJob
+        echo "Only execute Build-Docker-Images and Release Check stages, build and update docker images and tags"
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
