@@ -2996,9 +2996,7 @@ def launchTestJobs(pipeline, testFilter)
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
-                            // Not use internal mirror because we don't want to lock down the torchvision version.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torchvision --index-url https://download.pytorch.org/whl/cu130")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
                         }
 
                         def libEnv = []
