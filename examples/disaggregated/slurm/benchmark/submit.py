@@ -116,7 +116,8 @@ def submit_job(config, log_dir):
     if log_dir is None:
         # Create base log directory path
         date_prefix = datetime.now().strftime("%Y%m%d")
-        log_base = os.path.join(env_config['work_dir'], f"{date_prefix}/{isl}-{osl}")
+        log_base = os.path.join(env_config['work_dir'],
+                                f"{date_prefix}/{isl}-{osl}")
 
         # Get eplb num_slots for gen worker
         load_balancer_config = config['worker_config']['gen'].get(
