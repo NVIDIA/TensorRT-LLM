@@ -603,13 +603,11 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_disaggregated_stress_test(model_config, test_mode,
-                                   capacity_scheduler_policy,
                                    stress_time_timeout):
     """Run disaggregated serving stress test with configurable models.
 
     Args:
         model_config: Model configuration containing model_dir, tp_size, and memory_requirement
-        capacity_scheduler_policy: Scheduler policy ("MAX_UTILIZATION")
         stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
     """
     model_dir = model_config.model_dir
