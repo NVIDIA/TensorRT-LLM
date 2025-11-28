@@ -62,7 +62,7 @@ class Compressor(Controller):
 
         for i in range(self.max_iterations):
             yield from self.generation_controller.process([compress_task])
-            if compress_task.finish_reason == "finish":
+            if compress_task.finish_reason == "stop":
                 break
             if i < self.max_iterations - 1:
                 compress_task.messages.pop()
@@ -96,6 +96,7 @@ class Researcher(Controller):
                     prefix=research_system_prompt_prefix,
                 )
             ],
+            tools=self.tools,
         )
 
         yield from self.chat_with_tools_controller.process([chat_task])
