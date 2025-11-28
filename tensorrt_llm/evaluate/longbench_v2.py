@@ -66,7 +66,8 @@ class LongBenchV2(Evaluator):
                  output_dir: Optional[str] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None):
+                 system_prompt: Optional[str] = None,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         """Initialize LongBench v2 evaluator.
 
         Args:
@@ -85,10 +86,12 @@ class LongBenchV2(Evaluator):
             random_seed: Random seed for reproducibility
             apply_chat_template: Whether to apply model's chat template
             system_prompt: System prompt to prepend
+            chat_template_kwargs: Chat template kwargs as JSON string
         """
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
 
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -813,6 +816,13 @@ class LongBenchV2(Evaluator):
                   type=int,
                   default=32000,
                   help="Maximum generation length in sampling parameters.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
@@ -821,7 +831,8 @@ class LongBenchV2(Evaluator):
                 cot: bool, no_context: bool, rag: int, max_len: int,
                 output_dir: Optional[str], random_seed: int,
                 apply_chat_template: bool, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int) -> None:
+                max_input_length: int, max_output_length: int,
+                chat_template_kwargs: Optional[dict[str, Any]]) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
         sampling_params = SamplingParams(
@@ -844,7 +855,8 @@ class LongBenchV2(Evaluator):
                                 output_dir=output_dir,
                                 random_seed=random_seed,
                                 apply_chat_template=apply_chat_template,
-                                system_prompt=system_prompt)
+                                system_prompt=system_prompt,
+                                chat_template_kwargs=chat_template_kwargs)
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
