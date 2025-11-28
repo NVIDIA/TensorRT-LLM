@@ -356,7 +356,6 @@ def launch_disaggregated_llm(
         try:
             yield DuckLLM(args, tokenizer, generate_async)
         finally:
-            print("---- here!!! ----")
             if enable_perf:
                 _get_perf_metrics()
                 _show_kvcache_time(kv_cache_perf_dir)
