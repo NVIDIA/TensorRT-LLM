@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/ncclCommunicator.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
+
+#include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #if ENABLE_MULTI_DEVICE

@@ -17,6 +17,7 @@
 #pragma once
 #ifndef TRTLLM_MOETOPKFUNCS_CUH_H
 #define TRTLLM_MOETOPKFUNCS_CUH_H
+#include "tensorrt_llm/common/config.h"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -24,7 +25,9 @@
 
 #include "tensorrt_llm/kernels/archCondition.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace reduce_topk
@@ -281,5 +284,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> con
 #undef TOPK_SWAP
 
 } // namespace reduce_topk
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END
 #endif // TRTLLM_MOETOPKFUNCS_CUH_H

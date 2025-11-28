@@ -15,12 +15,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <optional>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 
 GuidedDecodingConfig::GuidedDecodingConfig(GuidedDecodingConfig::GuidedDecodingBackend backend,
@@ -93,4 +96,6 @@ void GuidedDecodingConfig::validate() const
     }
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

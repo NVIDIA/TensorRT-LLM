@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <array>
 #include <cuda_runtime_api.h>
 #include <optional>
@@ -35,7 +36,9 @@
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 
 template <typename AType, typename BType, typename BScaleType, typename OType>
@@ -336,4 +339,6 @@ private:
     size_t calcMaxWorkspaceSize(int num_experts) const;
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

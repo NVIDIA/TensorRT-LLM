@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-namespace tensorrt_llm
-{
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -36,4 +38,5 @@ static inline __device__ float __tanhf(float x)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -17,6 +17,7 @@
 #include "moeLoadBalancer.h"
 #include "hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
 #include "topologyDetector.h"
@@ -33,7 +34,9 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 // Helper structure to hold replica information
 struct ReplicaInfo
@@ -1176,4 +1179,6 @@ void MultiThreadWorker::workerLoop(int rank)
     }
 }
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

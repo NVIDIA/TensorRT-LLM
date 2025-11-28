@@ -17,13 +17,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor::kv_cache
 {
 
 class MpiConnection : public Connection
@@ -52,4 +55,6 @@ private:
     CommState mCommState;
 };
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+
+TRTLLM_NAMESPACE_END

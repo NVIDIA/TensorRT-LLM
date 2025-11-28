@@ -16,11 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
 #include <stdexcept>
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
 {
 
 // Grid size is num_tokens / TILE_TOKEN * hidden_out / TILE_OUT.
@@ -337,4 +340,6 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_fp8_gemm_swiglu_per_blo
         DISPATCH_FC_FP8_BF16_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED);                                       \
     }
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
+} // namespace kernels::llama4_min_latency::llama4_fp8_fp8_gemm_swiglu
+
+TRTLLM_NAMESPACE_END

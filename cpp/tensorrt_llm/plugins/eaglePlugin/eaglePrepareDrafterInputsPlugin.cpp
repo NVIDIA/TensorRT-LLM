@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 #include "eaglePrepareDrafterInputsPlugin.h"
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"

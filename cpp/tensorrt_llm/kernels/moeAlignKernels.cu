@@ -18,13 +18,17 @@
 
 #include "moeAlignKernels.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 #include <cub/cub.cuh>
 
 #define CEILDIV(x, y) (((x) + (y) -1) / (y))
 #define WARP_SIZE 32
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 template <typename scalar_t>
@@ -277,4 +281,6 @@ void invokeMoeAlignBlockSize(void const* topk_ids, int32_t topk_ids_dtype_size, 
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

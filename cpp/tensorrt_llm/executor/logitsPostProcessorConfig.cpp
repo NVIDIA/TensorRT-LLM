@@ -15,9 +15,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 
 LogitsPostProcessorConfig::LogitsPostProcessorConfig(std::optional<LogitsPostProcessorMap> processorMap,
@@ -58,4 +61,6 @@ void LogitsPostProcessorConfig::setReplicate(bool replicate)
     mReplicate = replicate;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

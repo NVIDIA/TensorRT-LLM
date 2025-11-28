@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/memoryCounters.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
+
+#include "tensorrt_llm/runtime/memoryCounters.h"
 
 #include <array>
 #include <cmath>
@@ -43,7 +44,9 @@ std::string doubleBytesToString(double bytes, int precision)
 
 } // namespace
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 std::string MemoryCounters::bytesToString(SizeType32 bytes, int precision)
 {
@@ -90,4 +93,6 @@ MemoryCounters& MemoryCounters::getInstance()
     static MemoryCounters mInstance;
     return mInstance;
 }
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

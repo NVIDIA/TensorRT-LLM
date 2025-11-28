@@ -17,11 +17,14 @@
 
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::batch_manager::rnn_state_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager::rnn_state_manager
 {
 
 RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runtime::ModelConfig const& modelConfig,
@@ -113,4 +116,6 @@ void RnnStateManager::fillSlotMapping(
     }
 }
 
-} // namespace tensorrt_llm::batch_manager::rnn_state_manager
+} // namespace batch_manager::rnn_state_manager
+
+TRTLLM_NAMESPACE_END

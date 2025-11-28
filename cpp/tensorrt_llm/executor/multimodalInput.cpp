@@ -15,10 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
     std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths)
@@ -43,4 +46,6 @@ std::vector<SizeType32> MultimodalInput::getMultimodalLengths() const
     return mMultimodalLengths;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

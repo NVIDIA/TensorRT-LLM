@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 #include "llmRequest.h"
-
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchUtils.h"

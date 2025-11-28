@@ -16,12 +16,15 @@
 
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 namespace tk = tensorrt_llm::kernels;
 
-namespace tensorrt_llm::runtime::decoder
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::decoder
 {
 using TensorPtr = DecoderState::TensorPtr;
 
@@ -667,4 +670,6 @@ DecodingOutput& DecoderState::getJointDecodingOutput() const
     return *mJointDecodingOutput;
 }
 
-} // namespace tensorrt_llm::runtime::decoder
+} // namespace runtime::decoder
+
+TRTLLM_NAMESPACE_END

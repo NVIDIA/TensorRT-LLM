@@ -17,11 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::plugins::utils
+TRTLLM_NAMESPACE_BEGIN
+
+namespace plugins::utils
 {
 using DimType64 = int64_t;
 
@@ -75,4 +78,6 @@ inline std::int32_t logErrorReturn0(char const* variable)
     ((value > 0x7FFFFFFFLL || value < -0x80000000LL) ? tensorrt_llm::plugins::utils::logErrorReturn0(#value)           \
                                                      : static_cast<int32_t>(value))
 
-} // namespace tensorrt_llm::plugins::utils
+} // namespace plugins::utils
+
+TRTLLM_NAMESPACE_END

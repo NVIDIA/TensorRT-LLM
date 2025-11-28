@@ -15,6 +15,7 @@
  */
 
 #include "moePrepareKernels.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <stdio.h>
 
@@ -24,7 +25,9 @@
 
 namespace cg = cooperative_groups;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace moe_prepare
@@ -374,4 +377,6 @@ size_t getMoePrepareWorkspaceSize(int epSize)
 
 } // namespace moe_prepare
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

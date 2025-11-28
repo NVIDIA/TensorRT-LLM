@@ -16,11 +16,14 @@
  */
 
 #include "tensorrt_llm/executor/transferAgent.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <dlfcn.h>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor::kv_cache
 {
 
 [[nodiscard]] DynLibLoader& DynLibLoader::getInstance()
@@ -58,4 +61,6 @@ DynLibLoader::~DynLibLoader()
     }
 }
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
@@ -26,7 +27,9 @@
 #include <optional>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 
 class SamplingConfig
@@ -419,4 +422,6 @@ public:
     }
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

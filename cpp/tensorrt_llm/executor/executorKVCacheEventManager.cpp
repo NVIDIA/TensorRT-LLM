@@ -16,9 +16,12 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 
 KVCacheEventManager::KVCacheEventManager(
@@ -32,4 +35,6 @@ std::deque<KVCacheEvent> KVCacheEventManager::getLatestEvents(std::optional<std:
     return kvCacheManager->getLatestEvents(timeout);
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

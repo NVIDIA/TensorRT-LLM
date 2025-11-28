@@ -15,10 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 
 CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
@@ -84,4 +87,6 @@ std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() 
 {
     return mKvTransferSenderFutureTimeoutMs;
 }
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

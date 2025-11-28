@@ -15,10 +15,10 @@
  */
 
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
-
 #include "common.h"
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"

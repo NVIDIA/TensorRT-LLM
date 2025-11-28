@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/decoderState.h"
@@ -26,7 +27,9 @@
 
 namespace tr = tensorrt_llm::runtime;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 using SizeType32 = MakeDecodingBatchInputOutput::SizeType32;
 using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
@@ -195,4 +198,6 @@ void MakeDecodingBatchInputOutput::operator()(DecoderInputBuffers& inputBuffers,
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+
+TRTLLM_NAMESPACE_END

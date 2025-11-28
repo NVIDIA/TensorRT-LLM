@@ -16,8 +16,9 @@
  */
 
 #include "encoderBuffers.h"
-
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -28,7 +29,9 @@
 
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 
 EncoderBuffers::EncoderBuffers(
@@ -557,4 +560,6 @@ void EncoderBuffers::insertInputTensors(TensorMap& inputMap)
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+
+TRTLLM_NAMESPACE_END

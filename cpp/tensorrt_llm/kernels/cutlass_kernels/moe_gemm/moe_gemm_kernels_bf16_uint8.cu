@@ -15,10 +15,15 @@
  */
 
 #include "moe_gemm_template_dispatch.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 #ifdef ENABLE_BF16
 template class MoeGemmRunner<__nv_bfloat16, uint8_t, __nv_bfloat16>;
 #endif
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

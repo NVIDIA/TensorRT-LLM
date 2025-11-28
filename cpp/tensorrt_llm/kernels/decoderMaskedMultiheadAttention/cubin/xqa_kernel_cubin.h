@@ -14,8 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 // clang-format off
@@ -1915,4 +1914,4 @@ static const struct XQAKernelMetaInfo
 
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

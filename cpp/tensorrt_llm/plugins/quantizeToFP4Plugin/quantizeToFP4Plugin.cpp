@@ -16,6 +16,7 @@
  */
 #include "quantizeToFP4Plugin.h"
 #include "pluginUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include <NvInferRuntimeBase.h>
 

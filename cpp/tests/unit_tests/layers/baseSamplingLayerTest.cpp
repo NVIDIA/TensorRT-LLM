@@ -15,8 +15,11 @@
  */
 
 #include "tests/unit_tests/layers/baseSamplingLayerTest.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::tests::layers::sampling
+TRTLLM_NAMESPACE_BEGIN
+
+namespace tests::layers::sampling
 {
 
 using namespace tensorrt_llm::runtime;
@@ -371,4 +374,6 @@ void BaseSamplingLayerTest<T>::runTest(
 template class BaseSamplingLayerTest<float>;
 template class BaseSamplingLayerTest<half>;
 
-} // namespace tensorrt_llm::tests::layers::sampling
+} // namespace tests::layers::sampling
+
+TRTLLM_NAMESPACE_END

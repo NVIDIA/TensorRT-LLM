@@ -16,9 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 
 class SpeculativeDecodingMode
@@ -191,4 +195,6 @@ static_assert(!SpeculativeDecodingMode::Eagle().isMedusa());
 static_assert(!SpeculativeDecodingMode::Eagle().isExplicitDraftTokens());
 static_assert(!SpeculativeDecodingMode::Eagle().isLookaheadDecoding());
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

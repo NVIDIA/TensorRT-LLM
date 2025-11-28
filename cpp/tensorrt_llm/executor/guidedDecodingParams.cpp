@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 
 #include <optional>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 
 GuidedDecodingParams::GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide)
@@ -45,4 +48,6 @@ std::optional<std::string> GuidedDecodingParams::getGuide() const
     return mGuide;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

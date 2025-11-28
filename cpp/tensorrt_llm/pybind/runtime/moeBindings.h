@@ -17,11 +17,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <pybind11/pybind11.h>
 
-namespace tensorrt_llm::pybind::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace pybind::runtime
 {
 
 void initMoeBindings(pybind11::module_& m);
 
-} // namespace tensorrt_llm::pybind::runtime
+} // namespace pybind::runtime
+
+TRTLLM_NAMESPACE_END

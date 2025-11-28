@@ -16,13 +16,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <list>
 #include <unordered_map>
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+
+namespace layers
 {
 
 //! @brief A helper class for managing key-ngram pool.
@@ -74,4 +77,6 @@ private:
     runtime::SizeType32 mGuessSetSize;
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+
+TRTLLM_NAMESPACE_END

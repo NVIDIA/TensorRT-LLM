@@ -22,6 +22,8 @@
 
 #include <torch/extension.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -48,6 +50,8 @@ torch::Tensor userbuffers_allreduce_finalize(torch::Tensor input, bool force_app
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("userbuffers_allreduce_finalize(Tensor input, bool force_applying_finalize) -> Tensor");
@@ -55,5 +59,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("userbuffers_allreduce_finalize", &torch_ext::userbuffers_allreduce_finalize);
+    m.impl("userbuffers_allreduce_finalize", &tensorrt_llm::torch_ext::userbuffers_allreduce_finalize);
 }

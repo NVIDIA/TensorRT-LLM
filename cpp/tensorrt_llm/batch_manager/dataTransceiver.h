@@ -16,15 +16,16 @@
  */
 
 #pragma once
+#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include <fstream>
 #include <future>
 #include <map>
 #include <string>
 #include <vector>
 
-#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
@@ -34,7 +35,9 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 
 namespace kv_cache_manager
@@ -329,4 +332,6 @@ private:
     std::unique_ptr<Impl, ImplDeleter> mImpl;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+
+TRTLLM_NAMESPACE_END

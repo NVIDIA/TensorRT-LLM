@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 #include "mcastDevMemUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include <unordered_map>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 using McastDeviceMemory = tensorrt_llm::runtime::McastDeviceMemory;
 
@@ -84,4 +87,6 @@ McastDeviceMemory* findMcastDevMemBuffer(void* ptr)
 {
     return McastDevMemBufferRegistry::getInstance().findBuffer(ptr);
 }
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

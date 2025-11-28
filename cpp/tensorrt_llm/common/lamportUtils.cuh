@@ -19,6 +19,7 @@
 #ifndef TRTLLM_CUDA_LAMPORT_UTILS_CUH
 #define TRTLLM_CUDA_LAMPORT_UTILS_CUH
 
+#include "tensorrt_llm/common/config.h"
 #include <array>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -29,7 +30,9 @@
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 constexpr uint16_t kNEGZERO_FP16 = 0x8000U;
@@ -279,6 +282,7 @@ private:
     }
 };
 
-} // namespace tensorrt_llm::common
+} // namespace common
 
+TRTLLM_NAMESPACE_END
 #endif // TRTLLM_CUDA_LAMPORT_UTILS_CUH

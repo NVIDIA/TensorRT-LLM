@@ -17,11 +17,14 @@
 #pragma once
 
 #include "lookaheadAlgorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+
+namespace layers
 {
 
 //! \brief LookaheadDecodingLayer
@@ -91,4 +94,6 @@ private:
     runtime::SizeType32 mGlobalSteps{0};
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+
+TRTLLM_NAMESPACE_END

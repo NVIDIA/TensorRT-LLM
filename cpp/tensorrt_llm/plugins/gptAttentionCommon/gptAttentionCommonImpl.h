@@ -18,8 +18,11 @@
 #pragma once
 
 #include "gptAttentionCommon.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+
+namespace plugins
 {
 template <typename T>
 T* GPTAttentionPluginCommon::cloneImpl() const noexcept
@@ -51,4 +54,6 @@ T* GPTAttentionPluginCreatorCommon::deserializePluginImpl(
     }
     return nullptr;
 }
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+
+TRTLLM_NAMESPACE_END

@@ -15,6 +15,7 @@
  */
 
 #include "eagleLayerTest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
@@ -30,7 +31,9 @@
 #include <cstdint>
 #include <random>
 
-namespace tensorrt_llm::tests::layers
+TRTLLM_NAMESPACE_BEGIN
+
+namespace tests::layers
 {
 
 using namespace tensorrt_llm::runtime;
@@ -1154,4 +1157,6 @@ TYPED_TEST(EagleDecodingLayerTest, IODifferentPathsBs2)
     this->runTest(prompts, predictionLetters, nextDraftLetters, lastDraftLetters, params);
 }
 
-} // namespace tensorrt_llm::tests::layers
+} // namespace tests::layers
+
+TRTLLM_NAMESPACE_END

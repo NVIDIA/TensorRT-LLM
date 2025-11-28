@@ -1,4 +1,5 @@
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
@@ -13,7 +14,9 @@
 #include <tuple>
 #include <unordered_map>
 
-namespace tensorrt_llm::testing
+TRTLLM_NAMESPACE_BEGIN
+
+namespace testing
 {
 
 struct TrivialConstantDecoderTestParameters
@@ -286,4 +289,6 @@ TEST(TrtInflightBatchingTest, CalculateCacheSizePerTokenForDisagg)
     }
 }
 
-} // namespace tensorrt_llm::testing
+} // namespace testing
+
+TRTLLM_NAMESPACE_END
