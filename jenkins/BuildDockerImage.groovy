@@ -570,18 +570,16 @@ def updateCIImageTag(globalVars) {
         }
         def repoPart = parts[0]
         def branchPart = parts[1]
-        def githubRepoUrl = "https://github.com/${repoPart}.git"
+        // Include credentials in the URL for authentication
+        def githubRepoUrl = "https://${GITHUB_USERNAME}:${GITHUB_PASSWORD}@github.com/${repoPart}.git"
         def githubBranch = branchPart
-        echo "Using GitHub repo: ${githubRepoUrl}, branch: ${githubBranch}"
+        echo "Using GitHub repo: https://github.com/${repoPart}.git, branch: ${githubBranch}"
 
         // 2. Clone the repository (create a temporary working directory)
         def workDir = "update_ci_image_tag_workspace"
-        sh """
-        rm -rf ${workDir}
-        mkdir -p ${workDir}
-        cd ${workDir}
-        git clone --depth 1 -b ${githubBranch} ${githubRepoUrl} repo
-        """
+        sh "rm -rf ${workDir}"
+        sh "mkdir -p ${workDir}"
+        sh "cd ${workDir} && git clone --depth 1 -b ${githubBranch} ${githubRepoUrl} repo"
 
         dir("${workDir}/repo") {
             // 3. Configure Git user
