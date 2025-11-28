@@ -230,8 +230,7 @@ python $MODELOPT_ROOT/examples/llm_ptq/hf_ptq.py \
     --batch_size=8 \
     --inference_tensor_parallel=1 \
     --inference_pipeline_parallel=1 \
-    --kv_cache_qformat none \
-    --export_fmt=hf
+    --kv_cache_qformat none
 ```
 
 Verify both checkpoints have the same KV cache dtype by checking `hf_quant_config.json`.

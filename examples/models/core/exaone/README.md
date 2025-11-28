@@ -92,7 +92,7 @@ You can either do pre-quantized models in HF model hub, or can generate quantize
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
 cd TensorRT-Model-Optimizer/examples/llm_ptq
-scripts/huggingface_example.sh --model  hf_models/$MODEL_NAME --quant fp8 --export_fmt hf
+scripts/huggingface_example.sh --model  hf_models/$MODEL_NAME --quant fp8
 ```
 
 For more information, please refer to official [docs](https://github.com/NVIDIA/TensorRT-Model-Optimizer) or [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
