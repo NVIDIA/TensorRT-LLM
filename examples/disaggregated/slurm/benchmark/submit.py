@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 
 import yaml
 
@@ -22,6 +23,10 @@ def parse_args():
                        '--dir',
                        type=str,
                        help='Directory containing YAML configuration files')
+    group.add_argument('--log-dir',
+                       type=str,
+                       default=None,
+                       help='Log directory')
     return parser.parse_args()
 
 
@@ -45,7 +50,7 @@ def calculate_nodes(world_size, num_servers, gpus_per_node):
     return (world_size + gpus_per_node - 1) // gpus_per_node * num_servers
 
 
-def submit_job(config):
+def submit_job(config, log_dir):
     # Extract configurations
     slurm_config = config['slurm']
     hw_config = config['hardware']
@@ -101,25 +106,28 @@ def submit_job(config):
     gen_enable_attention_dp = config['worker_config']['gen'][
         'enable_attention_dp']
 
-    # Create base log directory path
-    log_base = os.path.join(env_config['work_dir'], f"{isl}-{osl}")
+    if log_dir is None:
+        # Create base log directory path
+        date_prefix = datetime.now().strftime("%Y%m%d")
+        log_base = os.path.join(env_config['work_dir'], f"{date_prefix}/{isl}-{osl}")
 
-    # Get eplb num_slots for gen worker
-    load_balancer_config = config['worker_config']['gen'].get(
-        'moe_config', {}).get('load_balancer', {})
-    if isinstance(load_balancer_config, str):
-        with open(load_balancer_config, 'r') as f:
-            load_balancer_config = yaml.safe_load(f)
-    eplb_num_slots = load_balancer_config.get('num_slots', 0)
+        # Get eplb num_slots for gen worker
+        load_balancer_config = config['worker_config']['gen'].get(
+            'moe_config', {}).get('load_balancer', {})
+        if isinstance(load_balancer_config, str):
+            with open(load_balancer_config, 'r') as f:
+                load_balancer_config = yaml.safe_load(f)
+        eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-    # Determine directory suffix based on attention_dp
-    if gen_enable_attention_dp:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
-    else:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        # Determine directory suffix based on attention_dp
+        if gen_enable_attention_dp:
+            dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        else:
+            dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
 
-    # Create full log directory path
-    log_dir = os.path.join(log_base, dir_suffix)
+        # Create full log directory path
+        log_dir = os.path.join(log_base, dir_suffix)
+
     # Remove existing directory if it exists
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -231,7 +239,7 @@ def main():
         print(f"\nProcessing: {config_file}")
         try:
             config = load_config(config_file)
-            submit_job(config)
+            submit_job(config, args.log_dir)
             print(f"Successfully submitted job for: {config_file}")
         except Exception as e:
             print(f"Error processing {config_file}: {e}", file=sys.stderr)
