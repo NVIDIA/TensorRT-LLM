@@ -940,6 +940,8 @@ common-files: &common_files |
         tests/microbenchmarks/build_time_dashboard.py |
         tests/scripts/allreduce_perf/allreduce_heuristic_code_gen.py |
         tests/scripts/allreduce_perf/allreduce_perf_viz.py |
+        tests/scripts/cute_dsl_kernels/test_dense_blockscaled_gemm_persistent.py |
+        tests/scripts/cute_dsl_kernels/testing.py |
         tests/scripts/iteration_log_parser.py |
         tests/scripts/perf-sanity/parse_benchmark_results.py |
         tests/scripts/perf-sanity/run_benchmark_serve.py |
