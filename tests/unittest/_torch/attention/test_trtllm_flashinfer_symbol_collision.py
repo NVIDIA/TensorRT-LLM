@@ -4,6 +4,7 @@ import flashinfer.fused_moe
 import pytest
 import torch
 
+import tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.torch_moe  # noqa: F401
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as trt_ops  # noqa: F401
 
 
