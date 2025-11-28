@@ -204,6 +204,17 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             torch.distributed.barrier()
         super().setup_engine()
 
+    def _get_comm_ranks_device_id(self):
+        # Make sure C++ executor would use same devices/ranks as py_executor
+        global_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        comm_ranks = [None] * world_size
+        device_ids = [None] * world_size
+
+        torch.distributed.all_gather_object(comm_ranks, global_rank)
+        torch.distributed.all_gather_object(device_ids, self.device_id)
+        return comm_ranks, device_ids
+
     def enqueue_request(self,
                         request: GenerationRequest,
                         result_wait_queue: Queue | None = None) -> int:
