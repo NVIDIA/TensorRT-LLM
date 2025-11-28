@@ -363,7 +363,9 @@ def create_py_executor(
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper, StaticTreeDraftingLoopWrapper, DynamicTreeDraftingLoopWrapper)
+                        DynamicTreeDraftingLoopWrapper,
+                        LinearDraftingLoopWrapper,
+                        StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
                     use_tree_drafter = isinstance(
@@ -386,7 +388,8 @@ def create_py_executor(
                     elif dynamic_tree_drafter:
                         return DynamicTreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, max_batch_size, draft_spec_config.dynamic_tree_max_topK, model)
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            draft_spec_config.dynamic_tree_max_topK, model)
                     else:
                         return LinearDraftingLoopWrapper(
                             spec_config.max_draft_len,

@@ -68,7 +68,7 @@ class SpecTreeManager:
     draft_tokens_indices_cumsum: torch.Tensor = None
 
     ############################ Auxiliary buffers for the dynamic tree. ############################
-    # For the dynamic tree, before reconstructing the tree, 
+    # For the dynamic tree, before reconstructing the tree,
     # the draft token offsets of each draft layer are fixed, which we can set in advance.
     # shape: [1, max_total_draft_tokens + 1], device tensor.
     spec_dec_position_offsets_for_drafter_model: torch.Tensor = None
@@ -118,8 +118,7 @@ class SpecTreeManager:
         else:
             self.init_tree_info_for_static_tree()
 
-        self.dump_tree_info()
-        import pdb; pdb.set_trace()
+        # self.dump_tree_info()
 
     def init_tree_info_for_dynamic_tree(self):
         # For the dynamic tree
@@ -132,10 +131,13 @@ class SpecTreeManager:
         tmp_position_offsets = []
         for i in range(self.max_draft_len):
             tmp_position_offsets.extend([i] * self.dynamic_tree_max_topK)
-        self.spec_dec_position_offsets_for_drafter_model[0, :len(tmp_position_offsets)].copy_(
-            torch.tensor(tmp_position_offsets, dtype=torch.int32, device='cuda'),
-            non_blocking=True,
-        )
+        self.spec_dec_position_offsets_for_drafter_model[
+            0, :len(tmp_position_offsets)].copy_(
+                torch.tensor(tmp_position_offsets,
+                             dtype=torch.int32,
+                             device='cuda'),
+                non_blocking=True,
+            )
 
     # For the static tree
     def init_tree_info_for_static_tree(self):
@@ -324,7 +326,9 @@ class SpecTreeManager:
         print(f"TopK list: {self.top_k_list}")
         if self.use_dynamic_tree:
             print(f"Dynamic max top k: {self.dynamic_tree_max_topK}")
-            print(f"Spec dec position offsets for drafter model: {self.spec_dec_position_offsets_for_drafter_model}")
+            print(
+                f"Spec dec position offsets for drafter model: {self.spec_dec_position_offsets_for_drafter_model}"
+            )
         else:
             print(f"Max top k list cuda: {self.max_top_k}")
             print(f"Eagle paths: {self.eagle_paths}")
