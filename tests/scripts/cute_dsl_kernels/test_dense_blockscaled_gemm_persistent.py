@@ -434,7 +434,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=
-        "Performance test for Sm100 Dense Persistent BlockScaled GEMM.")
+        "Functionality and Performance Test for Sm100 Dense Persistent BlockScaled GEMM."
+    )
 
     parser.add_argument(
         "--mnkl",
