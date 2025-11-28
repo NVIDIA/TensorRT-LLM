@@ -346,7 +346,9 @@ def launch_disaggregated_llm(
                 print(f"Error fetching {perf_url}: {e}")
 
         def _show_kvcache_time(kv_cache_perf_dir, max_lines=1000):
+            print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
             for file in os.listdir(kv_cache_perf_dir):
+                print(f"file: {file}")
                 print(f"{'-'*25} {file}:{max_lines} {'-'*25}")
                 with open(os.path.join(kv_cache_perf_dir, file), "r") as f:
                     for line in f.readlines()[-max_lines:]:
@@ -357,8 +359,8 @@ def launch_disaggregated_llm(
             yield DuckLLM(args, tokenizer, generate_async)
         finally:
             if enable_perf:
-                _get_perf_metrics()
                 _show_kvcache_time(kv_cache_perf_dir)
+                _get_perf_metrics()
 
 
 def run_parallel_test(model_name: str,
