@@ -554,11 +554,24 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             )
 
         def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
+            act_fp4_key = KeywordArg('act_fp4')
+            weight_key = KeywordArg('weight')
+            act_sf_key = KeywordArg('act_sf')
+            weight_scale_key = KeywordArg('weight_scale')
+            alpha_key = KeywordArg('alpha')
+            output_dtype_key = KeywordArg('output_dtype')
+            to_userbuffers_key = KeywordArg('to_userbuffers')
+            backend_key = KeywordArg('backend')
             trtllm_nvfp4_gemm_default = CallFunction(
-                torch.ops.trtllm.nvfp4_gemm.default, KeywordArg('act_fp4'),
-                KeywordArg('weight'), KeywordArg('act_sf'),
-                KeywordArg('weight_scale'), KeywordArg('alpha'),
-                KeywordArg('output_dtype'))
+                torch.ops.trtllm.nvfp4_gemm.default,
+                act_fp4_key,
+                weight_key,
+                act_sf_key,
+                weight_scale_key,
+                alpha_key,
+                output_dtype_key,
+                to_userbuffers=to_userbuffers_key,
+                backend=backend_key)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
 
@@ -569,6 +582,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                backend: str,
             ):
                 return
 
@@ -579,18 +594,45 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                backend: str,
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    True)
+                    True, backend)
                 return nvfp4_gemm_output
 
-            # No extra check needed as the output dtype of nvfp4_gemm has been verified when
-            # ub_copy is inserted.
+            def extra_check(match: Match) -> bool:
+                # Validate backend value
+                backend_node = match.kwargs.get('backend')
+                if backend_node is None:
+                    # No backend specified, use default - OK
+                    return True
+
+                valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
+
+                # Case 1: backend is a Node with metadata
+                if hasattr(backend_node, 'meta') and 'val' in backend_node.meta:
+                    backend_value = backend_node.meta['val']
+                    if isinstance(backend_value, str):
+                        return backend_value in valid_backends
+                    return False  # Invalid type
+
+                # Case 2: backend is a constant Node in the graph
+                if hasattr(backend_node, 'target'):
+                    return backend_node.target in valid_backends
+
+                # Case 3: backend is a Python literal in kwargs
+                if isinstance(backend_node, str):
+                    return backend_node in valid_backends
+
+                # Unknown format - reject to be safe
+                return False
+
             register_replacement(
                 empty_nvfp4_gemm_prologue_pattern,
                 target_nvfp4_gemm_prologue_pattern,
-                [],
+                [extra_check],
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
