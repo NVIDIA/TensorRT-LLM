@@ -176,6 +176,7 @@ def launch_disaggregated_llm(
     ctx_urls = disaggregated_server_config["context_servers"]["urls"]
     gen_urls = disaggregated_server_config["generation_servers"]["urls"]
 
+    serve_port = disaggregated_server_config["port"]
     ctx_ports = [int(url.split(":")[1]) for url in ctx_urls]
     gen_ports = [int(url.split(":")[1]) for url in gen_urls]
 
@@ -274,14 +275,14 @@ def launch_disaggregated_llm(
                     )
             try:
                 print("Checking health endpoint")
-                response = requests.get("http://localhost:8000/health")
+                response = requests.get(f"http://localhost:{serve_port}/health")
                 if response.status_code == 200:
                     break
             except requests.exceptions.ConnectionError:
                 continue
 
         client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:8000/v1",
+                               base_url=f"http://localhost:{serve_port}/v1",
                                timeout=1800000)
 
         def send_request(prompt: str, sampling_params: SamplingParams,
