@@ -822,7 +822,8 @@ class LongBenchV2(Evaluator):
         default=None,
         callback=lambda ctx, param, value: json.loads(value) if value else None,
         help=
-        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
+        'Chat template kwargs as JSON string, e.g., \'{"enable_thinking": true}\' or \'{"thinking": true}\' to enable thinking mode.'
+    )
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
