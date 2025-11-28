@@ -1,5 +1,5 @@
 version: 0.0.1
-perf_sanity_l0_gb200_multi_nodes:
+perf_sanity_l0_gb200:
 - condition:
     ranges:
       # 2 nodes with each node has 4 GPUs
