@@ -583,32 +583,36 @@ def updateCIImageTag(globalVars) {
         echo "Setting up workspace with upstream repo: ${upstreamRepoPath}"
         echo "Fork repo: ${repoPart}"
 
+        // Clean up and prepare workspace
+        sh "rm -rf ${workDir}"
+        sh "mkdir -p ${workDir}"
+
+        // Disable git-lfs globally to avoid lock verification
+        sh "git lfs uninstall || true"
+
+        // Clone upstream repository without LFS
         sh """
-        rm -rf ${workDir}
-        mkdir -p ${workDir}
-        cd ${workDir}
-
-        # Clone upstream repository
         export GIT_LFS_SKIP_SMUDGE=1
+        cd ${workDir}
         git clone --depth 20 ${upstreamRepoUrl} repo
-        cd repo
-
-        # Add contributor's fork as remote
-        git remote add contributor ${forkRepoUrl}
-
-        # Fetch PR branch from contributor's fork
-        git fetch contributor ${branchName}
-
-        # Checkout the PR branch
-        git checkout -b pr-branch contributor/${branchName}
-
-        # Configure Git user
-        git config user.name "tensorrt-cicd"
-        git config user.email "90828364+tensorrt-cicd@users.noreply.github.com"
-
-        # Disable LFS for this operation
-        git lfs uninstall --local || true
         """
+
+        // Disable LFS in the cloned repo
+        sh "cd ${workDir}/repo && git lfs uninstall --local || true"
+        sh "cd ${workDir}/repo && git config --local lfs.locksverify false"
+
+        // Add contributor's fork as remote
+        sh "cd ${workDir}/repo && git remote add contributor ${forkRepoUrl}"
+
+        // Fetch PR branch from contributor's fork
+        sh "cd ${workDir}/repo && git fetch contributor ${branchName}"
+
+        // Checkout the PR branch
+        sh "cd ${workDir}/repo && git checkout -b pr-branch contributor/${branchName}"
+
+        // Configure Git user
+        sh "cd ${workDir}/repo && git config user.name 'tensorrt-cicd'"
+        sh "cd ${workDir}/repo && git config user.email '90828364+tensorrt-cicd@users.noreply.github.com'"
 
         // 3. Read current file and update content
         echo "Reading and updating ${filePath}"
@@ -625,14 +629,21 @@ def updateCIImageTag(globalVars) {
 
         // 4. Commit and push back to contributor's fork
         echo "Committing and pushing changes"
+
+        // Ensure LFS is still disabled (prevent lock verification)
+        sh "cd ${workDir}/repo && git lfs uninstall --local || true"
+        sh "cd ${workDir}/repo && git config --local lfs.locksverify false"
+
+        // Stage changes
+        sh "cd ${workDir}/repo && git add ${filePath}"
+
+        // Commit with sign-off
+        sh "cd ${workDir}/repo && git commit -s -m '[auto] Update CI image tags with newly built images'"
+
+        // Push to contributor's fork branch (maintainer permission allows this)
         sh """
-        cd ${workDir}/repo
         export GIT_LFS_SKIP_SMUDGE=1
-
-        git add ${filePath}
-        git commit -s -m "[auto] Update CI image tags with newly built images"
-
-        # Push to contributor's fork branch (maintainer permission allows this)
+        cd ${workDir}/repo
         git push contributor HEAD:${branchName}
         """
 
