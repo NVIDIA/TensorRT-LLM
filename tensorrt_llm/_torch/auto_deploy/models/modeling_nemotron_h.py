@@ -261,6 +261,8 @@ class NemotronHBlock(nn.Module):
             self.mixer = NemotronHAttention(config, layer_idx=layer_idx)
         elif self.block_type == "mlp":
             self.mixer = NemotronHMLP(config, layer_idx=layer_idx)
+        elif self.block_type == "moe":
+            self.mixer = NemotronHMOE(config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Invalid layer pattern {config.hybrid_override_pattern[layer_idx]}")
 
@@ -277,18 +279,119 @@ class NemotronHBlock(nn.Module):
 
 # Copied from transformers.models.nemotron.modeling_nemotron Nemotron->NemotronH
 class NemotronHMLP(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, intermediate_size: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = intermediate_size or config.intermediate_size
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.mlp_hidden_act]
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.up_proj(x)))
+
+
+class NemotronHMOE(nn.Module):
+    def __init__(self, config, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList(
+            [
+                NemotronHMLP(
+                    config, intermediate_size=config.moe_intermediate_size, layer_idx=layer_idx
+                )
+                for _ in range(config.n_routed_experts)
+            ]
+        )
+        self.gate = NemotronHTopkRouter(config)
+        self.shared_experts = NemotronHMLP(
+            config=config,
+            intermediate_size=config.moe_shared_expert_intermediate_size,
+            layer_idx=layer_idx,
+        )
+
+    # Swiped from `tensorrt_llm/_torch/auto_deploy/models/patches/nemotron_h.py::_nemotron_h_moe_forward`.
+    def forward(self, hidden_states):
+        """
+        Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe
+        with act_fn='relu2'. Handles both latent MOE and direct MOE architectures.
+        """
+
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        topk_indices, topk_weights = self.gate(hidden_states)
+        x_flat = hidden_states.view(-1, hidden_states.shape[-1])
+
+        # NOTE: So far we've seen that the dispatch order in eager code is the same as the node
+        # order in the exported graph.
+        # We dispatch shared expert first so that we can easily fork the execution of the routed
+        # experts (using the custom op below) to an auxiliary stream.
+        shared_out = self.shared_experts(residuals)
+        # Check if this is a latent MOE (has fc1_latent_proj and fc2_latent_proj)
+        has_latent_proj = hasattr(self, "fc1_latent_proj") and hasattr(self, "fc2_latent_proj")
+
+        if has_latent_proj:
+            # Latent MOE: project to latent space before routing
+            x_flat = self.fc1_latent_proj(x_flat)
+
+        # Route through experts (operates in latent space if latent MOE, full space otherwise)
+        out_flat = torch.ops.auto_deploy.torch_moe(
+            x_flat,
+            topk_indices,
+            topk_weights,
+            w1_weight=[e.up_proj.weight for e in self.experts],
+            w2_weight=[e.down_proj.weight for e in self.experts],
+            w3_weight=[],
+            act_fn="relu2",
+            mlp_style="mlp",
+        )
+
+        if has_latent_proj:
+            # Latent MOE: project back from latent space
+            out_flat = self.fc2_latent_proj(out_flat)
+
+        routed_out = out_flat.view(*orig_shape)
+        out = shared_out + routed_out
+        return out
+
+
+class NemotronHTopkRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "e_score_correction_bias", torch.zeros(self.n_routed_experts, dtype=torch.float32)
+        )
+
+    # Swiped from `tensorrt_llm/_torch/auto_deploy/models/patches/nemotron_h.py::_nemotron_h_topk_router_forward`.
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.view(-1, self.config.hidden_size)
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+
+        # Use the fused noaux_tc_op kernel which applies sigmoid internally
+        # and performs group-based top-k selection with normalization
+        topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            self.n_group,
+            self.topk_group,
+            self.top_k,
+            self.routed_scaling_factor,
+        )
+
+        return topk_indices, topk_weights
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
