@@ -49,7 +49,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             assert output_dtype == torch.bfloat16
 
-            if get_sm_version() != 100 or get_sm_version() != 103:
+            if get_sm_version() not in [100, 103]:
                 raise ValueError(
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
                 )
