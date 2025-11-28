@@ -53,6 +53,8 @@ def calculate_nodes(world_size, num_servers, gpus_per_node):
 def submit_job(config, log_dir):
     # Extract configurations
     slurm_config = config['slurm']
+    slurm_config.setdefault('extra_args', '')
+
     hw_config = config['hardware']
     env_config = config['environment']
 
@@ -75,6 +77,11 @@ def submit_job(config, log_dir):
     env_config.setdefault('trtllm_wheel_path', '')
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
+
+    profiling_config = config.get('profiling', {})
+    profiling_config.setdefault('nsys_on', False)
+    profiling_config.setdefault('ctx_profile_range', '10-30')
+    profiling_config.setdefault('gen_profile_range', '200-250')
 
     # Get number of servers from config
     ctx_num = hw_config['num_ctx_servers']
@@ -192,9 +199,9 @@ def submit_job(config, log_dir):
         env_config['trtllm_wheel_path'],
 
         # Profiling
-        str(config['profiling']['nsys_on']).lower(),
-        config['profiling']['ctx_profile_range'],
-        config['profiling']['gen_profile_range'],
+        str(profiling_config['nsys_on']).lower(),
+        profiling_config['ctx_profile_range'],
+        profiling_config['gen_profile_range'],
 
         # Accuracy evaluation
         str(config['accuracy']['enable_accuracy_test']).lower(),
