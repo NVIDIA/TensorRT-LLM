@@ -846,7 +846,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // Disagg mode
             def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-submit.py"
-            def scriptDisaggLaunchDraftPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_draft.sh")
+            def scriptDisaggLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.py"
             def scriptDisaggLaunchDraftPathNode = "${jobWorkspace}/${jobUID}-slurm_launch_draft.sh"
             def configName = testList.replaceFirst("^perf_sanity_", "")
             def configPathLocal = "${llmSrcLocal}/tests/scripts/perf-sanity/${configName}.yaml"
