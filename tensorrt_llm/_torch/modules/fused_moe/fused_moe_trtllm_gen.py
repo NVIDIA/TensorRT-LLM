@@ -319,7 +319,6 @@ class TRTLLMGenFusedMoE(MoE):
     ) -> torch.Tensor:
 
         assert x.dtype == torch.bfloat16
-
         # DeepSeekV3 style routing
         if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
             top_k = self.routing_method.routing_impl.top_k
@@ -378,6 +377,12 @@ class TRTLLMGenFusedMoE(MoE):
             # Use routed slots for subsequent processing
             token_selected_experts = token_selected_slots
 
+            # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+            # fc31_act_scale shape: (1, hidden_size)
+            # x shape: (num_tokens, hidden_size)
+            if hasattr(self,
+                       'fc31_act_scale') and self.fc31_act_scale is not None:
+                x = x * self.fc31_act_scale
             x, x_sf, x_row, x_col = self._quantize_for_post_quant_comm(x)
 
         if self.enable_alltoall:
@@ -546,6 +551,14 @@ class TRTLLMGenFusedMoE(MoE):
             is_scale_factor_swizzled = False  # use linear layout here
 
             if not post_quant_comm:
+                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+                # fc31_act_scale shape: (1, hidden_size)
+                # x shape: (num_tokens, hidden_size)
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    x = x * self.fc31_act_scale
+
                 hidden_states_fp4, hidden_states_scale_linear_fp4 = (
                     torch.ops.trtllm.fp4_quantize(
                         x,
