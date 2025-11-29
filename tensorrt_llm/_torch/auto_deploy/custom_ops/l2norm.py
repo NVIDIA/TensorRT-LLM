@@ -4,10 +4,6 @@ import torch
 
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 
-# TODO: add a pattern matcher for this such that
-# 1. pattern match to torch_l2norm
-# 2. fuse transform to map to desired backend like fla
-
 
 @torch.library.custom_op("auto_deploy::torch_l2norm", mutates_args=())
 def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
