@@ -367,7 +367,7 @@ class GemmRunnerComplexTuningConfigs(TunableRunner):
         return [gemm_0, gemm_1, gemm_fallback][tactic_id](*inputs)
 
     @staticmethod
-    def inputs_pre_hook(inputs: List[torch.Tensor]):
+    def inputs_pre_hook(inputs: List[torch.Tensor], **kwargs):
         # always set the first element to bo iota in x
         x, w = inputs
         x_hooked = torch.zeros_like(x)

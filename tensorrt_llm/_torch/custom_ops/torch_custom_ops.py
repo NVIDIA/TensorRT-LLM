@@ -14,6 +14,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, fp4_scale_infer_shape,
+                     gen_balanced_moe_routing_input,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -24,6 +25,18 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
     torch.bmm(a, b, out=out)
 
 
+def inputs_pre_hook(inputs: List[torch.Tensor], ep_size: int,
+                    **kwargs) -> List[torch.Tensor]:
+    x, token_selected_experts, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+    num_tokens = x.shape[0]
+    num_experts = fc2_expert_weights.shape[0] * ep_size
+    top_k = token_selected_experts.shape[1]
+    router = gen_balanced_moe_routing_input(num_tokens, num_experts, top_k)
+    inputs[1] = router.to(dtype=torch.int32,
+                          device=token_selected_experts.device)
+    return inputs
+
+
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
@@ -31,7 +44,9 @@ class MoERunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
         tune_max_num_tokens=8192,
+        inputs_pre_hook=inputs_pre_hook,
     )
 
     def __init__(
@@ -122,10 +137,13 @@ class MoERunner(TunableRunner):
         gemm_idx: int = 0,
         tactic: int = -1,
         do_preparation: bool = False,
+        **kwargs,
     ):
-        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        x, token_selected_experts, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        use_customized_router = True
         self.fused_moe_runner.run_gemm_profile(
             x,
+            token_selected_experts,
             fc1_expert_weights,
             fc1_expert_biases,
             fc2_expert_weights,
@@ -144,6 +162,7 @@ class MoERunner(TunableRunner):
             do_preparation,
             self.activation_type,
             self.unpadded_hidden_size,
+            use_customized_router,
         )
 
 
@@ -220,27 +239,30 @@ def fused_moe(
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
-
+    input_tensors = [
+        tuner_input,
+        token_selected_experts,
+        fc1_expert_weights,
+        fc1_expert_biases,
+        fc2_expert_weights,
+        fc2_expert_biases,
+    ]
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        input_tensors,
         gemm_idx=1,
+        ep_size=ep_size,
     )
 
     _, gemm_tactic_2 = tuner.choose_one(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        input_tensors,
         gemm_idx=2,
+        ep_size=ep_size,
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe

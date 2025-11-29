@@ -435,8 +435,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         permuted_idx_to_expanded_idx.append(self.pad_val)
             return permuted_idx_to_expanded_idx
 
-        def inputs_pre_hook(self,
-                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        def inputs_pre_hook(self, inputs: List[torch.Tensor],
+                            **kwargs) -> List[torch.Tensor]:
             a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others = inputs
             num_tokens = self.infer_num_tokens(a.size(0))
             num_tokens_per_expert = self.generate_num_tokens_per_expert(
@@ -460,8 +460,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 device=num_non_exiting_tiles.device)
             return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others
 
-        def inputs_pre_hook_finalize_fusion(
-                self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        def inputs_pre_hook_finalize_fusion(self, inputs: List[torch.Tensor],
+                                            **kwargs) -> List[torch.Tensor]:
             a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             num_tokens = self.infer_num_tokens(a.size(0))
             num_tokens_per_expert = self.generate_num_tokens_per_expert(
@@ -1409,8 +1409,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
             return input_shapes[0][0]
 
-        def inputs_pre_hook(self,
-                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        def inputs_pre_hook(self, inputs: List[torch.Tensor],
+                            **kwargs) -> List[torch.Tensor]:
             x, x_sf, token_selected_experts, token_final_scales, *others = inputs
             num_tokens = token_selected_experts.size(0)
             new_token_final_scales, new_token_selected_experts = torch.randn(

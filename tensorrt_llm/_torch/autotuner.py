@@ -818,7 +818,8 @@ class AutoTuner:
         best_runner_id, best_tactic = None, None
         # If the inputs_pre_hook is provided, it will be called before profiling.
         if tuning_config.inputs_pre_hook is not None:
-            input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+            input_tensors = tuning_config.inputs_pre_hook(
+                input_tensors, **kwargs)
         for runner_id, runner in enumerate(runners):
             # TODO: use FakeTensor here.
             runner_arg_names = {
