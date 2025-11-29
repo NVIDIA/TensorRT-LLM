@@ -159,6 +159,7 @@ class QKNormRoPEAttention(Attention):
         use_gemma_rms_norm: bool = False,
         attn_output_gate: Optional[bool] = None,
         is_qk_norm: bool = True,
+        reduce_output: bool = True,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -189,6 +190,7 @@ class QKNormRoPEAttention(Attention):
             q_scaling=q_scaling,
             disable_deep_gemm=disable_deep_gemm,
             attn_output_gate=attn_output_gate,
+            reduce_output=reduce_output,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
