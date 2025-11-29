@@ -89,7 +89,8 @@ class ONNX_TRT:
             dynamic_axes={"input": {
                 0: "batch"
             }},
-        )
+            # Required for pytorch>=2.9.0 as dynamo becomes the default and introduces bugs as it does not support opset_version=17 natively
+            dynamo=False)
         release_gc()  # Further release memory
         print(
             f"Export to ONNX file successfully! The ONNX file stays in {onnx_file_path}"
