@@ -18,6 +18,25 @@ from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
 
 
+def is_address_loopback(address: str) -> bool:
+    """Check if the address represents a local/loopback connection."""
+    # IPC and inproc are always local
+    if address.startswith(("ipc://", "inproc://")):
+        return True
+
+    # Check TCP loopback addresses
+    if address.startswith("tcp://"):
+        # IPv4 loopback patterns
+        if (address.startswith("tcp://127.")
+                or address.startswith("tcp://localhost")):
+            return True
+        # IPv6 loopback
+        if address.startswith("tcp://[::1]"):
+            return True
+
+    return False
+
+
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
 
@@ -50,6 +69,8 @@ class ZeroMqQueue:
         self.socket_type = socket_type
         self.address_endpoint = address[
             0] if address is not None else "tcp://127.0.0.1:*"
+        if is_address_loopback(self.address_endpoint):
+            use_hmac_encryption = False
         self.is_server = is_server
         self.context = zmq.Context() if not is_async else zmq.asyncio.Context()
         self.poller = None
