@@ -1555,7 +1555,6 @@ class DeepseekV3Model(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            reduce_output=False,
         )
 
         self.layers = nn.ModuleList([

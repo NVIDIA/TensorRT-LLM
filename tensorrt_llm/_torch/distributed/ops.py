@@ -611,11 +611,9 @@ class AllReduce(nn.Module):
             if self.strategy != AllReduceStrategy.UB:
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
-                if self.strategy in (AllReduceStrategy.UB,
-                                     AllReduceStrategy.NCCL,
-                                     AllReduceStrategy.NCCL_SYMMETRIC):
-                    self.workspace = None
-                else:
+                if self.strategy not in (AllReduceStrategy.UB,
+                                         AllReduceStrategy.NCCL,
+                                         AllReduceStrategy.NCCL_SYMMETRIC):
                     self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
