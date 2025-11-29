@@ -515,6 +515,26 @@ class _SyncQueue:
                 time.sleep(0.01)
 
 
+def set_sched_setaffinity(required_cores: int):
+    ''' Set the CPU affinity of the current process to the required number of
+    cores.
+
+    Known issue: This may race with other processes that also set the affinity.
+    '''
+    cpu_percentages = psutil.cpu_percent(percpu=True)
+    # sort the cores by usage
+    free_cores = sorted(range(len(cpu_percentages)),
+                        key=lambda i: cpu_percentages[i])
+
+    pid = os.getpid()
+    os.sched_setaffinity(pid, set(free_cores[:required_cores]))
+
+
+def clear_sched_affinity(pid: int):
+    ''' Clear the CPU affinity of the current process. '''
+    os.sched_setaffinity(pid, set(range(psutil.cpu_count())))
+
+
 def get_numa_aware_cpu_affinity(device_id):
     '''Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
 
