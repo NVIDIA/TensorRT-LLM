@@ -11,6 +11,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import click
 import torch
 import yaml
+from pydantic import ValidationError
 from strenum import StrEnum
 from torch.cuda import device_count
 
@@ -32,6 +33,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.recipes import RecipeConfig
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
@@ -435,7 +437,24 @@ def serve(
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
+            loaded_data = yaml.safe_load(f)
+
+        # Try to parse as recipe format with Pydantic validation
+        try:
+            recipe = RecipeConfig(**loaded_data)
+            # Recipe format validated - extract llm_api_options and env
+            llm_args_extra_dict = recipe.llm_api_options
+
+            # Set environment variables from 'env' section (if not already set)
+            for key, value in recipe.env.items():
+                if key not in os.environ:
+                    os.environ[key] = str(value)
+                    logger.info(
+                        f"Set environment variable from recipe: {key}={value}")
+        except ValidationError:
+            # Not a valid recipe format - treat as simple llm_api_options format
+            llm_args_extra_dict = loaded_data
+
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
@@ -856,6 +875,7 @@ class DefaultGroup(click.Group):
 main = DefaultGroup(
     commands={
         "serve": serve,
+        "configure": configure,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder

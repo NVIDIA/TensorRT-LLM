@@ -29,6 +29,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.bench.utils.scenario import (
+    prepare_llm_api_options_for_recipe, process_recipe_scenario)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -45,6 +47,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     help="Path to a serialized TRT-LLM engine.",
 )
+@optgroup.option(
+    "--recipe",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    help=
+    "Path to a recipe YAML file containing scenario and LLM API configuration. "
+    "CLI flags explicitly set will override recipe values.")
 @optgroup.option(
     "--extra_llm_api_options",
     type=str,
@@ -196,6 +208,19 @@ def latency_command(
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
 
+    # Process recipe scenario if present
+    cli_defaults = {
+        'concurrency': 1,  # Latency default is 1 (not -1 like throughput)
+        'target_input_len': None,
+        'target_output_len': None,
+        'num_requests': 0,
+        'tp': 1,
+        'pp': 1,
+        'ep': None,
+    }
+    params, options, scenario = process_recipe_scenario(params, options,
+                                                        bench_env, cli_defaults)
+
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")
     # Initialize the HF tokenizer for the specified model.
@@ -275,7 +300,16 @@ def latency_command(
     exec_settings["performance_options"]["cuda_graphs"] = True
     exec_settings["performance_options"]["multi_block_mode"] = True
 
-    exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    # Process recipe format if detected - extract llm_api_options only
+    # Priority: --extra_llm_api_options > --recipe
+    recipe_path = params.get("recipe", None)
+    extra_llm_api_options_path = params.get("extra_llm_api_options", None)
+    config_path = extra_llm_api_options_path if extra_llm_api_options_path else recipe_path
+    # Convert Path to string if needed
+    if config_path is not None:
+        config_path = str(config_path)
+    exec_settings["extra_llm_api_options"] = prepare_llm_api_options_for_recipe(
+        config_path, scenario)
 
     # Decoding Options
     if medusa_choices is not None:

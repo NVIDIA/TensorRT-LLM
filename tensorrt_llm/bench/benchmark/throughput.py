@@ -28,6 +28,8 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.bench.utils.scenario import (
+    prepare_llm_api_options_for_recipe, process_recipe_scenario)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -60,6 +62,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     multiple=True,
     help="Paths to custom module directories to import.",
 )
+@optgroup.option(
+    "--recipe",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    help=
+    "Path to a recipe YAML file containing scenario and LLM API configuration. "
+    "CLI flags explicitly set will override recipe values.")
 @optgroup.option(
     "--extra_llm_api_options",
     type=str,
@@ -302,6 +314,20 @@ def throughput_command(
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
     tokenizer = initialize_tokenizer(options.checkpoint_path)
 
+    # Process recipe scenario if present
+    cli_defaults = {
+        'concurrency': -1,
+        'target_input_len': None,
+        'target_output_len': None,
+        'num_requests': 0,
+        'tp': 1,
+        'pp': 1,
+        'ep': None,
+        'streaming': False,
+    }
+    params, options, scenario = process_recipe_scenario(params, options,
+                                                        bench_env, cli_defaults)
+
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
     max_num_tokens = params.get("max_num_tokens")
@@ -398,7 +424,17 @@ def throughput_command(
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
 
     # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
+    # Process recipe format if detected - extract llm_api_options only
+    # Priority: --extra_llm_api_options > --recipe
+    recipe_path = params.pop("recipe", None)
+    extra_llm_api_options_path = params.pop("extra_llm_api_options", None)
+    config_path = extra_llm_api_options_path if extra_llm_api_options_path else recipe_path
+    # Convert Path to string if needed
+    if config_path is not None:
+        config_path = str(config_path)
+    exec_settings["extra_llm_api_options"] = prepare_llm_api_options_for_recipe(
+        config_path, scenario)
+
     exec_settings["iteration_log"] = options.iteration_log
 
     # Construct the runtime configuration dataclass.
