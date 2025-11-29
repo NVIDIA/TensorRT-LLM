@@ -76,7 +76,7 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['factory','heuristic']
+    sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     allreduce_strategy: 'AUTO'
