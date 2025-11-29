@@ -466,20 +466,53 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 #define MMAS_N_PER_MASK 2
 
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask, uint32_t rowOffset,
-    uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize)
+    uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    ,
+    int32_t tok0WinBeg, uint32_t seqIter, uint32_t const cacheSeqLen, uint32_t const warpTileTokenBeg
+#endif
+)
 {
     uint32_t const idxInQuad = laneId() % 4;
     uint32_t const idxQuad = laneId() / 4;
     // Packed mask is aligned with 32 bits (2 uint16_t).
     uint32_t const nbPackedMasksPerRow = divUp(qSeqLen, 32u) * 2u;
     uint16_t const* uint16Mask = reinterpret_cast<uint16_t const*>(mask);
+    constexpr uint64_t fullMask = ~uint64_t{0};
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    Range const tileRange = {warpTileTokenBeg, warpTileTokenBeg + warpTile.x};
+    Range const maxMaskOutRange = {0, mha::max(0, tok0WinBeg) + (nbValidRows / MMAS_N_PER_MASK - 1)};
+    bool const ctaNeedBegMask = tileRange.beg < maxMaskOutRange.end;
+    assert(ctaNeedBegMask == overlap(tileRange, maxMaskOutRange));
+    int32_t const tok0NbMaskOut = int32_t(tok0WinBeg) - int32_t(warpTileTokenBeg);
+    uint32_t const nbSeqItersWithoutSpecDecMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+    bool const ctaNeedSpecDecMask = (seqIter >= nbSeqItersWithoutSpecDecMask);
+#else
+    constexpr bool ctaNeedBegMask = false;
+    bool const ctaNeedSpecDecMask = true;
+    int32_t const tok0NbMaskOut = -2147483648;
+#endif
+    bool const needMask = ctaNeedBegMask || ctaNeedSpecDecMask;
+
+    if (!needMask)
+    {
+        return;
+    }
 #pragma unroll
     for (uint32_t m = 0; m < acc.rows; m++)
     {
 #pragma unroll
         for (uint32_t i = 0; i < InstAcc::rows; i++)
         {
-            uint32_t const tokenRow = min((rowOffset + instM * m + idxQuad + i * 8) / headGrpSize, actualQSeqLen - 1);
+            uint32_t const idxQTokInCta = (rowOffset + instM * m + idxQuad + i * 8) / headGrpSize;
+            uint32_t const tokenRow = min(idxQTokInCta, actualQSeqLen - 1);
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+            int32_t const begNbMaskOut = tok0NbMaskOut + int32_t(idxQTokInCta);
+            uint64_t const begMask = (begNbMaskOut > 0 ? fullMask << begNbMaskOut : fullMask);
+#else
+            uint64_t const begMask = fullMask;
+#endif
+
 #pragma unroll
             for (uint32_t mask_n = 0; mask_n < acc.cols / MMAS_N_PER_MASK; mask_n++)
             {
@@ -491,12 +524,15 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                 uint32_t const maskPos1 = lastCol + actualQSeqLen < nbValidCols
                     ? 0u
                     : min(lastCol + actualQSeqLen - nbValidCols, actualQSeqLen - 1);
-                uint32_t packedMask = 0u;
                 uint32_t const maskPosStart = (maskPos0 / 16) * 16;
-                reinterpret_cast<uint16_t*>(&packedMask)[0]
-                    = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos0 / 16)];
-                reinterpret_cast<uint16_t*>(&packedMask)[1]
-                    = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos1 / 16)];
+                uint32_t packedMask = ~uint32_t{0};
+                if (ctaNeedSpecDecMask)
+                {
+                    reinterpret_cast<uint16_t*>(&packedMask)[0]
+                        = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos0 / 16)];
+                    reinterpret_cast<uint16_t*>(&packedMask)[1]
+                        = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos1 / 16)];
+                }
 #pragma unroll
                 for (uint32_t nj = 0; nj < MMAS_N_PER_MASK; nj++)
                 {
@@ -510,7 +546,11 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                         bool const maskFlag = col + actualQSeqLen < nbValidCols
                             ? true
                             : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
-                        acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
+
+                        bool const begMaskFlag = ctaNeedBegMask ? (begMask & (1ULL << col)) : true;
+
+                        acc(m, n)(i, j)
+                            = maskFlag && begMaskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
                     }
                 }
             }
@@ -1611,8 +1651,14 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
-#if SLIDING_WINDOW
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1 + idxHeadTokenInGrp; // ctaTokOffset;
+    int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
+    uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
+
+#elif SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+    assert(!SPEC_DEC || !rtIsReallySliding);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
 #else
     constexpr bool rtIsReallySliding = false;
@@ -1626,7 +1672,9 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
-#if SPEC_DEC
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    uint32_t const nbSeqItersWithoutMask = nbSkipLeadingTiles;
+#elif SPEC_DEC
     uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
@@ -1912,8 +1960,12 @@ CUBIN_EXPORT __global__
             if (seqIter >= nbSeqItersWithoutMask)
             {
                 uint32_t const nbValidCols = (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
-                applyMaskFromInput(
-                    warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize);
+                applyMaskFromInput(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+                    ,
+                    tok0WinBeg, seqIter, cacheSeqLen, warpTileTokenBeg
+#endif
+                );
             }
 #else
             bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
