@@ -28,6 +28,7 @@ class Constants:
     tp_size_list = [2, 4, 8]
     strategy_name_to_enum = {
         'NCCL': 0,
+        'NCCL_SYMMETRIC': 8,
         'ONESHOT': 4,
         'TWOSHOT': 5,
     }
@@ -84,10 +85,10 @@ def generate_heuristic_look_up_table(df: pd.DataFrame) -> str:
     hidden_size_count = len(Constants.hidden_size_list)
     num_tokens_count = len(Constants.num_tokens_list)
 
-    # Initialize lookup table with default values (NCCL = 0)
+    # Initialize lookup table with default values (NCCL_SYMMETRIC = 8)
     strategy_table = np.full(
         (tp_size_count, fusion_count, hidden_size_count, num_tokens_count),
-        Constants.strategy_name_to_enum['NCCL'],
+        Constants.strategy_name_to_enum['NCCL_SYMMETRIC'],
         dtype=int)
 
     # Fill the lookup table with best strategies
