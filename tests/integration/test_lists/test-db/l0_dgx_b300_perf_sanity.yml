@@ -1,5 +1,5 @@
 version: 0.0.1
-perf_sanity_l0_dgx_b200:
+l0_dgx_b300_perf_sanity:
 - condition:
     ranges:
       system_gpu_count:
@@ -7,7 +7,8 @@ perf_sanity_l0_dgx_b200:
         lte: 8
     wildcards:
       gpu:
-      - '*b200*'
+      - '*gb110*'
+      - '*b300*'
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
@@ -26,7 +27,8 @@ perf_sanity_l0_dgx_b200:
         lte: 4
     wildcards:
       gpu:
-      - '*b200*'
+      - '*gb110*'
+      - '*b300*'
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
@@ -37,5 +39,3 @@ perf_sanity_l0_dgx_b200:
   - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp4_v2_dep4_mtp1_1k1k] TIMEOUT (180)
   - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp4_v2_tep4_mtp3_1k1k] TIMEOUT (180)
   - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-r1_fp4_v2_tp4_mtp3_1k1k] TIMEOUT (180)
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-gpt_oss_fp4_dep2,gpt_oss_fp4_dep4] TIMEOUT (180)
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200-gpt_oss_fp4_tp4_eagle3] TIMEOUT (180)
