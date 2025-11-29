@@ -265,9 +265,29 @@ class KvCacheCreator:
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += (num_req_tokens + self._tokens_per_block -
                                  1) // self._tokens_per_block
+
+        # Max cuda graph warmup required tokens
+        max_cuda_graph_bs = min(self._model_engine.batch_size,
+                                self._model_engine._max_cuda_graph_batch_size)
+        cuda_graph_warmup_block = (
+            self._model_engine.max_seq_len +
+            1) // self._tokens_per_block + max_cuda_graph_bs - 1
+        num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
+
+        # This is the minimal blocks required to run with max bs
+        # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
+        num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
+
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
+        max_num_tokens_in_memory = max_memory // self._get_kv_size_per_token(
+        ) // self._tokens_per_block * self._tokens_per_block
+
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
-            0].sampling_config.beam_width
+        return min(
+            num_cache_blocks * self._tokens_per_block *
+            self._dummy_reqs[0].sampling_config.beam_width,
+            max_num_tokens_in_memory)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
