@@ -1,8 +1,10 @@
 import os
 import time
 
+import pytest
 import requests
-from defs.conftest import llm_models_root, skip_no_hopper
+from defs.conftest import (llm_models_root, skip_no_hopper,
+                           skip_post_blackwell_ultra, skip_pre_hopper)
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
@@ -126,6 +128,59 @@ def test_extra_llm_api_options(serve_test_root):
     print_info("Launching trtllm-serve...")
     with popen(cmd):
         check_server_ready()
+        # Extract model name from the model path for consistency
+        model_name = model_path.split('/')[-1]  # "Qwen3-30B-A3B-FP8"
+        # Test the server with OpenAI chat completion
+        check_openai_chat_completion(model_name=model_name)
+
+
+@skip_pre_hopper
+@skip_post_blackwell_ultra
+@pytest.mark.skip_less_device(8)
+def test_extra_llm_api_options_for_deepseek_r1_fp4(serve_test_root):
+    test_configs_root = f"{serve_test_root}/test_configs"
+
+    # moe backend = CUTLASS which only supports fp8 blockscale on Hopper
+    config_file = f"{test_configs_root}/DeepSeek-R1-FP4.yml"
+    model_path = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4"
+
+    # Assert that required files and directories exist
+    assert os.path.exists(
+        test_configs_root
+    ), f"test_configs_root directory does not exist: {test_configs_root}"
+    assert os.path.exists(
+        config_file), f"config_file does not exist: {config_file}"
+    assert os.path.exists(
+        model_path), f"model_path does not exist: {model_path}"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--backend",
+        "pytorch",
+        "--max_batch_size",
+        "32",
+        "--max_num_tokens",
+        "32768",
+        "--max_seq_len",
+        "163840",
+        "--tp_size",
+        "8",
+        "--ep_size",
+        "1",
+        "--extra_llm_api_options",
+        config_file,
+        "--log_level",
+        "info",
+    ]
+
+    print_info("Launching trtllm-serve...")
+    with popen(cmd):
+        check_server_ready(timeout_timer=3600)
         # Extract model name from the model path for consistency
         model_name = model_path.split('/')[-1]  # "Qwen3-30B-A3B-FP8"
         # Test the server with OpenAI chat completion
