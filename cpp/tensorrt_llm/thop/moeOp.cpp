@@ -435,7 +435,8 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+        auto const quant_params
+            = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
         kernels::MoeMinLatencyParams min_latency_params{};
 
         // TODO: support lora in the future
@@ -613,7 +614,8 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+        auto const quant_params
+            = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
 
         // TODO: support lora in the future
         ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -859,8 +861,10 @@ private:
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
-        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales) const
+        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
+        ActivationType base_activation_type) const
     {
+        int expand_ratio = isGatedActivation(base_activation_type) ? 2 : 1;
         if (isFp8Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for fp8 quantization");
@@ -925,12 +929,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
@@ -978,12 +982,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank
@@ -1044,12 +1048,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
