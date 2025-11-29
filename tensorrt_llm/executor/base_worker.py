@@ -21,7 +21,8 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import (_SyncQueue, clear_sched_affinity,
+                            get_numa_aware_cpu_affinity, logger_debug)
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -149,6 +150,8 @@ class BaseWorker(GenerationExecutor):
                 f"Worker process {pid} is affined to run on the following CPUs: "
                 f"{cpu_affinity} (subset of all logical CPUs). This may harm "
                 f"performance if set incorrectly.")
+            logger.info(f"Clearing CPU affinity for worker process {pid}")
+            clear_sched_affinity(pid)
 
         # If affinity is unconstrained and the user hasn't explicitly
         # prohibited it or the user has explicitly requested it, choose the
@@ -156,7 +159,11 @@ class BaseWorker(GenerationExecutor):
         numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
         if ((numa_aware_affinity is None and not constrained_affinity)
                 or (numa_aware_affinity == "1")):
-            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+            numa_aware_cpu_affinity = get_numa_aware_cpu_affinity(device_id)
+            logger.info(
+                f"Setting CPU affinity for worker process {pid} to {numa_aware_cpu_affinity}"
+            )
+            process.cpu_affinity(numa_aware_cpu_affinity)
 
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
