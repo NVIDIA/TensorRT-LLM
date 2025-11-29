@@ -971,7 +971,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export coverageConfigFile="$coverageConfigFile"
                     export NVIDIA_IMEX_CHANNELS=0
                     [ -z "\${NVIDIA_VISIBLE_DEVICES:-}" ] && export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
-                """
+                """.replaceAll("(?m)^\\s*", "")
+                echo "launchScriptPrefix is ${launchScriptPrefix}"
 
                 def containerImageArg = container
                 def launchSrunPrologue = ""
@@ -1011,6 +1012,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     retry_command "enroot import -o $enrootImagePath -- docker://$container"
                     """.replaceAll("(?m)^\\s*", "")
                 }
+                echo "launchSrunPrologue is ${launchSrunPrologue}"
 
                 def srunArgs = [
                     "--container-image=$containerImageArg",
@@ -1049,7 +1051,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         scriptDisaggLaunchDraftPathNode,
                         true
                     )
-
                     def submitPyCmd = """python3 ${scriptSubmitPathNode} \\
                                         --run-ci \\
                                         --config-yaml ${configPathNode} \\
@@ -1057,10 +1058,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                         --launch-sh ${scriptLaunchPathNode} \\
                                         --run-sh ${scriptRunPathNode} \\
                                         --stage-name '${stageName}' \\
-                                        --script-prefix '${launchScriptPrefix}' \\
-                                        --srun-prologue '${launchSrunPrologue}' \\
+                                        --script-prefix '$(echo "$launchScriptPrefix" | sed ':a;N;$!ba;s/\n/\\n/g')' \\
+                                        --srun-prologue '$(echo "$launchSrunPrologue" | sed ':a;N;$!ba;s/\n/\\n/g')' \\
                                         --srun-args '${srunArgs.join(" ")}'
                                     """
+                    echo "submitPyCmd is ${submitPyCmd}"
                     Utils.exec(
                         pipeline,
                         timeout: false,
