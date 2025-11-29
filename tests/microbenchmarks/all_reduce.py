@@ -26,6 +26,7 @@ except ImportError:
     from cuda import cudart
 
 import tensorrt_llm as tllm
+import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -33,7 +34,6 @@ from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
                                  nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 
 def profile_allreduce(
@@ -49,8 +49,6 @@ def profile_allreduce(
     scale=None,
     bias=None,
 ):
-    tllm.logger.set_level('error')
-
     allreduce_params = AllReduceParams(
         fusion_op=fusion,
         residual=residual,
@@ -122,40 +120,85 @@ def allreduce_benchmark(
     enable_cudagraph: bool = False,
     explore_2d: bool = False,
     save_csv: str = None,
-    enable_auto: bool = False,
+    strategy: str = None,
+    inner_loop: int = 200,
+    outer_loop: int = 10,
+    tokens_range: str = "1,16384,2",
+    hidden_sizes_range: str = "128,8192,2",
 ):
-    tllm.logger.set_level('error')
+    """
+    Benchmark AllReduce operations.
+
+    Args:
+        dtype: Data type for benchmarking
+        test_range: Range specification (min,max,ratio)
+        enable_cudagraph: Enable CUDA graph capture
+        explore_2d: Explore 2D parameter space (num_tokens x hidden_size)
+        save_csv: Path to save CSV results
+        strategy: Specific strategy to test (if None, tests default set: NCCL, NCCL_SYMMETRIC, NCCL_DEVICE, MNNVL)
+        inner_loop: Number of iterations per timing measurement (default: 200)
+        outer_loop: Number of timing measurements to take (default: 10)
+        tokens_range: Range for number of tokens in 2D mode (min,max,ratio) (default: "1,16384,2")
+        hidden_sizes_range: Range for hidden sizes in 2D mode (min,max,ratio) (default: "128,8192,2")
+    """
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
     local_rank = local_mpi_rank()
     gpus_per_node = local_mpi_size()
 
+    if world_size == 1:
+        if rank == 0:
+            print("ERROR: Benchmark must run with mpi_world_size > 1",
+                  file=sys.stderr,
+                  flush=True)
+        sys.exit(1)
+
+    # Device setup
     torch.cuda.set_device(local_rank)
     cudart.cudaSetDevice(local_rank)
 
     mapping = Mapping(world_size, rank, gpus_per_node, tp_size=world_size)
     sm_version = get_sm_version()
 
-    if world_size == 1:
-        raise RuntimeError("Benchmark must run with mpi_world_size > 1")
-
+    # Data type setup
     torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
+    dtype_size_bytes = torch_dtype.itemsize
 
-    inner_loop = 200
-    outer_loop = 10
+    # Parse test range
+    min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
 
     # generate shape list
     shape_list = []
 
     if explore_2d:
-        num_seqs_list = [
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
+        # Parse tokens range
+        min_tokens, max_tokens, tokens_ratio = [
+            int(i) for i in tokens_range.split(",")
         ]
-        hidden_size_list = [128, 256, 512, 1024, 2048, 4096, 8192]
+
+        # Parse hidden sizes range
+        min_hidden, max_hidden, hidden_ratio = [
+            int(i) for i in hidden_sizes_range.split(",")
+        ]
+
+        # Generate token counts list
+        num_seqs_list = []
+        current = min_tokens
+        while current <= max_tokens:
+            num_seqs_list.append(current)
+            current *= tokens_ratio
+
+        # Generate hidden sizes list
+        hidden_size_list = []
+        current = min_hidden
+        while current <= max_hidden:
+            hidden_size_list.append(current)
+            current *= hidden_ratio
+
+        # Create all combinations
         for num_tokens, hidden_size in product(num_seqs_list, hidden_size_list):
             shape_list.append((num_tokens, hidden_size))
     else:
-        min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
         size = min_size
         hidden_size = min_size
         num_tokens = 1
@@ -174,20 +217,79 @@ def allreduce_benchmark(
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
     ]
-    strategies = [
-        AllReduceStrategy.NCCL,
-        AllReduceStrategy.ONESHOT,
-        AllReduceStrategy.TWOSHOT,
-        AllReduceStrategy.AUTO,
-    ]
+
+    # Map strategy names to enum values
+    strategy_map = {
+        "NCCL": AllReduceStrategy.NCCL,
+        "MIN_LATENCY": AllReduceStrategy.MIN_LATENCY,
+        "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC,
+        "NCCL_DEVICE": AllReduceStrategy.NCCL_DEVICE,
+        "MNNVL": AllReduceStrategy.MNNVL,
+        "UB": AllReduceStrategy.UB,
+        "ONESHOT": AllReduceStrategy.ONESHOT,
+        "TWOSHOT": AllReduceStrategy.TWOSHOT,
+        "AUTO": AllReduceStrategy.AUTO,
+    }
+
+    # Select strategies based on input
+    if strategy:
+        # Single strategy specified
+        if strategy.upper() not in strategy_map:
+            raise ValueError(
+                f"Unknown strategy: {strategy}. Available: {', '.join(strategy_map.keys())}"
+            )
+        strategies = [strategy_map[strategy.upper()]]
+    else:
+        # Default: test main strategies
+        strategies = [
+            AllReduceStrategy.NCCL,
+            AllReduceStrategy.NCCL_SYMMETRIC,
+            AllReduceStrategy.NCCL_DEVICE,
+            AllReduceStrategy.MNNVL,
+        ]
+
+    # Validate strategy compatibility for user buffer initialization
+    # NCCL_SYMMETRIC and NCCL_DEVICE need UB with use_multicast=True
+    # UB strategy needs UB with use_multicast=False
+    # These two groups cannot be mixed in a single run
+    ub_multicast_strategies = {
+        AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL_DEVICE
+    }
+    ub_no_multicast_strategies = {AllReduceStrategy.UB}
+
+    has_multicast_strategies = any(s in ub_multicast_strategies
+                                   for s in strategies)
+    has_no_multicast_strategies = any(s in ub_no_multicast_strategies
+                                      for s in strategies)
+
+    # Error out if incompatible strategies are mixed
+    if has_multicast_strategies and has_no_multicast_strategies:
+        multicast_strats = [
+            s.name for s in strategies if s in ub_multicast_strategies
+        ]
+        no_multicast_strats = [
+            s.name for s in strategies if s in ub_no_multicast_strategies
+        ]
+        raise ValueError(
+            f"Incompatible strategies selected: {multicast_strats} require use_multicast=True "
+            f"while {no_multicast_strats} require use_multicast=False. "
+            f"Please run these strategies separately using --strategy.")
+
+    # Initialize user buffers if any strategy needs it
+    needs_ub = has_multicast_strategies or has_no_multicast_strategies
+
+    if needs_ub:
+        max_bytes = max_size * dtype_size_bytes
+        use_multicast = has_multicast_strategies  # True for NCCL_SYMMETRIC/NCCL_DEVICE, False for UB
+
+        ub.initialize_userbuffers_manager(world_size, 1, 1, rank,
+                                          torch.cuda.device_count(), max_bytes,
+                                          use_multicast)
+
     df = pd.DataFrame()
     for (num_tokens, hidden_size) in shape_list:
         message_size = num_tokens * hidden_size * torch.finfo(
             torch_dtype).bits // 8
-
-        if message_size > CustomAllReduceHelper.max_workspace_size_auto(
-                mapping.tp_size):
-            continue
 
         input = torch.ones((num_tokens, hidden_size),
                            dtype=torch_dtype,
@@ -208,7 +310,8 @@ def allreduce_benchmark(
             if fusion == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 and sm_version < 100:
                 continue
 
-            if not enable_auto and strategy == AllReduceStrategy.AUTO:
+            # UB strategy doesn't support NONE fusion
+            if strategy == AllReduceStrategy.UB and fusion == AllReduceFusionOp.NONE:
                 continue
 
             median_ms = profile_allreduce(
@@ -242,6 +345,9 @@ def allreduce_benchmark(
     # print the dataframe
     if mapping.rank == 0:
         pd.set_option('display.max_rows', None)
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', None)
         print(df)
 
     # # save the dataframe to a csv file
@@ -253,24 +359,71 @@ def allreduce_benchmark(
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--dtype", "-t", default="bfloat16")
+    parser.add_argument("--dtype",
+                        "-t",
+                        default="bfloat16",
+                        help="Data type for benchmarking")
     parser.add_argument(
         "--range",
         "-r",
-        default="256,256000000,10",  # 256 to 256M
+        default="256,256000000,4",  # 256 to 256M
         help="min_size,max_size,multiplicative_ratio")
-    parser.add_argument("--explore_2d", action="store_true", default=False)
-    parser.add_argument("--enable_cudagraph", action="store_true")
-    parser.add_argument("--save_csv", type=str, default=None)
-    parser.add_argument("--enable_auto", action="store_true", default=False)
+    parser.add_argument(
+        "--explore_2d",
+        action="store_true",
+        default=False,
+        help="Explore 2D parameter space (num_tokens x hidden_size)")
+    parser.add_argument("--enable_cudagraph",
+                        action="store_true",
+                        help="Enable CUDA graph capture")
+    parser.add_argument("--save_csv",
+                        type=str,
+                        default=None,
+                        help="Path to save CSV results")
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        help=
+        "Test specific strategy. If not specified, defaults to: NCCL, NCCL_SYMMETRIC, NCCL_DEVICE, MNNVL. "
+        "Available: NCCL, NCCL_SYMMETRIC, NCCL_DEVICE, MNNVL, MIN_LATENCY, UB, ONESHOT, TWOSHOT, AUTO"
+    )
+    parser.add_argument(
+        "--inner_loop",
+        type=int,
+        default=200,
+        help="Number of iterations per timing measurement (default: 200)")
+    parser.add_argument(
+        "--outer_loop",
+        type=int,
+        default=10,
+        help="Number of timing measurements to take (default: 10)")
+    parser.add_argument(
+        "--tokens_range",
+        type=str,
+        default="1,16384,2",
+        help=
+        "Range for number of tokens in 2D mode: min,max,ratio (default: 1,16384,2)"
+    )
+    parser.add_argument(
+        "--hidden_sizes_range",
+        type=str,
+        default="128,8192,2",
+        help=
+        "Range for hidden sizes in 2D mode: min,max,ratio (default: 128,8192,2)"
+    )
 
     args = parser.parse_args()
 
     allreduce_benchmark(
-        args.dtype,
-        args.range,
-        args.enable_cudagraph,
-        args.explore_2d,
-        args.save_csv,
-        args.enable_auto,
+        dtype=args.dtype,
+        test_range=args.range,
+        enable_cudagraph=args.enable_cudagraph,
+        explore_2d=args.explore_2d,
+        save_csv=args.save_csv,
+        strategy=args.strategy,
+        inner_loop=args.inner_loop,
+        outer_loop=args.outer_loop,
+        tokens_range=args.tokens_range,
+        hidden_sizes_range=args.hidden_sizes_range,
     )
