@@ -2429,6 +2429,7 @@ def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
     llm = LLM_CLASS(
         model=llama_model_path,
         tensor_parallel_size=tp_size,
+        enable_chunked_prefill=False,  # Explicitly disable to test error handling
         **llm_args_extra,
     )
 
