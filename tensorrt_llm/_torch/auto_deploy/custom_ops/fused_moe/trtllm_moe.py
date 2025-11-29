@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from tensorrt_llm._torch.utils import ActivationType
@@ -235,4 +237,109 @@ def trtllm_quant_fp8_moe_fused_fake(
     mlp_style: str,
     act_fn: str,
 ) -> torch.Tensor:
+    _validate_mlp_style_and_act_fn(mlp_style, act_fn)
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_quant_nvfp4_moe_fused", mutates_args=())
+def trtllm_quant_nvfp4_moe_fused(
+    x: torch.Tensor,  # [B, S, H] or [B*S, H], 16-bit float
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight_q: torch.Tensor,  # [E, I, H] stacked FP4 weights
+    w2_weight_q: torch.Tensor,  # [E, H, I] stacked FP4 weights
+    w3_weight_q: torch.Tensor,  # [E, I, H] for gated_mlp, unused for mlp
+    w1_weight_gs: torch.Tensor,
+    w2_weight_gs: torch.Tensor,
+    w3_weight_gs: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w3_blockscale: torch.Tensor,
+    fc1_act_global: torch.Tensor,
+    fc2_act_global: torch.Tensor,
+    fc1_global: Optional[torch.Tensor] = None,  # Precomputed global scale for FC1
+    fc2_global: Optional[torch.Tensor] = None,  # Precomputed global scale for FC2
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
+) -> torch.Tensor:
+    NVFP4_BLOCK_SIZE = 16
+    mlp_style = mlp_style.lower()
+    act_fn = act_fn.lower()
+
+    activation_type = ActivationType.Swiglu
+    if mlp_style == "gated_mlp":
+        # For gated MLP, concatenate w1 and w3 as [w3, w1]
+        w3_w1_stacked = torch.cat([w3_weight_q, w1_weight_q], dim=1).contiguous().view(torch.long)
+        fc1_expert_weights = w3_w1_stacked
+        fc1_weight_blockscale = torch.cat([w3_blockscale, w1_blockscale], dim=1)
+        fc1_weight_gs = torch.max(w3_weight_gs, w1_weight_gs)
+        if act_fn == "silu":
+            activation_type = ActivationType.Swiglu
+        else:
+            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
+    elif mlp_style == "mlp":
+        # For non-gated MLP with ReLU^2
+        fc1_expert_weights = w1_weight_q.contiguous().view(torch.long)
+        fc1_weight_blockscale = w1_blockscale.contiguous().view(torch.long)
+        fc1_weight_gs = w1_weight_gs
+        if act_fn == "relu2":
+            activation_type = ActivationType.Relu2
+        else:
+            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
+    else:
+        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+
+    fc2_weight_block_scale = w2_blockscale
+    fc2_weight_gs = w2_weight_gs
+    fc1_global = fc1_global or 1.0 / (fc1_act_global * fc1_weight_gs)
+    fc2_global = fc2_global or 1.0 / (fc2_act_global * fc2_weight_gs)
+
+    quant_scales = [
+        fc1_act_global,
+        fc1_weight_blockscale.view(torch.int32),
+        fc1_global,
+        fc2_act_global,
+        fc2_weight_block_scale.view(torch.int32),
+        fc2_global,
+    ]
+
+    if x.dtype in (torch.float16, torch.bfloat16):
+        x_q_fp4, input_sf = torch.ops.trtllm.fp4_quantize(x, fc1_act_global, NVFP4_BLOCK_SIZE)
+        output_dtype = x.dtype
+    else:
+        x_q_fp4 = x
+        output_dtype = None
+
+    trtllm_output = torch.ops.trtllm.fused_moe(
+        x_q_fp4,
+        selected_experts.to(torch.int),
+        routing_weights,
+        fc1_expert_weights=fc1_expert_weights,
+        fc1_expert_biases=None,
+        fc2_expert_weights=w2_weight_q.contiguous().view(torch.long),
+        fc2_expert_biases=None,
+        output_dtype=output_dtype,
+        quant_scales=quant_scales,
+        input_sf=input_sf,
+        activation_type=activation_type,
+    )[0].view(x.shape)
+
+    return trtllm_output[0].view(x.shape)
+
+
+@trtllm_quant_nvfp4_moe_fused.register_fake
+def trtllm_quant_nvfp4_moe_fused_fake(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
