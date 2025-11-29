@@ -14,6 +14,7 @@ from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    ShardingTransformConfig,
     ShardingTransformContainer,
     SplitDimension,
     WeightShardingInfo,
@@ -266,9 +267,14 @@ def test_allreduce_strategy_propagation(strategy):
 
     # Create sharding config with specified strategy
     rank, world_size = 0, 4
-    sharding_container = ShardingTransformContainer(
-        rank=rank, world_size=world_size, allreduce_strategy=AllReduceStrategy[strategy]
+
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy[strategy],
     )
+    sharding_container = ShardingTransformContainer(config=config)
 
     # Add transforms: column shard linear1, row shard linear2 (triggers allreduce)
     sharding_container.add(
