@@ -5,8 +5,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.utils import input_guard
+from fla.utils import input_guard
 
 
 @triton.heuristics({
