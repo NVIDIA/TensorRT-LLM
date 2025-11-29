@@ -192,9 +192,12 @@ class MoE(nn.Module):
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=model_config.allreduce_strategy,
-                                    dtype=self.dtype)
+        self.all_reduce = None
+        if not self.use_dp and self.mapping.tp_size > 1:
+            self.all_reduce = AllReduce(
+                mapping=self.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=self.dtype)
 
         # Initialize load balancer related attributes
         self._init_load_balancer(model_config, aux_stream_dict)
