@@ -5,6 +5,7 @@ This module provides a high-level interface for MoE all-to-all dispatch and comb
 with proper workspace management and synchronization.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -35,6 +36,29 @@ class MoeAlltoAll:
     _WORKSPACE: dict | None = None
 
     _METAINFO_INDEX: Dict[str, int] | None = None
+
+    @staticmethod
+    def get_aux_data_size(ep_size: int, max_num_tokens: int) -> int:
+        return torch.ops.trtllm.moe_a2a_get_aux_data_size(
+            ep_size, max_num_tokens)
+
+    @staticmethod
+    def calculate_required_workspace_size(ep_size: int, max_num_tokens: int,
+                                          hidden_size: int,
+                                          dtype: torch.dtype) -> int:
+        element_size = dtype.itemsize
+        aux_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens)
+
+        # Required workspace for combine [ep_size, max_tokens] tokens
+        payload_size_combine = ep_size * max_num_tokens * hidden_size * element_size
+
+        # Dispatch also needs workspace for [ep_size, max_tokens] tokens,
+        # but due to the various recipe of quantization, we cannot know the exact size, so we conservatively estimate assuming no quantization.
+        # We additionally add 32 bytes for considering small payloads like token_selected_experts, token_final_scales etc.
+        payload_size_dispatch = ep_size * max_num_tokens * (
+            hidden_size * element_size + 32)
+
+        return aux_size + payload_size_combine + payload_size_dispatch
 
     @classmethod
     def _init_constants(cls):
@@ -71,8 +95,7 @@ class MoeAlltoAll:
         max_num_tokens: int,
         top_k: int,
         num_experts: int,
-        # TODO: WE should be able to know the required workspace size if knowing max_num_tokens, ep_size and hidden_size
-        workspace_size_per_rank: int = 256 * 1024 * 1024,
+        workspace_size_per_rank: int,
     ):
         """
         Initialize MoeAlltoAll with workspace allocation.
@@ -82,6 +105,17 @@ class MoeAlltoAll:
             max_num_tokens: Maximum number of tokens supported. Should be ModelConfig.max_num_tokens.
             workspace_size_per_rank: Size of workspace per rank in bytes
         """
+        # Check for environment variable override
+        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        if workspace_mb_env:
+            workspace_size_env = int(workspace_mb_env) * 1024 * 1024
+            tllm_logger.warning(
+                f"Overriding automatically calculated workspace_size_per_rank ({workspace_size_per_rank} bytes) with "
+                f"TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env} ({workspace_size_env} bytes)."
+                f"Automatically calculated workspace_size_per_rank is conservatively large, please only consider overriding it if you have a specific reason."
+            )
+            workspace_size_per_rank = workspace_size_env
+
         # Initialize constants from C++
         self._init_constants()
 
@@ -102,7 +136,7 @@ class MoeAlltoAll:
 
         if self._WORKSPACE is None:
             tllm_logger.info(
-                f"MoE AlltoAll: Allocating workspace with size {workspace_size_per_rank} bytes. ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, max_num_tokens: {self.max_num_tokens}"
+                f"nvlink_one_sided AlltoAll: Allocating workspace with size {workspace_size_per_rank} bytes. ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, max_num_tokens: {self.max_num_tokens}"
             )
             mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
