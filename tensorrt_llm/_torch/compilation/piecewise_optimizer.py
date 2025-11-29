@@ -79,6 +79,10 @@ class PiecewiseInterpreter(Interpreter):
                                                               dim_idx)
                                     found_dynamic_shape = True
                                     break
+                if not found_dynamic_shape:
+                    raise RuntimeError(
+                        "Cannot identify dynamic shape, please disable enable_piecewise_cuda_graph in TorchCompileConfig"
+                    )
 
             if self.max_num_streams > 1 and not self.enable_inductor:
                 num_events = multi_stream_schedule(submod, self.max_num_streams)

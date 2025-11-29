@@ -76,6 +76,12 @@ def inplace_info():
         },
         torch.ops.trtllm.logits_bitmask.default: {
             1: "logits"
+        },
+        torch.ops.trtllm.pp_recv_tensors.default: {
+            1: "tensors"
+        },
+        torch.ops.trtllm.pp_send_tensors.default: {
+            1: "tensors"
         }
     }
     return inplace_map
