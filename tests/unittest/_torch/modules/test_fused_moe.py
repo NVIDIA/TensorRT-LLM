@@ -16,6 +16,7 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from transformers.configuration_utils import PretrainedConfig
 from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest,
                         skip_non_hopper_unittest, skip_pre_blackwell,
@@ -139,14 +140,20 @@ def test_fused_moe(moe_backend,
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         fused_moe = create_moe(
-            num_experts=NUM_EXPERTS,
             routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
             reduce_results=True,
-            model_config=ModelConfig(mapping=mapping, moe_backend=moe_backend),
+            model_config=ModelConfig(pretrained_config=pretrained_config,
+                                     mapping=mapping,
+                                     moe_backend=moe_backend),
             bias=bias,
         )
         fused_moe.load_weights([weights])
@@ -589,14 +596,18 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             weights[f"{expert_id}.w2.input_scale"] = w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
 
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-        fused_moe = create_moe(num_experts=NUM_EXPERTS,
-                               routing_method=routing_method,
-                               hidden_size=HIDDEN_SIZE,
-                               intermediate_size=INTERMEDIATE_SIZE,
-                               dtype=dtype,
+        fused_moe = create_moe(routing_method=routing_method,
                                reduce_results=False,
                                model_config=ModelConfig(
+                                   pretrained_config=pretrained_config,
                                    quant_config=quant_config,
                                    moe_backend=moe_backend),
                                bias=bias)
@@ -1446,14 +1457,19 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         fused_moe = create_moe(
-            num_experts=NUM_EXPERTS,
             routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
             reduce_results=True,
-            model_config=ModelConfig(quant_config=quant_config,
+            model_config=ModelConfig(pretrained_config=pretrained_config,
+                                     quant_config=quant_config,
                                      moe_backend=moe_backend),
         )
         fused_moe.load_weights([weights])
@@ -1935,14 +1951,19 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE_UNPADDED
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE_UNPADDED
+    pretrained_config.torch_dtype = dtype
+
     fused_moe = create_moe(
-        num_experts=NUM_EXPERTS,
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE_UNPADDED,
-        intermediate_size=INTERMEDIATE_SIZE_UNPADDED,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config,
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
                                  moe_backend=moe_backend),
         bias=bias,
     )
@@ -2238,13 +2259,18 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
             weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
-        fused_moe = create_moe(num_experts=NUM_EXPERTS,
-                               routing_method=routing_method,
-                               hidden_size=HIDDEN_SIZE,
-                               intermediate_size=INTERMEDIATE_SIZE,
-                               dtype=dtype,
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
+        fused_moe = create_moe(routing_method=routing_method,
                                reduce_results=False,
                                model_config=ModelConfig(
+                                   pretrained_config=pretrained_config,
                                    quant_config=quant_config,
                                    moe_backend=moe_backend))
         fused_moe.load_weights([weights])
