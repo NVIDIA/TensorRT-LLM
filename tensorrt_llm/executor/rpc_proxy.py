@@ -6,7 +6,6 @@ from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
-from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, _SyncQueue, logger_debug
 from ..logger import logger
 from .executor import GenerationExecutor
@@ -137,7 +136,6 @@ class RpcExecutorMixin:
             responses = [responses]
 
         for res in responses:
-            global_tracer().log_instant("RPC.get")
             process_res(res)
 
         if async_queues:

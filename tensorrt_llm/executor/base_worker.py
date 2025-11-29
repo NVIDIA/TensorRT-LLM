@@ -20,7 +20,6 @@ from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
@@ -753,7 +752,6 @@ class AwaitResponseHelper:
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
             if isinstance(queue, _SyncQueue):
-                global_tracer().log_instant("worker-rsp.put")
                 queue.put_nowait(response)
                 async_queues.append(queue)
                 # all the loops are identical

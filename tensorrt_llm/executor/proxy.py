@@ -14,7 +14,6 @@ from tensorrt_llm.logger import logger
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
-from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
@@ -189,7 +188,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         res = res if isinstance(res, list) else [res]
 
         for i in res:
-            global_tracer().log_instant("IPC.get")
             if i is None:
                 return False
             process_res(i)
@@ -309,15 +307,12 @@ class GenerationExecutorProxy(GenerationExecutor):
                 if self_ := self_ref():
                     self_._error_queue.put_nowait(future.exception())
 
-        tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
-        ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
         torch.cuda.Stream()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,
             worker_cls=self.worker_cls,
-            tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=GenerationExecutorProxy.READY_SIGNAL,
         )
