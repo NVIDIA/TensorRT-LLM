@@ -80,6 +80,9 @@ transforms:
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     allreduce_strategy: 'AUTO'
+    # NOTE: Order of the keys matters. Process grid's layout is in the
+    # generalized column-major order, that is, the last dimension is stride-one.
+    process_grid: {'ep': 2, 'tp': 2}
     requires_shape_prop: true
   sharding_transform_executor:
     stage: sharding

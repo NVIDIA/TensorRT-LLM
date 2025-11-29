@@ -14,12 +14,13 @@ from _model_test_utils import FakeFP8Linear
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    FP8TPShardingInfo,
+    ShardingTransformConfig,
     SplitDimension,
     WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
 from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
@@ -254,6 +255,12 @@ def _run_pattern_detection_job(
     x = torch.randn(batch_size, sequence_len, num_features, device="cuda", dtype=torch.float16)
 
     # Test pattern detection - create expected transformations for validation
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy.AUTO,
+    )
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     expected_transformations = []
     # if world_size == 1, no sharding transformations should be detected
@@ -276,11 +283,9 @@ def _run_pattern_detection_job(
                         WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == MLP:
@@ -298,11 +303,9 @@ def _run_pattern_detection_job(
                         WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == nn.Linear:
@@ -313,11 +316,9 @@ def _run_pattern_detection_job(
                         WeightShardingInfo(
                             target_node=node.name,
                             split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op="all_gather",
                             min_local_shape=1,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
         elif model_cls == FP8MLP:
@@ -335,11 +336,9 @@ def _run_pattern_detection_job(
                         FP8TPShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
-                            rank=rank,
-                            world_size=world_size,
+                            config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
                         )
                     )
 
