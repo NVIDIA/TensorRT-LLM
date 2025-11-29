@@ -1959,8 +1959,6 @@ def detect_sharding_from_config(
     head_dim = config["head_dim"]
     tp_plan = config["tp_plan"]
 
-    rank, world_size = transform_container.rank, transform_container.world_size
-
     # If the node is inside the attention module, we need to set min_local_shape to the
     # head_dim - otherwise, we would risk splitting the heads into smaller shards.
     # TODO: is there a better way to check if we are in attention module?
@@ -2009,9 +2007,9 @@ def detect_sharding_from_config(
                         linear_nodes=[lin_node],
                         subgraph_nodes=None,
                         transform_container=transform_container,
-                        rank=rank,
-                        world_size=world_size,
+                        config=config,
                         min_local_shape=min_local_shape,
+                        layer_type=layer_type,
                     )
                 elif config == "rowwise":
                     if transform_container.add(
@@ -2028,33 +2026,18 @@ def detect_sharding_from_config(
                             num_attention_shards += 1
                         num_row_col_shards += 1
                 elif config == "mamba":
-                    if (
-                        _process_ssm_sharding(gm, lin_node, transform_container, rank, world_size)
-                        > 0
-                    ):
+                    if _process_ssm_sharding(gm, lin_node, transform_container, config=config) > 0:
                         num_ssm_shards += 1
                         num_row_col_shards += 1
 
                 elif "sequence" in config:
-                    transform_container.add(
-                        WeightShardingInfo.from_node(
-                            lin_node,
-                            split_dim=SplitDimension.COLUMN,
-                            config=transform_container.config,
-                            dist_op=None,
-                            min_local_shape=min_local_shape,
-                            layer_type=LayerType.MAMBA,
-                        )
-                    )
-                    num_row_col_shards += 1
-                elif "sequence" in tp_config:
                     # TODO: Sequence parallelism is not supported yet.
                     ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
-                elif "local" in tp_config:
+                elif "local" in config:
                     # Check if this applies to shared experts in EP parallelism.
                     # If yes, apply the TP col-row shard.
                     if "shared" in module_name:
-                        col_row_action = tp_config.replace("local_", "")
+                        col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
                             transform_container.add(
                                 WeightShardingInfo.from_node(
@@ -2079,12 +2062,12 @@ def detect_sharding_from_config(
                             ):
                                 num_row_col_shards += 1
                         else:
-                            ad_logger.warning(f"Unsupported sharding action {tp_config}. Skipping.")
+                            ad_logger.warning(f"Unsupported sharding action {config}. Skipping.")
                     else:
                         # TODO: local refers to hybrid EP+TP parallelism. Not supported yet.
                         ad_logger.warning("Local EP+TP sharding is not supported yet. Skipping.")
 
-                elif "gather" in tp_config:
+                elif "gather" in config:
                     # Simple shard (row + all_gather)
                     if transform_container.add(
                         WeightShardingInfo.from_node(
@@ -2132,7 +2115,7 @@ def detect_ssm_shard(
     appropriate sharding transformations.
     """
     config = transform_container.config
-    rank, world_size = config.rank, config.world_size
+    world_size = config.world_size
     if world_size < 2:
         ad_logger.info("Skipping TP sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
@@ -2148,7 +2131,7 @@ def detect_ssm_shard(
         in_proj_node, _ = bfs(ssm_node, is_any_lin_op, attr_next="args", include_root=False)
 
         num_ssm_shards += int(
-            _process_ssm_sharding(gm, in_proj_node, transform_container, rank, world_size)
+            _process_ssm_sharding(gm, in_proj_node, transform_container, config=config)
         )
 
     ad_logger.info(f"Found {num_ssm_shards} SSM shards")
@@ -2178,11 +2161,7 @@ def detect_column_row_shard(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-    config = transform_container.config
-    world_size = config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
+    rank, world_size = transfrom_container.rank, transfrom_container.world_size
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     ad_logger.info("Running TP sharding detection")
@@ -2265,6 +2244,7 @@ def detect_column_row_shard(
                             rank,
                             world_size,
                             transfrom_container,
+                            layer_type=layer_type,
                         )
                         # TODO: handle the case where num_kv_heads is not divisible by world_size
                         continue
@@ -2276,26 +2256,28 @@ def detect_column_row_shard(
             transform_container=transfrom_container,
             rank=rank,
             world_size=world_size,
-        else:
-            min_local_shape = 1
+            min_local_shape=min_local_shape,
+        )
 
-        # We are inserting column-row shard for each group of linear enodes
-        # This may require parameter update of nodes whose args depend on (sharded) dimensions,
-        # such as view or split nodes.
-        nodes_to_column_shard = list(nodes_linear.values())[0]
-        nodes_to_row_shard = list(nodes_linear.values())[1]
-        if len(nodes_to_row_shard) != 1:
-            ad_logger.warning(
-                "Expecting only one linear node for row sharding, but got %s",
-                len(nodes_to_row_shard),
+        # shard single row node
+        if transfrom_container.add(
+            WeightShardingInfo.from_node(
+                closing,
+                split_dim=SplitDimension.ROW,
+                rank=rank,
+                world_size=world_size,
+                dist_op="all_reduce",
+                min_local_shape=min_local_shape,
+                layer_type=layer_type,
             )
-            num_simple_shards += _process_simple_shard(nodes_linear, transform_container)
-            continue
+        ):
+            num_column_row_shards += 1
+            if layer_type == LayerType.ATTENTION:
+                num_attention_shards += 1
 
-        # column-row sharding
-        _process_column_sharding(
-            gm,
-            linear_nodes=nodes_to_column_shard,
+    # simple shard remaining linear nodes
+    num_simple_shards += _process_simple_shard(
+        unprocessed_linear_nodes, rank, world_size, transfrom_container
     )
     num_column_row_shards += num_ssm_shards
     ad_logger.info(
