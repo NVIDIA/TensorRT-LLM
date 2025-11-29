@@ -195,7 +195,7 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
-            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha, swiglu_beta and swiglu_limit."
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
 
     def _get_quant_method(self):
         if self.quant_config is not None:
@@ -229,7 +229,7 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
-        if (self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8
+        if (self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8
                 or self.has_w4a8_mxfp4_fp8
                 or self.has_w4a8_mxfp4_mxfp8) and not self.bias:
             self.w3_w1_bias = nn.Parameter(torch.zeros(
@@ -283,6 +283,9 @@ class TRTLLMGenFusedMoE(MoE):
                 x_col = x.shape[1] * 2
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                if pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, pad_size))
                 x_row = x.shape[0]
                 x_col = x.shape[1]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
@@ -546,6 +549,8 @@ class TRTLLMGenFusedMoE(MoE):
             is_scale_factor_swizzled = False  # use linear layout here
 
             if not post_quant_comm:
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
                 hidden_states_fp4, hidden_states_scale_linear_fp4 = (
                     torch.ops.trtllm.fp4_quantize(
                         x,
@@ -556,6 +561,8 @@ class TRTLLMGenFusedMoE(MoE):
                     ))
             else:
                 hidden_states_fp4, hidden_states_scale_linear_fp4 = x, x_sf
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // 2
 
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits_arg,
@@ -564,8 +571,13 @@ class TRTLLMGenFusedMoE(MoE):
                 hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_bias,
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_bias,
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
                 self.fc2_alpha.data,
@@ -573,7 +585,10 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size_per_partition
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -581,8 +596,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
                 topk_weights=token_final_scales,
-                topk_ids=token_selected_experts,
-            )
+                topk_ids=token_selected_experts)
 
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
