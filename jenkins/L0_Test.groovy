@@ -2359,7 +2359,6 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-0")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-compat-13-0")
                         }
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
@@ -2368,9 +2367,6 @@ def launchTestJobs(pipeline, testFilter)
                         }
 
                         def libEnv = []
-                        if (values[5] != DLFW_IMAGE) {
-                            libEnv += ["LD_LIBRARY_PATH+compat=/usr/local/cuda/compat"]
-                        }
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {
                                 trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
