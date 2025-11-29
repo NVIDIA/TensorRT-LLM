@@ -335,7 +335,6 @@ class Qwen3MoEModel(DecoderModel):
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                reduce_output=False,
             )
         else:
             self.embed_tokens = Embedding(
