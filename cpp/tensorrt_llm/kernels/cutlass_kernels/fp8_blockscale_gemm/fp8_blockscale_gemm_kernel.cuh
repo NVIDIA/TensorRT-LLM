@@ -1605,32 +1605,26 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     {
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    using ElementInput = cute::float_e4m3_t;
-    using ElementOutput = cute::bfloat16_t;
-    using ElementAccum = float;
-    using ElementBlockScale = float;
-    static constexpr int Stages = 3;
-    using TileShape = cutlass::gemm::GemmShape<32, 128, 128>;
-    using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<ElementInput, ElementOutput, ElementAccum, ElementBlockScale,
-        Stages, TileShape::kM, TileShape::kN, TileShape::kK>;
-    using GemmKernel = ada_blockwise_gemm::AdaBlockwiseGemmKernel<KT>;
+    ada_blockwise_gemm::DeepGemmLaunchConfig cfg{};
+    cfg.M = static_cast<int>(shape_m);
+    cfg.N = static_cast<int>(shape_n);
+    cfg.K = static_cast<int>(shape_k);
+    cfg.scale_m_stride = ada_blockwise_gemm::align_to(cfg.M, 4);
+    cfg.scale_n_stride = ada_blockwise_gemm::ceil_div(cfg.K, ada_blockwise_gemm::kScaleGranularityK);
+    cfg.scale_k_tiles = ada_blockwise_gemm::ceil_div(cfg.K, ada_blockwise_gemm::kScaleGranularityK);
+    cfg.use_wide = ada_blockwise_gemm::prefer_wide_tile(cfg.M, cfg.N) ? 1 : 0;
 
-    static constexpr int kSmemSize = KT::kSmemSize;
-    static constexpr int kThreadCount = KT::kThreadCount;
-    int grid_m = (shape_m + KT::kTileM - 1) / KT::kTileM;
-    int grid_n = (shape_n + KT::kTileN - 1) / KT::kTileN;
-    int grid_k = 1;
-    dim3 grid = dim3(grid_m, grid_n, grid_k);
-    dim3 block = dim3(kThreadCount, 1, 1);
+    const int block_n = ada_blockwise_gemm::block_n_for_config(cfg.use_wide != 0);
+    dim3 grid = dim3(div_up(shape_n, static_cast<uint32_t>(block_n)),
+        div_up(shape_m, static_cast<uint32_t>(ada_blockwise_gemm::kBlockM)), 1);
+    dim3 block = dim3(ada_blockwise_gemm::kThreadsPerBlock, 1, 1);
 
-    auto result = cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+    using GemmKernel = int;
+    ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel><<<grid, block, 0, stream>>>(
+        cfg, reinterpret_cast<ada_blockwise_gemm::Fp8*>(mat_a), reinterpret_cast<ada_blockwise_gemm::Fp8*>(mat_b),
+        reinterpret_cast<ada_blockwise_gemm::Bf16*>(mat_d), scales_a, scales_b);
 
-    ada_blockwise_gemm::sm89_fp8_gemm_1d1d_impl<GemmKernel>
-        <<<grid, block, kSmemSize, stream>>>(shape_m, shape_n, shape_k, mat_a, mat_b, mat_d, scales_a, scales_b);
-
-    result = cudaGetLastError();
+    auto result = cudaGetLastError();
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
@@ -1879,36 +1873,30 @@ void strided_batch_gemm_dispatch_sm89(__nv_fp8_e4m3* mat_a, int ld_a, int stride
     {
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    using ElementInput = cute::float_e4m3_t;
-    using ElementOutput = cute::bfloat16_t;
-    using ElementAccum = float;
-    using ElementBlockScale = float;
-    static constexpr int Stages = 3;
-    using TileShape = cutlass::gemm::GemmShape<32, 128, 128>;
-    using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<ElementInput, ElementOutput, ElementAccum, ElementBlockScale,
-        Stages, TileShape::kM, TileShape::kN, TileShape::kK>;
-    using GemmKernel = ada_blockwise_gemm::AdaBlockwiseGemmKernel<KT>;
-
-    static constexpr int kSmemSize = KT::kSmemSize;
-    static constexpr int kThreadCount = KT::kThreadCount;
-    int grid_m = (shape_m + KT::kTileM - 1) / KT::kTileM;
-    int grid_n = (shape_n + KT::kTileN - 1) / KT::kTileN;
-    int grid_k = num_problems;
-    dim3 grid = dim3(grid_m, grid_n, grid_k);
-    dim3 block = dim3(kThreadCount, 1, 1);
-
     int stride_scales_b = ((shape_n + 128 - 1) / 128) * ((shape_k + 128 - 1) / 128);
 
-    if (kSmemSize > (48 << 10))
-    {
-        cudaFuncSetAttribute(ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize);
-        auto result = cudaGetLastError();
-        TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel cannot launch: %s", cudaGetErrorString(result));
-    }
-    ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel><<<grid, block, kSmemSize, stream>>>(shape_m, shape_n,
-        shape_k, mat_a, mat_b, mat_d, scales_a, scales_b, stride_a, stride_b, stride_d, stride_scales_a,
-        stride_scales_b);
+    ada_blockwise_gemm::DeepGemmLaunchConfig cfg{};
+    cfg.M = static_cast<int>(shape_m);
+    cfg.N = static_cast<int>(shape_n);
+    cfg.K = static_cast<int>(shape_k);
+    cfg.scale_m_stride = ada_blockwise_gemm::align_to(cfg.M, 4);
+    cfg.scale_n_stride = ada_blockwise_gemm::ceil_div(cfg.K, ada_blockwise_gemm::kScaleGranularityK);
+    cfg.scale_k_tiles = ada_blockwise_gemm::ceil_div(cfg.K, ada_blockwise_gemm::kScaleGranularityK);
+    cfg.use_wide = ada_blockwise_gemm::prefer_wide_tile(cfg.M, cfg.N) ? 1 : 0;
+
+    const int block_n = ada_blockwise_gemm::block_n_for_config(cfg.use_wide != 0);
+    dim3 grid = dim3(div_up(shape_n, static_cast<uint32_t>(block_n)),
+        div_up(shape_m, static_cast<uint32_t>(ada_blockwise_gemm::kBlockM)), num_problems);
+    dim3 block = dim3(ada_blockwise_gemm::kThreadsPerBlock, 1, 1);
+
+    using GemmKernel = int;
+    ada_blockwise_gemm::sm89_fp8_bmm_1d1d_impl<GemmKernel><<<grid, block, 0, stream>>>(cfg,
+        reinterpret_cast<ada_blockwise_gemm::Fp8*>(mat_a), reinterpret_cast<ada_blockwise_gemm::Fp8*>(mat_b),
+        reinterpret_cast<ada_blockwise_gemm::Bf16*>(mat_d), scales_a, scales_b, stride_a, stride_b, stride_d,
+        stride_scales_a, stride_scales_b);
+
+    auto result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 strided gemm runtime error: %s", cudaGetErrorString(result));
 }
 
 void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a, int ld_a,
