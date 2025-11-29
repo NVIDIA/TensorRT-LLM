@@ -49,9 +49,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             assert output_dtype == torch.bfloat16
 
-            if get_sm_version() != 100:
+            if get_sm_version() not in [100, 103]:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
                 )
 
         # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
