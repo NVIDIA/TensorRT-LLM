@@ -17,6 +17,7 @@
 #pragma once
 
 #include "pluginUtils.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <cuda_runtime.h>
 
@@ -30,7 +31,9 @@
 #include <unordered_map>
 #include <vector>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+
+namespace plugins
 {
 
 struct GemmDims
@@ -329,4 +332,6 @@ private:
     MNKProfileMapPtr mMNKProfileMap{};
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+
+TRTLLM_NAMESPACE_END

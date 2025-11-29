@@ -16,9 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 struct RuntimeDefaults
 {
@@ -35,4 +38,6 @@ struct RuntimeDefaults
     RuntimeDefaults() = default;
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

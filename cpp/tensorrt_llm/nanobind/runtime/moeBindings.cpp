@@ -16,6 +16,7 @@
  */
 
 #include "moeBindings.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
@@ -27,7 +28,9 @@ namespace nb = nanobind;
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
 
-namespace tensorrt_llm::nanobind::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace nanobind::runtime
 {
 
 void pyDoReplication(tk::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<float>& expertLoadFactor,
@@ -130,4 +133,6 @@ void initMoeBindings(nb::module_& m)
         "Do placement");
 }
 
-} // namespace tensorrt_llm::nanobind::runtime
+} // namespace nanobind::runtime
+
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
  */
 
 #include "topKSamplingLayer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
@@ -30,7 +31,9 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+
+namespace layers
 {
 
 template <typename T>
@@ -197,4 +200,6 @@ size_t TopKSamplingLayer<T>::getWorkspaceSize() const noexcept
 template class TopKSamplingLayer<float>;
 template class TopKSamplingLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+
+TRTLLM_NAMESPACE_END

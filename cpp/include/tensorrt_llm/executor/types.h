@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -33,12 +34,14 @@
 #include <cuda_bf16.h>
 #endif
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 class CudaStream;
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
 
-namespace tensorrt_llm::executor
+namespace executor
 {
 
 class Request;
@@ -1043,4 +1046,6 @@ static_assert(!DecodingMode::Eagle().isLookahead());
 static_assert(!DecodingMode::Eagle().isExplicitDraftTokens());
 static_assert(!DecodingMode::Eagle().isExternalDraftTokens());
 static_assert(DecodingMode::Eagle().isEagle());
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

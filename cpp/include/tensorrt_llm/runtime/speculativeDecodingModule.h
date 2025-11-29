@@ -16,10 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 
 class SpeculativeDecodingModule
@@ -108,4 +111,6 @@ private:
     SizeType32 mMaxNumPaths;            // max number of paths (or rays/branches)
     SizeType32 mMaxNumPackedMasks;
 };
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

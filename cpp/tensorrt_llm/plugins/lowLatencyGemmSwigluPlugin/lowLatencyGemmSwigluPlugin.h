@@ -18,6 +18,7 @@
 #pragma once
 
 #include "low_latency_gemm_swiglu.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -28,7 +29,9 @@
 #include <string>
 #include <vector>
 
-namespace tensorrt_llm::plugins
+TRTLLM_NAMESPACE_BEGIN
+
+namespace plugins
 {
 using LowLatencyGemmSwigluRunnerPtr
     = std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassLowLatencyFp8GemmSwigluRunnerInterface>;
@@ -137,4 +140,6 @@ private:
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace tensorrt_llm::plugins
+} // namespace plugins
+
+TRTLLM_NAMESPACE_END

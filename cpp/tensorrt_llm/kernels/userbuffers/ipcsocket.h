@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -27,7 +28,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace tensorrt_llm::runtime::ub
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::ub
 {
 
 typedef enum
@@ -60,4 +63,6 @@ ipcSocketResult_t ipcSocketGetFd(IpcSocketHandle* handle, int* fd);
 
 ipcSocketResult_t ipcSocketRecvFd(IpcSocketHandle* handle, int* fd);
 ipcSocketResult_t ipcSocketSendFd(IpcSocketHandle* handle, int const fd, int rank, uint64_t hash);
-} // namespace tensorrt_llm::runtime::ub
+} // namespace runtime::ub
+
+TRTLLM_NAMESPACE_END

@@ -13,9 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tests/unit_tests/kernels/sampling/samplingTest.h"
 
-namespace tensorrt_llm::tests::kernels::sampling
+#include "tests/unit_tests/kernels/sampling/samplingTest.h"
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace tests::kernels::sampling
 {
 
 using namespace tensorrt_llm::runtime;
@@ -506,4 +510,6 @@ void SamplingKernelTest<T>::runTest(SamplingKernelTestParam const& param)
 template class SamplingKernelTest<float>;
 template class SamplingKernelTest<half>;
 
-} // namespace tensorrt_llm::tests::kernels::sampling
+} // namespace tests::kernels::sampling
+
+TRTLLM_NAMESPACE_END

@@ -17,11 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <optional>
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 
 using runtime::SizeType32;
@@ -93,4 +96,6 @@ struct PeftCacheManagerConfig
     // folder to store the LoRA weights we hope to load during engine initialization
     std::optional<std::string> loraPrefetchDir;
 };
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+
+TRTLLM_NAMESPACE_END

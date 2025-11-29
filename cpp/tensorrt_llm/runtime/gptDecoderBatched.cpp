@@ -14,18 +14,19 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 
 #include "common.h"
 #include "decoderState.h"
 #include "iBuffer.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 
 #include <algorithm>
 #include <cassert>

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -27,7 +28,9 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::layers
+TRTLLM_NAMESPACE_BEGIN
+
+namespace layers
 {
 
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -681,4 +684,6 @@ public:
     TensorPtr eagleNetGenPastKeyValueLengthsHost; // [maxBatchSize], on pinned
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+
+TRTLLM_NAMESPACE_END

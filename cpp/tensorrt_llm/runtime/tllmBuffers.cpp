@@ -15,8 +15,11 @@
  */
 
 #include "tensorrt_llm/runtime/tllmBuffers.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 template <typename TAllocator>
 typename PoolAllocator<TAllocator>::PoolType& PoolAllocator<TAllocator>::getPool()
@@ -114,4 +117,6 @@ MemoryType MulticastTensorView::getMemoryType() const
 
 // explicit instantiations
 template class PoolAllocator<PinnedAllocator>;
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

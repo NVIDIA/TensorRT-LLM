@@ -16,8 +16,11 @@
  */
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 
 ContextProgress::ContextProgress(int numLayers)
@@ -54,4 +57,6 @@ void ContextProgress::wait(int layerIdx)
     mCudaEvents[layerIdx].synchronize();
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+
+TRTLLM_NAMESPACE_END

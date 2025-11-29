@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/penaltyKernels.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
+
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 
 #include <cassert>
@@ -27,7 +28,9 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 __device__ bool almostEqual(float a, float b, float epsilon)
@@ -262,4 +265,6 @@ template void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<float> const
 
 template void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<half> const& params);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

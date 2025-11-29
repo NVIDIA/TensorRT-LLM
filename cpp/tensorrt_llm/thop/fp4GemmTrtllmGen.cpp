@@ -25,6 +25,8 @@
 
 #include <cstdint>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -126,6 +128,8 @@ at::Tensor fp4_gemm_trtllmgen(at::Tensor const& mat1, at::Tensor const& mat2, at
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -136,5 +140,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp4_gemm_trtllmgen", &torch_ext::fp4_gemm_trtllmgen);
+    m.impl("fp4_gemm_trtllmgen", &tensorrt_llm::torch_ext::fp4_gemm_trtllmgen);
 }

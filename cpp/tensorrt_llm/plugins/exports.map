@@ -27,8 +27,8 @@
       nvinfer1::IPluginV2Ext::*;
       nvinfer1::IPluginV2IOExt::*;
       nvinfer1::PluginRegistrar*;
-      tensorrt_llm::plugins::api::*;
-      tensorrt_llm::plugins::*;
+      tensorrt_llm::_v1::plugins::api::*;
+      tensorrt_llm::_v1::plugins::*;
     };
   local: *;
 };

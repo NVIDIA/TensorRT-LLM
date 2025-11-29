@@ -16,12 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <string>
 
-namespace tensorrt_llm::runtime::utils
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::utils
 {
 
 //! \brief Create new tensor from numpy file.
@@ -30,4 +33,6 @@ namespace tensorrt_llm::runtime::utils
 //! \brief Save tensor to numpy file.
 void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename);
 
-} // namespace tensorrt_llm::runtime::utils
+} // namespace runtime::utils
+
+TRTLLM_NAMESPACE_END

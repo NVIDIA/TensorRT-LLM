@@ -24,6 +24,8 @@
 
 #include <cstdint>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 // self: [M, K], fp16/bf16/fp8_quantized
@@ -102,6 +104,8 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -111,5 +115,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mxfp8_quantize", &torch_ext::mxfp8_quantize);
+    m.impl("mxfp8_quantize", &tensorrt_llm::torch_ext::mxfp8_quantize);
 }

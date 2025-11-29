@@ -53,6 +53,7 @@
 #endif
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -73,7 +74,9 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss
 {
 
 // ============================= Variable batched Gemm things ===========================
@@ -473,9 +476,9 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
     }
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+} // namespace kernels::cutlass_kernels_oss
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+namespace kernels::cutlass_kernels
 {
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -967,4 +970,6 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
     runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

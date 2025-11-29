@@ -20,6 +20,6 @@
 #define CUTLASS_MOE_GEMM_NAMESPACE tensorrt_llm::kernels::cutlass_kernels
 #define CUTLASS_MOE_GEMM_KERNELS_NAMESPACE tensorrt_llm::kernels::cutlass_kernels
 #else
-#define CUTLASS_MOE_GEMM_NAMESPACE tensorrt_llm
+#define CUTLASS_MOE_GEMM_NAMESPACE TRTLLM_NAMESPACE_QUALIFIER
 #define CUTLASS_MOE_GEMM_KERNELS_NAMESPACE tensorrt_llm::kernels
 #endif

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <memory>
 
 #include "tensorrt_llm/common/dataType.h"
@@ -26,7 +27,9 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 
 ///@brief A collection of shared resources and data for the decoding layers.
@@ -198,4 +201,6 @@ private:
     }
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

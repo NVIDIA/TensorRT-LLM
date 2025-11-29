@@ -16,13 +16,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdexcept>
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
 {
 
 // Grid size is num_tokens / TILE_TOKEN * hidden_out / TILE_OUT.
@@ -357,4 +360,6 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_bf16_gemm_attn_scaling_
         DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED, POS_IDS_INT64); \
     }
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+} // namespace kernels::llama4_min_latency::llama4_fp8_bf16_gemm
+
+TRTLLM_NAMESPACE_END

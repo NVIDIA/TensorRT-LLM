@@ -17,6 +17,7 @@
 
 #include "lruPlugin.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;

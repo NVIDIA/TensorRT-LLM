@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -27,7 +28,9 @@
 
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::batch_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager
 {
 
 DecoderInputBuffers::DecoderInputBuffers(
@@ -320,4 +323,6 @@ SlotDecoderBuffers::SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSe
     logProbsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kFLOAT);
 }
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace batch_manager
+
+TRTLLM_NAMESPACE_END

@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -34,7 +35,9 @@
 #include <unistd.h>
 #include <vector>
 
-namespace tensorrt_llm::executor::kv_cache
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor::kv_cache
 {
 
 class FileLock
@@ -689,4 +692,6 @@ extern "C"
 #pragma clang diagnostic pop
 #endif
 
-} // namespace tensorrt_llm::executor::kv_cache
+} // namespace executor::kv_cache
+
+TRTLLM_NAMESPACE_END

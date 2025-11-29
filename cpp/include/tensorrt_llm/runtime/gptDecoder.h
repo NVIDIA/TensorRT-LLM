@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
@@ -27,8 +28,7 @@
 
 #include <memory>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 
 namespace layers
 {
@@ -151,4 +151,5 @@ inline runtime::ITensor::SharedConstPtr getDefaultBatchSlots(runtime::SizeType32
     return defaultBatchSlots;
 }
 } // namespace runtime
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

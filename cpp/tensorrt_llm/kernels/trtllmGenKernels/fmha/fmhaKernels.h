@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cuda_runtime_api.h"
+#include "tensorrt_llm/common/config.h"
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -34,8 +35,8 @@
 
 namespace tc = tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -702,12 +703,13 @@ inline TllmGenFmhaKernel const* getTllmFmhaKernels(
 {
 
 #if !defined(EXCLUDE_SM_100) || !defined(EXCLUDE_SM_103)
-    return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
-        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
+    return TllmFmhaKernelFactory::Get().getKernels(
+        sTllmGenFmhaKernelMetaInfos, sTllmGenFmhaKernelMetaInfosSize, dtypeQ, dtypeKv, dtypeOut, sm);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -18,12 +18,15 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <algorithm>
 #include <map>
 #include <optional>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+TRTLLM_NAMESPACE_BEGIN
+
+namespace batch_manager::kv_cache_manager
 {
 
 class NoEvictScheduledBlocksManager
@@ -116,4 +119,6 @@ private:
     bool const mTwoStepsLookAhead;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace batch_manager::kv_cache_manager
+
+TRTLLM_NAMESPACE_END

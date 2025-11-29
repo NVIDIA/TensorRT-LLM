@@ -16,11 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_fp8.h>
 
 #include "tensorrt_llm/common/envUtils.h"
 
-namespace tensorrt_llm::kernels::llama4_min_latency
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency
 {
 
 namespace llama4_bf16_bf16_gemm
@@ -119,4 +122,6 @@ struct __align__(8) aligned_bfloat16x4
     __align__(8) __nv_bfloat16 data[4];
 };
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency
+} // namespace kernels::llama4_min_latency
+
+TRTLLM_NAMESPACE_END

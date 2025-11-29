@@ -15,13 +15,16 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include <filesystem>
 
 #include <utility>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 OrchestratorConfig::OrchestratorConfig(bool isOrchestrator, std::string workerExecutablePath,
     std::shared_ptr<mpi::MpiComm> orchLeaderComm, bool spawnProcesses)
@@ -77,4 +80,6 @@ void OrchestratorConfig::setSpawnProcesses(bool spawnProcesses)
     mSpawnProcesses = spawnProcesses;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

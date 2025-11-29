@@ -17,13 +17,18 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <nanobind/nanobind.h>
 
 namespace nb = nanobind;
 
-namespace tensorrt_llm::nanobind::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace nanobind::runtime
 {
 
 void initMoeBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::nanobind::runtime
+} // namespace nanobind::runtime
+
+TRTLLM_NAMESPACE_END

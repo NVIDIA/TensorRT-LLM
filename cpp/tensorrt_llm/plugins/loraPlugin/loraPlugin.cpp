@@ -19,6 +19,7 @@
 
 #include "pluginUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <vector>
 

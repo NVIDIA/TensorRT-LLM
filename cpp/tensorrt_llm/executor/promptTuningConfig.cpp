@@ -15,10 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 PromptTuningConfig::PromptTuningConfig(Tensor embeddingTable, std::optional<VecTokenExtraIds> inputTokenExtraIds)
     : mEmbeddingTable(std::move(embeddingTable))
@@ -38,4 +41,6 @@ std::optional<VecTokenExtraIds> PromptTuningConfig::getInputTokenExtraIds() cons
     return mInputTokenExtraIds;
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

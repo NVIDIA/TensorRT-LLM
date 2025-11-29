@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cassert>
 #include <condition_variable>
 #include <functional>
@@ -27,7 +28,9 @@
 #include <type_traits>
 #include <vector>
 
-namespace tensorrt_llm::runtime
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime
 {
 
 class WorkerPool
@@ -82,4 +85,6 @@ private:
     bool stop{};
 };
 
-} // namespace tensorrt_llm::runtime
+} // namespace runtime
+
+TRTLLM_NAMESPACE_END

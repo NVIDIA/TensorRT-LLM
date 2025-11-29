@@ -15,10 +15,13 @@
  */
 
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include <stack>
 #include <vector>
 
-namespace tensorrt_llm::runtime::utils
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::utils
 {
 
 static SizeType32 constexpr PREFIX_CHUNK_SIZE_BITS = 4;
@@ -369,4 +372,6 @@ SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDe
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return depth;
 }
-} // namespace tensorrt_llm::runtime::utils
+} // namespace runtime::utils
+
+TRTLLM_NAMESPACE_END

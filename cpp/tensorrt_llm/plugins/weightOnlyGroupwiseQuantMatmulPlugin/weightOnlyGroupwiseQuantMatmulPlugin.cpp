@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "weightOnlyGroupwiseQuantMatmulPlugin.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <numeric>
 

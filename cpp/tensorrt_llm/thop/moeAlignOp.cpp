@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moeAlignKernels.h"
 #include "thUtils.h"
 #include <torch/extension.h>
 
 namespace tk = tensorrt_llm::kernels;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -46,6 +49,8 @@ void moeAlignBlockSizeOp(torch::Tensor topk_ids, int64_t num_experts, int64_t bl
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -55,5 +60,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_align_block_size", &torch_ext::moeAlignBlockSizeOp);
+    m.impl("moe_align_block_size", &tensorrt_llm::torch_ext::moeAlignBlockSizeOp);
 }

@@ -15,10 +15,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <tensorrt_llm/executor/executor.h>
 #include <tensorrt_llm/executor/executorImpl.h>
 
-namespace tensorrt_llm::executor
+TRTLLM_NAMESPACE_BEGIN
+
+namespace executor
 {
 
 Executor::Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig)
@@ -141,4 +144,6 @@ KVCacheEvent::KVCacheEvent(
 {
 }
 
-} // namespace tensorrt_llm::executor
+} // namespace executor
+
+TRTLLM_NAMESPACE_END

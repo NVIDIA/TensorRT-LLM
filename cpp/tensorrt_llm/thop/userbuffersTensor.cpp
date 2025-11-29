@@ -15,6 +15,8 @@
  */
 #include "userbuffersTensor.h"
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -46,7 +48,9 @@ torch::Tensor create_userbuffers_tensor_op(at::IntArrayRef shape, torch::ScalarT
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("create_userbuffers_tensor", &torch_ext::create_userbuffers_tensor_op);
+    m.def("create_userbuffers_tensor", &tensorrt_llm::torch_ext::create_userbuffers_tensor_op);
 }

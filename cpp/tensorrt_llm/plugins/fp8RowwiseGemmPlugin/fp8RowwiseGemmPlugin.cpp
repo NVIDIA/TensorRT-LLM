@@ -17,6 +17,7 @@
 
 #include "fp8RowwiseGemmPlugin.h"
 #include "cutlass_extensions/gemm_configs.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <NvInferRuntimeBase.h>
 #include <numeric>

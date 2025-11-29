@@ -30,10 +30,11 @@
 #include "cutlass/epilogue/thread/linear_combination_relu.h"
 #include "cutlass/epilogue/thread/linear_combination_silu.h"
 #include "cutlass_extensions/epilogue/thread/fused_activations.h"
+#include "tensorrt_llm/common/config.h"
 #include <cutlass/epilogue/fusion/operations.hpp>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace cutlass_extensions
 {
 
@@ -150,4 +151,5 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
 };
 
 } // namespace cutlass_extensions
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

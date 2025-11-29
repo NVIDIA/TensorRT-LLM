@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <memory>
 #if ENABLE_MULTI_DEVICE
@@ -25,10 +26,13 @@
 #include <dlfcn.h>
 #endif
 #else
+
 using ncclWindow_t = void*;
 #endif
 
-namespace tensorrt_llm::runtime::ub
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::ub
 {
 static auto constexpr tensor_prefix = "allreduce_ub_";
 
@@ -132,4 +136,6 @@ private:
 #else
 using communicator = void;
 #endif
-}; // namespace tensorrt_llm::runtime::ub
+}; // namespace runtime::ub
+
+TRTLLM_NAMESPACE_END

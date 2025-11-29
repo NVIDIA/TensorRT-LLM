@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
@@ -25,8 +26,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
@@ -134,4 +134,4 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
 } // namespace runtime::kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

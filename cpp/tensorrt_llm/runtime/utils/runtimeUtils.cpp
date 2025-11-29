@@ -15,13 +15,16 @@
  */
 
 #include "runtimeUtils.h"
-
 #include "tensorrt_llm/common/assert.h"
+
+#include "tensorrt_llm/common/config.h"
 
 #include <cassert>
 #include <cstddef>
 
-namespace tensorrt_llm::runtime::utils
+TRTLLM_NAMESPACE_BEGIN
+
+namespace runtime::utils
 {
 
 int initDevice(WorldConfig const& worldConfig)
@@ -79,4 +82,6 @@ void insertTensorSlices(
     }
 }
 
-} // namespace tensorrt_llm::runtime::utils
+} // namespace runtime::utils
+
+TRTLLM_NAMESPACE_END
