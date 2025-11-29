@@ -532,7 +532,6 @@ def set_sched_setaffinity(required_cores: int):
 
 def clear_sched_affinity(pid: int):
     ''' Clear the CPU affinity of the current process. '''
-    raise ValueError("clear_sched_affinity Not implemented yet.")
     os.sched_setaffinity(pid, set(range(psutil.cpu_count())))
 
 
