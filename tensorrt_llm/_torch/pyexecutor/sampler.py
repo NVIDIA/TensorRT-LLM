@@ -56,6 +56,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..speculative.interface import get_force_num_accepted_tokens
 from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -615,7 +616,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
-        disable_flash_infer_sampling: bool = False
+        disable_flashinfer_sampling: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -651,7 +652,7 @@ class TorchSampler(Sampler):
             }
 
         self._grouped_sampler_cls: Type[GroupedStrategySampler]
-        if IS_FLASHINFER_AVAILABLE and not args.disable_flash_infer_sampling:
+        if IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling:
             from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
 
             self._grouped_sampler_cls = FlashInferGroupedStrategySampler
@@ -661,6 +662,9 @@ class TorchSampler(Sampler):
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
         self._generator = None
+
+        # Force number of accepted tokens for speculative decoding testing
+        self._force_num_accepted_tokens = get_force_num_accepted_tokens()
 
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
@@ -698,12 +702,24 @@ class TorchSampler(Sampler):
         )
 
     @staticmethod
-    def _meet_stop_token_criteria(request: LlmRequest):
+    def _meet_stop_token_criteria(request: LlmRequest, new_token: int):
         if request.py_stop_words_list:
             assert isinstance(request.py_stop_words_list, list), (
                 "request.py_stop_words_list should be a list"
             )
             stop_words_list, prefix_sum = request.py_stop_words_list
+
+            # Determine max stop word length to decide optimization path
+            max_stop_word_length = prefix_sum[0] if prefix_sum else 0
+            for i in range(1, len(prefix_sum)):
+                word_length = prefix_sum[i] - prefix_sum[i - 1]
+                max_stop_word_length = max(max_stop_word_length, word_length)
+
+            # Fast path: all stop words are single tokens
+            if max_stop_word_length == 1:
+                return new_token in stop_words_list
+
+            # Slow path: at least one multi-token stop word exists
             tokens = request.get_tokens(0)
             offset = 0
             for i, offset_end in enumerate(prefix_sum):
@@ -730,7 +746,7 @@ class TorchSampler(Sampler):
             request.finish_by(FinishReason.LENGTH, BEAM)
             return True
 
-        if cls._meet_stop_token_criteria(request):
+        if cls._meet_stop_token_criteria(request, new_token):
             request.finish_by(FinishReason.STOP_WORDS, BEAM)
             return True
 
@@ -784,15 +800,24 @@ class TorchSampler(Sampler):
             return 0
         num_accepted = 0
 
-        for draft_token in request.py_draft_tokens:
-            if draft_token != new_token:
-                # Reject.
-                break
+        if self._force_num_accepted_tokens != 0:
+            # Force acceptance of up to force_num_accepted_tokens draft tokens
+            force_limit = min(self._force_num_accepted_tokens, len(request.py_draft_tokens))
+            for _ in request.py_draft_tokens[:force_limit]:
+                num_accepted += 1
+                new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
+                if self.finish_if_reason(request, finish_reasons, step=num_accepted):
+                    break
+        else:
+            for draft_token in request.py_draft_tokens:
+                if draft_token != new_token:
+                    # Reject.
+                    break
 
-            num_accepted += 1
-            new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
-            if self.finish_if_reason(request, finish_reasons, step=num_accepted):
-                break
+                num_accepted += 1
+                new_token = add_token(request, new_tokens, beam=BEAM, step=num_accepted)
+                if self.finish_if_reason(request, finish_reasons, step=num_accepted):
+                    break
         return num_accepted
 
     def _process_draft_tokens_tree(

@@ -181,7 +181,11 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-        self.input_processor = create_input_processor(model_path, None)
+
+        self.input_processor = create_input_processor(
+            model_path,
+            tokenizer=None,
+            checkpoint_format=llm_args.checkpoint_format)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:

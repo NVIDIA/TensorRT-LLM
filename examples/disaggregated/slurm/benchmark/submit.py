@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 
 import yaml
 
@@ -22,6 +23,10 @@ def parse_args():
                        '--dir',
                        type=str,
                        help='Directory containing YAML configuration files')
+    group.add_argument('--log-dir',
+                       type=str,
+                       default=None,
+                       help='Log directory')
     return parser.parse_args()
 
 
@@ -45,9 +50,11 @@ def calculate_nodes(world_size, num_servers, gpus_per_node):
     return (world_size + gpus_per_node - 1) // gpus_per_node * num_servers
 
 
-def submit_job(config):
+def submit_job(config, log_dir):
     # Extract configurations
     slurm_config = config['slurm']
+    slurm_config.setdefault('extra_args', '')
+
     hw_config = config['hardware']
     env_config = config['environment']
 
@@ -70,6 +77,11 @@ def submit_job(config):
     env_config.setdefault('trtllm_wheel_path', '')
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
+
+    profiling_config = config.get('profiling', {})
+    profiling_config.setdefault('nsys_on', False)
+    profiling_config.setdefault('ctx_profile_range', '10-30')
+    profiling_config.setdefault('gen_profile_range', '200-250')
 
     # Get number of servers from config
     ctx_num = hw_config['num_ctx_servers']
@@ -101,24 +113,35 @@ def submit_job(config):
     gen_enable_attention_dp = config['worker_config']['gen'][
         'enable_attention_dp']
 
-    # Create base log directory path
-    log_base = os.path.join(env_config['work_dir'], f"{isl}-{osl}")
+    if log_dir is None:
+        # Create base log directory path
+        date_prefix = datetime.now().strftime("%Y%m%d")
+        log_base = os.path.join(env_config['work_dir'],
+                                f"{date_prefix}/{isl}-{osl}")
 
-    # Get eplb num_slots for gen worker
-    eplb_num_slots = (config['worker_config']['gen'].get('moe_config', {}).get(
-        'load_balancer', {}).get('num_slots', 0))
-    # Determine directory suffix based on attention_dp
-    if gen_enable_attention_dp:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
-    else:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        # Get eplb num_slots for gen worker
+        load_balancer_config = config['worker_config']['gen'].get(
+            'moe_config', {}).get('load_balancer', {})
+        if isinstance(load_balancer_config, str):
+            with open(load_balancer_config, 'r') as f:
+                load_balancer_config = yaml.safe_load(f)
+        eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-    # Create full log directory path
-    log_dir = os.path.join(log_base, dir_suffix)
+        # Determine directory suffix based on attention_dp
+        if gen_enable_attention_dp:
+            dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        else:
+            dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+
+        # Create full log directory path
+        log_dir = os.path.join(log_base, dir_suffix)
+
     # Remove existing directory if it exists
     if os.path.exists(log_dir):
+        print(f"[WARNING] Removing existing log directory: {log_dir}")
         shutil.rmtree(log_dir)
     os.makedirs(log_dir)
+    print(f"Log will be saved to: {log_dir}")
 
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
@@ -130,7 +153,6 @@ def submit_job(config):
     cmd = [
         'sbatch',
         f'--partition={slurm_config["partition"]}',
-        f'--gres=gpu:{hw_config["gpus_per_node"]}',
         f'--account={slurm_config["account"]}',
         f'--time={slurm_config["job_time"]}',
         f'--job-name={slurm_config["job_name"]}',
@@ -138,6 +160,7 @@ def submit_job(config):
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
         f'--segment={total_nodes}',
+        *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
         # Hardware configuration
         str(hw_config['gpus_per_node']),
@@ -177,7 +200,9 @@ def submit_job(config):
         env_config['trtllm_wheel_path'],
 
         # Profiling
-        str(config['profiling']['nsys_on']).lower(),
+        str(profiling_config['nsys_on']).lower(),
+        profiling_config['ctx_profile_range'],
+        profiling_config['gen_profile_range'],
 
         # Accuracy evaluation
         str(config['accuracy']['enable_accuracy_test']).lower(),
@@ -221,11 +246,11 @@ def main():
 
     # Process each config file
     for config_file in config_files:
-        print(f"\nProcessing: {config_file}")
+        print(f"Processing: {config_file}")
         try:
             config = load_config(config_file)
-            submit_job(config)
-            print(f"Successfully submitted job for: {config_file}")
+            submit_job(config, args.log_dir)
+            print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
             print(f"Error processing {config_file}: {e}", file=sys.stderr)
             # Continue processing other files even if one fails

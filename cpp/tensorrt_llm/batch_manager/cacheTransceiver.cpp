@@ -495,8 +495,8 @@ RequestsStatus CacheTransceiver::checkContextTransferStatus(std::optional<int> c
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context transfer for request %ld after %d milliseconds.",
-                        request->mRequestId, senderFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
+                        senderFutureTimeoutMs.value());
                     ++it;
                 }
                 else

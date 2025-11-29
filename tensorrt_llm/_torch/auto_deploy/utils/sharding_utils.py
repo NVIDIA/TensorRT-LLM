@@ -6,11 +6,14 @@ import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from ..transform.library.sharding import ShardingTransformConfig
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from ....functional import AllReduceStrategy
@@ -1261,6 +1264,7 @@ class ShardingSource(Enum):
 
     HEURISTIC = "heuristic"
     FACTORY = "factory"
+    MANUAL = "manual"
 
 
 class ShardingDim(Enum):
@@ -1272,15 +1276,16 @@ class ShardingDim(Enum):
     BMM = "bmm"
 
 
-class ShardingConfig(BaseModel):
+class ShardingTransformContainer(BaseModel):
     """Configuration for sharding the model."""
 
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    predefined_config: Optional[Dict[str, Any]] = None
+    factory_config: Dict[str, Any] = Field(default_factory=dict)
+    manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
-    support_partial_config: bool = False
+    support_partial_config: bool = Field(default=True)
     sharding_source: List[ShardingSource] = Field(
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
@@ -1312,15 +1317,28 @@ class ShardingConfig(BaseModel):
             ParameterUpdateInfo: self.parameter_update_transforms,
         }
 
-    @model_validator(mode="after")
-    def _validate_and_normalize(self):
-        # Normalize empty dict to None for "no config"
-        if isinstance(self.predefined_config, dict) and not self.predefined_config:
-            self.predefined_config = None
-        # Validate only if provided
-        if self.predefined_config is not None:
-            self.validate_config()
-        return self
+    def init_params(
+        self, other: "ShardingTransformConfig", rank: int = None, world_size: int = None
+    ) -> None:
+        """
+        Copy parameters from ShardingTransformConfig. The class is not
+        imported here to avoid circular imports.
+        """
+        if rank is not None:
+            self.rank = rank
+        if world_size is not None:
+            self.world_size = world_size
+        self.factory_config = other.factory_config
+        self.manual_config = other.manual_config
+        self.simple_shard_only = other.simple_shard_only
+        self.support_partial_config = other.support_partial_config
+        self.sharding_dims = other.sharding_dims
+        self.sharding_source = other.sharding_source
+        # Extract factory_source from factory_config if present
+        self.factory_source = self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
+        self.allreduce_strategy = other.allreduce_strategy
+        self.validate_config(ShardingSource.MANUAL)
+        self.validate_config(ShardingSource.FACTORY)
 
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
@@ -1354,38 +1372,38 @@ class ShardingConfig(BaseModel):
         transform_list.append(transform)
         return True
 
-    def validate_config(self) -> bool:
-        if self.factory_source != ShardingConfigSource.HUGGINGFACE:
-            ad_logger.warning(
+    def validate_config(self, source: ShardingSource) -> bool:
+        if (
+            source == ShardingSource.FACTORY
+            and self.factory_source != ShardingConfigSource.HUGGINGFACE
+        ):
+            ad_logger.debug(
                 "Sharding config is currently only supported for HuggingFace. Skipping."
             )
             # invalidate the config
-            self.predefined_config = {}
+            self.factory_config.clear()
             return False
 
-        if not isinstance(self.predefined_config, dict):
-            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
+        config = self.manual_config if source == ShardingSource.MANUAL else self.factory_config
+
+        if "head_dim" not in config:
+            ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
             # invalidate the config
-            self.predefined_config = {}
+            config.clear()
             return False
 
-        if "head_dim" not in self.predefined_config:
-            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+        if "tp_plan" not in config or config["tp_plan"] is None:
+            ad_logger.debug("Sharding config does not contain tp_plan. Skipping.")
             # invalidate the config
-            self.predefined_config = {}
+            config.clear()
             return False
-
-        if "tp_plan" not in self.predefined_config or self.predefined_config["tp_plan"] is None:
-            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
-            # invalidate the config
-            self.predefined_config = {}
-            return False
-        tp_plan = self.predefined_config["tp_plan"]
+        tp_plan = config["tp_plan"]
 
         values = set(tp_plan.values())
         supported_modes = {
             "colwise",  # row split and no collective
             "rowwise",  # column split and all-reduce
+            "mamba",  # mamba SSM layer
             "gather",  # simple shard (row + all_gather)
             # TODO: remaining values are not supported yet.
             # They require hybrid EP+TP and/or SP support.
@@ -1396,11 +1414,14 @@ class ShardingConfig(BaseModel):
             # "local",
         }
         if not self.support_partial_config and not values.issubset(supported_modes):
-            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            ad_logger.debug("Sharding config contains invalid values. Skipping.")
             # invalidate the config
-            self.predefined_config = {}
+            config.clear()
             return False
         return True
 
-    def get_predefined_config(self) -> Dict[str, Any]:
-        return self.predefined_config
+    def get_factory_config(self) -> Dict[str, Any]:
+        return self.factory_config
+
+    def get_manual_config(self) -> Dict[str, Any]:
+        return self.manual_config

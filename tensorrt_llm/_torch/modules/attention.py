@@ -1072,24 +1072,20 @@ class MLA(nn.Module):
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            chunks_o = [
-                t.contiguous() for t in torch.split(partial_o,
-                                                    partial_o.shape[-1] //
-                                                    self.mapping.cp_size,
-                                                    dim=-1)
-            ]
-            chunks_stats = [
-                t.contiguous() for t in torch.split(softmax_stats,
-                                                    softmax_stats.shape[1] //
-                                                    self.mapping.cp_size,
-                                                    dim=1)
-            ]
-            gathered_o, gathered_stats = alltoall_helix(
-                chunks_o + chunks_stats,
-                self.mapping.cp_group,
-            )
-            return torch.ops.trtllm.helix_post_process(gathered_o,
-                                                       gathered_stats, 1.0)
+            # transpose the tensors to make the split across cp_size contiguous
+            # for both tensors, we need to split across the second dimension
+            chunks = []
+            for t in [partial_o, softmax_stats]:
+                t = t.transpose(1, 0).contiguous()
+                chunks.extend(torch.split(t,
+                                          t.shape[0] // self.mapping.cp_size))
+            gathered = alltoall_helix(chunks, self.mapping.cp_group)
+            # transpose the tensors back to ensure dimensions are ordered correctly
+            # note: an additional dimension was added at the first index for all-to-all,
+            # so the transpose dimensions are shifted by 1
+            gathered = [t.transpose(1, 2).contiguous() for t in gathered]
+            return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
+                                                       1.0)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output
@@ -2060,9 +2056,10 @@ class MLA(nn.Module):
 
         # [seq, num_heads, kv_lora_rank], account for padding
         attn_out_latent = attn_out_latent[:, :self.num_heads_tp, :]
-        # TODO: seems we need .contiguous() here when padding enabled before pass to bmm?
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp, self.kv_lora_rank])
+        if self.num_heads_tp != padding:
+            attn_out_latent = attn_out_latent.contiguous()
 
         assert (attn_out_latent.shape[0] == q.shape[0]
                 and attn_out_latent.shape[1] == self.num_heads_tp)

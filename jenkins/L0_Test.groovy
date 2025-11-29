@@ -826,6 +826,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmWaivesTxtfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
             def resourcePathNode = "/tmp"
@@ -834,13 +835,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
-            def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def outputPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptExecPathLocal = Utils.createTempLocation(pipeline, "./slurm_exec.sh")
             def scriptExecPathNode = "${jobWorkspace}/${jobUID}-slurm_exec.sh"
-            def isAarch64 = config.contains("aarch64")
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("[${stageName}] Initializing Test") {
@@ -985,6 +984,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
+                    export llmWaivesTxtfile=$llmWaivesTxtfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     export perfMode=$perfMode
@@ -1008,7 +1008,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                def scriptExec = """
+                def scriptExec = """#!/bin/bash
+                    set -Eeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     touch ${outputPath}
                     jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
@@ -1424,8 +1426,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     server: 10.117.145.14
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
-    if (type.contains("6000d")) {
-        // rtx-pro-6000d nodes are located in Austin DC, we use the FlexCache to speed up the data access.
+    if (type.contains("6000d") || type.contains("gh200")) {
+        // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
@@ -1944,19 +1946,41 @@ def generateRerunReport(stageName, llmSrc) {
     def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
     def regularRerunDir = "${rerunBaseDir}/regular"
 
-    // Check if regular rerun directory exists
-    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+    // Check if regular rerun directory has rerun_results_*.xml files
+    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && find '${regularRerunDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
 
-    // Find all isolated rerun directories (isolated_0, isolated_1, etc.)
-    def isolatedRerunDirs = []
-    def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
-    if (isolatedDirsOutput) {
-        isolatedRerunDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+    // Check if any isolated rerun directories have rerun_results_*.xml files
+    def hasIsolatedReruns = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' -exec find {} -name 'rerun_results_*.xml' \\; 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+    // Find isolated tests that have actual rerun results and build mapping
+    def isolatedTestsWithReruns = []
+    if (hasIsolatedReruns) {
+        def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
+        if (isolatedDirsOutput) {
+            def isolatedDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+            isolatedDirs.each { isolatedDir ->
+                // Extract the isolated number from directory name (e.g., isolated_0 -> 0)
+                def isolatedNum = isolatedDir.split('/').last().replace('isolated_', '')
+
+                // Check if this isolated directory has any rerun results
+                def hasRerunResults = sh(script: "find '${isolatedDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+                if (hasRerunResults) {
+                    isolatedTestsWithReruns.add([
+                        dir: isolatedDir,
+                        num: isolatedNum,
+                        originalResult: "${WORKSPACE}/${stageName}/results_isolated_${isolatedNum}.xml"
+                    ])
+                }
+            }
+        }
     }
-    def hasIsolatedReruns = isolatedRerunDirs.size() > 0
+
+    // Collect rerun result files and corresponding original result files
+    def rerunResultFiles = []
 
     echo "Found regular reruns: ${hasRegularReruns}"
-    echo "Found isolated rerun directories: ${isolatedRerunDirs}"
+    echo "Found isolated tests with reruns: ${isolatedTestsWithReruns.collect { "isolated_${it.num}" }}"
 
     if (!hasRegularReruns && !hasIsolatedReruns) {
         echo "No rerun results found, skipping rerun report generation"
@@ -1972,14 +1996,32 @@ def generateRerunReport(stageName, llmSrc) {
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
+        // Add to rerunResultFiles only if it has reruns
+        if (hasRegularReruns) {
+            rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
+        }
     }
 
-    // Add isolated test results
+    // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
         isolatedResults.split('\n').each { file ->
             if (file.trim()) {
                 allInputFiles.add(file.trim())
+            }
+        }
+        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
+        isolatedTestsWithReruns.each { isolatedTest ->
+            if (fileExists(isolatedTest.originalResult)) {
+                rerunResultFiles.add(isolatedTest.originalResult)
+                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+            }
+            for (times in [1, 2]) {
+                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
+                if (fileExists(rerunFile)) {
+                    allInputFiles.add(rerunFile)
+                    rerunResultFiles.add(rerunFile)
+                }
             }
         }
     }
@@ -1990,19 +2032,7 @@ def generateRerunReport(stageName, llmSrc) {
             def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
-            }
-        }
-    }
-
-    // Add isolated rerun results from all isolated directories
-    if (hasIsolatedReruns) {
-        isolatedRerunDirs.each { isolatedDir ->
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedDir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    echo "Added isolated rerun result: ${rerunFile}"
-                }
+                rerunResultFiles.add(rerunFile)
             }
         }
     }
@@ -2012,14 +2042,14 @@ def generateRerunReport(stageName, llmSrc) {
         return
     }
 
-    echo "Generating rerun report with input files: ${allInputFiles.join(',')}"
+    echo "Generating rerun report with input files: ${rerunResultFiles.join(',')}"
 
     // Generate comprehensive rerun report
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
-        --input-files=${allInputFiles.join(",")}
+        --input-files=${rerunResultFiles.join(",")}
     """
 
     // Update original results xml file with all rerun results for junit
@@ -2993,7 +3023,13 @@ def launchTestJobs(pipeline, testFilter)
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130")
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
+                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
+                            if (k8s_arch == "amd64") {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                            }
                         }
 
                         def libEnv = []
