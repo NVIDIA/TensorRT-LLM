@@ -25,6 +25,7 @@ from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
 from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
+from ..mapping import CpType
 
 
 @click.group()
@@ -74,6 +75,10 @@ from ..logger import logger, severity_map
               type=int,
               default=1,
               help='Pipeline parallelism size.')
+@click.option("--cp_size",
+              type=int,
+              default=1,
+              help='Context parallelism size.')
 @click.option("--ep_size",
               type=int,
               default=None,
@@ -92,6 +97,11 @@ from ..logger import logger, severity_map
               is_flag=True,
               default=False,
               help="Flag for HF transformers.")
+@click.option("--revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
 @click.option("--extra_llm_api_options",
               type=str,
               default=None,
@@ -100,13 +110,18 @@ from ..logger import logger, severity_map
               is_flag=True,
               default=False,
               help="Flag for disabling KV cache reuse.")
+@click.option("--cp_config",
+              type=dict,
+              default=None,
+              help="Context parallelism configuration as JSON.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          backend: str, max_beam_width: int, max_batch_size: int,
          max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
-         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
+         revision: Optional[str], extra_llm_api_options: Optional[str],
+         disable_kv_cache_reuse: bool, cp_size: int, cp_config: Optional[dict]):
     logger.set_level(log_level)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
@@ -117,14 +132,24 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         enable_block_reuse=not disable_kv_cache_reuse)
 
+    if cp_config is not None and "cp_type" in cp_config:
+        cp_config = cp_config.copy()
+        try:
+            cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+        except KeyError:
+            raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                             f"Must be one of: {', '.join([t.name for t in CpType])}")
     llm_args = {
         "model": model,
         "tokenizer": tokenizer,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
+        "context_parallel_size": cp_size,
+        "cp_config": cp_config if cp_config is not None else {},
         "moe_expert_parallel_size": ep_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
+        "revision": revision,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
     }

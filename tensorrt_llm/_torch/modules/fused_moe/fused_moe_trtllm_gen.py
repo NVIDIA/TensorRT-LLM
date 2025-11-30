@@ -121,34 +121,29 @@ class TRTLLMGenFusedMoE(MoE):
         if self.enable_alltoall:
             self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
-                    MnnvlMemory.initialize()
-                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                        model_config.mapping)
-                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                        model_config.mapping)
-                elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
-                    workspace_mb = int(
-                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
-                    self.moe_a2a = MoeAlltoAll(
-                        mapping=self.mapping,
-                        max_num_tokens=model_config.max_num_tokens,
-                        top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
-                        workspace_size_per_rank=workspace_mb * 1024 * 1024,
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
-                    )
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
+                MnnvlMemory.initialize()
+                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    model_config.mapping)
+                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                    model_config.mapping)
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                workspace_mb = int(
+                    os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
+                self.moe_a2a = MoeAlltoAll(
+                    mapping=self.mapping,
+                    max_num_tokens=model_config.max_num_tokens,
+                    top_k=self.routing_method.experts_per_token,
+                    num_experts=self.num_slots,
+                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                )
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
                     "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
                 )
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         self._weights_created = False
@@ -178,15 +173,11 @@ class TRTLLMGenFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return AlltoallMethodType.NotEnabled
-
-        # TODO: We found that MNNVL performs better than NCCL AllGather/ReduceScatter,
-        # regardless of the relationship between EP size and topK. We favor AlltoAll for now.
+        # TODO: We found that NVLinkOneSided performs better than NCCL AllGather/ReduceScatter,
+        # regardless of the relationship between EP size and topK. We favor NVLinkOneSided for now.
         # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
         #     return AlltoallMethodType.NotEnabled
-
-        return AlltoallMethodType.MNNVL
+        return AlltoallMethodType.NVLinkOneSided
 
     def _supports_load_balancer(self) -> bool:
         """TRTLLMGenFusedMoE supports load balancer."""
@@ -197,12 +188,6 @@ class TRTLLMGenFusedMoE(MoE):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
-
-    @cached_property
-    def moe_alltoall_backend(self):
-        # "NVLINK_ONE_SIDED" (default) or "NVLINK_TWO_SIDED"
-        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "NVLINK_ONE_SIDED").strip().upper()
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
@@ -375,7 +360,7 @@ class TRTLLMGenFusedMoE(MoE):
 
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
-            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
+            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -407,7 +392,7 @@ class TRTLLMGenFusedMoE(MoE):
             else:
                 token_final_scales = token_final_scales.to(torch.float32)
 
-            if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
                 if is_last_call:
                     loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
@@ -457,7 +442,7 @@ class TRTLLMGenFusedMoE(MoE):
 
                 if token_final_scales is not None:
                     token_final_scales = token_final_scales.to(torch.bfloat16)
-            elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,
                                      ceil_div(x_col, self.scaling_vector_size))
@@ -499,7 +484,7 @@ class TRTLLMGenFusedMoE(MoE):
                     token_final_scales = token_final_scales.to(torch.bfloat16)
             else:
                 raise ValueError(
-                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    f"Unsupported moe alltoall method type: {self.alltoall_method_type}"
                 )
 
         elif run_post_quant_allgather:
@@ -523,7 +508,7 @@ class TRTLLMGenFusedMoE(MoE):
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
         # TODO: use_workspace_output only supports w4a8_mxfp4_mxfp8 (gpt-oss) for now
-        if self.enable_alltoall and self.moe_alltoall_backend == "NVLINK_ONE_SIDED" and self.has_w4a8_mxfp4_mxfp8:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided and self.has_w4a8_mxfp4_mxfp8:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
             use_workspace_output = True
@@ -787,7 +772,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Combine results if using alltoall
         if self.enable_alltoall:
-            if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if alltoall_info is not None:
                     final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
                         final_hidden_states,
@@ -800,7 +785,7 @@ class TRTLLMGenFusedMoE(MoE):
                         use_low_precision_combine,
                         token_count=token_count,
                     )
-            elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 # If use_workspace_output=True, the MoE result is already in workspace
                 # Otherwise, we need to reshape and pass it
                 if use_workspace_output:
@@ -823,7 +808,7 @@ class TRTLLMGenFusedMoE(MoE):
                         payload_in_workspace=False)
             else:
                 raise ValueError(
-                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    f"Unsupported moe alltoall method type: {self.alltoall_method_type}"
                 )
 
         final_hidden_states = self.reducescatter_or_allreduce(
