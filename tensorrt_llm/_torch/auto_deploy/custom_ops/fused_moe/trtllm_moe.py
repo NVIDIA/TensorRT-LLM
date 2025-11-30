@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 from typing import Optional
 
 import torch
@@ -325,22 +341,30 @@ def trtllm_quant_nvfp4_moe_fused(
         activation_type=activation_type,
     )[0].view(x.shape)
 
-    return trtllm_output[0].view(x.shape)
+    return trtllm_output
 
 
 @trtllm_quant_nvfp4_moe_fused.register_fake
 def trtllm_quant_nvfp4_moe_fused_fake(
-    hidden_states: torch.Tensor,
-    router_weight: torch.Tensor,
-    router_bias: torch.Tensor,
-    top_k: int,
-    gate_up_blocks: torch.Tensor,
-    gate_up_bias: torch.Tensor,
-    gate_up_scales: torch.Tensor,
-    alpha: float,
-    limit: float,
-    down_blocks: torch.Tensor,
-    down_bias: torch.Tensor,
-    down_scales: torch.Tensor,
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight_q: torch.Tensor,
+    w2_weight_q: torch.Tensor,
+    w3_weight_q: torch.Tensor,
+    w1_weight_gs: torch.Tensor,
+    w2_weight_gs: torch.Tensor,
+    w3_weight_gs: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w3_blockscale: torch.Tensor,
+    fc1_act_global: torch.Tensor,
+    fc2_act_global: torch.Tensor,
+    fc1_global: Optional[torch.Tensor] = None,
+    fc2_global: Optional[torch.Tensor] = None,
+    input_sf: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    return torch.empty_like(x)

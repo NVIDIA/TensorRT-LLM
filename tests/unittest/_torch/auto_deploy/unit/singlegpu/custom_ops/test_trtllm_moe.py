@@ -459,12 +459,6 @@ def test_trtllm_fused_moe_fp8(
     torch.testing.assert_close(ref_output, ad_test_output, rtol=1e-1, atol=1e-1)
 
 
-NVFP4_TEST_DTYPES = [
-    (torch.float16, torch.float8_e4m3fn),
-    (torch.bfloat16, torch.float8_e4m3fn),
-]
-
-
 # Originally from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
 def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
     B, D = a.shape
@@ -560,6 +554,12 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
     return out.to(dtype=dtype)
 
 
+NVFP4_TEST_DTYPES = [
+    (torch.float16, torch.float8_e4m3fn),
+    (torch.bfloat16, torch.float8_e4m3fn),
+]
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -633,7 +633,7 @@ def test_trtllm_fused_moe_nvfp4(
 
         for expert in range(num_experts):
             w31_amax = torch.abs(w31[expert]).max().to(torch.float32)
-            w2_amax = torch.abs(w2).max().to(torch.float32)
+            w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
             w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w31_amax
             w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
 
