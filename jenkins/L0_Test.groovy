@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yanchaol-random-node', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -642,6 +642,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                             echo "--gpus ${gpuCount}"
                         fi
                     """, returnStdout: true).trim()
+
+                    if (cluster.host.contains("dlcluster")) {
+                        dockerArgs += " " + sh(script: 'echo " -e NVIDIA_IMEX_CHANNELS=${NVIDIA_IMEX_CHANNELS:-0}"', returnStdout: true).trim()
+                        dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                    }
                 }
 
                 dockerArgs = "${dockerArgs} " +
@@ -655,10 +660,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
 
-                if (partition.clusterName == "dlcluster") {
-                    dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
-                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
-                }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
@@ -996,8 +997,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
-                    export NVIDIA_IMEX_CHANNELS=0
-                    [ -z "\${NVIDIA_VISIBLE_DEVICES:-}" ] && export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
+                    export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
+                    export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
+
+                    echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
+                    echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
 
                     ${srunPrologue}
 
@@ -2815,6 +2819,7 @@ def launchTestJobs(pipeline, testFilter)
 
     SBSASlurmTestConfigs = [
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Tmp": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
@@ -2826,6 +2831,7 @@ def launchTestJobs(pipeline, testFilter)
         // Each testcase uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Tmp": ["gb200-trtllm", "l0_gb200_multi_nodes", 1, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
