@@ -1027,7 +1027,6 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.async_transfer_manager.requests_in_transfer(
                 ):
                     self._check_kv_transfer_timeout()
-                    self._finished_requests()
 
                 if self._disagg_pp_termination_handler is not None:
                     self._disagg_pp_termination_handler.terminate_pending_requests(
