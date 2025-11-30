@@ -229,9 +229,6 @@ def test_trtllm_fused_moe(
         activation_func=activation_func,
     )
 
-    torch.cuda.synchronize()
-    print("before fused_moe.cutlass_fused_moe")
-
     assert itype == torch.bfloat16 or itype == torch.float16, (
         "F16 test only supports bfloat16 or float16"
     )
@@ -256,6 +253,7 @@ def test_trtllm_fused_moe(
     _, w1_weight = torch.chunk(w31_weight, 2, dim=1)
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
 
+    torch.cuda.synchronize()
     ad_test_output = torch.ops.auto_deploy.trtllm_moe_fused(
         x,
         selected_experts.to(torch.int),
@@ -500,7 +498,7 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
                 inter_gs,
                 dtype=inter.dtype,
                 device=inter.device,
-                block_size=16,
+                block_size=NVFP4_BLOCK_SIZE,
             ).cuda()
             out[mask] = inter @ w2[i].transpose(0, 1)
     return (out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
@@ -565,6 +563,7 @@ NVFP4_TEST_DTYPES = [
 ]
 
 
+@pytest.mark.parametrize("precompute_fc_alphas", [True, False])
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -579,6 +578,7 @@ NVFP4_TEST_DTYPES = [
     reason="Requires fp4 and trtllm support",
 )
 def test_trtllm_fused_moe_nvfp4(
+    precompute_fc_alphas,
     batch_size,
     hidden_size,
     num_experts,
@@ -693,13 +693,13 @@ def test_trtllm_fused_moe_nvfp4(
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
-    if True:
+    if precompute_fc_alphas:
         fc1_weight_gs = torch.max(w3_gs, w1_gs)
-        fc1_global = 1.0 / (fc1_act_global * fc1_weight_gs)
-        fc2_global = 1.0 / (fc2_act_global * w2_gs)
+        fc1_alpha = 1.0 / (fc1_act_global * fc1_weight_gs)
+        fc2_alpha = 1.0 / (fc2_act_global * w2_gs)
     else:
-        fc1_global = None
-        fc2_global = None
+        fc1_alpha = None
+        fc2_alpha = None
 
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
     trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
@@ -717,8 +717,8 @@ def test_trtllm_fused_moe_nvfp4(
         w3_blockscale,
         fc1_act_global,
         fc2_act_global,
-        fc1_global=fc1_global,
-        fc2_global=fc2_global,
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
         input_blockscale=None,
         output_dtype=otype,
         mlp_style=mlp_style,
