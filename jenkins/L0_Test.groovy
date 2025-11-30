@@ -972,8 +972,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if(nodeCount > 1) {
                     srunArgs.add("--mpi=pmi2")
                 }
+
+                def exemptionComment = ""
+                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
+                    exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
+                }
                 def scriptContent = """#!/bin/bash
-                    #SBATCH --output=${outputPath}
+                    #SBATCH ${exemptionComment} --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
@@ -1049,7 +1054,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        scriptExecPathNode
+                        "\"${scriptExecPathNode}\""
                     ),
                     numRetries: 3
                 )
@@ -1525,7 +1530,7 @@ def runLLMDocBuild(pipeline, config)
     if (env.alternativeTRT) {
         sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     // Step 3: build doc
@@ -2150,7 +2155,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (env.alternativeTRT) {
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
         if (stageName.contains("-Ray-")) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
         }
@@ -2721,7 +2726,8 @@ def launchTestJobs(pipeline, testFilter)
         // "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
         // "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-PyTorch-Post-Merge-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         // "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
         // "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
@@ -3023,7 +3029,13 @@ def launchTestJobs(pipeline, testFilter)
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130")
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
+                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
+                            if (k8s_arch == "amd64") {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                            }
                         }
 
                         def libEnv = []

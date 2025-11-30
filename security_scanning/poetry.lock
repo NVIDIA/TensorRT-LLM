@@ -245,23 +245,22 @@ files = [
 
 [[package]]
 name = "anyio"
-version = "4.11.0"
+version = "4.12.0"
 description = "High-level concurrency and networking framework on top of asyncio or Trio"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "anyio-4.11.0-py3-none-any.whl", hash = "sha256:0287e96f4d26d4149305414d4e3bc32f0dcd0862365a4bddea19d7a1ec38c4fc"},
-    {file = "anyio-4.11.0.tar.gz", hash = "sha256:82a8d0b81e318cc5ce71a5f1f8b5c4e63619620b63141ef8c995fa0db95a57c4"},
+    {file = "anyio-4.12.0-py3-none-any.whl", hash = "sha256:dad2376a628f98eeca4881fc56cd06affd18f659b17a747d3ff0307ced94b1bb"},
+    {file = "anyio-4.12.0.tar.gz", hash = "sha256:73c693b567b0c55130c104d0b43a9baf3aa6a31fc6110116509f27bf75e21ec0"},
 ]
 
 [package.dependencies]
 exceptiongroup = {version = ">=1.0.2", markers = "python_version < \"3.11\""}
 idna = ">=2.8"
-sniffio = ">=1.1"
 typing_extensions = {version = ">=4.5", markers = "python_version < \"3.13\""}
 
 [package.extras]
-trio = ["trio (>=0.31.0)"]
+trio = ["trio (>=0.31.0)", "trio (>=0.32.0)"]
 
 [[package]]
 name = "async-timeout"
@@ -2902,6 +2901,15 @@ files = [
     {file = "nvtx-0.2.14-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d8cd1f2b464675b4d3c2036b7bbaf975baa9307f0795107dc69c556c0c8d191d"},
     {file = "nvtx-0.2.14-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6532556d81f782e24eb12c5e0c75e297493d6ab0431177c93c12bb29c523ea9e"},
     {file = "nvtx-0.2.14-cp313-cp313-win_amd64.whl", hash = "sha256:cd86f78ed56aede301b03e5ab8cb1aaeb8ba0b5ed683f98f87fbe474996d73f2"},
+    {file = "nvtx-0.2.14-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:51d48a98db0c3f4b701d3422ef34bf34c0c9256036d036dd115d48c6286b7b82"},
+    {file = "nvtx-0.2.14-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:638f66b6119fb3adfe3f5e2ba2d0cca9580bc4a898cd702b639d727a4a405c59"},
+    {file = "nvtx-0.2.14-cp313-cp313t-win_amd64.whl", hash = "sha256:d5dfaf02a91fd2a123e104d59681dc768c07b66b05e4afc4c05ee125e45f6261"},
+    {file = "nvtx-0.2.14-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:12c21b01b426e85054606d5d8e78d08ab804f1231d4f24be6ded595f901b1125"},
+    {file = "nvtx-0.2.14-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:296aa978e572d2854a980506cb9de6fe641d496b46879b56c6e6df7467056303"},
+    {file = "nvtx-0.2.14-cp314-cp314-win_amd64.whl", hash = "sha256:e265cce4d7ecfb56b9e974be736bba308be47402edfc09dd6a5f91a8eafa90c3"},
+    {file = "nvtx-0.2.14-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fc5522766fff59cf62e42c31324b1c405d308d7755e847e25d286f29e217f54a"},
+    {file = "nvtx-0.2.14-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:671b592464038054cc31a5d8c53a460d22fc38b066bbd055e086be8dd49fa43b"},
+    {file = "nvtx-0.2.14-cp314-cp314t-win_amd64.whl", hash = "sha256:2567ce29e905062c239a33ba91a46ca7307561c40fd7b37ec64c00cd78f9bdab"},
     {file = "nvtx-0.2.14-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:62ab011dc6c4da7a309475681463da45ddfc83698fb44f4778c08a128f2f87ab"},
     {file = "nvtx-0.2.14-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d884d23a9f75f2355cfbddb52a2aad40cb47fb165fd0a6861b7a02d87a238855"},
     {file = "nvtx-0.2.14-cp38-cp38-win_amd64.whl", hash = "sha256:724f2b51a3ca7e8dc58ddb7b552388c3ba28ab9dff4c32d29fbc10ab843ad350"},
