@@ -233,10 +233,12 @@ class ReportUtility:
                     clocks_mem = pynvml.nvmlDeviceGetMaxClockInfo(
                         handle, pynvml.NVML_CLOCK_MEM) / 1000.0
                     gpu_info["clocks.mem"] = clocks_mem
-                except Exception as e:
-                    self.logger.warning(f"Error querying GPU clock info: {e}")
+                except pynvml.NVMLError as e:
+                    self.logger.info(
+                        f"Error querying GPU clock info with NVML: {e}")
                     gpu_info["clocks.mem"] = None
         except Exception as e:
+            # broad catch for any other errors, since this is a non-critical operation
             self.logger.warning(f"Error querying GPU info: {e}")
             return None
         return gpu_info
