@@ -616,7 +616,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         max_total_draft_tokens: int
-        disable_flash_infer_sampling: bool = False
+        disable_flashinfer_sampling: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -652,7 +652,7 @@ class TorchSampler(Sampler):
             }
 
         self._grouped_sampler_cls: Type[GroupedStrategySampler]
-        if IS_FLASHINFER_AVAILABLE and not args.disable_flash_infer_sampling:
+        if IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling:
             from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
 
             self._grouped_sampler_cls = FlashInferGroupedStrategySampler
@@ -702,12 +702,24 @@ class TorchSampler(Sampler):
         )
 
     @staticmethod
-    def _meet_stop_token_criteria(request: LlmRequest):
+    def _meet_stop_token_criteria(request: LlmRequest, new_token: int):
         if request.py_stop_words_list:
             assert isinstance(request.py_stop_words_list, list), (
                 "request.py_stop_words_list should be a list"
             )
             stop_words_list, prefix_sum = request.py_stop_words_list
+
+            # Determine max stop word length to decide optimization path
+            max_stop_word_length = prefix_sum[0] if prefix_sum else 0
+            for i in range(1, len(prefix_sum)):
+                word_length = prefix_sum[i] - prefix_sum[i - 1]
+                max_stop_word_length = max(max_stop_word_length, word_length)
+
+            # Fast path: all stop words are single tokens
+            if max_stop_word_length == 1:
+                return new_token in stop_words_list
+
+            # Slow path: at least one multi-token stop word exists
             tokens = request.get_tokens(0)
             offset = 0
             for i, offset_end in enumerate(prefix_sum):
@@ -734,7 +746,7 @@ class TorchSampler(Sampler):
             request.finish_by(FinishReason.LENGTH, BEAM)
             return True
 
-        if cls._meet_stop_token_criteria(request):
+        if cls._meet_stop_token_criteria(request, new_token):
             request.finish_by(FinishReason.STOP_WORDS, BEAM)
             return True
 

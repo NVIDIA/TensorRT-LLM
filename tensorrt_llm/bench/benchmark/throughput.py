@@ -203,6 +203,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="pipeline parallelism size",
 )
 @optgroup.option(
+    "--cp",
+    type=int,
+    default=1,
+    help="context parallelism size",
+)
+@optgroup.option(
     "--ep",
     type=int,
     default=None,

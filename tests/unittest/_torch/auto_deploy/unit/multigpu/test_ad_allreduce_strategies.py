@@ -15,7 +15,7 @@ from utils.cpp_paths import llm_root  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
-    ShardingConfig,
+    ShardingTransformContainer,
     SplitDimension,
     WeightShardingInfo,
 )
@@ -266,12 +266,12 @@ def test_allreduce_strategy_propagation(strategy):
 
     # Create sharding config with specified strategy
     rank, world_size = 0, 4
-    sharding_config = ShardingConfig(
+    sharding_container = ShardingTransformContainer(
         rank=rank, world_size=world_size, allreduce_strategy=AllReduceStrategy[strategy]
     )
 
     # Add transforms: column shard linear1, row shard linear2 (triggers allreduce)
-    sharding_config.add(
+    sharding_container.add(
         WeightShardingInfo(
             target_node=linear1_node.name,
             rank=rank,
@@ -280,7 +280,7 @@ def test_allreduce_strategy_propagation(strategy):
             dist_op=None,
         )
     )
-    sharding_config.add(
+    sharding_container.add(
         WeightShardingInfo(
             target_node=linear2_node.name,
             rank=rank,
@@ -291,14 +291,14 @@ def test_allreduce_strategy_propagation(strategy):
     )
 
     # Verify transforms have the strategy injected
-    assert len(sharding_config.weight_sharding_transforms) == 2
-    for transform in sharding_config.weight_sharding_transforms:
+    assert len(sharding_container.weight_sharding_transforms) == 2
+    for transform in sharding_container.weight_sharding_transforms:
         assert transform.allreduce_strategy == AllReduceStrategy[strategy], (
             f"Transform {transform.target_node} should have strategy {strategy}, got {transform.allreduce_strategy}"
         )
 
     # Apply transforms
-    for transform in sharding_config.weight_sharding_transforms:
+    for transform in sharding_container.weight_sharding_transforms:
         node = next((n for n in gm.graph.nodes if n.name == transform.target_node), None)
         if node:
             transform.check_and_apply(gm, node)
