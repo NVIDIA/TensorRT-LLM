@@ -1348,6 +1348,8 @@ class DistBackend(Enum):
     AUTO = "auto"
     TRTLLM = "trtllm"
     TORCH = "torch"
+
+
 class ShardingTransformContainer(BaseModel):
     """Configuration for sharding the model."""
 
@@ -1410,6 +1412,7 @@ class ShardingTransformContainer(BaseModel):
         # Extract factory_source from factory_config if present
         self.factory_source = self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
         self.allreduce_strategy = other.allreduce_strategy
+        self.dist_backend = other.dist_backend
         self.validate_config(ShardingSource.MANUAL)
         self.validate_config(ShardingSource.FACTORY)
 
