@@ -674,7 +674,7 @@ class WeightShardingInfo(ShardingTransformInfo):
     # used for TP sharding of fused weights
     fused_weight_dims: Optional[list] = None
     allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
-    dist_backend: str = "auto"
+    dist_backend: Optional[str] = None  # Set by ShardingConfig.add() if None
 
     def quantization_cb(
         self,
@@ -941,7 +941,7 @@ class BMMShardingInfo(ShardingTransformInfo):
     world_size: int
     start_idx: int
     end_idx: int
-    dist_backend: str = "auto"
+    dist_backend: Optional[str] = None  # Set by ShardingConfig.add() if None
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -1213,12 +1213,13 @@ def _insert_sharded_mxfp4_mlp_ep(
 class EPShardingInfo(ShardingTransformInfo):
     """Configuration for EP sharding transformations.
 
-    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
-    if not provided at creation time. The strategy comes from the parent ShardingConfig.
+    NOTE: allreduce_strategy and dist_backend will be automatically injected by
+    ShardingConfig.add() if not provided at creation time. The values come from
+    the parent ShardingConfig.
     """
 
     allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
-    dist_backend: str = "auto"
+    dist_backend: Optional[str] = None  # Set by ShardingConfig.add() if None
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -1420,15 +1421,28 @@ class ShardingTransformContainer(BaseModel):
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
 
-        Automatically propagates allreduce_strategy from this config to the transform
-        if the transform doesn't already have one set.
+        Automatically propagates allreduce_strategy and dist_backend from this config
+        to the transform if the transform doesn't already have them set.
         """
-        # Inject allreduce_strategy from config into transform if it has the attribute and it's None
-        # This creates a new transform instance with the strategy set
+        # Inject allreduce_strategy and dist_backend from config into transform
+        # if they have the attributes and they're None
+        # This creates a new transform instance with the values set
+        needs_injection = False
+        transform_dict = None
+
         if hasattr(transform, "allreduce_strategy") and transform.allreduce_strategy is None:
-            # Create a new transform with the strategy injected
-            transform_dict = transform.model_dump()
+            if transform_dict is None:
+                transform_dict = transform.model_dump()
             transform_dict["allreduce_strategy"] = self.allreduce_strategy
+            needs_injection = True
+
+        if hasattr(transform, "dist_backend") and transform.dist_backend is None:
+            if transform_dict is None:
+                transform_dict = transform.model_dump()
+            transform_dict["dist_backend"] = self.dist_backend
+            needs_injection = True
+
+        if needs_injection:
             transform = type(transform)(**transform_dict)
 
         # Find the appropriate list by checking inheritance
