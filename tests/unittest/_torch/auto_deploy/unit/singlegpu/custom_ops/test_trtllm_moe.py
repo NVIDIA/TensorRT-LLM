@@ -566,7 +566,6 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype, wtype", NVFP4_TEST_DTYPES)
-@pytest.mark.parametrize("quantized_input", [False, True])
 # relu2 support requires merge of https://github.com/NVIDIA/TensorRT-LLM/pull/9261
 # @pytest.mark.parametrize("activation_func", ["silu", "relu2"])
 @pytest.mark.parametrize("activation_func", ["silu"])
@@ -582,7 +581,6 @@ def test_trtllm_fused_moe_nvfp4(
     intermediate_size,
     otype,
     wtype,
-    quantized_input,
     activation_func,
 ):
     # Skip invalid configurations
@@ -662,81 +660,37 @@ def test_trtllm_fused_moe_nvfp4(
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
-    input_sf = None
-    if quantized_input:
-        x_q_fp4, input_sf = torch.ops.trtllm.fp4_quantize(x, a1_gs, NVFP4_BLOCK_SIZE)
-    else:
-        x_q_fp4 = x
+    w3_weight_q, w1_weight_q = torch.chunk(w31_q, 2, dim=1)
+    w2_weight_q = w2_q
+    w3_blockscale, w1_blockscale = torch.chunk(w31_blockscale, 2, dim=1)
 
-    if False:
-        w3_weight_q, w1_weight_q = torch.chunk(w31_q, 2, dim=1)
-        w3_blockscale, w1_blockscale = torch.chunk(w31_blockscale, 2, dim=1)
-
-        fc1_expert_weights = (
-            torch.cat([w3_weight_q, w1_weight_q], dim=1).contiguous().view(torch.long)
-        )
-        fc1_weight_blockscale = torch.cat([w3_blockscale, w1_blockscale], dim=1)
-        fc2_weight_block_scale = w2_blockscale
-        fc1_act_global = a1_gs
-        fc2_act_global = a2_gs
-        fc1_global = 1.0 / (fc1_act_global * w31_gs)
-        fc2_global = 1.0 / (fc2_act_global * w2_gs)
-
-        quant_scales = [
-            fc1_act_global,
-            fc1_weight_blockscale.view(torch.int32),  # fc1_weight_block
-            fc1_global,
-            fc2_act_global,
-            fc2_weight_block_scale.view(torch.int32),  # fc2_weight_block
-            fc2_global,
-        ]
-
-        trtllm_output = torch.ops.trtllm.fused_moe(
-            x_q_fp4,
-            selected_experts.to(torch.int),
-            routing_weights,
-            fc1_expert_weights=fc1_expert_weights,
-            fc1_expert_biases=None,
-            fc2_expert_weights=w2_q.contiguous().view(torch.long),
-            fc2_expert_biases=None,
-            output_dtype=otype,
-            quant_scales=quant_scales,
-            input_sf=input_sf,
-            activation_type=_activation_type_from_str(activation_func),
-        )[0].view(x.shape)
-
-    else:
-        w3_weight_q, w1_weight_q = torch.chunk(w31_q, 2, dim=1)
-        w2_weight_q = w2_q
-        w3_blockscale, w1_blockscale = torch.chunk(w31_blockscale, 2, dim=1)
-
-        fc1_act_global = a1_gs
-        fc2_act_global = a2_gs
-        fc1_global = 1.0 / (fc1_act_global * w31_gs)
-        fc2_global = 1.0 / (fc2_act_global * w2_gs)
-        w1_weight_gs = w31_gs
-        w2_weight_gs = w2_gs
-        w3_weight_gs = w31_gs
-        mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
-        trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
-            x,
-            selected_experts.to(torch.int),
-            routing_weights,
-            w1_weight_q,
-            w2_weight_q,
-            w3_weight_q,
-            w1_weight_gs,
-            w2_weight_gs,
-            w3_weight_gs,
-            w1_blockscale,
-            w2_blockscale,
-            w3_blockscale,
-            fc1_act_global,
-            fc2_act_global,
-            mlp_style=mlp_style,
-            act_fn=activation_func,
-        )
-        # Ref check
+    fc1_act_global = a1_gs
+    fc2_act_global = a2_gs
+    w1_weight_gs = w31_gs
+    w2_weight_gs = w2_gs
+    w3_weight_gs = w31_gs
+    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
+    trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w1_weight_q,
+        w2_weight_q,
+        w3_weight_q,
+        w1_weight_gs,
+        w2_weight_gs,
+        w3_weight_gs,
+        w1_blockscale,
+        w2_blockscale,
+        w3_blockscale,
+        fc1_act_global,
+        fc2_act_global,
+        input_sf=None,
+        output_dtype=otype,
+        mlp_style=mlp_style,
+        act_fn=activation_func,
+    )
+    # Ref check
     a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(x, a1_gs, NVFP4_BLOCK_SIZE)
     _, m_k = a_fp4.shape
     a_in_dtype = dequantize_nvfp4_to_dtype(

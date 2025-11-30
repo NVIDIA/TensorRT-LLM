@@ -249,16 +249,18 @@ def trtllm_quant_nvfp4_moe_fused(
     w1_weight_q: torch.Tensor,  # [E, I, H] stacked FP4 weights
     w2_weight_q: torch.Tensor,  # [E, H, I] stacked FP4 weights
     w3_weight_q: torch.Tensor,  # [E, I, H] for gated_mlp, unused for mlp
-    w1_weight_gs: torch.Tensor,
-    w2_weight_gs: torch.Tensor,
-    w3_weight_gs: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w3_blockscale: torch.Tensor,
-    fc1_act_global: torch.Tensor,
-    fc2_act_global: torch.Tensor,
+    w1_weight_gs: torch.Tensor,  # Global scale for w1
+    w2_weight_gs: torch.Tensor,  # Global scale for w2
+    w3_weight_gs: torch.Tensor,  # Global scale for w3
+    w1_blockscale: torch.Tensor,  # Block scale for w1
+    w2_blockscale: torch.Tensor,  # Block scale for w2
+    w3_blockscale: torch.Tensor,  # Block scale for w3
+    fc1_act_global: torch.Tensor,  # Global scale for FC1 activations
+    fc2_act_global: torch.Tensor,  # Global scale for FC2 activations
     fc1_global: Optional[torch.Tensor] = None,  # Precomputed global scale for FC1
     fc2_global: Optional[torch.Tensor] = None,  # Precomputed global scale for FC2
+    input_sf: Optional[torch.Tensor] = None,  # Input scale factors for NVFP4 input
+    output_dtype: Optional[torch.dtype] = None,  # Output dtype for NVFP4 input
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
@@ -308,7 +310,6 @@ def trtllm_quant_nvfp4_moe_fused(
         output_dtype = x.dtype
     else:
         x_q_fp4 = x
-        output_dtype = None
 
     trtllm_output = torch.ops.trtllm.fused_moe(
         x_q_fp4,
