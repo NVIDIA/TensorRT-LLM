@@ -695,19 +695,26 @@ def _(
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
 
-    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
+    def __init__(self,
+                 to_userbuffers: bool,
+                 output_dtype: torch.dtype,
+                 backend: str = "auto"):
         super().__init__()
         self.to_userbuffers = to_userbuffers
         self.output_dtype = output_dtype
+        self.backend = backend
 
-    def get_valid_tactics(self,
-                          inputs: List[torch.Tensor],
+    def unique_id(self):
+        """Include backend in cache key to avoid sharing cache across backends."""
+        return (self.to_userbuffers, self.output_dtype, self.backend)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
-                          backend: str = "auto",
                           **kwargs) -> List[Tuple]:
         # return valid nvfp4 gemm implementations
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
+        backend = self.backend
 
         if backend in ["auto", "cuda_core"]:
             is_cuda_core_supported = False
@@ -800,8 +807,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Check if a specific backend was requested
-        requested_backend = kwargs.get('backend', 'auto')
+        requested_backend = self.backend
 
         # If a specific backend was requested (not 'auto') and we're using fallback tactic
         # This can happen on cache miss, where AutoTuner uses tactic=-1 as default
@@ -812,8 +818,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             # Get valid tactics for the requested backend
             from tensorrt_llm._torch.autotuner import OptimizationProfile
             valid_tactics = self.get_valid_tactics(inputs,
-                                                   OptimizationProfile(),
-                                                   backend=requested_backend)
+                                                   OptimizationProfile())
 
             if not valid_tactics or requested_backend not in valid_tactics:
                 # Requested backend doesn't support this shape
@@ -921,7 +926,7 @@ def nvfp4_gemm(
             f"Invalid backend '{backend}'. Must be one of {valid_backends}")
 
     # Build list of runners based on backend parameter
-    runner = NVFP4GemmUnifiedRunner(to_userbuffers, output_dtype)
+    runner = NVFP4GemmUnifiedRunner(to_userbuffers, output_dtype, backend)
 
     # Use AutoTuner to select best runner and tactic
     # - For 'auto' mode: compare across all backends, find global optimum
@@ -935,7 +940,6 @@ def nvfp4_gemm(
             FP4GemmRunner.
             tuning_config,  # All runners use the same tuning_config
             [act_fp4, weight, act_sf, weight_scale, alpha],
-            backend=backend,
         )
     except IndexError as e:
         # Provide more helpful error message
@@ -950,7 +954,6 @@ def nvfp4_gemm(
     return runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
         tactic=best_tactic,
-        backend=backend,
     )
 
 
