@@ -262,24 +262,37 @@ def trtllm_quant_nvfp4_moe_fused(
     x: torch.Tensor,  # [B, S, H] or [B*S, H], 16-bit float
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight_q: torch.Tensor,  # [E, I, H] stacked FP4 weights
-    w2_weight_q: torch.Tensor,  # [E, H, I] stacked FP4 weights
-    w3_weight_q: torch.Tensor,  # [E, I, H] for gated_mlp, unused for mlp
-    w1_weight_gs: torch.Tensor,  # Global scale for w1
-    w2_weight_gs: torch.Tensor,  # Global scale for w2
-    w3_weight_gs: torch.Tensor,  # Global scale for w3
-    w1_blockscale: torch.Tensor,  # Block scale for w1
-    w2_blockscale: torch.Tensor,  # Block scale for w2
-    w3_blockscale: torch.Tensor,  # Block scale for w3
+    w1_fp4: torch.Tensor,  # [E, I, H] stacked FP4 weights (uint8)
+    w2_fp4: torch.Tensor,  # [E, H, I] stacked FP4 weights (uint8)
+    w3_fp4: torch.Tensor,  # [E, I, H] for gated_mlp, unused for mlp (uint8)
+    w1_global_scale: torch.Tensor,  # Global scale for w1 (scalar)
+    w2_global_scale: torch.Tensor,  # Global scale for w2 (scalar)
+    w3_global_scale: torch.Tensor,  # Global scale for w3 (scalar)
+    w1_blockscale_fp8: torch.Tensor,  # Block scale for w1 (fp8 )
+    w2_blockscale_fp8: torch.Tensor,  # Block scale for w2 (fp8 )
+    w3_blockscale_fp8: torch.Tensor,  # Block scale for w3 (fp8 )
     fc1_act_global: torch.Tensor,  # Global scale for FC1 activations
     fc2_act_global: torch.Tensor,  # Global scale for FC2 activations
-    fc1_global: Optional[torch.Tensor] = None,  # Precomputed global scale for FC1
-    fc2_global: Optional[torch.Tensor] = None,  # Precomputed global scale for FC2
-    input_sf: Optional[torch.Tensor] = None,  # Input scale factors for NVFP4 input
+    fc1_global: Optional[
+        torch.Tensor
+    ] = None,  # Precomputed global scale for FC1 (1.0 / (fc1_act_global * fc1_weight_gs))
+    fc2_global: Optional[
+        torch.Tensor
+    ] = None,  # Precomputed global scale for FC2 (1.0 / (fc2_act_global * fc2_weight_gs))
+    input_blockscale: Optional[torch.Tensor] = None,  # Input scale factors for NVFP4 input
     output_dtype: Optional[torch.dtype] = None,  # Output dtype for NVFP4 input
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
+    """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
+
+    Computes (per expert):
+        For gated_mlp:
+            y = act(x @ w1.T) @ (x @ w3.T) @ w2.T  # act := SiLU
+        For mlp:
+            y = act(x @ w1.T) @ w2.T               # act := ReLU^2
+
+    """
     NVFP4_BLOCK_SIZE = 16
     mlp_style = mlp_style.lower()
     act_fn = act_fn.lower()
@@ -287,19 +300,19 @@ def trtllm_quant_nvfp4_moe_fused(
     activation_type = ActivationType.Swiglu
     if mlp_style == "gated_mlp":
         # For gated MLP, concatenate w1 and w3 as [w3, w1]
-        w3_w1_stacked = torch.cat([w3_weight_q, w1_weight_q], dim=1).contiguous().view(torch.long)
+        w3_w1_stacked = torch.cat([w3_fp4, w1_fp4], dim=1).contiguous().view(torch.long)
         fc1_expert_weights = w3_w1_stacked
-        fc1_weight_blockscale = torch.cat([w3_blockscale, w1_blockscale], dim=1)
-        fc1_weight_gs = torch.max(w3_weight_gs, w1_weight_gs)
+        fc1_weight_blockscale = torch.cat([w3_blockscale_fp8, w1_blockscale_fp8], dim=1)
+        fc1_weight_gs = torch.max(w3_global_scale, w1_global_scale)
         if act_fn == "silu":
             activation_type = ActivationType.Swiglu
         else:
             raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
     elif mlp_style == "mlp":
         # For non-gated MLP with ReLU^2
-        fc1_expert_weights = w1_weight_q.contiguous().view(torch.long)
-        fc1_weight_blockscale = w1_blockscale.contiguous().view(torch.long)
-        fc1_weight_gs = w1_weight_gs
+        fc1_expert_weights = w1_fp4.view(torch.long)
+        fc1_weight_blockscale = w1_blockscale_fp8.view(torch.long)
+        fc1_weight_gs = w1_global_scale
         if act_fn == "relu2":
             activation_type = ActivationType.Relu2
         else:
@@ -307,10 +320,10 @@ def trtllm_quant_nvfp4_moe_fused(
     else:
         raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
-    fc2_weight_block_scale = w2_blockscale
-    fc2_weight_gs = w2_weight_gs
-    fc1_global = fc1_global or 1.0 / (fc1_act_global * fc1_weight_gs)
-    fc2_global = fc2_global or 1.0 / (fc2_act_global * fc2_weight_gs)
+    fc2_weight_block_scale = w2_blockscale_fp8
+    fc2_weight_gs = w2_global_scale
+    fc1_global = 1.0 / (fc1_act_global * fc1_weight_gs) if fc1_global is None else fc1_global
+    fc2_global = 1.0 / (fc2_act_global * fc2_weight_gs) if fc2_global is None else fc2_global
 
     quant_scales = [
         fc1_act_global,
@@ -322,7 +335,9 @@ def trtllm_quant_nvfp4_moe_fused(
     ]
 
     if x.dtype in (torch.float16, torch.bfloat16):
-        x_q_fp4, input_sf = torch.ops.trtllm.fp4_quantize(x, fc1_act_global, NVFP4_BLOCK_SIZE)
+        x_q_fp4, input_blockscale = torch.ops.trtllm.fp4_quantize(
+            x, fc1_act_global, NVFP4_BLOCK_SIZE
+        )
         output_dtype = x.dtype
     else:
         x_q_fp4 = x
@@ -333,11 +348,11 @@ def trtllm_quant_nvfp4_moe_fused(
         routing_weights,
         fc1_expert_weights=fc1_expert_weights,
         fc1_expert_biases=None,
-        fc2_expert_weights=w2_weight_q.contiguous().view(torch.long),
+        fc2_expert_weights=w2_fp4.view(torch.long),
         fc2_expert_biases=None,
         output_dtype=output_dtype,
         quant_scales=quant_scales,
-        input_sf=input_sf,
+        input_sf=input_blockscale,
         activation_type=activation_type,
     )[0].view(x.shape)
 

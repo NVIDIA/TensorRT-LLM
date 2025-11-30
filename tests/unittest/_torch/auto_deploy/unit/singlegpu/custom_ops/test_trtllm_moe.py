@@ -461,6 +461,11 @@ def test_trtllm_fused_moe_fp8(
 
 # Originally from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
 def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
+    """Reference implementation of NVFP4 MoE.
+
+    The intermediate activations are quantized and dequantized to emulate the precision loss of a real
+    quantized operation.
+    """
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -583,6 +588,11 @@ def test_trtllm_fused_moe_nvfp4(
     wtype,
     activation_func,
 ):
+    # In the code below:
+    #   sf := block scale factors for NVFP4
+    #   blockscale := block scale factor for NVFP4
+    #   gs := global scale for NVFP4
+
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})")
@@ -590,58 +600,63 @@ def test_trtllm_fused_moe_nvfp4(
 
     def _get_test_data(
         otype,
-        wtype,
         batch_size,
         hidden_size,
         num_experts,
         intermediate_size,
     ):
         x = gen_tensor((batch_size, hidden_size), otype)
-        w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
-        w31 = gen_tensor(w31_shape, otype, scale=0.1)
-        w1_n = w31_shape[1]
+        w1_shape = (num_experts, intermediate_size, hidden_size)
+        w3_shape = w1_shape
+        w1 = gen_tensor(w1_shape, otype, scale=0.1)
         w2 = gen_tensor((num_experts, hidden_size, intermediate_size), otype, scale=0.1)
-        w31_d = torch.empty((num_experts, w1_n, hidden_size), device="cuda", dtype=otype)
-        w2_d = torch.empty(
-            (num_experts, hidden_size, intermediate_size), device="cuda", dtype=otype
-        )
+        w3 = gen_tensor(w3_shape, otype, scale=0.1)
         router_logits = torch.randn(batch_size, num_experts, dtype=otype).cuda()
-        return x, w31, w2, w31_d, w2_d, router_logits
+        return x, w1, w2, w3, router_logits
 
-    def _quantize_weights(w31, w2):
+    def _quantize_weights(w1, w2, w3):
         def round_up(x, y):
             return (x + y - 1) // y * y
 
-        w1_n = w31.shape[1]
-        sf_w1_2n = round_up(w1_n, 128)
+        w1_n = w1.shape[1]
+        w3_n = w3.shape[1]
+        sf_w1_n = round_up(w1_n, 128)
+        sf_w3_n = round_up(w3_n, 128)
         sf_w1_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, 4)
-        w31_blockscale = torch.empty(
-            (num_experts, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
+        w1_blockscale = torch.empty(
+            (num_experts, sf_w1_n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
         )
         sf_w2_k = round_up(hidden_size, 128)
         sf_w2_n = round_up(intermediate_size // NVFP4_BLOCK_SIZE, 4)
         w2_blockscale = torch.empty(
             (num_experts, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
         )
-        w31_q = torch.empty((num_experts, w1_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
+        w3_blockscale = torch.empty(
+            (num_experts, sf_w3_n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
+        )
+        w1_q = torch.empty((num_experts, w1_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
         w2_q = torch.empty(
             (num_experts, hidden_size, intermediate_size // 2), device="cuda", dtype=torch.uint8
         )
+        w3_q = torch.empty((num_experts, w3_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
 
         w1_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
         w2_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
+        w3_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
 
         for expert in range(num_experts):
-            w31_amax = torch.abs(w31[expert]).max().to(torch.float32)
+            w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
             w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
-            w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w31_amax
+            w3_amax = torch.abs(w3[expert]).max().to(torch.float32)
+            w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
             w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+            w3_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w3_amax
 
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                w31[expert], w1_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
+                w1[expert], w1_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
             )
-            w31_q[expert] = nvfp4_vals
-            w31_blockscale[expert] = fp8_block_scales.reshape(w31_blockscale[expert].shape)
+            w1_q[expert] = nvfp4_vals
+            w1_blockscale[expert] = fp8_block_scales.reshape(w1_blockscale[expert].shape)
 
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
                 w2[expert], w2_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
@@ -649,86 +664,128 @@ def test_trtllm_fused_moe_nvfp4(
             w2_q[expert] = nvfp4_vals
             w2_blockscale[expert] = fp8_block_scales.reshape(w2_blockscale[expert].shape)
 
-        return w31_q, w31_blockscale, w2_q, w2_blockscale, w1_gs, w2_gs
+            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
+                w3[expert], w3_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
+            )
+            w3_q[expert] = nvfp4_vals
+            w3_blockscale[expert] = fp8_block_scales.reshape(w3_blockscale[expert].shape)
 
-    x, w31, w2, w31_d, w2_d, router_logits = _get_test_data(
-        otype, wtype, batch_size, hidden_size, num_experts, intermediate_size
+        return w1_q, w2_q, w3_q, w1_blockscale, w2_blockscale, w3_blockscale, w1_gs, w2_gs, w3_gs
+
+    x, w1, w2, w3, router_logits = _get_test_data(
+        otype, batch_size, hidden_size, num_experts, intermediate_size
     )
-    w31_q, w31_blockscale, w2_q, w2_blockscale, w31_gs, w2_gs = _quantize_weights(w31, w2)
-    a1_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
-    a2_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+
+    (
+        w1_q_fp4,
+        w2_q_fp4,
+        w3_q_fp4,
+        w1_blockscale,
+        w2_blockscale,
+        w3_blockscale,
+        w1_gs,
+        w2_gs,
+        w3_gs,
+    ) = _quantize_weights(w1, w2, w3)
+
+    fc1_act_global = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    fc2_act_global = torch.tensor(1.0, device="cuda", dtype=torch.float32)
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
-    w3_weight_q, w1_weight_q = torch.chunk(w31_q, 2, dim=1)
-    w2_weight_q = w2_q
-    w3_blockscale, w1_blockscale = torch.chunk(w31_blockscale, 2, dim=1)
+    if True:
+        fc1_weight_gs = torch.max(w3_gs, w1_gs)
+        fc1_global = 1.0 / (fc1_act_global * fc1_weight_gs)
+        fc2_global = 1.0 / (fc2_act_global * w2_gs)
+    else:
+        fc1_global = None
+        fc2_global = None
 
-    fc1_act_global = a1_gs
-    fc2_act_global = a2_gs
-    w1_weight_gs = w31_gs
-    w2_weight_gs = w2_gs
-    w3_weight_gs = w31_gs
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
     trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
         x,
         selected_experts.to(torch.int),
         routing_weights,
-        w1_weight_q,
-        w2_weight_q,
-        w3_weight_q,
-        w1_weight_gs,
-        w2_weight_gs,
-        w3_weight_gs,
+        w1_q_fp4,
+        w2_q_fp4,
+        w3_q_fp4,
+        w1_gs,
+        w2_gs,
+        w3_gs,
         w1_blockscale,
         w2_blockscale,
         w3_blockscale,
         fc1_act_global,
         fc2_act_global,
-        input_sf=None,
+        fc1_global=fc1_global,
+        fc2_global=fc2_global,
+        input_blockscale=None,
         output_dtype=otype,
         mlp_style=mlp_style,
         act_fn=activation_func,
     )
-    # Ref check
-    a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(x, a1_gs, NVFP4_BLOCK_SIZE)
-    _, m_k = a_fp4.shape
-    a_in_dtype = dequantize_nvfp4_to_dtype(
-        a_fp4,
-        a_scale_interleaved,
-        a1_gs,
-        dtype=otype,
-        device=x.device,
-        block_size=NVFP4_BLOCK_SIZE,
-    )
 
-    for idx in range(0, num_experts):
-        w31_d[idx] = dequantize_nvfp4_to_dtype(
-            w31_q[idx],
-            w31_blockscale[idx],
-            w31_gs[idx],
-            dtype=w31.dtype,
-            device=w31.device,
-            block_size=NVFP4_BLOCK_SIZE,
+    def compute_ref_output(w1_gs, w3_gs):
+        # Quantize then dequantize the input to emulate the precision loss.
+        a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(
+            x, fc1_act_global, NVFP4_BLOCK_SIZE
         )
-        w2_d[idx] = dequantize_nvfp4_to_dtype(
-            w2_q[idx],
-            w2_blockscale[idx],
-            w2_gs[idx],
-            dtype=w2.dtype,
-            device=w2.device,
+        x_dq = dequantize_nvfp4_to_dtype(
+            a_fp4,
+            a_scale_interleaved,
+            fc1_act_global,
+            dtype=otype,
+            device=x.device,
             block_size=NVFP4_BLOCK_SIZE,
         )
 
-    ref_output = torch_moe_nvfp4(
-        a_in_dtype,
-        w31_d,
-        w2_d,
-        top_k,
-        routing_weights,
-        selected_experts,
-        _activation_type_from_str(activation_func),
-    )
+        concat_w3_w1 = mlp_style == "gated_mlp"
+        if concat_w3_w1:
+            w1_gs = w3_gs = torch.max(w1_gs, w3_gs)
+
+        w1_dq = torch.empty(w1.shape, device="cuda", dtype=otype)
+        w3_dq = torch.empty(w3.shape, device="cuda", dtype=otype)
+        w2_dq = torch.empty(w2.shape, device="cuda", dtype=otype)
+
+        # Dequantize the weights to emulate the precision loss.
+        for idx in range(0, num_experts):
+            w1_dq[idx] = dequantize_nvfp4_to_dtype(
+                w1_q_fp4[idx],
+                w1_blockscale[idx],
+                w1_gs[idx],
+                dtype=w1.dtype,
+                device=w1.device,
+                block_size=NVFP4_BLOCK_SIZE,
+            )
+            w2_dq[idx] = dequantize_nvfp4_to_dtype(
+                w2_q_fp4[idx],
+                w2_blockscale[idx],
+                w2_gs[idx],
+                dtype=w2.dtype,
+                device=w2.device,
+                block_size=NVFP4_BLOCK_SIZE,
+            )
+            w3_dq[idx] = dequantize_nvfp4_to_dtype(
+                w3_q_fp4[idx],
+                w3_blockscale[idx],
+                w3_gs[idx],
+                dtype=w3.dtype,
+                device=w3.device,
+                block_size=NVFP4_BLOCK_SIZE,
+            )
+
+        ref_output = torch_moe_nvfp4(
+            x_dq,
+            torch.cat([w3_dq, w1_dq], dim=1) if concat_w3_w1 else w1_dq,
+            w2_dq,
+            top_k,
+            routing_weights,
+            selected_experts,
+            _activation_type_from_str(activation_func),
+        )
+        return ref_output
+
+    ref_output = compute_ref_output(w1_gs, w3_gs)
     print(f"max diff: {(ref_output - trtllm_output).abs().max()}")
     print(f"diff = {ref_output - trtllm_output}")
     print(f"ref_output = {ref_output}")
