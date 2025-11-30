@@ -271,8 +271,8 @@ def trtllm_quant_nvfp4_moe_fused(
     w1_blockscale_fp8: torch.Tensor,  # Block scale for w1 (fp8 )
     w2_blockscale_fp8: torch.Tensor,  # Block scale for w2 (fp8 )
     w3_blockscale_fp8: torch.Tensor,  # Block scale for w3 (fp8 )
-    fc1_act_global: torch.Tensor,  # Global scale for FC1 activations
-    fc2_act_global: torch.Tensor,  # Global scale for FC2 activations
+    fc1_act_global_scale: torch.Tensor,  # Global scale for FC1 activations
+    fc2_act_global_scale: torch.Tensor,  # Global scale for FC2 activations
     fc1_alpha: Optional[
         torch.Tensor
     ] = None,  # Precomputed global scale for FC1 (1.0 / (fc1_act_global * fc1_weight_gs))
@@ -322,21 +322,21 @@ def trtllm_quant_nvfp4_moe_fused(
 
     fc2_weight_block_scale = w2_blockscale_fp8
     fc2_weight_gs = w2_global_scale
-    fc1_alpha = 1.0 / (fc1_act_global * fc1_weight_gs) if fc1_alpha is None else fc1_alpha
-    fc2_alpha = 1.0 / (fc2_act_global * fc2_weight_gs) if fc2_alpha is None else fc2_alpha
+    fc1_alpha = 1.0 / (fc1_act_global_scale * fc1_weight_gs) if fc1_alpha is None else fc1_alpha
+    fc2_alpha = 1.0 / (fc2_act_global_scale * fc2_weight_gs) if fc2_alpha is None else fc2_alpha
 
     quant_scales = [
-        fc1_act_global,
+        fc1_act_global_scale,
         fc1_weight_blockscale.view(torch.int32),
         fc1_alpha,
-        fc2_act_global,
+        fc2_act_global_scale,
         fc2_weight_block_scale.view(torch.int32),
         fc2_alpha,
     ]
 
     if x.dtype in (torch.float16, torch.bfloat16):
         x_q_fp4, input_blockscale = torch.ops.trtllm.fp4_quantize(
-            x, fc1_act_global, NVFP4_BLOCK_SIZE
+            x, fc1_act_global_scale, NVFP4_BLOCK_SIZE
         )
         output_dtype = x.dtype
     else:

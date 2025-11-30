@@ -688,15 +688,15 @@ def test_trtllm_fused_moe_nvfp4(
         w3_gs,
     ) = _quantize_weights(w1, w2, w3)
 
-    fc1_act_global = torch.tensor(1.0, device="cuda", dtype=torch.float32)
-    fc2_act_global = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    fc1_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    fc2_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
     if precompute_fc_alphas:
         fc1_weight_gs = torch.max(w3_gs, w1_gs)
-        fc1_alpha = 1.0 / (fc1_act_global * fc1_weight_gs)
-        fc2_alpha = 1.0 / (fc2_act_global * w2_gs)
+        fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
+        fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
     else:
         fc1_alpha = None
         fc2_alpha = None
@@ -715,8 +715,8 @@ def test_trtllm_fused_moe_nvfp4(
         w1_blockscale,
         w2_blockscale,
         w3_blockscale,
-        fc1_act_global,
-        fc2_act_global,
+        fc1_activation_gs,
+        fc2_activation_gs,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         input_blockscale=None,
@@ -728,12 +728,12 @@ def test_trtllm_fused_moe_nvfp4(
     def compute_ref_output(w1_gs, w3_gs):
         # Quantize then dequantize the input to emulate the precision loss.
         a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(
-            x, fc1_act_global, NVFP4_BLOCK_SIZE
+            x, fc1_activation_gs, NVFP4_BLOCK_SIZE
         )
         x_dq = dequantize_nvfp4_to_dtype(
             a_fp4,
             a_scale_interleaved,
-            fc1_act_global,
+            fc1_activation_gs,
             dtype=otype,
             device=x.device,
             block_size=NVFP4_BLOCK_SIZE,
