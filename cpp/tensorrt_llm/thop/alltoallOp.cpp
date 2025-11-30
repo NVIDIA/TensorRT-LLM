@@ -16,10 +16,10 @@
  */
 
 #include "alltoallOp.h"
-#include "thUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "thUtils.h"
 
 #include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>
@@ -134,7 +134,7 @@ std::vector<torch::Tensor> alltoall_helix(
  * @param cp_size Total number of context parallel ranks
  * @return tuple of (field0_out, field1_out) with same shapes as inputs
  */
- std::tuple<torch::Tensor, torch::Tensor> helixAllToAll(
+std::tuple<torch::Tensor, torch::Tensor> helixAllToAllNative(
     torch::Tensor field0, torch::Tensor field1, torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
 {
 
@@ -272,7 +272,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
     m.def(
-        "helixAllToAll(Tensor field0, Tensor field1, Tensor workspace, int "
+        "helixAllToAllNative(Tensor field0, Tensor field1, Tensor workspace, int "
         "cp_rank, int cp_size) -> (Tensor, Tensor)");
     m.def("getHelixWorkspaceSizePerRank(Tensor __dummy__, int cp_size) -> int");
     m.def(
@@ -283,7 +283,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("alltoall_helix", &torch_ext::alltoall_helix);
-    m.impl("helixAllToAll", &torch_ext::helixAllToAll);
+    m.impl("helixAllToAllNative", &torch_ext::helixAllToAllNative);
     m.impl("getHelixWorkspaceSizePerRank", &torch_ext::getHelixWorkspaceSizePerRank);
     m.impl("initializeHelixWorkspace", &torch_ext::initializeHelixWorkspace);
 }
