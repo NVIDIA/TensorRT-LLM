@@ -19,6 +19,8 @@
 #include <NvInferRuntime.h>
 #include <cuda_fp16.h>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -71,7 +73,7 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 
 class DecoderXQARunnerResource;
 
-class DecoderXQARunner
+class TRTLLM_API DecoderXQARunner
 {
 public:
     DecoderXQARunner(
@@ -121,7 +123,7 @@ private:
     friend DecoderXQAImplJIT;
 };
 
-class DecoderXQARunnerResource
+class TRTLLM_API DecoderXQARunnerResource
 {
 public:
     DecoderXQARunnerResource();

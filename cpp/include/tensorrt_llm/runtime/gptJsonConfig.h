@@ -21,6 +21,8 @@
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <filesystem>
 #include <istream>
 #include <string>
@@ -29,7 +31,7 @@
 namespace tensorrt_llm::runtime
 {
 
-class GptJsonConfig
+class TRTLLM_API GptJsonConfig
 {
 public:
     GptJsonConfig(std::string name, std::string version, std::string precision, SizeType32 tensorParallelism,

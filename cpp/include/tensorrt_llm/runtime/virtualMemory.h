@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -39,7 +40,7 @@ namespace tensorrt_llm::runtime
  * CUDAVirtualMemoryChunk is a handle to a piece of CUDA memory allocation,
  * providing the ability to release and rematerialize the allocation.
  */
-class CUDAVirtualMemoryChunk
+class TRTLLM_API CUDAVirtualMemoryChunk
 {
 public:
     /**
@@ -349,7 +350,7 @@ struct OffloadConfigurator : CUDAVirtualMemoryChunk::Configurator
     IBuffer::UniquePtr mBackedStorage;
 };
 
-class CudaVirtualMemoryManager
+class TRTLLM_API CudaVirtualMemoryManager
 {
 public:
     /**
@@ -553,8 +554,8 @@ public:
         return !mConfig->mBackground;
     }
 
-    void allocate(Pointer* ptr, std::size_t n, int device) const;
-    void deallocate(Pointer ptr, std::size_t n) const;
+    TRTLLM_API void allocate(Pointer* ptr, std::size_t n, int device) const;
+    TRTLLM_API void deallocate(Pointer ptr, std::size_t n) const;
 
 private:
     std::shared_ptr<Configuration> mConfig;
@@ -564,10 +565,10 @@ private:
 
 namespace tensorrt_llm::runtime
 {
-CudaVirtualMemoryManager& getVirtualMemoryManager();
-CudaVirtualMemoryAllocator getVirtualMemoryAllocator();
-void setVirtualMemoryAllocator(
+TRTLLM_API CudaVirtualMemoryManager& getVirtualMemoryManager();
+TRTLLM_API CudaVirtualMemoryAllocator getVirtualMemoryAllocator();
+TRTLLM_API void setVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
-void clearVirtualMemoryAllocator();
+TRTLLM_API void clearVirtualMemoryAllocator();
 
 } // namespace tensorrt_llm::runtime

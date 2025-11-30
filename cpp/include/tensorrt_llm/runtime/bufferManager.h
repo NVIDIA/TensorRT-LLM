@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -37,7 +38,7 @@ namespace tensorrt_llm::runtime
 class CudaMemPool;
 
 //! \brief A helper class for managing memory on host and device.
-class BufferManager
+class TRTLLM_API BufferManager
 {
 public:
     using IBufferPtr = IBuffer::UniquePtr;
@@ -51,7 +52,7 @@ public:
     //!
     //! \param[in] cudaStream The cuda stream to use for all operations on GPU (allocation, de-allocation, copying,
     //! etc.).
-    explicit BufferManager(CudaStreamPtr stream, bool trimPool = false);
+    TRTLLM_API explicit BufferManager(CudaStreamPtr stream, bool trimPool = false);
 
     //! \brief Destructor.
     ~BufferManager()
@@ -92,7 +93,7 @@ public:
     [[nodiscard]] static IBufferPtr pinnedPool(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU in the default memory pool.
-    [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+    TRTLLM_API [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size in UVM.
     [[nodiscard]] static IBufferPtr managed(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
@@ -108,7 +109,7 @@ public:
         MemoryType memoryType, std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
 
     //! \brief Allocates an `ITensor` of the given dimensions and memory type.
-    [[nodiscard]] ITensorPtr allocate(
+    TRTLLM_API [[nodiscard]] ITensorPtr allocate(
         MemoryType memoryType, nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
 
     //! \brief Create an empty `IBuffer` of the given memory type. It may be resized later.
@@ -130,10 +131,10 @@ public:
     void setZero(IBuffer& buffer) const;
 
     //! \brief Copy `src` to `dst`.
-    void copy(void const* src, IBuffer& dst, MemoryType srcType) const;
+    TRTLLM_API void copy(void const* src, IBuffer& dst, MemoryType srcType) const;
 
     //! \brief Copy `src` to `dst`.
-    void copy(IBuffer const& src, void* dst, MemoryType dstType) const;
+    TRTLLM_API void copy(IBuffer const& src, void* dst, MemoryType dstType) const;
 
     //! \brief Copy `src` to `dst`.
     void copy(void const* src, IBuffer& dst) const
@@ -185,7 +186,7 @@ public:
     }
 
     //! \brief Get the underlying cuda stream.
-    [[nodiscard]] CudaStream const& getStream() const;
+    TRTLLM_API [[nodiscard]] CudaStream const& getStream() const;
 
     //! \brief The current size of the memory reserved by the memory pool.
     [[nodiscard]] std::size_t memoryPoolReserved() const;
@@ -198,7 +199,7 @@ public:
 
     //! \brief Try to trim the memory reserved by the pool to `size` bytes. This synchronizes implicitly with the
     //! stream.
-    void memoryPoolTrimTo(std::size_t size);
+    TRTLLM_API void memoryPoolTrimTo(std::size_t size);
 
 private:
     friend class ::BufferManagerTest;

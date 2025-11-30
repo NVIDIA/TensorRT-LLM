@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/executor/executor.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -34,7 +36,7 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 class KVCacheBlock;
 using BlockPtr = std::shared_ptr<KVCacheBlock>;
 
-class KVCacheEventManager
+class TRTLLM_API KVCacheEventManager
 {
 public:
     explicit KVCacheEventManager(size_t maxKVEventEntries, std::optional<SizeType32> attentionDpRank = std::nullopt,

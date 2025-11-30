@@ -25,6 +25,8 @@
 #include <torch/torch.h>
 #include <vector>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -79,11 +81,11 @@ namespace tensorrt_llm::pg_utils
 {
 
 // ProcessGroup management functions
-c10::intrusive_ptr<c10d::ProcessGroup> get_world_pg();
+TRTLLM_API c10::intrusive_ptr<c10d::ProcessGroup> get_world_pg();
 
-c10::intrusive_ptr<c10d::ProcessGroup> get_local_pg();
+TRTLLM_API c10::intrusive_ptr<c10d::ProcessGroup> get_local_pg();
 
-void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
+TRTLLM_API void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
     c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_local);
 
 // Tensor wrapping utilities for ProcessGroup operations

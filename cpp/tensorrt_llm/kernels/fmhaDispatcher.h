@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
@@ -28,7 +29,7 @@ namespace tensorrt_llm::kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-class FmhaDispatcher
+class TRTLLM_API FmhaDispatcher
 {
 public:
     // Constructor.

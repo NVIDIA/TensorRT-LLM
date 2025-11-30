@@ -16,12 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 
 namespace tensorrt_llm::runtime
 {
 
-class TllmLogger : public nvinfer1::ILogger
+class TRTLLM_API TllmLogger : public nvinfer1::ILogger
 {
 public:
     void log(Severity severity, nvinfer1::AsciiChar const* msg) noexcept override;

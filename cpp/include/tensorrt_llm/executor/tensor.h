@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/executor/types.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/assert.h"
 
@@ -41,14 +43,14 @@ class Tensor;
 
 namespace detail
 {
-std::shared_ptr<runtime::ITensor> const& toITensor(Tensor const& tensor);
-Tensor ofITensor(std::shared_ptr<runtime::ITensor> tensor);
+TRTLLM_API std::shared_ptr<runtime::ITensor> const& toITensor(Tensor const& tensor);
+TRTLLM_API Tensor ofITensor(std::shared_ptr<runtime::ITensor> tensor);
 using DimType64 = int64_t;
 
 } // namespace detail
 
 // A thin wrapper around span that supports constructions with an initializer list.
-class Shape : public tensorrt_llm::common::ArrayView<detail::DimType64 const>
+class TRTLLM_API Shape : public tensorrt_llm::common::ArrayView<detail::DimType64 const>
 {
 public:
     using Base = tensorrt_llm::common::ArrayView<detail::DimType64 const>;
@@ -68,7 +70,7 @@ public:
     }
 };
 
-class Tensor
+class TRTLLM_API Tensor
 {
 public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;

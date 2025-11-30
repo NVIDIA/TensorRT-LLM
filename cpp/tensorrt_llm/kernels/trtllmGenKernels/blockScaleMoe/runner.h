@@ -18,6 +18,7 @@
 
 #include "DevKernel.h"
 #include "RoutingKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
@@ -138,7 +139,7 @@ inline int32_t getMaxPermutedPaddedCount(
     return maxCtas * padding;
 }
 
-class Runner
+class TRTLLM_API Runner
 {
 public:
     explicit Runner();
@@ -362,22 +363,22 @@ class Runner
 {
 public:
     // FIXME: tileTokensDim is hardcoded for now
-    Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-        int tileTokensDim = 8, ActType actType = ActType::SwiGlu);
-    Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
+    TRTLLM_API Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
+        bool useDeepSeekFp8, int tileTokensDim = 8, ActType actType = ActType::SwiGlu);
+    TRTLLM_API Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
-    void run(
+    TRTLLM_API void run(
         MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);
 
-    [[nodiscard]] std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(
+    TRTLLM_API [[nodiscard]] std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(
         MoERunnerArgs const& args, int64_t configIndex) const;
 
-    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-        int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
+    TRTLLM_API [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize,
+        int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
         int32_t validIntermediateSize = -1) const;
 
-    [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-        int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
+    TRTLLM_API [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+        int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
         int32_t validIntermediateSize = -1) const;
 
 private:

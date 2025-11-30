@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -37,7 +38,7 @@ namespace tensorrt_llm::runtime
 {
 
 //! GPT decoder class with support for in-flight batching
-class GptDecoderBatched : public IGptDecoderBatched
+class TRTLLM_API GptDecoderBatched : public IGptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;

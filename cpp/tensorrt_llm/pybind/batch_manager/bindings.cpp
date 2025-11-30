@@ -47,6 +47,11 @@ namespace tr = tensorrt_llm::runtime;
 
 using namespace tensorrt_llm::runtime;
 
+namespace tensorrt_llm::batch_manager
+{
+template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
+}
+
 namespace tensorrt_llm::pybind::batch_manager
 {
 

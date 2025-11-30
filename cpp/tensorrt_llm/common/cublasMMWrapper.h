@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -29,7 +30,7 @@ namespace tensorrt_llm
 namespace common
 {
 
-class CublasMMWrapper
+class TRTLLM_API CublasMMWrapper
 {
 protected:
     std::shared_ptr<cublasHandle_t> mCublasHandle;

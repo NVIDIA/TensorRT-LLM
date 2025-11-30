@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include <atomic>
 #include <condition_variable>
@@ -26,7 +27,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 // Use to track progress of context phase in dist-serving
-class ContextProgress
+class TRTLLM_API ContextProgress
 {
 public:
     ContextProgress(int numLayers);

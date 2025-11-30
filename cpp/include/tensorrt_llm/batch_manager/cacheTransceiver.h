@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -51,7 +52,7 @@ class BaseKVCacheManager;
 class CacheSender;
 class CacheReceiver;
 
-class CacheTransceiverComm
+class TRTLLM_API CacheTransceiverComm
 {
 public:
     // Construct from a non-owning raw pointer, won't take ownership of the pointer
@@ -179,7 +180,7 @@ private:
     c10::intrusive_ptr<c10d::ProcessGroup> mPgComm;
 };
 
-class CacheTransceiverFactory
+class TRTLLM_API CacheTransceiverFactory
 {
 public:
     static std::unique_ptr<BaseCacheTransceiver> createCacheTransceiver(
@@ -190,7 +191,7 @@ public:
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
 };
 
-class BaseCacheTransceiver
+class TRTLLM_API BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
@@ -211,7 +212,7 @@ public:
     virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
 };
 
-class CacheTransceiver : public BaseCacheTransceiver
+class TRTLLM_API CacheTransceiver : public BaseCacheTransceiver
 {
 public:
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,

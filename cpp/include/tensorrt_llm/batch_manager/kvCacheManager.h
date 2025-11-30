@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -195,12 +196,13 @@ struct BlockKey
     }
 };
 
-std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
+TRTLLM_API std::vector<BlockKey> buildBlockKeys(
+    std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
 
 // Implement hash functor for BlockKey.
 // This allows us to use unordered_map with BlockKey as key.
 // Based on https://stackoverflow.com/questions/20511347/a-good-hash-function-for-a-vector/72073933#72073933
-struct BlockKeyHasher
+struct TRTLLM_API BlockKeyHasher
 {
     [[nodiscard]] static size_t hash(BlockKey const& blockKey, std::size_t parentHash = 0) noexcept;
 
@@ -241,7 +243,7 @@ struct KvCacheStats
 // Basic building block of a paged KV cache - a single
 // cache block. This class just holds metadata, no pointers
 // since it is reused across all layers.
-class KVCacheBlock
+class TRTLLM_API KVCacheBlock
 {
 public:
     using IdType = std::int32_t;
@@ -367,7 +369,7 @@ private:
     size_t mHash;
 };
 
-class GenerationRequest
+class TRTLLM_API GenerationRequest
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -520,7 +522,7 @@ private:
 };
 
 // attach metadata to a pool pointer
-class KVCacheBlockPool
+class TRTLLM_API KVCacheBlockPool
 {
 public:
     SizeType32 numLayers;
@@ -574,7 +576,7 @@ public:
 // Alloc pops off the block at the front, and Free pushes it back to the vector.
 // WindowBlockManager maintains a vector of lists of request ids to allocated blocks
 // per sequence. This can be used to Free all blocks belonging to a sequence.
-class WindowBlockManager
+class TRTLLM_API WindowBlockManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -1016,7 +1018,7 @@ private:
     SizeType32 mIndexerKCacheIndexHeadDim;
 };
 
-class BlockManager
+class TRTLLM_API BlockManager
 {
 public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
@@ -1441,7 +1443,7 @@ struct OffsetTableDimensions
     CacheType cacheType;
 };
 
-class BaseKVCacheManager
+class TRTLLM_API BaseKVCacheManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -1657,7 +1659,7 @@ public:
     virtual void unpinBlocksById(KVCacheBlock::IdType blockId) = 0;
 };
 
-class KVCacheManager : public BaseKVCacheManager
+class TRTLLM_API KVCacheManager : public BaseKVCacheManager
 {
 public:
     friend class KVCacheManagerBindings;

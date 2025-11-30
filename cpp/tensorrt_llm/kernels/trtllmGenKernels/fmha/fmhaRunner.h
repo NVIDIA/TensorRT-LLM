@@ -18,6 +18,8 @@
 
 #include <cuda_runtime.h>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "fmhaKernels.h"
 #include "fmhaRunnerParams.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
@@ -27,16 +29,16 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-class TllmGenFmhaRunner
+class TRTLLM_API TllmGenFmhaRunner
 {
 public:
     // Constructor.
-    explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut);
+    TRTLLM_API explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut);
 
     TllmGenFmhaRunner() = default;
 
     // Check if fmha is supported.
-    bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) const;
+    TRTLLM_API bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) const;
 
     // Check if fmha is supported with additional info.
     std::pair<bool, std::string> isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const;
@@ -45,7 +47,7 @@ public:
     size_t getTotalDeviceMemory() const;
 
     // Run the fmha kernel.
-    void run(TllmGenFmhaRunnerParams const&);
+    TRTLLM_API void run(TllmGenFmhaRunnerParams const&);
 
 private:
     // The input/output datatype.

@@ -28,13 +28,14 @@
 #include <thread>
 #include <vector>
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceCommon.h"
 
 namespace tensorrt_llm::runtime
 {
 
-struct MoeWeight
+struct TRTLLM_API MoeWeight
 {
     // use 2D layout to support stride tensor using cudaMemcpy2D
     void* mWeightPtr = nullptr;
@@ -53,7 +54,7 @@ struct MoeWeight
     }
 };
 
-struct MoePlacementCpuInfo
+struct TRTLLM_API MoePlacementCpuInfo
 {
     std::vector<int> expertReplicaCount;
 
@@ -71,7 +72,7 @@ struct MoePlacementCpuInfo
 
 class SingleLayerMoeLoadBalancer;
 
-class MoeWeightUpdaterBase
+class TRTLLM_API MoeWeightUpdaterBase
 {
 public:
     MoeWeightUpdaterBase(
@@ -92,7 +93,7 @@ protected:
     SingleLayerMoeLoadBalancer* mLayerLoadBalancer;
 };
 
-class HostMemoryMoeWeightUpdater : public MoeWeightUpdaterBase
+class TRTLLM_API HostMemoryMoeWeightUpdater : public MoeWeightUpdaterBase
 {
 public:
     HostMemoryMoeWeightUpdater(
@@ -115,7 +116,7 @@ private:
 
 class MoeLoadBalancer;
 
-class SingleLayerMoeLoadBalancer
+class TRTLLM_API SingleLayerMoeLoadBalancer
 {
 public:
     SingleLayerMoeLoadBalancer(
@@ -216,7 +217,7 @@ private:
     int mLayerId = -1;
 };
 
-class MultiThreadWorker
+class TRTLLM_API MultiThreadWorker
 {
 public:
     explicit MultiThreadWorker(int numThreads, int cudaDeviceId);
@@ -253,7 +254,7 @@ private:
     int64_t mNextTaskId;
 };
 
-class MoeLoadBalancer
+class TRTLLM_API MoeLoadBalancer
 {
 public:
     MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter);
@@ -342,10 +343,10 @@ private:
 };
 
 // functions exposed for testing
-void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
+TRTLLM_API void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
     MoePlacementCpuInfo* cpuPlacement);
 
-void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
+TRTLLM_API void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
     MoePlacementCpuInfo* cpuPlacement);
 
 } // namespace tensorrt_llm::runtime

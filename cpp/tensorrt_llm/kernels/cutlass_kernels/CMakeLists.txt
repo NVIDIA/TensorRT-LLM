@@ -269,8 +269,9 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
   target_link_libraries(
-    moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4
-                         _moe_gemm_fp8)
+    moe_gemm_src
+    PRIVATE _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4 _moe_gemm_fp8
+    PUBLIC kernels_src)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
@@ -283,6 +284,7 @@ if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
+  target_link_libraries(ar_gemm_src PUBLIC cuda)
   if(ENABLE_NVSHMEM)
     target_link_libraries(ar_gemm_src PRIVATE nvshmem::nvshmem_host
                                               nvshmem::nvshmem_device)

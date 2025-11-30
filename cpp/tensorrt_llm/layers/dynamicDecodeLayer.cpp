@@ -44,8 +44,8 @@ size_t DynamicDecodeLayer<T>::getWorkspaceSize() const noexcept
 }
 
 template <typename T>
-DynamicDecodeLayer<T>::DynamicDecodeLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
-    std::shared_ptr<BufferManager> bufferManager)
+TRTLLM_API DynamicDecodeLayer<T>::DynamicDecodeLayer(executor::DecodingMode const& mode,
+    DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager)
     : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
 {

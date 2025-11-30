@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -80,7 +81,7 @@ enum LlmRequestType
 class ContextProgress;
 
 template <typename TTensor, typename TStream = runtime::BufferManager::CudaStreamPtr>
-class GenericLlmRequest
+class TRTLLM_API GenericLlmRequest
 {
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
 
@@ -1653,7 +1654,7 @@ public:
     ///     Decoder uses beamWidthIn=4, beamWidthOut=4 to get top 4 tokens
     ///     i.e. the same as normal Beam Search of `beamWidth==4`
     /// @param: forNextIteration: get beam width for next step rather than current beam width.
-    [[nodiscard]] SizeType32 getBeamWidthByIter(bool forNextIteration = false);
+    TRTLLM_API [[nodiscard]] SizeType32 getBeamWidthByIter(bool forNextIteration = false);
 
     [[nodiscard]] bool isFinished() const noexcept
     {
@@ -2191,7 +2192,7 @@ private:
     }
 };
 
-class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
+class TRTLLM_API LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
 {
     friend class LlmRequestBindings;
 

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
@@ -34,7 +35,7 @@ class CacheState;
 struct SocketState;
 } // namespace kv_cache
 
-class Serialization
+class TRTLLM_API Serialization
 {
 public:
     // BlockKey (KV cache)
@@ -342,26 +343,26 @@ public:
     template <typename T>
     static void serialize(KVCacheEventDiff<T> const& data, std::ostream& os);
     template <typename T>
-    [[nodiscard]] static KVCacheEventDiff<T> deserializeKVCacheEventDiff(std::istream& is);
+    [[nodiscard]] static TRTLLM_API KVCacheEventDiff<T> deserializeKVCacheEventDiff(std::istream& is);
 
     // KVCacheUpdateData
-    [[nodiscard]] static size_t serializedSize(KVCacheUpdatedData const& data);
+    [[nodiscard]] static TRTLLM_API size_t serializedSize(KVCacheUpdatedData const& data);
     static void serialize(KVCacheUpdatedData const& data, std::ostream& os);
-    [[nodiscard]] static KVCacheUpdatedData deserializeKVCacheUpdatedData(std::istream& is);
+    [[nodiscard]] static TRTLLM_API KVCacheUpdatedData deserializeKVCacheUpdatedData(std::istream& is);
 
     // UniqueToken
-    [[nodiscard]] static size_t serializedSize(tensorrt_llm::runtime::UniqueToken const& token);
-    static void serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os);
-    [[nodiscard]] static tensorrt_llm::runtime::UniqueToken deserializeUniqueToken(std::istream& is);
+    [[nodiscard]] static TRTLLM_API size_t serializedSize(tensorrt_llm::runtime::UniqueToken const& token);
+    static TRTLLM_API void serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os);
+    [[nodiscard]] static TRTLLM_API tensorrt_llm::runtime::UniqueToken deserializeUniqueToken(std::istream& is);
 
     // String
-    static std::string deserializeString(std::istream& is);
+    static TRTLLM_API std::string deserializeString(std::istream& is);
 
     // Bool
-    static bool deserializeBool(std::istream& is);
+    static TRTLLM_API bool deserializeBool(std::istream& is);
 
     // ModelType
-    static ModelType deserializeModelType(std::istream& is);
+    static TRTLLM_API ModelType deserializeModelType(std::istream& is);
 };
 
 } // namespace tensorrt_llm::executor

@@ -18,6 +18,8 @@
 
 #include <cuda.h>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
 #include <optional>
 
@@ -38,15 +40,15 @@ struct TrtllmGenGemmRunnerOptions
 class TrtllmGenGemmRunner
 {
 public:
-    explicit TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options);
+    TRTLLM_API explicit TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options);
 
-    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k);
+    TRTLLM_API [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k);
 
-    void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b, float const* bScale,
-        void* c, float* cScale, float* cScalePtr, void* workspace, CUstream stream, int device);
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b,
+        float const* bScale, void* c, float* cScale, float* cScalePtr, void* workspace, CUstream stream, int device);
 
-    void run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale, void* workspace,
-        CUstream stream, int device);
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale,
+        void* workspace, CUstream stream, int device);
 
 private:
     void selectGemmConfig(int32_t m, int32_t n, int32_t k);

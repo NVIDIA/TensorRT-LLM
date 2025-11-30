@@ -23,6 +23,8 @@
 #include <tuple>
 #include <vector>
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -43,17 +45,17 @@ namespace kernels
 // 1. check if FMHA kernels are supported statically.
 // 2. construct FMHA runner object with the fixed params.
 // 3. run the kernel (with all needed device pointers).
-class FusedMHARunnerV2
+class TRTLLM_API FusedMHARunnerV2
 {
 public:
     // Constructor.
-    FusedMHARunnerV2(MHARunnerFixedParams fixedParams);
+    TRTLLM_API FusedMHARunnerV2(MHARunnerFixedParams fixedParams);
 
     // Deconstructor.
-    ~FusedMHARunnerV2() = default; // for pimpl
+    TRTLLM_API ~FusedMHARunnerV2() = default; // for pimpl
 
     // Check if any fmha kernel meets the requirements.
-    bool isFmhaSupported();
+    TRTLLM_API bool isFmhaSupported();
 
     // Does FMHA need a separate Q and Kv input ?
     bool isSeparateQAndKvInput() const
@@ -62,7 +64,7 @@ public:
     }
 
     // Run the fmha kernel.
-    void run(MHARunnerParams runnerParams);
+    TRTLLM_API void run(MHARunnerParams runnerParams);
 
 private:
     // Set the kernel params.

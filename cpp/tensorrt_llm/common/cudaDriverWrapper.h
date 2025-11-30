@@ -28,7 +28,7 @@
 namespace tensorrt_llm::common
 {
 
-class CUDADriverWrapper
+class TRTLLM_API CUDADriverWrapper
 {
 public:
     static std::shared_ptr<CUDADriverWrapper> getInstance();

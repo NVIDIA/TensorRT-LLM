@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <NvInferRuntime.h>
@@ -24,7 +25,7 @@
 
 namespace tensorrt_llm::runtime
 {
-class WorldConfig
+class TRTLLM_API WorldConfig
 {
 public:
 #if ENABLE_MULTI_DEVICE

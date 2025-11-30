@@ -304,7 +304,7 @@ void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& out
 } // namespace
 
 template <typename T>
-void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
+TRTLLM_API void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 {
     auto data = bufferCast<T>(buffer);
     auto const size = buffer.getSize();
@@ -317,15 +317,15 @@ void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 }
 
 // template instantiation
-template void invokeFill(IBuffer&, SizeType64, CudaStream const&);
-template void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
-template void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
-template void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
-template void invokeFill(IBuffer&, bool, CudaStream const&);
-template void invokeFill(IBuffer&, half, CudaStream const&);
-template void invokeFill(IBuffer&, float, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, SizeType64, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, bool, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, half, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, float, CudaStream const&);
 #ifdef ENABLE_BF16
-template void invokeFill(IBuffer&, __nv_bfloat16, CudaStream const&);
+template TRTLLM_API void invokeFill(IBuffer&, __nv_bfloat16, CudaStream const&);
 #endif // ENABLE_BF16
 
 void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t slotStride, IBuffer const& values,

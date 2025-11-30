@@ -16,9 +16,10 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-class DebugConfig
+class TRTLLM_API DebugConfig
 {
 public:
     static bool isCheckDebugEnabled();

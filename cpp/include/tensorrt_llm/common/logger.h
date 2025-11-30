@@ -21,13 +21,15 @@
 #include <stdexcept>
 #include <string>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 namespace tensorrt_llm::common
 {
 
-class Logger
+class TRTLLM_API Logger
 {
 
 // On Windows, the file wingdi.h is included which has

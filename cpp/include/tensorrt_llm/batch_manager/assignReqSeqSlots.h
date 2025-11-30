@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm::batch_manager
@@ -28,7 +29,7 @@ namespace tensorrt_llm::batch_manager
 
 namespace tle = tensorrt_llm::executor;
 
-class AssignReqSeqSlots : Algorithm
+class TRTLLM_API AssignReqSeqSlots : Algorithm
 {
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 

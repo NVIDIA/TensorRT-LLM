@@ -20,6 +20,7 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tensorrt_llm::runtime
@@ -31,7 +32,7 @@ namespace tensorrt_llm::batch_manager
 {
 class DecoderInputBuffers;
 
-class LogitsPostProcessor : Algorithm
+class TRTLLM_API LogitsPostProcessor : Algorithm
 {
 public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;

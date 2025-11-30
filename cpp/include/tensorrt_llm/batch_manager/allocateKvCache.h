@@ -20,13 +20,14 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm::batch_manager
 {
 
-class AllocateKvCache : Algorithm
+class TRTLLM_API AllocateKvCache : Algorithm
 {
     using BaseKVCacheManager = tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager;
 

@@ -31,6 +31,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
@@ -72,12 +73,13 @@ struct SSMParamsBase
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename input_t, typename weight_t>
-void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream);
+TRTLLM_API void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream);
 
 template <typename input_t, typename weight_t>
-void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper* driver);
+TRTLLM_API void invokeChunkScan(
+    SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper* driver);
 
 template <typename input_t, typename weight_t>
-void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream);
+TRTLLM_API void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -17,6 +17,8 @@
 
 #if ENABLE_MULTI_DEVICE
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <memory>
 
@@ -27,13 +29,13 @@ namespace tensorrt_llm::runtime
 ////////////////////////////////////////////////////////////////
 struct NcclIpcSocket;
 
-std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32_t volatile* abortFlag);
+TRTLLM_API std::shared_ptr<NcclIpcSocket> ncclIpcSocketInit(int rank, uint64_t hash, uint32_t volatile* abortFlag);
 
-void ncclIpcSocketClose(std::shared_ptr<NcclIpcSocket> handle);
+TRTLLM_API void ncclIpcSocketClose(std::shared_ptr<NcclIpcSocket> handle);
 
-int ncclIpcSocketRecvFd(std::shared_ptr<NcclIpcSocket> handle);
+TRTLLM_API int ncclIpcSocketRecvFd(std::shared_ptr<NcclIpcSocket> handle);
 
-void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int fd, int rank);
+TRTLLM_API void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int fd, int rank);
 
 } // namespace tensorrt_llm::runtime
 

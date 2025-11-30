@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -41,7 +42,7 @@ class IExecutionContext;
 namespace tensorrt_llm::runtime
 {
 
-class ITensor : virtual public IBuffer
+class TRTLLM_API ITensor : virtual public IBuffer
 {
 public:
     friend class ITensorBindings;
@@ -190,7 +191,7 @@ public:
     //! \param size The size of the view w.r.t. dimension 0 of the tensor.
     //! \return A view on the `buffer`.
     //!
-    static UniquePtr slice(SharedPtr tensor, std::size_t offset, std::size_t size);
+    TRTLLM_API static UniquePtr slice(SharedPtr tensor, std::size_t offset, std::size_t size);
 
     template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
     static UniqueConstPtr slice(TConstPtr&& tensor, std::size_t offset, std::size_t size)
@@ -353,7 +354,7 @@ public:
     //! \param shape The shape of the tensor.
     //! \param capacity The capacity of the buffer.
     //! \return An `ITensor`.
-    static UniquePtr wrap(void* data, nvinfer1::DataType type, Shape const& shape, std::size_t capacity);
+    TRTLLM_API static UniquePtr wrap(void* data, nvinfer1::DataType type, Shape const& shape, std::size_t capacity);
 
     static UniquePtr wrap(void* data, nvinfer1::DataType type, Shape const& shape)
     {
@@ -381,12 +382,12 @@ public:
     //!
     //! \brief A convenience function to create a tensor shape with the given dimensions.
     //!
-    static Shape makeShape(std::initializer_list<DimType64> const& dims);
+    TRTLLM_API static Shape makeShape(std::initializer_list<DimType64> const& dims);
 
     //!
     //! \brief A convenience function for converting a tensor shape to a `string`.
     //!
-    static std::string toString(Shape const& dims);
+    TRTLLM_API static std::string toString(Shape const& dims);
 
     //!
     //! \brief A convenience function to compare shapes.

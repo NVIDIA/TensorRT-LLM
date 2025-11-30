@@ -18,6 +18,7 @@
 
 #include "decodingInput.h"
 #include "decodingOutput.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
@@ -25,7 +26,7 @@
 namespace tensorrt_llm::runtime::decoder
 {
 
-class BeamSearchBuffers
+class TRTLLM_API BeamSearchBuffers
 {
 public:
     explicit BeamSearchBuffers(BufferManager const& bufferManager);
@@ -39,7 +40,7 @@ public:
     SizeType32 mNumSMs;
 };
 
-class DecoderState
+class TRTLLM_API DecoderState
 {
 public:
     using TensorPtr = ITensor::SharedPtr;

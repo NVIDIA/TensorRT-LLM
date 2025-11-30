@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 
@@ -44,7 +45,7 @@ namespace tensorrt_llm::batch_manager
 
 namespace tle = tensorrt_llm::executor;
 
-class PauseRequests : Algorithm
+class TRTLLM_API PauseRequests : Algorithm
 {
     using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
 

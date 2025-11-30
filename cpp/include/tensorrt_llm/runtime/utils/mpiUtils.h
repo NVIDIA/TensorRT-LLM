@@ -19,6 +19,8 @@
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <functional>
 #include <limits>
 
@@ -249,7 +251,7 @@ public:
 
 MPI_Datatype getMpiDtype(MpiType dtype);
 
-class MpiComm
+class TRTLLM_API MpiComm
 {
 public:
     explicit MpiComm(MPI_Comm g, bool freeComm);
@@ -461,11 +463,12 @@ private:
     bool mFreeComm;
 };
 
-std::vector<int> getWorldRanks(MpiComm const& comm);
+TRTLLM_API std::vector<int> getWorldRanks(MpiComm const& comm);
 
-int getNumNodes();
+TRTLLM_API int getNumNodes();
 
-void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
+TRTLLM_API void initialize(
+    MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
 
 class MpiWaitThread
 {

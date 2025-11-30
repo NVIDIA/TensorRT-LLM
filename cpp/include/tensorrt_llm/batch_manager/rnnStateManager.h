@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -24,7 +25,7 @@
 namespace tensorrt_llm::batch_manager::rnn_state_manager
 {
 
-class RnnStateManager
+class TRTLLM_API RnnStateManager
 {
 public:
     using TensorPtr = runtime::ITensor::SharedPtr;

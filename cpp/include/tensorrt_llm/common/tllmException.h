@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/common/stringUtils.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -57,7 +59,7 @@ enum class RequestErrorCode : uint32_t
 /// @brief Constant for unknown request ID
 static constexpr uint64_t kUNKNOWN_REQUEST_ID = std::numeric_limits<uint64_t>::max();
 
-class TllmException : public std::runtime_error
+class TRTLLM_API TllmException : public std::runtime_error
 {
 public:
     static auto constexpr MAX_FRAMES = 128;
@@ -75,17 +77,18 @@ private:
     int mNbFrames;
 };
 
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, char const* info)
+[[noreturn]] inline TRTLLM_API void throwRuntimeError(char const* const file, int const line, char const* info)
 {
     throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info).c_str());
 }
 
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
+[[noreturn]] inline TRTLLM_API void throwRuntimeError(
+    char const* const file, int const line, std::string const& info = "")
 {
     throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
 }
 
-class RequestSpecificException : public std::runtime_error
+class TRTLLM_API RequestSpecificException : public std::runtime_error
 {
 public:
     explicit RequestSpecificException(

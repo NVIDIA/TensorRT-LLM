@@ -439,13 +439,13 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
 }
 
 #define DEFINE_INVOKE_QUANTIZE_MATRIX(type_out, type_scale, type_in)                                                   \
-    template void invokeQuantizeMatrix<type_out, type_scale, type_in>(type_out * output,                               \
+    template TRTLLM_API void invokeQuantizeMatrix<type_out, type_scale, type_in>(type_out * output,                    \
         type_scale const* input_scale, type_in const* input, int64_t numel, int64_t lda, QuantizeMode quantize_mode,   \
         cudaStream_t stream);                                                                                          \
-    template void invokeDequantizeMatrix<type_out, type_scale, type_in>(type_out * output,                             \
+    template TRTLLM_API void invokeDequantizeMatrix<type_out, type_scale, type_in>(type_out * output,                  \
         type_scale const* input_scale, type_in const* input, int64_t numel, int64_t lda, QuantizeMode quantize_mode,   \
         cudaStream_t stream);                                                                                          \
-    template void invokeComputeScalesAndQuantizeMatrix<type_out, type_scale, type_in>(type_out * output,               \
+    template TRTLLM_API void invokeComputeScalesAndQuantizeMatrix<type_out, type_scale, type_in>(type_out * output,    \
         type_scale * input_scale, type_in const* input, int64_t numel, int64_t lda, QuantizeMode quantize_mode,        \
         cudaStream_t stream);
 

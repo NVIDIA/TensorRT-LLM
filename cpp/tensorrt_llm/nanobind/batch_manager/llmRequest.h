@@ -19,6 +19,8 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <ATen/ATen.h>
 #include <ATen/ops/tensor.h>
 #include <memory>
@@ -36,7 +38,7 @@ namespace tb = tensorrt_llm::batch_manager;
  * so we have to pass the more generic c10::Stream, and convert it back to a full-fledged
  * torch.cuda.Stream in python. See example in test/bindings/test_gpt_manager.py
  */
-class LlmRequest : public tb::GenericLlmRequest<at::Tensor, c10::Stream>
+class TRTLLM_API LlmRequest : public tb::GenericLlmRequest<at::Tensor, c10::Stream>
 {
 public:
     using Base = GenericLlmRequest<at::Tensor, c10::Stream>;

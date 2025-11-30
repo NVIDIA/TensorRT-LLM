@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -48,14 +49,14 @@ namespace tensorrt_llm::executor
 {
 
 /// @brief Version of TRT-LLM
-char const* version() noexcept;
+TRTLLM_API char const* version() noexcept;
 
 class Model;
 class Serialization;
 class DataTransceiverState;
 
 /// @brief Sampling configuration
-class SamplingConfig
+class TRTLLM_API SamplingConfig
 {
 public:
     /// @brief Constructor for SamplingConfig
@@ -205,7 +206,7 @@ private:
 /// @brief Additional output that should be gathered.
 /// @details By default gather output of shape [beamWidth, x] from each generation phase.
 ///          If gatherContext is true, also gather output of shape [promptLen, x] from context phase.
-class AdditionalModelOutput
+class TRTLLM_API AdditionalModelOutput
 {
 public:
     explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
@@ -217,7 +218,7 @@ public:
 };
 
 /// @brief Configuration that controls the outputs of a Result
-class OutputConfig
+class TRTLLM_API OutputConfig
 {
 public:
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
@@ -245,7 +246,7 @@ public:
 
 /// @brief Configuration for speculative decoding with external draft tokens.
 /// Allows to include draft tokens, draft logits and specify acceptance threshold.
-class ExternalDraftTokensConfig
+class TRTLLM_API ExternalDraftTokensConfig
 {
 public:
     explicit ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
@@ -270,7 +271,7 @@ private:
 };
 
 /// @brief Configuration for prompt tuning
-class PromptTuningConfig
+class TRTLLM_API PromptTuningConfig
 {
 public:
     explicit PromptTuningConfig(
@@ -291,7 +292,7 @@ private:
 };
 
 /// @brief Multimodal input data class
-class MultimodalInput
+class TRTLLM_API MultimodalInput
 {
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
@@ -312,7 +313,7 @@ private:
 };
 
 /// @brief Configuration for mrope
-class MropeConfig
+class TRTLLM_API MropeConfig
 {
 public:
     explicit MropeConfig(Tensor mropeRoratySinCos, SizeType32 mropePositionDeltas);
@@ -330,7 +331,7 @@ private:
 };
 
 /// @brief Configuration for LoRA
-class LoraConfig
+class TRTLLM_API LoraConfig
 {
 public:
     explicit LoraConfig(
@@ -353,7 +354,7 @@ private:
 
 /// @brief Configuration for Look-Ahead speculative decoding.
 /// Allows to include window size, ngram size and verification set size
-struct LookaheadDecodingConfig
+struct TRTLLM_API LookaheadDecodingConfig
 {
     LookaheadDecodingConfig(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
 
@@ -395,7 +396,7 @@ private:
     SizeType32 mVerificationSetSize;
 };
 
-struct EagleConfig
+struct TRTLLM_API EagleConfig
 {
     explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt, bool greedySampling = true,
         std::optional<float> posteriorThreshold = std::nullopt, bool useDynamicTree = false,
@@ -431,7 +432,7 @@ private:
     std::optional<SizeType32> mDynamicTreeMaxTopK;
 };
 
-class ContextPhaseParams
+class TRTLLM_API ContextPhaseParams
 {
 public:
     using RequestIdType = std::uint64_t;
@@ -479,7 +480,7 @@ private:
 };
 
 /// @brief Configuration for speculative decoding (both draft and target models)
-class SpeculativeDecodingConfig
+class TRTLLM_API SpeculativeDecodingConfig
 {
 public:
     explicit SpeculativeDecodingConfig(bool fastLogits = false);
@@ -494,7 +495,7 @@ private:
 };
 
 /// @brief Guided decoding parameters for a request.
-class GuidedDecodingParams
+class TRTLLM_API GuidedDecodingParams
 {
 public:
     enum class GuideType
@@ -550,7 +551,7 @@ struct RetentionPriorityAndDuration
 };
 
 /// @brief Configuration for the request's retention in the KV Cache
-class KvCacheRetentionConfig
+class TRTLLM_API KvCacheRetentionConfig
 {
 
 public:
@@ -627,7 +628,7 @@ private:
 };
 
 /// @brief A class that holds information about the request
-class Request
+class TRTLLM_API Request
 {
 public:
     static constexpr PriorityType kDefaultPriority = 0.5;
@@ -798,7 +799,7 @@ private:
 };
 
 /// @brief Struct that holds the logits information when using direct transfer
-struct SpeculativeDecodingFastLogitsInfo
+struct TRTLLM_API SpeculativeDecodingFastLogitsInfo
 {
     /// @brief Draft request id
     uint64_t draftRequestId;
@@ -810,7 +811,7 @@ struct SpeculativeDecodingFastLogitsInfo
     [[nodiscard]] Tensor toTensor() const;
 };
 
-struct AdditionalOutput
+struct TRTLLM_API AdditionalOutput
 {
     AdditionalOutput(std::string name, Tensor output)
         : name(std::move(name))
@@ -829,7 +830,7 @@ struct AdditionalOutput
 };
 
 /// @brief Struct that holds the generation result
-struct Result
+struct TRTLLM_API Result
 {
     /// @brief Indicates if this is the final result for the request
     bool isFinal;
@@ -891,7 +892,7 @@ struct Result
 };
 
 /// @brief Class that holds either an error or a result
-class Response
+class TRTLLM_API Response
 {
 public:
     Response(IdType requestId, std::string errorMsg, std::optional<IdType> clientId = std::nullopt);
@@ -929,7 +930,7 @@ private:
 /// @brief Configuration class for dynamic tuning of batch size and max num tokens. During runtime the statistics of
 /// input and output lengths are recoreded. Based on these statistics, the batch size and max num tokens are tuned
 /// dynamically to better serve the requests.
-class DynamicBatchConfig
+class TRTLLM_API DynamicBatchConfig
 {
 public:
     /// @brief The default window size for moving average of input and output length which is used to calculate dynamic
@@ -972,7 +973,7 @@ private:
 };
 
 /// @brief Configuration class for the scheduler
-class SchedulerConfig
+class TRTLLM_API SchedulerConfig
 {
 public:
     explicit SchedulerConfig(
@@ -1002,7 +1003,7 @@ private:
 };
 
 /// @brief Configuration class for the KV cache
-class KvCacheConfig
+class TRTLLM_API KvCacheConfig
 {
 public:
     static constexpr auto kDefaultGpuMemFraction = 0.9F;
@@ -1115,7 +1116,7 @@ private:
 };
 
 /// @brief Configuration class for the runtime perf knobs
-class ExtendedRuntimePerfKnobConfig
+class TRTLLM_API ExtendedRuntimePerfKnobConfig
 {
 public:
     explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = true, bool enableContextFMHAFP32Acc = false,
@@ -1155,7 +1156,7 @@ private:
 };
 
 /// @brief Configuration class for debugging output
-class DebugConfig
+class TRTLLM_API DebugConfig
 {
     using StringVec = std::vector<std::string>;
 
@@ -1189,7 +1190,7 @@ private:
     SizeType32 mDebugTensorsMaxIterations;
 };
 
-class OrchestratorConfig
+class TRTLLM_API OrchestratorConfig
 {
 public:
     explicit OrchestratorConfig(bool isOrchestrator = true, std::string workerExecutablePath = "",
@@ -1214,7 +1215,7 @@ private:
 
 /// @brief A configuration class for the parallel execution parameters
 ///        Currently only supports commType = CommunicationType::kMPI
-class ParallelConfig
+class TRTLLM_API ParallelConfig
 {
 public:
     /// @brief Constructor
@@ -1269,7 +1270,7 @@ private:
 };
 
 /// @brief config for PeftCacheManager
-class PeftCacheConfig
+class TRTLLM_API PeftCacheConfig
 {
 public:
     static constexpr SizeType32 kDefaultOptimalAdapterSize = 8;
@@ -1331,7 +1332,7 @@ private:
 };
 
 /// @brief Configuration class for the decoding.
-class DecodingConfig
+class TRTLLM_API DecodingConfig
 {
 public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
@@ -1379,7 +1380,7 @@ private:
 };
 
 /// @brief Guided decoding configurations for executor.
-class GuidedDecodingConfig
+class TRTLLM_API GuidedDecodingConfig
 {
 public:
     enum class GuidedDecodingBackend
@@ -1431,7 +1432,7 @@ private:
     std::optional<std::vector<TokenIdType>> mStopTokenIds;
 };
 
-class LogitsPostProcessorConfig
+class TRTLLM_API LogitsPostProcessorConfig
 {
 public:
     explicit LogitsPostProcessorConfig(std::optional<LogitsPostProcessorMap> processorMap = std::nullopt,
@@ -1454,7 +1455,7 @@ private:
     bool mReplicate;
 };
 
-class CacheTransceiverConfig
+class TRTLLM_API CacheTransceiverConfig
 {
 public:
     enum class BackendType : std::uint8_t
@@ -1492,7 +1493,7 @@ private:
 };
 
 /// @brief Configuration class for the model executor
-class ExecutorConfig
+class TRTLLM_API ExecutorConfig
 {
 public:
     static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds
@@ -1680,14 +1681,14 @@ private:
     bool mFailFastOnAttentionWindowTooLarge{false};
 };
 
-struct KVCacheCreatedData
+struct TRTLLM_API KVCacheCreatedData
 {
     /// @brief The amount of blocks at each cache level
     std::vector<SizeType32> numBlocksPerCacheLevel;
 };
 
 /// @brief An entry for a single block stored into the tree
-struct KVCacheStoredBlockData
+struct TRTLLM_API KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
@@ -1712,7 +1713,7 @@ struct KVCacheStoredBlockData
     SizeType32 priority;
 };
 
-struct KVCacheStoredData
+struct TRTLLM_API KVCacheStoredData
 {
     /// @brief The parent of this sequence of stored blocks
     std::optional<IdType> parentHash;
@@ -1720,20 +1721,20 @@ struct KVCacheStoredData
     std::vector<KVCacheStoredBlockData> blocks;
 };
 
-struct KVCacheRemovedData
+struct TRTLLM_API KVCacheRemovedData
 {
     /// @brief The hashes of blocks being removed
     std::vector<IdType> blockHashes;
 };
 
 template <typename T>
-struct KVCacheEventDiff
+struct TRTLLM_API KVCacheEventDiff
 {
     T oldValue;
     T newValue;
 };
 
-struct KVCacheUpdatedData
+struct TRTLLM_API KVCacheUpdatedData
 {
 
     explicit KVCacheUpdatedData(IdType blockHash)
@@ -1767,7 +1768,7 @@ struct KVCacheUpdatedData
 
 using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVCacheRemovedData, KVCacheUpdatedData>;
 
-struct KVCacheEvent
+struct TRTLLM_API KVCacheEvent
 {
     KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
         std::optional<SizeType32> attentionDpRank = std::nullopt);
@@ -1783,7 +1784,7 @@ struct KVCacheEvent
 };
 
 /// @brief Exposes a limited set of KV cache manager functionalities
-class KVCacheEventManager
+class TRTLLM_API KVCacheEventManager
 {
 public:
     KVCacheEventManager(
@@ -1799,9 +1800,9 @@ private:
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
-class Executor
-{
 
+class TRTLLM_API Executor
+{
 public:
     /// @brief
     /// @param modelPath Path to the folder that defines the model to run
@@ -1912,7 +1913,7 @@ private:
 };
 
 /// @brief Class with utility functions to serialize statistics to json string
-class JsonSerialization
+class TRTLLM_API JsonSerialization
 {
 public:
     /// @brief Utility function to convert an iterationStats struct to a json serialized string

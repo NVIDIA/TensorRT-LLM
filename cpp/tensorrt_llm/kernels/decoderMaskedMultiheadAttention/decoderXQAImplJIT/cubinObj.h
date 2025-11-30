@@ -17,6 +17,8 @@
 #include <cuda_runtime_api.h>
 #include <string>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 
@@ -27,7 +29,7 @@ namespace kernels
 namespace jit
 {
 
-class CubinObj
+class TRTLLM_API CubinObj
 {
 public:
     // Default constructor constructs an empty unusable CubinObj instance.

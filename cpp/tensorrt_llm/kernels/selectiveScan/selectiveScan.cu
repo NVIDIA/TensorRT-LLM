@@ -439,7 +439,7 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::c
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(input_t, weight_t)                                                        \
-    template void invokeSelectiveScan<input_t, weight_t>(SSMParamsBase & params, cudaStream_t stream);
+    template TRTLLM_API void invokeSelectiveScan<input_t, weight_t>(SSMParamsBase & params, cudaStream_t stream);
 
 INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(float, float);
 INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(half, float);
@@ -449,7 +449,7 @@ INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(__nv_bfloat16, float);
 #undef INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE
 
 #define INSTANTIATE_CHUNK_SCAN_DATA_TYPE(input_t, weight_t)                                                            \
-    template void invokeChunkScan<input_t, weight_t>(                                                                  \
+    template TRTLLM_API void invokeChunkScan<input_t, weight_t>(                                                       \
         SSMParamsBase & params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper * driver);
 
 INSTANTIATE_CHUNK_SCAN_DATA_TYPE(float, float);
@@ -618,7 +618,7 @@ void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream)
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE(input_t, weight_t)                                                 \
-    template void invokeSelectiveScanUpdate<input_t, weight_t>(SSMParamsBase & params, cudaStream_t stream)
+    template TRTLLM_API void invokeSelectiveScanUpdate<input_t, weight_t>(SSMParamsBase & params, cudaStream_t stream)
 
 INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE(float, float);
 INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE(half, float);

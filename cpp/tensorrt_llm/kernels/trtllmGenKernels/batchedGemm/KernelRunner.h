@@ -20,6 +20,8 @@
 #include <cuda.h>
 #include <vector>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
@@ -61,14 +63,14 @@ struct TrtllmGenBatchedGemmRunnerOptions
 class TrtllmGenBatchedGemmRunner
 {
 public:
-    explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
+    TRTLLM_API explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
 
-    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
+    TRTLLM_API [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
         int32_t configIndex) const;
 
     // Generic GEMM interface
-    void run(int32_t m, int32_t n, int32_t k, int32_t validM, int32_t validN, int32_t validK,
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, int32_t validM, int32_t validN, int32_t validK,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
         void const* a, void const* sfA, void const* b, void const* sfB, void const* perTokensSfA,
         void const* perTokensSfB, float const* scaleC, float const* scaleGateC, float const* bias,
@@ -78,9 +80,9 @@ public:
         int device, int32_t configIndex);
 
     // Block-scaling GEMM
-    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
-        void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device,
-        int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a,
+        void const* sfA, void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream,
+        int device, int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
 
     // Block-scaling GEMM with SwiGLU activation
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
@@ -89,9 +91,9 @@ public:
         int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
 
     // FP8 per-tensor scaling GEMM
-    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* b,
-        float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream, int device,
-        int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a,
+        void const* b, float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream,
+        int device, int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
 
     // Get the list of configs that passed the validation based on the constructor options
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const
@@ -103,13 +105,13 @@ public:
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
 
     // Get the list of config indices that are valid for the given problem shape
-    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,
+    TRTLLM_API [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
         int32_t validM = -1, int32_t validN = -1, int32_t validK = -1) const;
 
     // Get a default config index that is valid for the given problem shape
     // This will be used as the fallback config if using auto-tuning
-    [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
+    TRTLLM_API [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
         int32_t validM = -1, int32_t validN = -1, int32_t validK = -1) const;
 

@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cassert>
 
 namespace tensorrt_llm
@@ -27,33 +29,33 @@ namespace common
 {
 
 // cudaMemcpyAsync with extra check via ASan for D2H copy
-cudaError_t cudaMemcpyAsyncSanitized(
+TRTLLM_API cudaError_t cudaMemcpyAsyncSanitized(
     void* dst, void const* src, size_t count, enum cudaMemcpyKind kind, cudaStream_t stream = nullptr);
 
 template <typename T>
-void deviceMalloc(T** ptr, size_t size, bool is_random_initialize = true);
+TRTLLM_API void deviceMalloc(T** ptr, size_t size, bool is_random_initialize = true);
 
 template <typename T>
-void deviceMemSetZero(T* ptr, size_t size);
+TRTLLM_API void deviceMemSetZero(T* ptr, size_t size);
 
 template <typename T>
 
-void deviceFree(T*& ptr);
+TRTLLM_API void deviceFree(T*& ptr);
 
 template <typename T>
-void deviceFill(T* devptr, size_t size, T value, cudaStream_t stream = 0);
+TRTLLM_API void deviceFill(T* devptr, size_t size, T value, cudaStream_t stream = 0);
 
 template <typename T>
-void cudaD2Hcpy(T* tgt, T const* src, size_t const size);
+TRTLLM_API void cudaD2Hcpy(T* tgt, T const* src, size_t const size);
 
 template <typename T>
-void cudaH2Dcpy(T* tgt, T const* src, size_t const size);
+TRTLLM_API void cudaH2Dcpy(T* tgt, T const* src, size_t const size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, T const* src, size_t const size, cudaStream_t stream = NULL);
+TRTLLM_API void cudaD2Dcpy(T* tgt, T const* src, size_t const size, cudaStream_t stream = NULL);
 
 template <typename T>
-void cudaAutoCpy(T* tgt, T const* src, size_t const size, cudaStream_t stream = NULL);
+TRTLLM_API void cudaAutoCpy(T* tgt, T const* src, size_t const size, cudaStream_t stream = NULL);
 
 template <typename T>
 void cudaRandomUniform(T* buffer, size_t const size);
@@ -267,8 +269,8 @@ bool invokeCheckRange(T const* buffer, size_t const size, T min, T max, bool* d_
 
 constexpr size_t DEFAULT_ALIGN_BYTES = 256;
 
-size_t calcAlignedSize(std::vector<size_t> const& sizes, size_t ALIGN_BYTES = DEFAULT_ALIGN_BYTES);
-void calcAlignedPointers(std::vector<void*>& outPtrs, void const* p, std::vector<size_t> const& sizes,
+TRTLLM_API size_t calcAlignedSize(std::vector<size_t> const& sizes, size_t ALIGN_BYTES = DEFAULT_ALIGN_BYTES);
+TRTLLM_API void calcAlignedPointers(std::vector<void*>& outPtrs, void const* p, std::vector<size_t> const& sizes,
     size_t ALIGN_BYTES = DEFAULT_ALIGN_BYTES);
 
 struct AlignedPointersUnpacker

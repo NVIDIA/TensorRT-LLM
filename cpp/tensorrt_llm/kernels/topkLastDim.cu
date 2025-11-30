@@ -1532,7 +1532,7 @@ void standalone_stable_radix_11bits(void* buf, size_t& buf_size, T const* in, in
     }
 }
 
-int nextPowerOfTwo(int num)
+static int nextPowerOfTwo(int num)
 {
     if (num <= 0)
     {

@@ -81,7 +81,7 @@ set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
-target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB})
+target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB} ${CUDA_RT_LIB} cuda)
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})

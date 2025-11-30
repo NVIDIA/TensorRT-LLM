@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -25,7 +26,7 @@
 namespace tensorrt_llm::runtime
 {
 
-class LookaheadDecodingBuffers
+class TRTLLM_API LookaheadDecodingBuffers
 {
 public:
     using TensorPtr = ITensor::SharedPtr;

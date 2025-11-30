@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <memory>
 
 /// @brief Forward declaration of cudaMemPool_t to avoid including "driver_types.h"
@@ -25,7 +26,7 @@ using cudaMemPool_t = CUmemPoolHandle_st*;
 namespace tensorrt_llm::runtime
 {
 
-class CudaMemPool
+class TRTLLM_API CudaMemPool
 {
 public:
     explicit CudaMemPool(cudaMemPool_t pool);
@@ -44,16 +45,16 @@ public:
     void memoryPoolTrimTo(std::size_t size);
 
     /// @brief Returns the underlying cudaMemPool_t for usage by CUDA APIs.
-    [[nodiscard]] cudaMemPool_t getPool() const;
+    [[nodiscard]] TRTLLM_API cudaMemPool_t getPool() const;
 
     /// @brief Gets or initializes and gets the primary memory pool for the provided device ID if it was successfully
     /// initialized, nullptr otherwise.
-    static std::shared_ptr<tensorrt_llm::runtime::CudaMemPool> getPrimaryPoolForDevice(int deviceId);
+    TRTLLM_API static std::shared_ptr<tensorrt_llm::runtime::CudaMemPool> getPrimaryPoolForDevice(int deviceId);
 
     /// @brief Returns a value indicating whether memory pools are supported on the device.
     /// @details Memory pools depend on the presence of the UVM driver. On some systems, the UVM driver is explicitly
     /// disabled.
-    static bool supportsMemoryPool(int deviceId);
+    TRTLLM_API static bool supportsMemoryPool(int deviceId);
 
 private:
     class Deleter

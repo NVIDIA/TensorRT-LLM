@@ -18,6 +18,8 @@
 
 #include <memory>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -30,7 +32,7 @@ namespace tensorrt_llm::runtime
 {
 
 ///@brief A collection of shared resources and data for the decoding layers.
-class DecodingLayerWorkspace
+class TRTLLM_API DecodingLayerWorkspace
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
@@ -38,8 +40,8 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using BufferPtr = IBuffer::SharedPtr;
 
-    DecodingLayerWorkspace(std::shared_ptr<BufferManager> bufferManager, layers::DecoderDomain const& decoderDomain,
-        nvinfer1::DataType logitsType, size_t workspaceBufferSizeInBytes);
+    TRTLLM_API DecodingLayerWorkspace(std::shared_ptr<BufferManager> bufferManager,
+        layers::DecoderDomain const& decoderDomain, nvinfer1::DataType logitsType, size_t workspaceBufferSizeInBytes);
 
     DecodingLayerWorkspace() = delete;
 

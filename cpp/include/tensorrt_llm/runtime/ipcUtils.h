@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -26,7 +27,7 @@
 namespace tensorrt_llm::runtime
 {
 
-class IpcMemory
+class TRTLLM_API IpcMemory
 {
 public:
     using BufferPtr = IBuffer::SharedPtr;
@@ -59,7 +60,7 @@ private:
     bool mOpenIpc;
 };
 
-class AllReduceBuffers
+class TRTLLM_API AllReduceBuffers
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
@@ -73,7 +74,7 @@ public:
     std::vector<runtime::IpcMemory> mIpcMemoryHandles;
 };
 
-void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size);
-bool canAccessPeer(WorldConfig const& worldConfig);
+TRTLLM_API void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size);
+TRTLLM_API bool canAccessPeer(WorldConfig const& worldConfig);
 
 } // namespace tensorrt_llm::runtime

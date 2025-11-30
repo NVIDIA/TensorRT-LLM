@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <optional>
 #include <torch/extension.h>
 
@@ -34,8 +35,8 @@ namespace torch_ext
  * - Multi-layer attention (MLA)
  * - Speculative decoding
  */
-void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
-    std::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
+TRTLLM_API void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v,
+    torch::Tensor& output, std::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
     std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
     torch::Tensor host_total_kv_lens, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
     torch::Tensor host_request_types, std::optional<torch::Tensor> kv_cache_block_offsets,

@@ -23,6 +23,8 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <vector>
 
 namespace tensorrt_llm::runtime::decoder
@@ -33,7 +35,7 @@ class DecoderState;
 namespace tensorrt_llm::batch_manager
 {
 
-class DecoderInputBuffers
+class TRTLLM_API DecoderInputBuffers
 {
 public:
     using SizeType32 = runtime::SizeType32;
@@ -109,7 +111,7 @@ public:
     TensorPtr nextDraftTokensLengthsHost; // [mMaxNumRequests]
 };
 
-class DecoderStepAsyncSend
+class TRTLLM_API DecoderStepAsyncSend
 {
 public:
     using SizeType32 = runtime::SizeType32;
@@ -141,7 +143,7 @@ private:
     std::unique_ptr<mpi::MpiRequest> mRequest9;
 };
 
-class SlotDecoderBuffers
+class TRTLLM_API SlotDecoderBuffers
 {
 public:
     using SizeType32 = runtime::SizeType32;

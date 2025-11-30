@@ -19,6 +19,8 @@
 #include <cuda.h>
 #include <optional>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "trtllmGen_gatedAct_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
@@ -37,15 +39,15 @@ struct TrtllmGenGemmGatedActRunnerOptions
 class TrtllmGenGemmGatedActRunner
 {
 public:
-    explicit TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options);
+    TRTLLM_API explicit TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options);
 
-    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k);
+    TRTLLM_API [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k);
 
-    void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b, float const* bScale,
-        void* c, float* cScale, float* cScaleGate, void* workspace, CUstream stream, int device);
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b,
+        float const* bScale, void* c, float* cScale, float* cScaleGate, void* workspace, CUstream stream, int device);
 
-    void run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale, float* cScaleGate,
-        void* workspace, CUstream stream, int device);
+    TRTLLM_API void run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale,
+        float* cScaleGate, void* workspace, CUstream stream, int device);
 
 private:
     void selectGemmConfig(int32_t m, int32_t n, int32_t k);

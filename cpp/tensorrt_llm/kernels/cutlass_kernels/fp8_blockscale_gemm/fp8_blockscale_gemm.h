@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
@@ -24,7 +25,7 @@
 namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
-class CutlassFp8BlockScaleGemmRunnerInterface
+class TRTLLM_API CutlassFp8BlockScaleGemmRunnerInterface
 {
 public:
     CutlassFp8BlockScaleGemmRunnerInterface() {}
@@ -91,7 +92,7 @@ protected:
 };
 
 template <typename ElementA, typename ElementB, typename ElementD>
-class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInterface
+class TRTLLM_API CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInterface
 {
 public:
     CutlassFp8BlockScaleGemmRunner() = default;

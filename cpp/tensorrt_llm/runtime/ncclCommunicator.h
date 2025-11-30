@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -30,16 +31,16 @@ namespace tensorrt_llm::runtime
 class NcclCommunicator
 {
 public:
-    explicit NcclCommunicator(ncclComm_t comm)
+    TRTLLM_API explicit NcclCommunicator(ncclComm_t comm)
         : mComm{comm} {};
 
-    explicit NcclCommunicator(int worldSize, int rank, mpi::MpiComm const& mpiComm = COMM_SESSION)
+    TRTLLM_API explicit NcclCommunicator(int worldSize, int rank, mpi::MpiComm const& mpiComm = COMM_SESSION)
         : mComm{createComm(worldSize, rank, mpiComm)} {};
 
-    explicit NcclCommunicator(WorldConfig const& worldConfig, mpi::MpiComm const& mpiComm = COMM_SESSION)
+    TRTLLM_API explicit NcclCommunicator(WorldConfig const& worldConfig, mpi::MpiComm const& mpiComm = COMM_SESSION)
         : NcclCommunicator{worldConfig.getSize(), worldConfig.getRank(), mpiComm} {};
 
-    ~NcclCommunicator();
+    TRTLLM_API ~NcclCommunicator();
 
     // no copy
     NcclCommunicator(NcclCommunicator const&) = delete;
@@ -56,12 +57,13 @@ public:
     }
 
 private:
-    void send(
+    TRTLLM_API void send(
         void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
 
-    void receive(void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
+    TRTLLM_API void receive(
+        void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
 
-    static ncclComm_t createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm);
+    TRTLLM_API static ncclComm_t createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm);
 
     ncclComm_t mComm;
 };

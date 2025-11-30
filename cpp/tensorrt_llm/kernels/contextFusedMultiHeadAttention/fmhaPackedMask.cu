@@ -275,12 +275,12 @@ void invokeBuildPackedMask(PackedMaskParams<MaskInputDataType> const& params, cu
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Instantiations.
-template void invokeBuildPackedMask(PackedMaskParams<float> const&, cudaStream_t);
-template void invokeBuildPackedMask(PackedMaskParams<half> const&, cudaStream_t);
-template void invokeBuildPackedMask(PackedMaskParams<bool> const&, cudaStream_t);
-template void invokeBuildPackedMask(PackedMaskParams<int> const&, cudaStream_t);
+template TRTLLM_API void invokeBuildPackedMask(PackedMaskParams<float> const&, cudaStream_t);
+template TRTLLM_API void invokeBuildPackedMask(PackedMaskParams<half> const&, cudaStream_t);
+template TRTLLM_API void invokeBuildPackedMask(PackedMaskParams<bool> const&, cudaStream_t);
+template TRTLLM_API void invokeBuildPackedMask(PackedMaskParams<int> const&, cudaStream_t);
 #ifdef ENABLE_BF16
-template void invokeBuildPackedMask(PackedMaskParams<__nv_bfloat16> const&, cudaStream_t);
+template TRTLLM_API void invokeBuildPackedMask(PackedMaskParams<__nv_bfloat16> const&, cudaStream_t);
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

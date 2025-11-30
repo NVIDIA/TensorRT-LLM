@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -42,7 +43,7 @@ namespace tensorrt_llm::batch_manager
 class MedusaBuffers;
 class DecoderInputBuffers;
 
-class CreateNewDecoderRequests : Algorithm
+class TRTLLM_API CreateNewDecoderRequests : Algorithm
 {
 public:
     constexpr static auto name{"CreateNewDecoderRequests"};

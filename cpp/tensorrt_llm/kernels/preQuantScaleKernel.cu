@@ -173,8 +173,9 @@ void apply_per_channel_scale_per_expert_kernel_launcher(T_out* smoothed_act, T_i
 }
 
 #define INSTANTIATE_PREQUANT_SCALE(T_in, T_out)                                                                        \
-    template void apply_per_channel_scale_kernel_launcher<T_in, T_out>(T_out * smoothed_act, const T_in* act,          \
-        const T_in* per_channel_scale, int rows, int cols, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
+    template TRTLLM_API void apply_per_channel_scale_kernel_launcher<T_in, T_out>(T_out * smoothed_act,                \
+        const T_in* act, const T_in* per_channel_scale, int rows, int cols, int64_t const* num_valid_tokens_ptr,       \
+        cudaStream_t stream)
 
 INSTANTIATE_PREQUANT_SCALE(half, half);
 #if defined(ENABLE_FP8)
@@ -189,7 +190,7 @@ INSTANTIATE_PREQUANT_SCALE(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
 
 #define INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(T_in, T_out)                                                             \
-    template void apply_per_channel_scale_per_expert_kernel_launcher<T_in, T_out>(T_out * smoothed_act,                \
+    template TRTLLM_API void apply_per_channel_scale_per_expert_kernel_launcher<T_in, T_out>(T_out * smoothed_act,     \
         const T_in* act, const T_in* per_channel_scale, int rows, int cols, int64_t* expert_first_token_offset,        \
         int const num_experts_per_node, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
 

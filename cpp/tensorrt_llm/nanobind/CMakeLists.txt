@@ -24,6 +24,7 @@ set(SRCS
     userbuffers/bindings.cpp
     thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
+    ../batch_manager/llmRequest.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)

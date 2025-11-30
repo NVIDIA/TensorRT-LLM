@@ -35,11 +35,12 @@
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/common/config.h"
 
 namespace tensorrt_llm::common::op
 {
 
-class AttentionOp
+class TRTLLM_API AttentionOp
 {
 public:
     using RotaryScalingType = tensorrt_llm::kernels::RotaryScalingType;

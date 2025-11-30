@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -31,7 +32,7 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-class FabricMemory
+class TRTLLM_API FabricMemory
 {
 public:
     explicit FabricMemory(size_t size);
@@ -54,7 +55,7 @@ private:
     std::unique_ptr<Impl> pImpl;
 };
 
-class CacheTransBufferManager
+class TRTLLM_API CacheTransBufferManager
 {
 public:
     CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,

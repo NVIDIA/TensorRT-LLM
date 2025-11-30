@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -36,7 +37,7 @@ namespace tensorrt_llm::runtime
 //!
 //! The class manages both unicast pointers (one per rank) and a single multicast pointer,
 //! along with signal pads used for synchronization between devices.
-class McastDeviceMemory
+class TRTLLM_API McastDeviceMemory
 {
 public:
     // Disallow copy construction

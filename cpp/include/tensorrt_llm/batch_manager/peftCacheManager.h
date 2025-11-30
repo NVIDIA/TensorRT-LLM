@@ -25,6 +25,8 @@
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <NvInferRuntime.h>
 
 #include <future>
@@ -39,7 +41,7 @@ namespace tensorrt_llm::batch_manager
 
 using runtime::SizeType32;
 
-class PeftTaskNotCachedException : public runtime::LoraExpectedException
+class TRTLLM_API PeftTaskNotCachedException : public runtime::LoraExpectedException
 {
 public:
     explicit PeftTaskNotCachedException(std::string const& msg);
@@ -52,7 +54,7 @@ public:
  * Manages caches of PEFT (Parameter Efficient Fine Tuning) weights.
  * Does cache updates during execution loop moving weights to device as needed.
  */
-class BasePeftCacheManager
+class TRTLLM_API BasePeftCacheManager
 {
 public:
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
@@ -96,7 +98,7 @@ public:
     [[nodiscard]] virtual bool enabled() const = 0;
 };
 
-class PeftCacheManager : public BasePeftCacheManager
+class TRTLLM_API PeftCacheManager : public BasePeftCacheManager
 {
 public:
     PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
@@ -168,7 +170,7 @@ private:
     int mDevice{-1};
 };
 
-class NoOpPeftCacheManager : public BasePeftCacheManager
+class TRTLLM_API NoOpPeftCacheManager : public BasePeftCacheManager
 {
 public:
     ~NoOpPeftCacheManager() override = default;

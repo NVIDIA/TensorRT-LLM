@@ -21,6 +21,8 @@
 #include <shared_mutex>
 #include <utility>
 
+#include "tensorrt_llm/common/config.h"
+
 #include "gdrwrap.h"
 #include "topologyDetector.h"
 
@@ -46,13 +48,13 @@ public:
      *
      * @return HostAccessibleDeviceAllocator& Reference to the singleton instance.
      */
-    static HostAccessibleDeviceAllocator& getInstance();
+    TRTLLM_API static HostAccessibleDeviceAllocator& getInstance();
 
     /**
      * @brief check if host accessible device is supported for current GPU.
      * @return true if supported else false.
      */
-    static bool isSupported();
+    TRTLLM_API static bool isSupported();
 
     /**
      * @brief Allocate host accessible memory on the device.
@@ -61,14 +63,14 @@ public:
      * @param allowManagedFallback Whether allow fall back to managed memory if not supported.
      * @return void* Pointer to the allocated memory.
      */
-    void* allocate(size_t memorySize);
+    TRTLLM_API void* allocate(size_t memorySize);
 
     /**
      * @brief Free the allocated memory.
      *
      * @param ptr Pointer to the memory to free.
      */
-    void free(void* ptr);
+    TRTLLM_API void free(void* ptr);
 
     /**
      * @brief Get the host-accessible pointer for a given device pointer.

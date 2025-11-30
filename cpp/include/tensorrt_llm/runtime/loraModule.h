@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <vector>
@@ -23,7 +24,7 @@
 namespace tensorrt_llm::runtime
 {
 
-class LoraModule
+class TRTLLM_API LoraModule
 {
 public:
     using TensorPtr = ITensor::SharedPtr;

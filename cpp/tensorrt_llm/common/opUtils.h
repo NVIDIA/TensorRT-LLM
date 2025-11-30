@@ -20,6 +20,8 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/workspace.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <NvInferRuntime.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -209,16 +211,16 @@ inline bool isBuilding()
         }                                                                                                              \
     } while (0)
 
-std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
+TRTLLM_API std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
 
-std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
+TRTLLM_API std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 
 #endif // ENABLE_MULTI_DEVICE
 
 //! To save GPU memory, all the plugins share the same cublas and cublasLt handle globally.
 //! Get cublas and cublasLt handle for current cuda context
-std::shared_ptr<cublasHandle_t> getCublasHandle();
-std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
+TRTLLM_API std::shared_ptr<cublasHandle_t> getCublasHandle();
+TRTLLM_API std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
 
 #ifndef DEBUG
 

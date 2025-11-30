@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
@@ -29,7 +30,7 @@
 namespace tensorrt_llm::runtime
 {
 
-class ExplicitDraftTokensBuffers
+class TRTLLM_API ExplicitDraftTokensBuffers
 {
 public:
     using SizeType32 = runtime::SizeType32;

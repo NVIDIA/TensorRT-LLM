@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -31,7 +32,7 @@ namespace tensorrt_llm::batch_manager
 /// Helper class to manage sequence slots
 /// This class is not thread-safe
 
-class SequenceSlotManager
+class TRTLLM_API SequenceSlotManager
 {
 public:
     using SlotIdType = int32_t;

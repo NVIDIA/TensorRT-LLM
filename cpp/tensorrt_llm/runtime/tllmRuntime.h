@@ -24,6 +24,8 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <memory>
 #include <set>
@@ -32,7 +34,7 @@
 
 namespace tensorrt_llm::runtime
 {
-class TllmRuntime
+class TRTLLM_API TllmRuntime
 {
 public:
     using TensorMap = StringPtrMap<ITensor>;

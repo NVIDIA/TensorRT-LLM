@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -25,37 +26,37 @@
 namespace tensorrt_llm::common
 {
 // Useful when you want to inject some debug code controllable with env var.
-std::optional<int32_t> getIntEnv(char const* name);
+TRTLLM_API std::optional<int32_t> getIntEnv(char const* name);
 
-std::optional<size_t> getUInt64Env(char const* name);
+TRTLLM_API std::optional<size_t> getUInt64Env(char const* name);
 
-std::optional<float> getFloatEnv(char const* name);
+TRTLLM_API std::optional<float> getFloatEnv(char const* name);
 
-bool getBoolEnv(char const* name);
+TRTLLM_API bool getBoolEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
-bool forceXQAKernels();
+TRTLLM_API bool forceXQAKernels();
 
 // Whether XQA JIT is enabled.
 //
 // Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
-std::optional<bool> getEnvEnableXQAJIT();
+TRTLLM_API std::optional<bool> getEnvEnableXQAJIT();
 
 // 0 means to use heuristics.
-std::optional<int32_t> getEnvXqaBlocksPerSequence();
+TRTLLM_API std::optional<int32_t> getEnvXqaBlocksPerSequence();
 
 // Whether use tileSizeKv64 for multiCtasKvMode of trtllm-gen kernels.
-bool getEnvUseTileSizeKv64ForTrtllmGen();
+TRTLLM_API bool getEnvUseTileSizeKv64ForTrtllmGen();
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
-bool getEnvMmhaMultiblockDebug();
+TRTLLM_API bool getEnvMmhaMultiblockDebug();
 
-int getEnvMmhaBlocksPerSequence();
+TRTLLM_API int getEnvMmhaBlocksPerSequence();
 
-int getEnvMmhaKernelBlockSize();
+TRTLLM_API int getEnvMmhaKernelBlockSize();
 
 // Whether PDL is enabled.
-bool getEnvEnablePDL();
+TRTLLM_API bool getEnvEnablePDL();
 
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
@@ -77,80 +78,80 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...));
 }
 
-bool getEnvUseUCXKvCache();
+TRTLLM_API bool getEnvUseUCXKvCache();
 
-bool getEnvUseMPIKvCache();
-bool getEnvUseNixlKvCache();
+TRTLLM_API bool getEnvUseMPIKvCache();
+TRTLLM_API bool getEnvUseNixlKvCache();
 
-bool getEnvUseRoundRobinBlockDistForCP();
+TRTLLM_API bool getEnvUseRoundRobinBlockDistForCP();
 
-std::string getEnvUCXInterface();
+TRTLLM_API std::string getEnvUCXInterface();
 
-std::string getEnvNixlInterface();
+TRTLLM_API std::string getEnvNixlInterface();
 
-std::string getEnvNixlBackend();
+TRTLLM_API std::string getEnvNixlBackend();
 
-bool getEnvDisaggLayerwise();
+TRTLLM_API bool getEnvDisaggLayerwise();
 
-bool getEnvParallelCacheSend();
+TRTLLM_API bool getEnvParallelCacheSend();
 
-bool getEnvRequestKVCacheConcurrent();
+TRTLLM_API bool getEnvRequestKVCacheConcurrent();
 
-bool getEnvDisableKVCacheTransferOverlap();
+TRTLLM_API bool getEnvDisableKVCacheTransferOverlap();
 
-bool getEnvEnableReceiveKVCacheParallel();
+TRTLLM_API bool getEnvEnableReceiveKVCacheParallel();
 
-std::string const& getEnvKVCacheTimeOutputPath();
+TRTLLM_API std::string const& getEnvKVCacheTimeOutputPath();
 
-bool getEnvTryZCopyForKVCacheTransfer();
+TRTLLM_API bool getEnvTryZCopyForKVCacheTransfer();
 
 // Force deterministic behavior for all kernels.
-bool getEnvForceDeterministic();
+TRTLLM_API bool getEnvForceDeterministic();
 
 // Force deterministic behavior for MoE plugin.
-bool getEnvForceDeterministicMOE();
+TRTLLM_API bool getEnvForceDeterministicMOE();
 
 // Disable finalize fusion in MoE plugin
-bool getEnvMOEDisableFinalizeFusion();
+TRTLLM_API bool getEnvMOEDisableFinalizeFusion();
 
 // Force deterministic behavior for attention plugin.
-bool getEnvForceDeterministicAttention();
+TRTLLM_API bool getEnvForceDeterministicAttention();
 
 // Force deterministic behavior for all reduce plugin.
-bool getEnvForceDeterministicAllReduce();
+TRTLLM_API bool getEnvForceDeterministicAllReduce();
 
 // Return the workspace size for custom all reduce kernels.
 // This only works when force deterministic is enabled.
-size_t getEnvAllReduceWorkspaceSize();
+TRTLLM_API size_t getEnvAllReduceWorkspaceSize();
 
-size_t getEnvKVCacheRecvBufferCount();
+TRTLLM_API size_t getEnvKVCacheRecvBufferCount();
 
-bool getEnvKVCacheTransferUseAsyncBuffer();
+TRTLLM_API bool getEnvKVCacheTransferUseAsyncBuffer();
 
-bool getEnvKVCacheTransferUseSyncBuffer();
+TRTLLM_API bool getEnvKVCacheTransferUseSyncBuffer();
 
-size_t getEnvKVCacheSendMaxConcurrenceNum();
+TRTLLM_API size_t getEnvKVCacheSendMaxConcurrenceNum();
 
-size_t getEnvMemSizeForKVCacheTransferBuffer();
+TRTLLM_API size_t getEnvMemSizeForKVCacheTransferBuffer();
 
-uint16_t getEnvNixlPort();
+TRTLLM_API uint16_t getEnvNixlPort();
 
-bool getEnvDisaggBenchmarkGenOnly();
+TRTLLM_API bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.
-bool getEnvDisableChunkedAttentionInGenPhase();
+TRTLLM_API bool getEnvDisableChunkedAttentionInGenPhase();
 
 // Whether to use one block per token for MoE A2A kernels (default true).
-bool getEnvMoeA2AOneBlockPerToken();
+TRTLLM_API bool getEnvMoeA2AOneBlockPerToken();
 
 // TODO: For DEV purpose temporarily.
 // Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
-int getEnvMoeA2ADispatchBlockSize();
+TRTLLM_API int getEnvMoeA2ADispatchBlockSize();
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
-int getEnvMoeA2ACombineBlockSize();
+TRTLLM_API int getEnvMoeA2ACombineBlockSize();
 
-bool getEnvKVCacheTransferAllBlocksForWindow();
+TRTLLM_API bool getEnvKVCacheTransferAllBlocksForWindow();
 
-bool getEnvEplbForceGdrcopy();
+TRTLLM_API bool getEnvEplbForceGdrcopy();
 
 } // namespace tensorrt_llm::common

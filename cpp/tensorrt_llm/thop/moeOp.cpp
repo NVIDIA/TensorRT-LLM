@@ -42,6 +42,8 @@
         C10_THROW_ERROR(ErrorType, oss.str());                                                                         \
     } while (0)
 
+namespace tensorrt_llm
+{
 namespace torch_ext
 {
 
@@ -1188,13 +1190,14 @@ private:
 };
 
 } // namespace torch_ext
+} // namespace tensorrt_llm
 
 TORCH_LIBRARY(trtllm, m)
 {
-    m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
+    m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
-        .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
-        .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
-        .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
-        .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
+        .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
+        .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
+        .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
+        .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency);
 }

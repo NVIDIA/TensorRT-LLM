@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/arrayView.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
@@ -373,7 +374,7 @@ std::shared_ptr<std::remove_const_t<T>> constPointerCast(std::unique_ptr<T, D>&&
     return std::const_pointer_cast<std::remove_const_t<T>>(std::shared_ptr(std::move(ptr)));
 }
 
-class IBuffer
+class TRTLLM_API IBuffer
 {
 public:
     using UniquePtr = std::unique_ptr<IBuffer>;
@@ -535,7 +536,7 @@ public:
     //! \param size The size of the buffer.
     //! \param capacity The capacity of the buffer.
     //! \return An `IBuffer`.
-    static UniquePtr wrap(void* data, DataType type, std::size_t size, std::size_t capacity);
+    TRTLLM_API static UniquePtr wrap(void* data, DataType type, std::size_t size, std::size_t capacity);
 
     static UniquePtr wrap(void* data, DataType type, std::size_t size)
     {
@@ -563,7 +564,7 @@ public:
     //!
     //! \brief Determine the memory type of a pointer.
     //!
-    static MemoryType memoryType(void const* data);
+    TRTLLM_API static MemoryType memoryType(void const* data);
 
 protected:
     IBuffer() = default;

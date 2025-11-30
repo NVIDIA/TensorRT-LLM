@@ -21,6 +21,8 @@
 #endif // ENABLE_BF16
 #include <cuda_fp16.h>
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdarg>
 #include <memory>  // std::make_unique
 #include <sstream> // std::stringstream
@@ -125,7 +127,7 @@ inline std::string fmtstr(std::string&& s)
 }
 
 typedef char* (*fmtstr_allocator)(void* target, size_t count);
-void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args);
+TRTLLM_API void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args);
 
 #if defined(_MSC_VER)
 inline std::string fmtstr(char const* format, ...);

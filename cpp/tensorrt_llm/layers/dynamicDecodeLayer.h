@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/penaltyLayer.h"
@@ -24,7 +25,7 @@ namespace tensorrt_llm::layers
 {
 
 template <typename T>
-class DynamicDecodeLayer : public BaseLayer
+class TRTLLM_API DynamicDecodeLayer : public BaseLayer
 {
     using Base = BaseLayer;
 

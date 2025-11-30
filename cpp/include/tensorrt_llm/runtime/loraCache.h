@@ -25,6 +25,8 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include "tensorrt_llm/common/config.h"
+
 #include <NvInferRuntime.h>
 
 #include <deque>
@@ -38,14 +40,14 @@
 namespace tensorrt_llm::runtime
 {
 
-class LoraExpectedException : public std::runtime_error
+class TRTLLM_API LoraExpectedException : public std::runtime_error
 {
 public:
     explicit LoraExpectedException(std::string const& msg);
     ~LoraExpectedException() noexcept override;
 };
 
-class LoraCacheFullException : public LoraExpectedException
+class TRTLLM_API LoraCacheFullException : public LoraExpectedException
 {
 public:
     explicit LoraCacheFullException(std::string const& msg);
@@ -58,7 +60,7 @@ public:
  *
  * Note that this class is not thread safe
  */
-class LoraCachePageManager
+class TRTLLM_API LoraCachePageManager
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
@@ -142,7 +144,7 @@ private:
  *
  * Cache pages are allocated on one or more blocks
  */
-class LoraCache
+class TRTLLM_API LoraCache
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
@@ -451,8 +453,8 @@ private:
         TaskValue const& sourceTaskValue, std::vector<size_t> const& targetPageIds, LoraCache const& targetCache);
 };
 
-std::string to_string(LoraCache::TaskLayerModuleConfig const& v);
+TRTLLM_API std::string to_string(LoraCache::TaskLayerModuleConfig const& v);
 
-std::ostream& operator<<(std::ostream& os, LoraCache::TaskLayerModuleConfig const& v);
+TRTLLM_API std::ostream& operator<<(std::ostream& os, LoraCache::TaskLayerModuleConfig const& v);
 
 } // namespace tensorrt_llm::runtime

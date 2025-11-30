@@ -19,6 +19,7 @@
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <variant>
@@ -140,7 +141,7 @@ public:
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 };
 
-class CapacityScheduler : public Algorithm
+class TRTLLM_API CapacityScheduler : public Algorithm
 {
 public:
     constexpr static auto name{"CapacityScheduler"};

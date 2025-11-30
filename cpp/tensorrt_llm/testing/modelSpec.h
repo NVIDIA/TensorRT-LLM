@@ -18,6 +18,7 @@
 #pragma once
 
 #include "NvInfer.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
@@ -38,7 +39,7 @@ enum class QuantMethod
     kSMOOTH_QUANT,
 };
 
-enum class OutputContentType
+enum class TRTLLM_API OutputContentType
 {
     kNONE,
     kCONTEXT_LOGITS,
@@ -47,7 +48,7 @@ enum class OutputContentType
     kCUM_LOG_PROBS
 };
 
-class ModelSpec
+class TRTLLM_API ModelSpec
 {
 public:
     ModelSpec(std::string const& inputFile, nvinfer1::DataType dtype,
