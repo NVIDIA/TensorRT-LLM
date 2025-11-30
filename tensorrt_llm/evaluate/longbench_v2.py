@@ -822,7 +822,8 @@ class LongBenchV2(Evaluator):
         default=None,
         callback=lambda ctx, param, value: json.loads(value) if value else None,
         help=
-        'Chat template kwargs as JSON string, e.g., \'{"enable_thinking": true}\' or \'{"thinking": true}\' to enable thinking mode.'
+        'A JSON string specifying chat template arguments, used to enable features like thinking mode. Examples: '
+        '\'{"enable_thinking": true}\' for Qwen3, or \'{"thinking": true}\' for DeepSeek-V3.2.'
     )
     @click.pass_context
     @staticmethod
