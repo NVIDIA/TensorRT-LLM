@@ -642,6 +642,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                             echo "--gpus ${gpuCount}"
                         fi
                     """, returnStdout: true).trim()
+
+                    if (cluster.host.contains("dlcluster")) {
+                        dockerArgs += " " + sh(script: 'echo " -e NVIDIA_IMEX_CHANNELS=${NVIDIA_IMEX_CHANNELS:-0}"', returnStdout: true).trim()
+                        dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                    }
                 }
 
                 dockerArgs = "${dockerArgs} " +
@@ -655,10 +660,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
 
-                if (partition.clusterName == "dlcluster") {
-                    dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
-                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
-                }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
@@ -996,8 +997,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
-                    export NVIDIA_IMEX_CHANNELS=0
-                    [ -z "\${NVIDIA_VISIBLE_DEVICES:-}" ] && export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
+                    export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
+                    export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
+
+                    echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
+                    echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
 
                     ${srunPrologue}
 
