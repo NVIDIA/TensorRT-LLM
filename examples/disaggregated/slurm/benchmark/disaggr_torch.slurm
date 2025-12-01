@@ -1,59 +1,53 @@
 #!/bin/bash
 set -euo pipefail
 
-# Parse arguments
-# Hardware configuration
-gpus_per_node=${1}
-numa_bind=${2}
-ctx_nodes=${3}  # Number of nodes needed for ctx workers
-gen_nodes=${4}  # Number of nodes needed for gen workers
-ctx_world_size=${5}  # World size for ctx workers
-gen_world_size=${6}  # World size for gen workers
-
-# Worker configuration
-num_ctx_servers=${7}
-ctx_config_path=${8}
-num_gen_servers=${9}
-gen_config_path=${10}
-concurrency_list=${11}
-
-# Sequence and benchmark parameters
-isl=${12}
-osl=${13}
-multi_round=${14}
-benchmark_ratio=${15}
-streaming=${16}
-use_nv_sa_benchmark=${17}
-benchmark_mode=${18}
-cache_max_tokens=${19}
-
-# Environment and paths
-dataset_file=${20}
-model_path=${21}
-trtllm_repo=${22}
-work_dir=${23}
-full_logdir=${24}
-container_mount=${25}
-container_image=${26}
-build_wheel=${27}
-trtllm_wheel_path=${28}
-
-# Profiling
-nsys_on=${29}
-ctx_profile_range=${30}
-gen_profile_range=${31}
-
-# Accuracy evaluation
-enable_accuracy_test=${32}
-accuracy_model=${33}
-accuracy_tasks=${34}
-model_args_extra=${35}
-
-# Worker environment variables
-worker_env_var=${36}
-
-# Server environment variables
-server_env_var=${37}
+# Parse named arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpus-per-node) gpus_per_node="$2"; shift 2 ;;
+        --numa-bind) numa_bind="$2"; shift 2 ;;
+        --ctx-nodes) ctx_nodes="$2"; shift 2 ;;
+        --gen-nodes) gen_nodes="$2"; shift 2 ;;
+        --ctx-world-size) ctx_world_size="$2"; shift 2 ;;
+        --gen-world-size) gen_world_size="$2"; shift 2 ;;
+        --num-ctx-servers) num_ctx_servers="$2"; shift 2 ;;
+        --ctx-config-path) ctx_config_path="$2"; shift 2 ;;
+        --num-gen-servers) num_gen_servers="$2"; shift 2 ;;
+        --gen-config-path) gen_config_path="$2"; shift 2 ;;
+        --concurrency-list) concurrency_list="$2"; shift 2 ;;
+        --isl) isl="$2"; shift 2 ;;
+        --osl) osl="$2"; shift 2 ;;
+        --multi-round) multi_round="$2"; shift 2 ;;
+        --benchmark-ratio) benchmark_ratio="$2"; shift 2 ;;
+        --streaming) streaming="$2"; shift 2 ;;
+        --use-nv-sa-benchmark) use_nv_sa_benchmark="$2"; shift 2 ;;
+        --benchmark-mode) benchmark_mode="$2"; shift 2 ;;
+        --cache-max-tokens) cache_max_tokens="$2"; shift 2 ;;
+        --dataset-file) dataset_file="$2"; shift 2 ;;
+        --model-path) model_path="$2"; shift 2 ;;
+        --trtllm-repo) trtllm_repo="$2"; shift 2 ;;
+        --work-dir) work_dir="$2"; shift 2 ;;
+        --full-logdir) full_logdir="$2"; shift 2 ;;
+        --container-mount) container_mount="$2"; shift 2 ;;
+        --container-image) container_image="$2"; shift 2 ;;
+        --build-wheel) build_wheel="$2"; shift 2 ;;
+        --install-trtllm) install_trtllm="$2"; shift 2 ;;
+        --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --nsys-on) nsys_on="$2"; shift 2 ;;
+        --ctx-profile-range) ctx_profile_range="$2"; shift 2 ;;
+        --gen-profile-range) gen_profile_range="$2"; shift 2 ;;
+        --enable-accuracy-test) enable_accuracy_test="$2"; shift 2 ;;
+        --accuracy-model) accuracy_model="$2"; shift 2 ;;
+        --accuracy-tasks) accuracy_tasks="$2"; shift 2 ;;
+        --model-args-extra) model_args_extra="$2"; shift 2 ;;
+        --worker-env-var) worker_env_var="$2"; shift 2 ;;
+        --server-env-var) server_env_var="$2"; shift 2 ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -89,6 +83,7 @@ echo "  container_image: ${container_image}"
 echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
 echo "  build_wheel: ${build_wheel}"
+echo "  install_trtllm: ${install_trtllm}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
 echo "  work_dir: ${work_dir}"
 echo "  nsys_on: ${nsys_on}"
@@ -162,15 +157,17 @@ elif [ -d "${trtllm_repo}" ]; then
         echo "TensorRT-LLM build completed successfully"
     fi
 
-    echo "Installing TensorRT-LLM..."
-    if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} --no-container-mount-home \
-        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
-        &> ${full_logdir}/install.log; then
-        cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
+    if [ "${install_trtllm}" = "true" ]; then
+        echo "Installing TensorRT-LLM..."
+        if ! srun --container-name=${container_name} \
+            --container-mounts=${container_mount} --no-container-mount-home \
+            --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+            bash -c "cd ${trtllm_repo} && pip install -e ." \
+            &> ${full_logdir}/install.log; then
+            cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
+        fi
+        echo "TensorRT-LLM installation completed successfully"
     fi
-    echo "TensorRT-LLM installation completed successfully"
 fi
 
 # Get node lists
