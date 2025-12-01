@@ -712,6 +712,7 @@ class KVCacheManager(BaseResourceManager):
             mem_per_token = math.ceil(mem_per_token / 2) + math.ceil(
                 mem_per_token / 16)
         else:
+            # All other cases (fp16/bf16 kv cache), we need 2 bytes per token for K and V.
             mem_per_token *= 2
         return mem_per_token
 
