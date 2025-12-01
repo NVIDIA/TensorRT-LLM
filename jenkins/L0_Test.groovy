@@ -1547,7 +1547,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         cpu: '2'
                         memory: 10Gi
                         ephemeral-storage: 25Gi
-                  tolerations:
+                tolerations:
                   - key: "node_for_blossom_trt"
                     operator: "Exists"
                     effect: "NoSchedule"
