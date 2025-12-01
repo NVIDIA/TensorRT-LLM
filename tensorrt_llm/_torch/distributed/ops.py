@@ -2,14 +2,16 @@ import math
 import os
 import platform
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -361,6 +363,84 @@ def alltoall_helix(
             "all input tensors in a group must have the same shape"
 
     return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
+
+
+class HelixAllToAllNative:
+    """
+    Manager for Helix All-to-All operations with MNNVL workspace management.
+
+    Exchanges data along the cp_size dimension:
+    - partial_0: [..., cp_size, kv_lora_rank] half-precision
+    - softmax_stats: [..., cp_size, 2] float32
+    """
+
+    # Global cache: mapping -> instance
+    _cache: Dict[Mapping, "HelixAllToAllNative"] = {}
+
+    def __init__(self, mapping: Mapping, workspace: HelixCpMnnvlMemory,
+                 workspace_tensor: torch.Tensor):
+        """Private constructor - use get() instead."""
+        self.mapping = mapping
+        self.workspace = workspace
+        self.workspace_tensor = workspace_tensor
+
+    @staticmethod
+    def get(mapping: Mapping) -> "HelixAllToAllNative":
+        """
+        Get or create a HelixAllToAllNative instance for the given configuration.
+
+        Args:
+            mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
+
+        Returns:
+            Cached or newly-created HelixAllToAllNative instance
+        """
+        if mapping not in HelixAllToAllNative._cache:
+            logger.info(
+                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
+            )
+            MnnvlMemory.initialize()
+
+            # Get workspace size (in bytes)
+            workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
+                mapping.cp_size)
+
+            # Allocate MNNVL memory using CP communicator for Helix
+            workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
+            workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
+
+            torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
+                                                        mapping.cp_rank,
+                                                        mapping.cp_size)
+            torch.cuda.synchronize()
+            HelixCpMnnvlMemory.get_comm(mapping).barrier()
+
+            HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
+                mapping, workspace, workspace_tensor)
+
+        return HelixAllToAllNative._cache[mapping]
+
+    def alltoall_native(self, partial_0: torch.Tensor,
+                        softmax_stats: torch.Tensor):
+        """
+        Perform all-to-all data exchange.
+
+        Args:
+            partial_0: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
+            softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
+
+        Returns:
+            Tuple of (partial_0_out, softmax_stats_out) with same shapes as inputs.
+        """
+        partial_0_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
+            partial_0,
+            softmax_stats,
+            self.workspace_tensor,
+            self.mapping.cp_rank,
+            self.mapping.cp_size,
+        )
+
+        return partial_0_out, softmax_stats_out
 
 
 def reducescatter(

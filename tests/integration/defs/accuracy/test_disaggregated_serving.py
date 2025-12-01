@@ -848,7 +848,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                  "cudagraph:none", "cudagraph:without_padding",
                                  "cudagraph:with_padding"
                              ])
-    def test_auto_dtype_with_helix(self, cuda_graph_config):
+    @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
+    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config):
+        use_nccl_for_alltoall = comms_medium == "nccl"
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
@@ -873,7 +875,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "context_parallel_size": 2,
             "cp_config": {
                 "cp_type": "HELIX",
-                "tokens_per_block": 32
+                "tokens_per_block": 32,
+                "use_nccl_for_alltoall": use_nccl_for_alltoall
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
