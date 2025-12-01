@@ -241,7 +241,16 @@ def worker_main(
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
 ) -> None:
+
     mpi_comm().barrier()
+
+    if llm_args is not None and llm_args.env_overrides:
+        # this is needed because MPI_Init seems to cache the env at import time.
+        # The cached env snapshot is used to spawn workers.
+        # Any env overrides to the main process after tensorrt_llm import
+        # may not get reflected in the spawned worker process, no matter how early,
+        # unless we update it explicitly here.
+        os.environ.update(llm_args.env_overrides)
 
     if llm_args is not None and llm_args.trust_remote_code:
         _init_hf_modules()
