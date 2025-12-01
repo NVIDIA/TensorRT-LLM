@@ -314,8 +314,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     Configuration for skip softmax attention.
     """
     algorithm: ClassVar[str] = "skip_softmax"
-    threshold: Optional[float] = Field(
-        default=None, description="The threshold for skip softmax attention.")
+    threshold_scale_factor: Optional[float] = Field(
+        default=None,
+        description="The threshold scale factor for skip softmax attention.")
 
     @classmethod
     def from_dict(cls, data: dict):

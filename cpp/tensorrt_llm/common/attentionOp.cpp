@@ -1888,7 +1888,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         // Skip-softmax attention parameters
-        fmhaParams.skipSoftmaxThreshold = mSkipSoftmaxThreshold;
+        fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactor;
 #ifdef SKIP_SOFTMAX_STAT
         fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
         fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;

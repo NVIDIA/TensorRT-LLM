@@ -743,7 +743,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mPagedContextFMHA = use_paged_context_fmha;
 
     op->mAttentionChunkSize = attention_chunk_size;
-    op->mSkipSoftmaxThreshold = static_cast<float>(skip_softmax_threshold_scale_factor.value_or(0));
+    op->mSkipSoftmaxThresholdScaleFactor = static_cast<float>(skip_softmax_threshold_scale_factor.value_or(0));
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;
