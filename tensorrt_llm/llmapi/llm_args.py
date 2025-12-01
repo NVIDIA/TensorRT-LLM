@@ -817,7 +817,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 )
             else:
                 assert self.max_total_draft_tokens <= total_history_draft_tokens and self.max_total_draft_tokens >= default_max_total_draft_tokens, f"max_total_draft_tokens should be between {default_max_total_draft_tokens} and {total_history_draft_tokens}"
-            assert self.max_total_draft_tokens + 1 <= 32
 
         # Linear tree
         if self.max_total_draft_tokens is None:
