@@ -2002,6 +2002,7 @@ class Linear(nn.Module):
             nvfp4_backend: Backend selection for NVFP4 GEMM operations.
                 Supported values: "auto", "cutlass", "cublaslt", "cutedsl".
                 Default is "auto" which automatically selects the best backend.
+                Can be overridden via TRTLLM_NVFP4_GEMM_BACKEND environment variable.
         """
         from ..distributed import AllReduce
 
@@ -2021,7 +2022,21 @@ class Linear(nn.Module):
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
-        self.nvfp4_backend = nvfp4_backend
+
+        # Support environment variable override for nvfp4_backend
+        nvfp4_backend_value = os.environ.get('TRTLLM_NVFP4_GEMM_BACKEND',
+                                             nvfp4_backend)
+
+        # Validate backend selection
+        valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
+        if nvfp4_backend_value not in valid_backends:
+            raise ValueError(
+                f"Invalid nvfp4_backend: '{nvfp4_backend_value}'. "
+                f"Supported values are: {', '.join(sorted(valid_backends))}. "
+                f"Set via constructor argument or TRTLLM_NVFP4_GEMM_BACKEND environment variable."
+            )
+
+        self.nvfp4_backend = nvfp4_backend_value
 
         local_in_features = in_features
         local_out_features = out_features
