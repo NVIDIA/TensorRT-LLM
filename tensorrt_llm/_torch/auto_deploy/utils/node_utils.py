@@ -658,7 +658,11 @@ def get_layer_after_linear_node(
     """Get the layer after a linear node."""
 
     def boundary_condition(node: Node) -> bool:
-        return is_any_lin_op(node) or is_op(node, ops=[torch.ops.aten.arange, torch.ops.aten.to])
+        return is_any_lin_op(node)  # or is_op(node, ops=[torch.ops.aten.arange, torch.ops.aten.to])
+
+    # last linear node (output embedding) cannot be a part of any layer
+    def filter_condition(node: Node) -> bool:
+        return is_any_lin_op(node) and node != linear_nodes[-1]
 
     lin_nodes_in_subgraph = []
     start_lin_index = terminating_indices[-1] + 1
@@ -669,15 +673,14 @@ def get_layer_after_linear_node(
         forward_subgraph = subgraph(
             sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
         )
-        lin_nodes_in_subgraph = list(
-            filtered_nodes(forward_subgraph, ops=torch.ops.auto_deploy.torch_linear_simple)
-        )
+        lin_nodes_in_subgraph = list(filtered_nodes(forward_subgraph, filter_condition))
         start_lin_index += 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
-    # get all opening linear nodes
-    opening_linear_nodes = subgraph(
-        sinks=[terminating_linear_node], include=is_any_lin_op, boundary_condition=is_any_lin_op
+    backward_subgraph = subgraph(
+        sinks=[terminating_linear_node], boundary_condition=boundary_condition
     )
+    # get all opening linear nodes
+    opening_linear_nodes = list(filtered_nodes(backward_subgraph, is_any_lin_op))
     # opening nodes must succeed last terminating node
     last_terminating_index = terminating_indices[-1]
     opening_linear_nodes = [
@@ -686,7 +689,7 @@ def get_layer_after_linear_node(
     assert linear_nodes[start_lin_index - 1] in opening_linear_nodes, (
         "Linear node not found in opening linear nodes"
     )
-    layer_subgraph = [opening_linear_nodes, forward_subgraph, terminating_linear_node]
+    layer_subgraph = [opening_linear_nodes, backward_subgraph, terminating_linear_node]
 
     # return the index of the terminating linear node
     if terminating_linear_node == linear_nodes[-1]:

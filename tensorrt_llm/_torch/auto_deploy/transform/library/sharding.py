@@ -16,10 +16,8 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import operator
 import re
-from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Set, Tuple, Type, Union
+from typing import Any, Dict, List, Tuple, Type, Union
 
 import torch
 from pydantic import Field, field_validator
@@ -34,12 +32,11 @@ from ...utils.node_utils import (
     extract_weight_node,
     filtered_nodes,
     get_all_layer_subgraphs,
-    identify_regions_between_residuals,
+    is_any_attention_op,
     is_any_lin_op,
+    is_any_ssm_op,
     is_op,
     subgraph,
-    is_any_attention_op,
-    is_any_ssm_op,
 )
 from ...utils.sharding_utils import (
     BMMShardingInfo,
@@ -155,7 +152,6 @@ class ShardingTransformExecutor(BaseTransform):
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,
         )
-        # exit()
         return gm, info
 
 
@@ -374,6 +370,7 @@ def _process_ssm_sharding(
             dist_op=None,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims["in_proj"],
+            layer_type=LayerType.MAMBA,
         )
     )
 
@@ -412,6 +409,7 @@ def _process_ssm_sharding(
                 dist_op=None,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_dims,
+                layer_type=LayerType.MAMBA,
             )
         )
 
@@ -448,6 +446,7 @@ def _process_ssm_sharding(
             rank=rank,
             world_size=world_size,
             dist_op="all_reduce",
+            layer_type=LayerType.MAMBA,
         )
     )
     return 1
@@ -499,6 +498,7 @@ def _process_column_sharding(
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_weight_dims,
+                layer_type=LayerType.MLP if min_local_shape == 1 else LayerType.ATTENTION,
             )
         )
 
@@ -513,7 +513,7 @@ def _process_column_sharding(
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
             args = list(view_node.args)
-            view_shape[2] = view_shape[2] // world_size
+            view_shape[2] = -1
             args[1] = tuple(view_shape)
             transform_container.add(
                 ParameterUpdateInfo(
@@ -619,8 +619,10 @@ def detect_sharding_from_config(
 
         if any(attn_name in module_name for attn_name in attn_names):
             min_local_shape = head_dim
+            layer_type = LayerType.ATTENTION
         else:
             min_local_shape = 1
+            layer_type = LayerType.MLP
 
         # use regex to find if module_name matches any of the keys in sharding_config
         for key in tp_plan.keys():
@@ -643,6 +645,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op=None,
                             min_local_shape=min_local_shape,
+                            layer_type=layer_type,
                         )
                     ):
                         num_row_col_shards += 1
@@ -655,6 +658,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                            layer_type=layer_type,
                         )
                     ):
                         num_row_col_shards += 1
@@ -688,6 +692,7 @@ def detect_sharding_from_config(
                                     world_size=world_size,
                                     dist_op=None,
                                     min_local_shape=min_local_shape,
+                                    layer_type=layer_type,
                                 )
                             )
                         elif col_row_action == "rowwise":
@@ -699,6 +704,7 @@ def detect_sharding_from_config(
                                     world_size=world_size,
                                     dist_op="all_reduce",
                                     min_local_shape=min_local_shape,
+                                    layer_type=layer_type,
                                 )
                             ):
                                 num_row_col_shards += 1
@@ -718,6 +724,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            layer_type=layer_type,
                         )
                     ):
                         num_simple_shards += 1
@@ -733,6 +740,7 @@ def detect_sharding_from_config(
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            layer_type=layer_type,
                         )
                     )
                 # after successful match, break the loop
@@ -851,9 +859,12 @@ def detect_column_row_shard_new(
         ssm_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_ssm_nodes))
         attention_nodes = list(filtered_nodes(layer_subgraph, ops=shardable_attention_nodes))
         min_local_shape = 1
+        layer_type = LayerType.MLP
 
         if len(ssm_nodes) > 0:
             # Mamba layers need special handling due to the fused weights for in_proj and conv1d
+            assert len(ssm_nodes) == 1, "Expected exactly one SSM node in layer subgraph"
+            assert len(opening) == 1, "Expected exactly one opening node in Mamba layer"
             ad_logger.debug(f"Found SSM nodes in layer subgraph: {ssm_nodes}")
             num_ssm_shards += _process_ssm_sharding(
                 gm, opening[0], sharding_config, rank, world_size
@@ -861,6 +872,7 @@ def detect_column_row_shard_new(
             continue
 
         if len(attention_nodes) > 0:
+            layer_type = LayerType.ATTENTION
             ad_logger.debug(f"Found attention nodes in layer subgraph: {attention_nodes}")
             if len(attention_nodes) > 1:
                 # Column-row shard boundary region detection is probably wrong - there should be
@@ -874,6 +886,8 @@ def detect_column_row_shard_new(
             # Assume that head_dim is the last (innermost) dimension of the tensor
             min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
             num_attention_shards += 1
+        else:
+            layer_type = LayerType.MLP
 
         # column-row sharding
         _process_column_sharding(
@@ -887,7 +901,7 @@ def detect_column_row_shard_new(
         )
 
         # shard single row node
-        sharding_config.weight_sharding_transforms.append(
+        sharding_config.add(
             WeightShardingInfo.from_node(
                 closing,
                 split_dim=SplitDimension.ROW,
@@ -895,6 +909,7 @@ def detect_column_row_shard_new(
                 world_size=world_size,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
+                layer_type=layer_type,
             )
         )
 
@@ -1136,7 +1151,9 @@ def detect_dp_bmm_shard(
     )
 
 
-def detect_ep_shard(gm: GraphModule, transform_container: ShardingTransformContainer) -> TransformInfo:
+def detect_ep_shard(
+    gm: GraphModule, transform_container: ShardingTransformContainer
+) -> TransformInfo:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     rank, world_size = transform_container.rank, transform_container.world_size
