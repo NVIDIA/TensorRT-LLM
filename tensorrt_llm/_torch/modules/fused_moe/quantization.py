@@ -1851,8 +1851,6 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # If pre_quant_scale exists, we need a per-channel act scale for fc31
         # All experts share the same input, so pre_quant_scale should be identical across experts
         if has_pre_quant_scale:
-            from ..linear import TensorParallelMode, load_weight_shard
-
             # Create fc31_act_scale parameter (for gate_up_proj / w3_w1)
             # Shape: (1, hidden_size) - single vector for all experts (they share the same input)
             fc31_act_scale = nn.Parameter(torch.empty(1,
