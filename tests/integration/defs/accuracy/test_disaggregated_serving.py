@@ -862,7 +862,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 2,
             "context_parallel_size": 1,
-            "max_batch_size": 8,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
@@ -879,7 +878,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "cp_type": "HELIX",
                 "tokens_per_block": 32
             },
-            "max_batch_size": 8,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
@@ -907,7 +905,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, extra_acc_spec="helix_with_bs8")
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
