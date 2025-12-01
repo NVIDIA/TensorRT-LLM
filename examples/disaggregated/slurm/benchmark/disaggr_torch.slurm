@@ -276,7 +276,7 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         --mpi=pmix --overlap -N 1 -n 1 \
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
-        "${model_args_extra}" \
+        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
         &> ${full_logdir}/accuracy_eval.log; then
         cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
     fi

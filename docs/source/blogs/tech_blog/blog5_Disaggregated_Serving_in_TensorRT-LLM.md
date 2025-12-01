@@ -124,7 +124,7 @@ In the Dynamo workflow, requests are initially processed by pre- and post-proces
 
 Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
 
-For more information on how to use Dynamo with TensorRT LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
+For more information on how to use Dynamo with TensorRT LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/backends/trtllm/README.html).
 
 ### Triton Inference Server
 

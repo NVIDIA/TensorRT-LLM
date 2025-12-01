@@ -868,6 +868,17 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             names = name.split('.')
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            if names[-1] == "backend" and isinstance(module, MoE):
+                name = '.'.join(names[:-1])
+                names = name.split('.')
+
             # WAR: better solution is that llama has its own load_weights function.
             if names[-1] == 'next_layer_layernorm':
                 return
@@ -968,6 +979,17 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             names = name.split('.')
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            if names[-1] == "backend" and isinstance(module, MoE):
+                name = '.'.join(names[:-1])
+                names = name.split('.')
+
             module_names_breakdown, module_name = names[:-1], names[-1]
 
             if weight_mapper.does_require_special_handling(module_name):

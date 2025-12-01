@@ -64,6 +64,10 @@ public:
         // note: ensures that input_list size > 0
         TLLM_CHECK_WITH_INFO(static_cast<int>(input_list.size()) == num_ranks * num_lists_,
             "input_list size should be equal to group size * num_lists");
+        for (auto const& input : input_list)
+        {
+            TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+        }
         std::vector<torch::Tensor> output_list(static_cast<size_t>(num_lists_));
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
         ncclGroupStart();
