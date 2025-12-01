@@ -270,6 +270,10 @@ if(BUILD_DEEP_GEMM)
   FetchContent_MakeAvailable(deepgemm)
 endif()
 
+if(NOT NVTX_DISABLE)
+  set(maybe_nvtx_includedir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
+endif()
+
 # include as system to suppress warnings
 include_directories(
   SYSTEM
@@ -277,7 +281,7 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
-  ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include
+  ${maybe_nvtx_includedir}
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
   ${CMAKE_BINARY_DIR}/_deps/json-src/include)
@@ -494,7 +498,7 @@ print(os.path.dirname(torch.__file__),end='');"
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
-  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(nvtx3_dir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
   set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
   set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
@@ -571,7 +575,7 @@ if(ENABLE_UCX)
       OUTPUT_VARIABLE UCXX_BUILD_OUTPUT
       RESULT_VARIABLE UCXX_BUILD_RESULT)
     if(UCXX_BUILD_RESULT)
-      message("ucxx build:" ${UCXX_BUILD_OUTPUT})
+      message("ucxx build: ${UCXX_BUILD_OUTPUT}")
       message(FATAL_ERROR "ucxx build failed")
     endif()
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build

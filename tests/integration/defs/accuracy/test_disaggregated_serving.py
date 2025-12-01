@@ -44,7 +44,8 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
-DEFAULT_TEST_TIMEOUT = 1800
+# TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
+DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 3600
 
 
@@ -66,6 +67,41 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
         return False
 
 
+def check_port_available(port: int) -> int:
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('localhost', port))
+            return port
+    except socket.error:
+        # find a free port
+        sock = socket.socket()
+        sock.bind(('', 0))
+        return sock.getsockname()[1]
+
+
+def revise_disaggregated_server_config_urls_with_free_ports(
+        disaggregated_server_config: Dict[str, Any]) -> Dict[str, Any]:
+    disaggregated_server_config['port'] = check_port_available(
+        disaggregated_server_config['port'])
+    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
+    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
+
+    new_ctx_urls = []
+    new_gen_urls = []
+    for url in ctx_urls:
+        port = check_port_available(int(url.split(":")[1]))
+        new_ctx_urls.append(f"localhost:{port}")
+    for url in gen_urls:
+        port = check_port_available(int(url.split(":")[1]))
+        new_gen_urls.append(f"localhost:{port}")
+
+    disaggregated_server_config["context_servers"]["urls"] = new_ctx_urls
+    disaggregated_server_config["generation_servers"]["urls"] = new_gen_urls
+
+    return disaggregated_server_config
+
+
 @contextlib.contextmanager
 def launch_disaggregated_llm(
         disaggregated_server_config: Dict[str, Any],
@@ -85,6 +121,24 @@ def launch_disaggregated_llm(
         print(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
+
+    enable_perf = True
+    perf_max_requests = 10000
+
+    def _apply_perf_flags(cfg: Optional[Dict[str, Any]]):
+        if not isinstance(cfg, dict):
+            return
+        if enable_perf:
+            # Only set these if the switch is enabled.
+            # Use `setdefault` so explicit per-test overrides are preserved.
+            cfg.setdefault("return_perf_metrics", True)
+            cfg.setdefault("perf_metrics_max_requests", perf_max_requests)
+
+    _apply_perf_flags(disaggregated_server_config)
+    _apply_perf_flags(ctx_server_config)
+    _apply_perf_flags(gen_server_config)
+    disaggregated_server_config = revise_disaggregated_server_config_urls_with_free_ports(
+        disaggregated_server_config)
 
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
@@ -137,17 +191,23 @@ def launch_disaggregated_llm(
     ctx_urls = disaggregated_server_config["context_servers"]["urls"]
     gen_urls = disaggregated_server_config["generation_servers"]["urls"]
 
+    serve_port = disaggregated_server_config["port"]
     ctx_ports = [int(url.split(":")[1]) for url in ctx_urls]
     gen_ports = [int(url.split(":")[1]) for url in gen_urls]
 
     ctx_servers = []
     current_gpu_offset = 0
 
+    kv_cache_perf_dir = os.path.join(temp_dir.name, "kv_cache_perf")
+
     for i, port in enumerate(ctx_ports):
-        env_ctx = os.environ.copy()
+        env = os.environ.copy()
+        env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        if enable_perf:
+            env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
-        env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
         current_gpu_offset += ctx_total_gpus
 
         ctx_server_args = ctx_args + [
@@ -159,15 +219,18 @@ def launch_disaggregated_llm(
             ctx_server_args.append(
                 f"--max_num_tokens={ctx_server_config['max_num_tokens']}")
 
-        ctx_servers.append((env_ctx, ctx_server_args))
+        ctx_servers.append((env, ctx_server_args))
 
     gen_servers = []
 
     for i, port in enumerate(gen_ports):
-        env_gen = os.environ.copy()
+        env = os.environ.copy()
+        env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        if enable_perf:
+            env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
-        env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
@@ -179,7 +242,7 @@ def launch_disaggregated_llm(
             gen_server_args.append(
                 f"--max_num_tokens={gen_server_config['max_num_tokens']}")
 
-        gen_servers.append((env_gen, gen_server_args))
+        gen_servers.append((env, gen_server_args))
 
     @contextlib.contextmanager
     def multi_popen(server_configs, server_name="", enable_redirect_log=False):
@@ -233,14 +296,14 @@ def launch_disaggregated_llm(
                     )
             try:
                 print("Checking health endpoint")
-                response = requests.get("http://localhost:8000/health")
+                response = requests.get(f"http://localhost:{serve_port}/health")
                 if response.status_code == 200:
                     break
             except requests.exceptions.ConnectionError:
                 continue
 
         client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:8000/v1",
+                               base_url=f"http://localhost:{serve_port}/v1",
                                timeout=1800000)
 
         def send_request(prompt: str, sampling_params: SamplingParams,
@@ -299,8 +362,43 @@ def launch_disaggregated_llm(
             thread_pool.futures.append(future)
             return future
 
+        def _get_perf_metrics():
+            path = "/perf_metrics"
+            perf_url = f"http://localhost:8000{path}"
+            try:
+                print(f"Fetching perf metrics from {perf_url}")
+                resp = requests.get(perf_url, timeout=10)
+                if resp.status_code == 200:
+                    try:
+                        metrics = resp.json()
+                        print("perf_metrics JSON:")
+                        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+                    except ValueError:
+                        print("perf_metrics returned non-JSON response:",
+                              resp.text)
+                else:
+                    print(
+                        f"perf_metrics returned status {resp.status_code}: {resp.text}"
+                    )
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching {perf_url}: {e}")
+
+        def _show_kvcache_time(kv_cache_perf_dir, max_lines=1000):
+            print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
+            for file in os.listdir(kv_cache_perf_dir):
+                print(f"file: {file}")
+                print(f"{'-'*25} {file}:{max_lines} {'-'*25}")
+                with open(os.path.join(kv_cache_perf_dir, file), "r") as f:
+                    for line in f.readlines()[-max_lines:]:
+                        print(line.strip())
+
         tokenizer = load_hf_tokenizer(model_name)
-        yield DuckLLM(args, tokenizer, generate_async)
+        try:
+            yield DuckLLM(args, tokenizer, generate_async)
+        finally:
+            if enable_perf:
+                _show_kvcache_time(kv_cache_perf_dir)
+                _get_perf_metrics()
 
 
 def run_parallel_test(model_name: str,
@@ -1094,23 +1192,24 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_chunked_prefill(self):
+        # bs=1 will stabilize the result, but the test will be much slower
+        max_batch_size = 32
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT"
+                "backend": "UCX"
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
-            "max_batch_size":
-            1,  # max_batch_size=1 will stabilize the accuracy test result at a cost of speed
+            "max_batch_size": max_batch_size,
         }
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT"
+                "backend": "UCX"
             },
-            "max_batch_size": 1,
+            "max_batch_size": max_batch_size,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
