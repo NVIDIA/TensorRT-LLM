@@ -2093,7 +2093,7 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                          dst_w3_w1_weight)
 
         # Interleave FC1 weight for GEMM1 + SwiGLU fusion.
-        w3_w1_weight = dst_w3_w1_weight.view(float4_e2m1x2)
+        w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
         w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
                                                               group_size=64,
                                                               dim=0)
@@ -2112,7 +2112,7 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
         n = module.intermediate_size_per_partition * 2
         k = module.hidden_size
-        w3_w1_weight_scale = dst_w3_w1_weight_scale.view(float4_sf_dtype)
+        w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
         w3_w1_weight_scale_unswizzled = unswizzle_sf(
             w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
         w3_w1_weight_scale_unswizzled_interleaved = interleave_linear_and_gate(
