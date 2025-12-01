@@ -1,3 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# open_search_query.py
+#
+# This module provides functions to query the OpenSearch database for passed
+# test results from previous pipeline runs. It retrieves test names that have
+# passed for a given commit ID and stage name, which can be reused to skip
+# redundant test execution in subsequent runs.
+#
+# Main functionality:
+# - queryJobEvents: Queries OpenSearch for job events with pagination support
+# - getPassedTestList: Retrieves and deduplicates passed test names
+# - writeTestListToFile: Writes test list to a file for further processing
+#
+# =============================================================================
+
 import argparse
 import json
 import os
@@ -7,6 +37,17 @@ from open_search_db import OpenSearchDB
 
 
 def queryJobEvents(commitID="", stageName="", onlySuccess=True):
+    """
+    Query OpenSearch database for job events with pagination.
+    
+    Args:
+        commitID: Git commit SHA to filter by (optional)
+        stageName: Stage name to filter by (optional)
+        onlySuccess: If True, only return PASSED tests (default: True)
+        
+    Returns:
+        List of all matching test result records
+    """
     mustConditions = []
     if commitID:
         mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
@@ -65,9 +106,11 @@ def writeTestListToFile(testList, fileName):
 
 def getPassedTestList(commitID, stageName, outputFile):
     hits = queryJobEvents(commitID=commitID, stageName=stageName, onlySuccess=True)
-    testList = []
+    # Use set to automatically remove duplicates
+    testSet = set()
     for hit in hits:
-        testList.append(hit["_source"]["s_turtle_name"])
+        testSet.add(hit["_source"]["s_turtle_name"])
+    testList = list(testSet)
     writeTestListToFile(testList, outputFile)
 
 

@@ -879,11 +879,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
 
                 // Add passed test list from previous pipeline run to the waives.txt
-                reusePassedTestResults(llmSrcLocal, stageName, testListPathNode, waivesListPathNode)
-
-                // Add passed test list from previous pipeline run to the waives.txt
                 if (testFilter[(REUSE_TEST)] != false) {
-                    reusePassedTestResults(llmSrcLocal, stageName, testListPathLocal, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
+                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
                 }
 
                 Utils.copyFileToRemoteHost(
@@ -2121,7 +2118,7 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     }
 }
 
-def reusePassedTestResults(llmSrc, stageName, testDBList, waivesTxt) {
+def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
     try {
         // Get passed test list from open search
         def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
@@ -2133,22 +2130,7 @@ def reusePassedTestResults(llmSrc, stageName, testDBList, waivesTxt) {
         """
 
         def passedTestList = readFile(file: passedTestListFile).readLines()
-        // Read the original test list
-        def originalTestLines = readFile(file: testDBList).readLines()
-
-        def reusedTests = []
-        for (originalLine in originalTestLines) {
-            def testLine = originalLine.trim()
-            if (testLine) {
-                for (passedTest in passedTestList) {
-                    passedTest = passedTest.trim()
-                    if (testLine.contains(passedTest)) {
-                        reusedTests.add(passedTest)
-                        break
-                    }
-                }
-            }
-        }
+        def reusedTests = passedTestList.collect { test -> test.trim() }
 
         // Append reused tests to waives.txt
         if (reusedTests.size() > 0) {
@@ -2345,7 +2327,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Add passed test list from previous pipeline run to the waives.txt
         if (testFilter[(REUSE_TEST)] != false) {
-            reusePassedTestResults(llmSrc, stageName, testDBList, "${llmSrc}/tests/integration/test_lists/waives.txt")
+            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
         }
 
         // Process shard test list and create separate files for regular and isolate tests
