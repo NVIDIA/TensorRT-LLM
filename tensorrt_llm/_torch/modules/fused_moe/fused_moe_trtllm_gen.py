@@ -137,7 +137,7 @@ class TRTLLMGenFusedMoE(MoE):
                     max_num_tokens = model_config.max_num_tokens
                     hidden_size = self.hidden_size
                     dtype = self.dtype or torch.bfloat16
-                    
+
                     workspace_size = MoeAlltoAll.calculate_required_workspace_size(
                         ep_size, max_num_tokens, hidden_size, dtype)
 
@@ -146,8 +146,7 @@ class TRTLLMGenFusedMoE(MoE):
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
                         num_experts=self.num_slots,
-                        workspace_size_per_rank=workspace_size
-                    )
+                        workspace_size_per_rank=workspace_size)
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
                         "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"

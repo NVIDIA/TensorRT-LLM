@@ -63,6 +63,28 @@ class NVLinkOneSided(Communication):
     COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
     PAYLOAD_DATA_OFFSET_INDEX = None
 
+    @staticmethod
+    def get_aux_data_size(ep_size: int, max_num_tokens: int) -> int:
+        return torch.ops.trtllm.moe_a2a_get_aux_data_size(ep_size, max_num_tokens)
+
+    @staticmethod
+    def calculate_required_workspace_size(
+        ep_size: int, max_num_tokens: int, hidden_size: int, dtype: torch.dtype
+    ) -> int:
+        element_size = dtype.itemsize
+        aux_size = NVLinkOneSided.get_aux_data_size(ep_size, max_num_tokens)
+
+        # Required workspace for combine [ep_size, max_tokens] tokens
+        payload_size_combine = ep_size * max_num_tokens * hidden_size * element_size
+
+        # Dispatch also needs workspace for [ep_size, max_tokens] tokens,
+        # but due to the variety of quantization recipes, we cannot know the exact size,
+        # so we conservatively estimate assuming no quantization.
+        # We additionally add 32 bytes for considering small payloads like token_selected_experts, token_final_scales etc.  # noqa: E501
+        payload_size_dispatch = ep_size * max_num_tokens * (hidden_size * element_size + 32)
+
+        return aux_size + payload_size_combine + payload_size_dispatch
+
     @classmethod
     def _init_constants(cls):
         """Initialize constants from C++ if not already done."""
@@ -86,9 +108,11 @@ class NVLinkOneSided(Communication):
         self,
         mapping: Mapping,
         num_experts: int,
-        top_k: int = 1,
-        max_num_tokens_per_rank: Optional[int] = None,
+        top_k: int,
+        max_num_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        hidden_size: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -99,22 +123,51 @@ class NVLinkOneSided(Communication):
             top_k: Number of experts per token
             max_num_tokens_per_rank: Maximum number of tokens per rank (for workspace allocation)
             payload_in_workspace: If True, final_hidden_states is already in workspace
+            hidden_size: Hidden dimension size (optional, for auto workspace calculation)
+            dtype: Data type (optional, for auto workspace calculation)
         """
         super().__init__(mapping)
+
+        if self.mapping.world_size != self.ep_size:
+            raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
 
         # Store needed parameters
         self.num_experts = num_experts
         self.top_k = top_k
-
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
 
         # Initialize constants from C++
         self._init_constants()
 
-        # Get workspace size from environment variable (default 2048MB to match MoeAlltoAll)
-        workspace_mb = int(os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
-        self.workspace_size_per_rank = workspace_mb * 1024 * 1024
+        # Get workspace size
+        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        if workspace_mb_env:
+            self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
+            if (
+                hidden_size is not None
+                and dtype is not None
+                and max_num_tokens_per_rank is not None
+            ):
+                auto_size = self.calculate_required_workspace_size(
+                    self.ep_size, max_num_tokens_per_rank, hidden_size, dtype
+                )
+                tllm_logger.warning(
+                    f"Overriding automatically calculated workspace_size_per_rank ({auto_size} bytes) with "
+                    f"TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env} ({self.workspace_size_per_rank} bytes). "
+                    f"Auto calculation is conservative, so only consider overriding it if you have a specific reason."
+                )
+        elif hidden_size is not None and dtype is not None:
+            self.workspace_size_per_rank = self.calculate_required_workspace_size(
+                self.ep_size, self.max_num_tokens_per_rank, hidden_size, dtype
+            )
+        else:
+            tllm_logger.warning(
+                "hidden_size and dtype are not provided (which are required for calculating workspace size)."
+                "Using default workspace size 2048MB."
+            )
+            self.workspace_size_per_rank = 2048 * 1024 * 1024
+
         # Initialize or reuse workspace
         MnnvlMemory.initialize()
 
