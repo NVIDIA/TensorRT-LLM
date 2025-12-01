@@ -98,10 +98,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_major = "k"
             b_major = "k"
 
-            # Data types
-            ab_dtype = cutlass.Float4E2M1FN
-            c_dtype = cutlass.BFloat16
-
             # Early exit: Check K dimension alignment
             # For K-major layout (A and B tensors), K is the major mode (contiguous dimension).
             # 16-byte alignment requirement: K must be divisible by 32 for FP4 (128 bits / 4 bits = 32)
