@@ -2052,8 +2052,7 @@ class Linear(nn.Module):
             )
             local_out_features = out_features // self.tp_size
         else:
-            assert self.tp_mode is None, (
-                'unsupported tensor parallel mode: {self.tp_mode}')
+            assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
 
         self.in_features = local_in_features
         self.out_features = local_out_features
@@ -2061,6 +2060,7 @@ class Linear(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=allreduce_strategy,
                                     dtype=self.dtype) if reduce_output else None
+
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
