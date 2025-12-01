@@ -604,38 +604,26 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
 
             def extra_check(match: Match) -> bool:
                 # Validate backend value
-                backend_node = match.kwargs.get('backend')
-                if backend_node is None:
+                backend_value = match.kwargs.get('backend')
+                if backend_value is None:
                     # No backend specified, use default - OK
                     return True
 
+                # backend should be a string literal
+                if not isinstance(backend_value, str):
+                    return False
+
                 valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
-
-                # Case 1: backend is a Node with metadata
-                if hasattr(backend_node, 'meta') and 'val' in backend_node.meta:
-                    backend_value = backend_node.meta['val']
-                    if isinstance(backend_value, str):
-                        return backend_value in valid_backends
-                    return False  # Invalid type
-
-                # Case 2: backend is a constant Node in the graph
-                if hasattr(backend_node, 'target'):
-                    return backend_node.target in valid_backends
-
-                # Case 3: backend is a Python literal in kwargs
-                if isinstance(backend_node, str):
-                    return backend_node in valid_backends
-
-                # Unknown format - reject to be safe
-                return False
+                return backend_value in valid_backends
 
             register_replacement(
                 empty_nvfp4_gemm_prologue_pattern,
                 target_nvfp4_gemm_prologue_pattern,
-                [extra_check],
+                [],
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
+                extra_check=extra_check,
             )
 
         def register_mm_prologue(custom_pass: PatternMatcherPass):
