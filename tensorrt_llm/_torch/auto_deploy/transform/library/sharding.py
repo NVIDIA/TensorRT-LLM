@@ -102,6 +102,14 @@ class SplitDimension(IntEnum):
     ROW = 1
 
 
+class DistBackend(Enum):
+    """Enum for distributed backend."""
+
+    AUTO = "auto"
+    TRTLLM = "trtllm"
+    TORCH = "torch"
+
+
 class ShardingTransformConfig(TransformConfig):
     """Configuration for sharding the model."""
 
