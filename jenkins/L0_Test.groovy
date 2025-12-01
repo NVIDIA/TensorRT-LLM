@@ -782,7 +782,8 @@ def getPytestBaseCommandLine(
         testCmdLine += [
             "--perf",
             "--perf-log-formats csv",
-            "--perf-log-formats yaml"
+            "--perf-log-formats yaml",
+            "--enable-gpu-clock-lock"
         ]
     }
     if (stageName.contains("-Ray-")) {
