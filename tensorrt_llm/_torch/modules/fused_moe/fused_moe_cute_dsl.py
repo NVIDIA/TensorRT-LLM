@@ -8,7 +8,7 @@ from tensorrt_llm._utils import is_sm_100f
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor, ceil_div
+from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
@@ -206,175 +206,59 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 return NVFP4CuteDslFusedMoEMethod()
         return super()._get_quant_method()
 
-    def forward_chunk_unquantized(
-            self,
-            x: Union[torch.Tensor, Fp4QuantizedTensor],
-            router_logits: torch.Tensor,
-            output_dtype: Optional[torch.dtype] = None,
-            all_rank_num_tokens: Optional[List[int]] = None,
-            use_dp_padding: Optional[bool] = None,
-            repeating_info: tuple = (True, True),
-    ) -> torch.Tensor:
-        assert not self.has_any_quant
-        return super().forward_chunk(x,
-                                     router_logits,
-                                     output_dtype=output_dtype,
-                                     all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=use_dp_padding,
-                                     repeating_info=repeating_info)
+    def quantize_input(self,
+                       x: Union[torch.Tensor, Fp4QuantizedTensor],
+                       post_quant_comm: bool = True):
+        """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
 
-    def forward_chunk_fp8_block_scales(
-            self,
-            x: Union[torch.Tensor, Fp4QuantizedTensor],
-            router_logits: torch.Tensor,
-            output_dtype: Optional[torch.dtype] = None,
-            all_rank_num_tokens: Optional[List[int]] = None,
-            use_dp_padding: Optional[bool] = None,
-            repeating_info: tuple = (True, True),
-    ) -> torch.Tensor:
-        assert self.has_deepseek_fp8_block_scales
+        Args:
+            x: Input tensor to quantize
+            post_quant_comm:
+                If True, quantize for post-quant communication path.
+                If False, quantize for non-communication path
 
-        # apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
-        assert token_selected_experts.shape[
-            1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
+        Returns: (x, x_sf) where x_sf is already reshaped to 2D if needed
 
-        if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
-            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
-            x = x * token_final_scales.to(x.dtype)
-            # TODO: remove this once we have correct fusedmoe kernel ready
-            token_final_scales = None
-
-        weight_dtype = self.w3_w1_weight.dtype
-
-        (
-            permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
-            permuted_data_tensor,
-            expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
-            unpermuted_row_to_permuted_row_tensor,
-        ) = torch.ops.trtllm.moe_permute_op(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            None,  # w3_w1_weight.view(weight_dtype),
-            None,  # w2_weight.view(weight_dtype),
-            None,  # quant_scales,
-            input_sf=None,
-            num_experts_on_rank=self.expert_size_per_partition,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            min_latency_mode=False,
-            use_fp8_block_scaling=True,
-        )
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-            permuted_data_tensor)
-        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset_tensor,
-        )
-        h2 = swiglu_fused_moe(h1)
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
-        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset_tensor,
-        )
-        h4 = torch.ops.trtllm.moe_finalize_scale_op(
-            h3,
-            None,  # biases
-            token_final_scales,
-            unpermuted_row_to_permuted_row_tensor,
-            permuted_row_to_unpermuted_row_tensor,
-            token_selected_experts,
-            expert_first_token_offset_tensor,
-            False,  # enable_alltoall
-            x.shape[0],  # num_rows
-            x.shape[1],  # (possibly padded) hidden_size
-            self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
-            self.expert_size_per_partition,  # num_experts_per_node
-            self.tp_size,
-            self.tp_rank,
-            self.ep_size,
-            self.ep_rank,
-        )
-        return h4
-
-    def forward_chunk_nvfp4(
-            self,
-            x: Union[torch.Tensor, Fp4QuantizedTensor],
-            router_logits: torch.Tensor,
-            output_dtype: Optional[torch.dtype] = None,
-            all_rank_num_tokens: Optional[List[int]] = None,
-            use_dp_padding: Optional[bool] = None,
-            repeating_info: tuple = (True, True),
-    ) -> torch.Tensor:
-        assert self.has_nvfp4
-
-        if isinstance(x, Fp4QuantizedTensor):
-            assert output_dtype is not None
-        else:
-            output_dtype = x.dtype
-
-        # apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
-        assert token_selected_experts.shape[
-            1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
-
-        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
-        if run_post_quant_allgather:
+        For quantization methods that produce scaling factors:
+        - x_sf is reshaped from 1D to 2D: [num_elements] -> [batch_size, ceil_div(hidden_size, scaling_vector_size)]
+        - The 2D shape is required for proper handling in alltoall/allgather operations
+        - scaling_vector_size is typically the group size for block-wise quantization
+        """
+        x_sf = None
+        if self.has_nvfp4:
             if isinstance(x, Fp4QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
+                x_row = x.shape[0]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,
                     False)
-            # note: we use uint8 to store 2 fp4 values
-            x_row, x_col = x.size(0), x.size(1) * 2
+        elif self.has_deepseek_fp8_block_scales:
+            # FP8 block scales doesn't support permutation of quantized inputs.
+            # WAR: The quantization is in run_moe_fp8_block_scales.
+            pass
         else:
-            if not isinstance(x, Fp4QuantizedTensor):
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+            raise ValueError(
+                f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
+            )
 
-        if run_post_quant_allgather:
-            # Original allgather logic
-            if x_sf is not None:
-                x_sf = x_sf.view(x_row, ceil_div(x_col,
-                                                 self.scaling_vector_size))
-                assert x_sf.dim(
-                ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
+        if x_sf is not None:
+            x_sf = x_sf.view(x_row, -1)
+        return x, x_sf
 
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
-
+    def run_moe_nvfp4(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert self.has_nvfp4
+        output_dtype = torch.bfloat16
         tile_size = 128
+
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
@@ -452,6 +336,122 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             )
         return x
 
+    def run_moe_fp8_block_scales(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert self.has_deepseek_fp8_block_scales
+        assert x_sf is None
+        weight_dtype = self.w3_w1_weight.dtype
+
+        (
+            permuted_row_to_unpermuted_row_tensor,
+            permuted_token_selected_experts_tensor,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            permuted_token_final_scales_tensor,
+            unpermuted_row_to_permuted_row_tensor,
+        ) = torch.ops.trtllm.moe_permute_op(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            None,  # w3_w1_weight.view(weight_dtype),
+            None,  # w2_weight.view(weight_dtype),
+            None,  # quant_scales,
+            input_sf=None,
+            num_experts_on_rank=self.expert_size_per_partition,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            min_latency_mode=False,
+            use_fp8_block_scaling=True,
+        )
+        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+            permuted_data_tensor)
+        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
+            a=act_input_fp8,
+            b=self.w3_w1_weight.view(weight_dtype),
+            a_sf=act_input_sf,
+            b_sf=self.quant_scales[0],
+            offset_array=expert_first_token_offset_tensor,
+        )
+        h2 = swiglu_fused_moe(h1)
+        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
+        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
+            a=act_input_fp8,
+            b=self.w2_weight.view(weight_dtype),
+            a_sf=act_input_sf,
+            b_sf=self.quant_scales[1],
+            offset_array=expert_first_token_offset_tensor,
+        )
+        h4 = torch.ops.trtllm.moe_finalize_scale_op(
+            h3,
+            None,  # biases
+            token_final_scales,
+            unpermuted_row_to_permuted_row_tensor,
+            permuted_row_to_unpermuted_row_tensor,
+            token_selected_experts,
+            expert_first_token_offset_tensor,
+            False,  # enable_alltoall
+            x.shape[0],  # num_rows
+            x.shape[1],  # (possibly padded) hidden_size
+            self.unpadded_hidden_size,  # original hidden size
+            self.routing_method.top_k,
+            self.expert_size_per_partition,  # num_experts_per_node
+            self.tp_size,
+            self.tp_rank,
+            self.ep_size,
+            self.ep_rank,
+        )
+        return h4
+
+    def run_moe(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Run MoE computation with CuteDSL backend.
+
+        This method encapsulates the core MoE computation logic, handling different
+        quantization schemes (fp8_block_scales and nvfp4).
+
+        Args:
+            # Standard MoE interface parameters:
+            x: Input hidden states (may be pre-quantized)
+            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
+                                    this represents expert slots [num_tokens, top_k] instead.
+            token_final_scales: Final scaling factors for each token
+            x_sf: Input scale factors (optional, for certain quantization schemes)
+
+        Returns:
+            final_hidden_states tensor.
+        """
+        if self.has_nvfp4:
+            return self.run_moe_nvfp4(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf)
+        elif self.has_deepseek_fp8_block_scales:
+            return self.run_moe_fp8_block_scales(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf)
+        else:
+            raise ValueError(
+                f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
+            )
+
     def forward_chunk(
             self,
             x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -461,32 +461,27 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_dp_padding: Optional[bool] = None,
             repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
-        if self.has_any_quant:
-            if self.has_nvfp4:
-                return self.forward_chunk_nvfp4(
-                    x,
-                    router_logits,
-                    output_dtype=output_dtype,
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    use_dp_padding=use_dp_padding,
-                    repeating_info=repeating_info)
-            elif self.has_deepseek_fp8_block_scales:
-                return self.forward_chunk_fp8_block_scales(
-                    x,
-                    router_logits,
-                    output_dtype=output_dtype,
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    use_dp_padding=use_dp_padding,
-                    repeating_info=repeating_info)
-            else:
-                raise ValueError(
-                    f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
-                )
-        else:
-            return self.forward_chunk_unquantized(
-                x,
-                router_logits,
-                output_dtype=output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=use_dp_padding,
-                repeating_info=repeating_info)
+        # Apply routing
+        token_selected_experts, token_final_scales = self.routing_method.apply(
+            router_logits)
+        assert token_selected_experts.shape[
+            1] == self.routing_method.experts_per_token
+        assert token_selected_experts.shape == token_final_scales.shape
+        assert token_selected_experts.shape[0] == router_logits.shape[0]
+        assert token_final_scales.dtype == torch.float32
+        assert token_selected_experts.dtype == torch.int32
+
+        x, x_sf = self.quantize_input(x)
+
+        if self.use_dp and self.parallel_size > 1:
+            x, x_sf, token_selected_experts, token_final_scales = allgather(
+                [x, x_sf, token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens)
+
+        x = self.run_moe(x=x,
+                         token_selected_experts=token_selected_experts,
+                         token_final_scales=token_final_scales,
+                         x_sf=x_sf)
+        return x

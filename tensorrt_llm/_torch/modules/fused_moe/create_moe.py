@@ -33,7 +33,16 @@ def get_moe_cls(
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
     elif moe_backend.upper() == "CUTEDSL":
-        return CuteDslFusedMoE
+        if quant_config is not None and (
+                quant_config.quant_mode.has_fp8_block_scales()
+                or quant_config.quant_mode.has_nvfp4()):
+            return CuteDslFusedMoE
+        else:
+            logger.warning(
+                "CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
+            return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "TRTLLM":
@@ -48,8 +57,8 @@ def get_moe_cls(
         else:
             logger.warning(
                 "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8. "
-                f"Check out details in quant_config: {quant_config}"
-                "Using CutlassFusedMoE instead.")
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
             return CutlassFusedMoE
     elif moe_backend.upper() == "WIDEEP":
         return WideEPMoE
@@ -337,7 +346,7 @@ def create_moe(
 
     if enable_configurable_moe:
         # ConfigurableMoE is only supported for TRTLLMGenFusedMoE backend
-        if moe_cls == TRTLLMGenFusedMoE:
+        if moe_cls in (TRTLLMGenFusedMoE, CuteDslFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,
@@ -358,12 +367,13 @@ def create_moe(
         else:
             # Check if this is a TRTLLM backend request that fallback to CutlassFusedMoE
             requested_backend = model_config.moe_backend.upper()
-            if requested_backend == "TRTLLM" and moe_cls == CutlassFusedMoE:
+            if requested_backend in ("TRTLLM",
+                                     "CUTEDSL") and moe_cls == CutlassFusedMoE:
                 # Workaround for test cases where TRTLLM backend fallbacks to CutlassFusedMoE due to quant_config incompatibility
                 # Log warning and continue with the fallback backend
                 logger.warning(
                     f"ENABLE_CONFIGURABLE_MOE is set but TRTLLM backend fallback to {moe_cls.__name__} due to quant_config. "
-                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE backend. "
+                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends. "
                     f"Continuing with legacy MoE backend {moe_cls.__name__}.")
             else:
                 # For other incompatible backends, raise error
