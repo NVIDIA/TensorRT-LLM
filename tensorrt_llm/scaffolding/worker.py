@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 import openai
+import requests
 from enum import Enum
 import requests
 from transformers import AutoTokenizer
