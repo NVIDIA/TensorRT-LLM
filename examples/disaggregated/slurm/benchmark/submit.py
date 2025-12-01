@@ -166,10 +166,10 @@ def submit_job(config, log_dir):
         # Hardware configuration
         '--gpus-per-node', str(hw_config['gpus_per_node']),
         '--numa-bind', str(slurm_config['numa_bind']).lower(),
-        '--ctx-nodes', str(ctx_nodes),
-        '--gen-nodes', str(gen_nodes),
-        '--ctx-world-size', str(ctx_world_size),
-        '--gen-world-size', str(gen_world_size),
+        '--ctx-nodes', str(ctx_nodes),  # Number of nodes needed for ctx workers
+        '--gen-nodes', str(gen_nodes),  # Number of nodes needed for gen workers
+        '--ctx-world-size', str(ctx_world_size),  # World size for ctx workers
+        '--gen-world-size', str(gen_world_size),  # World size for gen workers
 
         # Worker configuration
         '--num-ctx-servers', str(ctx_num),
@@ -198,7 +198,6 @@ def submit_job(config, log_dir):
         '--container-mount', env_config['container_mount'],
         '--container-image', env_config['container_image'],
         '--build-wheel', str(env_config['build_wheel']).lower(),
-        '--install-trtllm', str(env_config['install_trtllm']).lower(),
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
 
         # Profiling
