@@ -28,3 +28,4 @@ jobs:
           labels-to-remove-when-unstale: 'stale,waiting for feedback'
           stale-issue-label: 'stale'
           stale-pr-label: 'stale'
+          operations-per-run: 1000

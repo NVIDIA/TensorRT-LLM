@@ -264,8 +264,6 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         mKernelParams.packed_mask_ptr = runnerParams.packedMaskPtr;
         mKernelParams.cu_mask_rows = reinterpret_cast<int const*>(runnerParams.cuMaskRowsPtr);
     }
-    TLLM_CHECK_WITH_INFO(
-        runnerParams.attentionSinksPtr == nullptr || mSM == kSM_90, "The attention sinks is only supported on SM90.");
     mKernelParams.attention_sinks_ptr = runnerParams.attentionSinksPtr;
     mKernelParams.cu_q_seqlens = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
     mKernelParams.tile_id_counter_ptr = reinterpret_cast<uint32_t*>(runnerParams.tileCounterPtr);

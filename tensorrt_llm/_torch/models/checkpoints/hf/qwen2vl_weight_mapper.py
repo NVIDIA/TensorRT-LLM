@@ -10,13 +10,18 @@ class Qwen2VLHfWeightMapper(HfWeightMapper):
     'language_model.' prefix removal from weight keys.
     """
 
-    def filter_weights(self, prefix: str, weights: dict) -> dict:
+    def preprocess_weights(self, weights: dict) -> dict:
+        """
+        Preprocess weights to remove the 'model.language_model.' and 'model.visual.' prefixes.
+        """
         transformed_weights = {}
-        language_model_prefix = "model.language_model."
         for key, value in weights.items():
-            if key.startswith(language_model_prefix):
-                new_key = "model." + key[len(language_model_prefix):]
+            if key.startswith("model.language_model."):
+                new_key = "model." + key[len("model.language_model."):]
+                transformed_weights[new_key] = value
+            elif key.startswith("model.visual."):
+                new_key = "visual." + key[len("model.visual."):]
                 transformed_weights[new_key] = value
             else:
                 transformed_weights[key] = value
-        return super().filter_weights(prefix, transformed_weights)
+        return transformed_weights

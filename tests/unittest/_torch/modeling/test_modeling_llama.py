@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+from utils.llm_data import llm_models_root
 from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
@@ -15,8 +16,11 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -226,6 +230,7 @@ class TestLlama(unittest.TestCase):
 
             llama = LlamaForCausalLM(model_config).to(dtype).to(device)
             llama.load_weights(hf_llama.state_dict())
+            llama.post_load_weights()
 
         num_blocks = 1
         tokens_per_block = 128
@@ -326,10 +331,8 @@ class TestLlama(unittest.TestCase):
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-        graph_runner = None
-        if scenario.use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(
+            1) if scenario.use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
@@ -372,4 +375,312 @@ class TestLlama(unittest.TestCase):
                                    rtol=0.4)
         if graph_runner is not None:
             graph_runner.clear()
+        kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_llama_verification_with_kv_cache_relocation(self) -> None:
+        """
+        Verify the output of the model with kv cache relocation
+        """
+        backend = "TRTLLM"
+        metadata_cls = get_attention_backend(backend).Metadata
+
+        config_dict = deepcopy(LLAMA_3_1_8B_CONFIG)
+
+        llama_config = LlamaConfig.from_dict(config_dict)
+        dtype = llama_config.torch_dtype
+        device = torch.device('cuda')
+
+        with torch.device(device), default_dtype(dtype):
+            models_path = llm_models_root()
+            model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+            hf_llama = HFLlamaForCausalLM.from_pretrained(
+                model_dir,
+                torch_dtype=torch.bfloat16,
+                device_map="cuda",
+            ).eval()
+
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       attn_backend=backend)
+
+            llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+            llama.load_weights(hf_llama.state_dict())
+        num_blocks = 1
+        tokens_per_block = 64
+        head_dim = llama.config.hidden_size // llama.config.num_attention_heads
+        num_layers = llama.config.num_hidden_layers
+        num_kv_heads = llama.config.num_key_value_heads
+        num_heads_per_kv = llama.config.num_attention_heads // num_kv_heads
+        max_seq_len = num_blocks * tokens_per_block
+        batch_size = 1
+
+        if dtype == torch.half:
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+        elif dtype == torch.bfloat16:
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+        else:
+            raise ValueError("Invalid dtype")
+        kv_cache_dtype_byte_size = 2
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
+                                        tokens_per_block)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+        )
+
+        # context
+        input_ids = torch.tensor([
+            128000, 32, 6369, 1990, 264, 22999, 1217, 323, 459, 21075, 11478,
+            18328, 13, 578, 18328, 6835, 11190, 11, 11944, 11, 323, 48887,
+            11503, 311, 279, 1217, 596, 4860, 13, 14194, 25, 22691, 36660, 3931,
+            2891, 25
+        ],
+                                 dtype=torch.int,
+                                 device=device)
+
+        num_cached_tokens_per_seq = [0]
+        request_ids = [900]
+        token_nums = [input_ids.size(-1)]
+        prompt_lens = [input_ids.size(-1)]
+        requests = kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        request = requests[0]
+
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            num_heads_per_kv=num_heads_per_kv,
+        )
+
+        position_ids = [torch.arange(0, input_ids.size(-1))]
+        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = llama.forward(input_ids=input_ids,
+                                   position_ids=position_ids,
+                                   attn_metadata=attn_metadata)
+
+        def run_forward(input_ids, position_ids, attn_metadata):
+            return llama.forward(input_ids=input_ids,
+                                 position_ids=position_ids,
+                                 attn_metadata=attn_metadata,
+                                 return_context_logits=True)
+
+        # prepare for the first generation
+        gen_input_ids_0 = torch.tensor([
+            22691, 11, 0, 13, 15592, 323, 315, 12, 311, 362, 220, 32, 362, 426,
+            330, 358, 362, 358, 358, 362, 32, 0, 13, 32, 6369
+        ],
+                                       dtype=torch.int,
+                                       device=device)
+        spec_decoding_position_offsets = torch.tensor([
+            0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 3
+        ],
+                                                      dtype=torch.int,
+                                                      device=device)
+        spec_decoding_packed_mask = torch.tensor(
+            [
+                1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2051, 4099, 8195,
+                16387, 32771, 65541, 131077, 262153, 524297, 1048593, 2097169,
+                4194321, 8388641, 16842757
+            ],
+            dtype=torch.int,
+            device=device).unsqueeze(0).unsqueeze(2)
+
+        num_cached_tokens_per_seq = [input_ids.size(-1)]
+        is_spec_decoding_enabled = True
+        use_spec_decoding = True
+        is_spec_dec_tree = True
+        is_spec_dec_dynamic_tree = True
+        max_total_draft_tokens = gen_input_ids_0.size(-1) - 1
+
+        attn_metadata_gen_phase_0 = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids_0.size(-1)], dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            is_spec_decoding_enabled=is_spec_decoding_enabled,
+            use_spec_decoding=use_spec_decoding,
+            is_spec_dec_tree=is_spec_dec_tree,
+            is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
+            num_heads_per_kv=num_heads_per_kv,
+        )
+        spec_decoding_tensor = SpecDecodingTensor(
+            position_offsets=spec_decoding_position_offsets,
+            packed_mask=spec_decoding_packed_mask)
+
+        attn_metadata_gen_phase_0.prepare()
+        attn_metadata_gen_phase_0.update_spec_dec_param(
+            batch_size=batch_size,
+            is_spec_decoding_enabled=is_spec_decoding_enabled,
+            is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
+            is_spec_dec_tree=is_spec_dec_tree,
+            max_draft_len=max_total_draft_tokens,
+            max_total_draft_tokens=max_total_draft_tokens,
+            model_is_wrapped=False,
+            spec_decoding_tensor=spec_decoding_tensor,
+        )
+
+        gen_position_ids_0 = [
+            torch.full((gen_input_ids_0.size(-1), ),
+                       input_ids.size(-1),
+                       dtype=torch.int64)
+        ]
+        gen_position_ids_0 = torch.cat(gen_position_ids_0).unsqueeze(0).cuda()
+
+        with torch.inference_mode():
+            gen_logits_0 = run_forward(input_ids=gen_input_ids_0,
+                                       position_ids=gen_position_ids_0,
+                                       attn_metadata=attn_metadata_gen_phase_0)
+
+            request.py_num_accepted_draft_tokens = 1
+            request.py_num_accepted_draft_tokens_indices = [1]
+            request.py_rewind_len = gen_input_ids_0.size(
+                -1) - request.py_num_accepted_draft_tokens - 1
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            scheduled_requests = ScheduledRequests()
+            scheduled_requests.generation_requests = [request]
+            kv_cache_manager.max_draft_len = gen_input_ids_0.size(-1) - 1
+            kv_cache_manager.update_kv_cache_draft_token_location(
+                scheduled_requests, attn_metadata_gen_phase_0,
+                kv_cache_dtype_byte_size)
+            if request.py_rewind_len > 0:
+                kv_cache_manager.rewind_kv_cache(request, request.py_rewind_len)
+        torch.cuda.synchronize()
+
+        # prepare for the second generation
+        gen_input_ids_1 = torch.tensor([2650, 649],
+                                       dtype=torch.int,
+                                       device=device)
+
+        num_cached_tokens_per_seq_1 = [
+            input_ids.size(-1) + request.py_num_accepted_draft_tokens + 1
+        ]
+        attn_metadata_gen_phase_0.seq_lens = torch.tensor(
+            [gen_input_ids_1.size(-1)], dtype=torch.int)
+        attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
+
+        attn_metadata_gen_phase_0.spec_decoding_position_offsets = None
+        attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
+        attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
+        attn_metadata_gen_phase_0.prepare()
+        attn_metadata_gen_phase_0.update_spec_dec_param(
+            batch_size=batch_size,
+            is_spec_decoding_enabled=is_spec_decoding_enabled,
+            is_spec_dec_tree=is_spec_dec_tree
+            if get_sm_version() < 100 else False,
+            is_spec_dec_dynamic_tree=False,
+            max_draft_len=gen_input_ids_1.size(-1) - 1,
+            max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
+            model_is_wrapped=False)
+
+        gen_position_ids_1 = [
+            torch.full(
+                (gen_input_ids_1.size(-1), ),
+                input_ids.size(-1) + request.py_num_accepted_draft_tokens + 1,
+                dtype=torch.int64)
+        ]
+        gen_position_ids_1 = torch.cat(gen_position_ids_1).unsqueeze(0).cuda()
+
+        with torch.inference_mode():
+            gen_logits_1 = run_forward(input_ids=gen_input_ids_1,
+                                       position_ids=gen_position_ids_1,
+                                       attn_metadata=attn_metadata_gen_phase_0)
+
+        torch.cuda.synchronize()
+
+        # prepare for the reference generation
+        gen_input_ids_ref = torch.tensor([22691, 0, 2650, 649],
+                                         dtype=torch.int,
+                                         device=device)
+        num_cached_tokens_per_seq_ref = [input_ids.size(-1)]
+
+        attn_metadata_ref = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids_ref.size(-1)],
+                                  dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq_ref,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            is_spec_decoding_enabled=is_spec_decoding_enabled,
+            use_spec_decoding=use_spec_decoding,
+            is_spec_dec_tree=is_spec_dec_tree,
+            is_spec_dec_dynamic_tree=False,
+            num_heads_per_kv=num_heads_per_kv,
+        )
+
+        attn_metadata_ref.spec_decoding_position_offsets = None
+        attn_metadata_ref.spec_decoding_packed_mask = None
+        attn_metadata_ref.spec_decoding_generation_lengths = None
+        attn_metadata_ref.prepare()
+        attn_metadata_ref.update_spec_dec_param(
+            batch_size=batch_size,
+            is_spec_decoding_enabled=is_spec_decoding_enabled,
+            is_spec_dec_tree=is_spec_dec_tree
+            if get_sm_version() < 100 else False,
+            is_spec_dec_dynamic_tree=False,
+            max_draft_len=gen_input_ids_ref.size(-1) - 1,
+            max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
+            model_is_wrapped=False)
+
+        gen_position_ids_ref = [
+            torch.full((gen_input_ids_ref.size(-1), ),
+                       input_ids.size(-1),
+                       dtype=torch.int64)
+        ]
+        gen_position_ids_ref = torch.cat(gen_position_ids_ref).unsqueeze(
+            0).cuda()
+
+        with torch.inference_mode():
+            gen_logits_ref = run_forward(input_ids=gen_input_ids_ref,
+                                         position_ids=gen_position_ids_ref,
+                                         attn_metadata=attn_metadata_ref)
+
+        torch.cuda.synchronize()
+        torch.testing.assert_close(gen_logits_1[0, :],
+                                   gen_logits_ref[2, :],
+                                   atol=0.4,
+                                   rtol=0.4)
+        torch.testing.assert_close(gen_logits_1[1, :],
+                                   gen_logits_ref[3, :],
+                                   atol=0.4,
+                                   rtol=0.4)
+
+        token_id_ref = torch.argmax(gen_logits_ref[3, :], dim=-1)
+        token_id_gen = torch.argmax(gen_logits_1[1, :], dim=-1)
+        assert token_id_ref == token_id_gen, "Greedy sampling token id not match"
+
         kv_cache_manager.shutdown()

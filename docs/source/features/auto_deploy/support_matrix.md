@@ -83,6 +83,7 @@ In addition, the following models have been officially validated using the defau
 - nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
 - nvidia/Llama-3_3-Nemotron-Super-49B-v1
 - nvidia/Mistral-NeMo-Minitron-8B-Base
+- nvidia/Nemotron-Flash-3B-Instruct
 - perplexity-ai/r1-1776-distill-llama-70b
 
 </details>
@@ -113,6 +114,7 @@ Optimize attention operations with different attention kernel implementations:
 
 | `"attn_backend"` | Description |
 |----------------------|-------------|
+| `torch`  | Custom fused multi-head attention (MHA) with KV Cache reference implementation in pure PyTorch (slow!) |
 | `triton` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
 | `flashinfer`         | Uses optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 

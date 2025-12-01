@@ -2,68 +2,75 @@
 set -euo pipefail
 
 # Parse arguments
-num_ctx_servers=${1}
-ctx_tp_size=${2}
-ctx_pp_size=${3}
-ctx_batch_size=${4}
-ctx_max_num_tokens=${5}
-ctx_enable_attention_dp=${6}
-ctx_gpu_frac=${7}
-num_gen_servers=${8}
-gen_tp_size=${9}
-gen_pp_size=${10}
-gen_batch_size=${11}
-gen_max_num_tokens=${12}
-gen_enable_attention_dp=${13}
-gen_gpu_frac=${14}
-eplb_num_slots=${15}
-mtp_size=${16}
-concurrency_list=${17}
-gpus_per_node=${18}
-use_nv_sa_benchmark=${19}
-isl=${20}
-osl=${21}
-multi_round=${22}
-benchmark_ratio=${23}
-streaming=${24}
-cache_max_tokens=${25}
-dataset_file=${26}
-container_mount=${27}
-container_image=${28}
-model_path=${29}
-trtllm_repo=${30}
-build_wheel=${31}
-work_dir=${32}
-nsys_on=${33}
-seq_offset=${34}  # Offset added to sequence lengths
-numa_bind=${35}    # Whether to enable NUMA binding
-benchmark_mode=${36}  # Benchmark mode: e2e or gen_only
+# Hardware configuration
+gpus_per_node=${1}
+numa_bind=${2}
+ctx_nodes=${3}  # Number of nodes needed for ctx workers
+gen_nodes=${4}  # Number of nodes needed for gen workers
+ctx_world_size=${5}  # World size for ctx workers
+gen_world_size=${6}  # World size for gen workers
+
+# Worker configuration
+num_ctx_servers=${7}
+ctx_config_path=${8}
+num_gen_servers=${9}
+gen_config_path=${10}
+concurrency_list=${11}
+
+# Sequence and benchmark parameters
+isl=${12}
+osl=${13}
+multi_round=${14}
+benchmark_ratio=${15}
+streaming=${16}
+use_nv_sa_benchmark=${17}
+benchmark_mode=${18}
+cache_max_tokens=${19}
+
+# Environment and paths
+dataset_file=${20}
+model_path=${21}
+trtllm_repo=${22}
+work_dir=${23}
+full_logdir=${24}
+container_mount=${25}
+container_image=${26}
+build_wheel=${27}
+trtllm_wheel_path=${28}
+
+# Profiling
+nsys_on=${29}
+ctx_profile_range=${30}
+gen_profile_range=${31}
+
+# Accuracy evaluation
+enable_accuracy_test=${32}
+accuracy_model=${33}
+accuracy_tasks=${34}
+model_args_extra=${35}
+
+# Worker environment variables
+worker_env_var=${36}
+
+# Server environment variables
+server_env_var=${37}
 
 # Print all parsed arguments
 echo "Parsed arguments:"
-echo "Context Server Configuration:"
-echo "  num_ctx_servers: ${num_ctx_servers}"
-echo "  ctx_tp_size: ${ctx_tp_size}"
-echo "  ctx_pp_size: ${ctx_pp_size}"
-echo "  ctx_batch_size: ${ctx_batch_size}"
-echo "  ctx_max_num_tokens: ${ctx_max_num_tokens}"
-echo "  ctx_enable_attention_dp: ${ctx_enable_attention_dp}"
-echo "  ctx_gpu_frac: ${ctx_gpu_frac}"
-echo
-echo "Generation Server Configuration:"
-echo "  num_gen_servers: ${num_gen_servers}"
-echo "  gen_tp_size: ${gen_tp_size}"
-echo "  gen_pp_size: ${gen_pp_size}"
-echo "  gen_batch_size: ${gen_batch_size}"
-echo "  gen_max_num_tokens: ${gen_max_num_tokens}"
-echo "  gen_enable_attention_dp: ${gen_enable_attention_dp}"
-echo "  gen_gpu_frac: ${gen_gpu_frac}"
-echo "  eplb_num_slots: ${eplb_num_slots}"
-echo "  mtp_size: ${mtp_size}"
-echo "  concurrency_list: ${concurrency_list}"
-echo
 echo "Hardware Configuration:"
 echo "  gpus_per_node: ${gpus_per_node}"
+echo "  numa_bind: ${numa_bind}"
+echo "  ctx_nodes: ${ctx_nodes}"
+echo "  gen_nodes: ${gen_nodes}"
+echo "  ctx_world_size: ${ctx_world_size}"
+echo "  gen_world_size: ${gen_world_size}"
+echo
+echo "Worker Configuration:"
+echo "  num_ctx_servers: ${num_ctx_servers}"
+echo "  ctx_config_path: ${ctx_config_path}"
+echo "  num_gen_servers: ${num_gen_servers}"
+echo "  gen_config_path: ${gen_config_path}"
+echo "  concurrency_list: ${concurrency_list}"
 echo
 echo "Benchmark Configuration:"
 echo "  use_nv_sa_benchmark: ${use_nv_sa_benchmark}"
@@ -73,8 +80,6 @@ echo "  multi_round: ${multi_round}"
 echo "  benchmark_ratio: ${benchmark_ratio}"
 echo "  streaming: ${streaming}"
 echo "  cache_max_tokens: ${cache_max_tokens}"
-echo "  seq_offset: ${seq_offset}"
-echo "  numa_bind: ${numa_bind}"
 echo "  benchmark_mode: ${benchmark_mode}"
 echo
 echo "Environment Configuration:"
@@ -84,21 +89,27 @@ echo "  container_image: ${container_image}"
 echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
 echo "  build_wheel: ${build_wheel}"
+echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
 echo "  work_dir: ${work_dir}"
 echo "  nsys_on: ${nsys_on}"
+echo "  ctx_profile_range: ${ctx_profile_range}"
+echo "  gen_profile_range: ${gen_profile_range}"
+echo
+echo "Accuracy Configuration:"
+echo "  enable_accuracy_test: ${enable_accuracy_test}"
+echo "  accuracy_model: ${accuracy_model}"
+echo "  accuracy_tasks: ${accuracy_tasks}"
+echo "  model_args_extra: ${model_args_extra}"
+echo
+echo "Worker Environment Variables:"
+echo "  worker_env_var: ${worker_env_var}"
+echo
+echo "Server Environment Variables:"
+echo "  server_env_var: ${server_env_var}"
 
 container_name="disaggr-test"
 
-# Setup logging directory
-log_base="${work_dir}/${isl}-${osl}/" # path to the log directory
-full_logdir=${log_base}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
-enable_pdl=false
-if [ "${gen_enable_attention_dp}" = "false" ]; then
-    enable_pdl=true
-    echo "enable_pdl: ${enable_pdl}"
-    full_logdir=${log_base}/ctx${num_ctx_servers}_gen${num_gen_servers}_tep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
-fi
-mkdir -p "${full_logdir}"
+echo "Log directory: ${full_logdir}"
 
 # Function to cleanup on failure
 cleanup_on_failure() {
@@ -106,6 +117,9 @@ cleanup_on_failure() {
     scancel ${SLURM_JOB_ID}
     exit 1
 }
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID}" > ${full_logdir}/job_info.txt
+env > ${full_logdir}/environment.txt
 
 # Start container
 echo "Starting container..."
@@ -117,8 +131,20 @@ if ! srun -l --container-image=${container_image} \
     cleanup_on_failure "Failed to start container. Check ${full_logdir}/container_launch.log"
 fi
 
-# Build TensorRT-LLM if needed
-if [ -d "${trtllm_repo}" ]; then
+# Install TensorRT-LLM
+if [ -n "${trtllm_wheel_path}" ]; then
+    # Install from pre-built wheel if path is provided
+    echo "Installing TensorRT-LLM from wheel: ${trtllm_wheel_path}..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "pip install ${trtllm_wheel_path}" \
+        &> ${full_logdir}/install.log; then
+        cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/install.log for details"
+    fi
+    echo "TensorRT-LLM wheel installation completed successfully"
+elif [ -d "${trtllm_repo}" ]; then
+    # Build and install from repository if no wheel path provided
     echo "Installing TensorRT-LLM from ${trtllm_repo}..."
     TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
@@ -138,7 +164,7 @@ if [ -d "${trtllm_repo}" ]; then
 
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} \
+        --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
         bash -c "cd ${trtllm_repo} && pip install -e ." \
         &> ${full_logdir}/install.log; then
@@ -147,98 +173,75 @@ if [ -d "${trtllm_repo}" ]; then
     echo "TensorRT-LLM installation completed successfully"
 fi
 
-# Generate worker config
-echo "Generating worker config..."
-# Sequence Length Configuration
-ctx_max_seq_len=$((isl + seq_offset))  # Add sequence offset to input sequence length
-gen_max_seq_len=$((isl + osl + seq_offset))  # Add sequence offset to total sequence length
-if ! srun -l -N 1 -n 1 \
-        --container-name=${container_name} \
-        --container-mounts=${container_mount} \
-        --mpi=pmix --overlap \
-        python3 ${work_dir}/gen_worker_config.py \
-                --work_dir ${full_logdir} \
-                --ctx_tp_size ${ctx_tp_size} \
-                --ctx_pp_size ${ctx_pp_size} \
-                --ctx_batch_size ${ctx_batch_size} \
-                --ctx_max_num_tokens ${ctx_max_num_tokens} \
-                --ctx_max_seq_len ${ctx_max_seq_len} \
-                --ctx_free_gpu_memory_fraction ${ctx_gpu_frac} \
-                --gen_tp_size ${gen_tp_size} \
-                --gen_pp_size ${gen_pp_size} \
-                --gen_batch_size ${gen_batch_size} \
-                --gen_max_num_tokens ${gen_max_num_tokens} \
-                --gen_max_seq_len ${gen_max_seq_len} \
-                --gen_gpu_memory_fraction ${gen_gpu_frac} \
-                --eplb_num_slots ${eplb_num_slots} \
-                --mtp_size ${mtp_size} \
-                --cache_transceiver_max_num_tokens ${cache_max_tokens} \
-                $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
-                $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
-                &> ${full_logdir}/gen_worker_config.log; then
-    cleanup_on_failure "Failed to generate worker config. Check ${full_logdir}/gen_worker_config.log for details"
-fi
-echo "Worker config generated successfully"
-
-# Calculate nodes needed
-ctx_nodes_num=$(((ctx_tp_size + gpus_per_node - 1) / gpus_per_node))
-gen_nodes_num=$(((gen_tp_size + gpus_per_node - 1) / gpus_per_node))
-
+# Get node lists
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
 echo "all_nodes: ${all_nodes[@]}, total_nodes_num: ${total_nodes_num}"
 
-# get the node list for the gen workers
-total_gen_nodes_num=$((gen_nodes_num * num_gen_servers))
-gen_nodes=(${all_nodes[@]:0:${total_gen_nodes_num}})
-echo "gen_nodes: ${gen_nodes[@]}, total_gen_nodes_num: ${total_gen_nodes_num}"
+# Split nodes between gen and ctx workers
+gen_node_list=(${all_nodes[@]:0:${gen_nodes}})
+ctx_node_list=(${all_nodes[@]:${gen_nodes}:${total_nodes_num}})
 
-# get the node list for the ctx workers
-total_ctx_nodes_num=$((ctx_nodes_num * num_ctx_servers))
-ctx_nodes=(${all_nodes[@]:${total_gen_nodes_num}:${total_nodes_num}})
-echo "ctx_nodes: ${ctx_nodes[@]}, total_ctx_nodes_num: ${total_ctx_nodes_num}"
+echo "gen_nodes: ${gen_node_list[@]}, num_nodes: ${gen_nodes}"
+echo "ctx_nodes: ${ctx_node_list[@]}, num_nodes: ${ctx_nodes}"
 
 rm -rf ${full_logdir}/hostnames
 rm -rf ${full_logdir}/server_config.yaml
 
+gen_nodes_num_in_single_server=$((${gen_nodes} / ${num_gen_servers}))
+ctx_nodes_num_in_single_server=$((${ctx_nodes} / ${num_ctx_servers}))
+echo "gen_nodes_num_in_single_server: ${gen_nodes_num_in_single_server}"
+echo "ctx_nodes_num_in_single_server: ${ctx_nodes_num_in_single_server}"
+
 # start the gen workers
 echo "Starting gen workers..."
 for i in $(seq 0 $((num_gen_servers - 1))); do
-    srun -l -N ${gen_nodes_num} \
-        --ntasks=${gen_tp_size} \
+    srun -l -N ${gen_nodes_num_in_single_server} \
+        --ntasks=$((gen_world_size)) \
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" \
+        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_profile_range}" "${gen_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
 # start the ctx workers
 echo "Starting ctx workers..."
 for i in $(seq 0 $((num_ctx_servers - 1))); do
-    srun -l -N ${ctx_nodes_num} \
-        --ntasks=${ctx_tp_size} \
+    srun -l -N ${ctx_nodes_num_in_single_server} \
+        --ntasks=$((ctx_world_size)) \
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" \
+        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_profile_range}" "${ctx_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 
-# start the server
+# start the server (in background)
 echo "Starting server..."
 srun -l --container-name=${container_name} \
     --container-image=${container_image} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
-        &> ${full_logdir}/output_server.log &
+    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
+    &> ${full_logdir}/output_server.log &
+
+# Wait for server to be ready (runs synchronously)
+echo "Waiting for server to be ready..."
+if ! srun -l --container-name=${container_name} \
+    --container-mounts=${container_mount} \
+    --mpi=pmix --overlap -N 1 -n 1 \
+    bash ${work_dir}/wait_server.sh ${full_logdir} \
+    &> ${full_logdir}/wait_server.log; then
+    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/wait_server.log for details"
+fi
+echo "Server is ready!"
 
 # Start benchmarking
 echo "Starting benchmark..."
@@ -264,6 +267,23 @@ else
     fi
 fi
 echo "Benchmark completed successfully"
+
+# Run accuracy evaluation if enabled
+if [ "${enable_accuracy_test}" = "true" ]; then
+    echo "Starting accuracy evaluation..."
+    if ! srun -l --container-name=${container_name} \
+        --container-mounts=${container_mount} \
+        --mpi=pmix --overlap -N 1 -n 1 \
+        bash ${work_dir}/accuracy_eval.sh \
+        "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
+        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
+        &> ${full_logdir}/accuracy_eval.log; then
+        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
+    fi
+    echo "Accuracy evaluation completed successfully"
+fi
+
+echo "Total runtime: $SECONDS seconds"
 
 # try to kill the server and workers
 scancel ${SLURM_JOB_ID}

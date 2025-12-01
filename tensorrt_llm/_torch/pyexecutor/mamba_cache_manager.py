@@ -19,9 +19,9 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KvCacheConfigCpp,
-    KVCacheManager, get_pp_layers)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -180,7 +180,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_ssm_cache_dtype: torch.dtype,
 
         # kv cache parameters
-        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
@@ -195,6 +195,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        is_estimating_kv_cache: bool = False,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -231,6 +232,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             dtype=dtype,
             spec_config=spec_config,
             layer_mask=layer_mask,
+            is_estimating_kv_cache=is_estimating_kv_cache,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

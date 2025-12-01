@@ -13,7 +13,7 @@ from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.multimodal import MultimodalParams
 from ....sampling_params import SamplingParams
-from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
+from ...pyexecutor.sampling_utils import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
@@ -234,8 +234,10 @@ class DemoEngine(ADEngine):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_shape = logits.shape
         logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
-        if isinstance(sampling_params.top_k, int):
-            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        if isinstance(sampling_params.top_k, int) and sampling_params.top_k > 1:
+            idx_next, probs = top_k_sampling_batch(
+                logits, top_k=sampling_params.top_k, temperature=1.0
+            )
         else:
             idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])

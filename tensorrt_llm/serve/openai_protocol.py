@@ -68,10 +68,15 @@ class StreamOptions(OpenAIBaseModel):
     continuous_usage_stats: Optional[bool] = True
 
 
+class PromptTokensDetails(OpenAIBaseModel):
+    cached_tokens: int = 0
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
 
 
 class ModelCard(OpenAIBaseModel):
@@ -87,10 +92,10 @@ class ModelList(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be one of "text", "json", "json_object", or "structural_tag"
-    type: Literal["text", "json", "json_object", "regex", "ebnf",
+    type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
     schema: Optional[dict] = None
+    json_schema: Optional[dict] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     format: Optional[xgrammar.structural_tag.Format] = None
@@ -188,6 +193,12 @@ def _response_format_to_guided_decoding_params(
                 "The 'schema' field is required when response_format.type is 'json'."
             )
         return GuidedDecodingParams(json=response_format.schema)
+    elif response_format.type == "json_schema":
+        if response_format.json_schema is None:
+            raise ValueError(
+                "The 'json_schema' field is required when response_format.type is 'json_schema'."
+            )
+        return GuidedDecodingParams(json=response_format.json_schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
@@ -220,10 +231,11 @@ class CompletionRequest(OpenAIBaseModel):
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
+    prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -275,8 +287,10 @@ class CompletionRequest(OpenAIBaseModel):
             presence_penalty=self.presence_penalty,
             seed=self.seed,
             stop=self.stop,
-            temperature=self.temperature,
-            top_p=self.top_p,
+            temperature=(self.temperature
+                         if self.temperature is not None else 1.0),
+            top_p=(self.top_p if self.top_p is not None else 1.0),
+            prompt_ignore_length=self.prompt_ignore_length,
 
             # completion-sampling-params
             use_beam_search=self.use_beam_search,
@@ -388,6 +402,12 @@ ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam,
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
     """Enables custom roles in the Chat Completion API."""
+
+    # This is so custom fields not in any of the `ChatCompletionMessage<XYZ>Param` defined by OpenAI
+    # are still allowed.
+    # Examples include: assistant messages with `reasoning` / `reasoning_content`.
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
     role: Required[str]
     """The role of the message's author."""
 
@@ -510,8 +530,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
@@ -524,6 +544,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "reasoning is shown in the model's response. Options: "
                 "'low', 'medium', 'high'."),
         )
+    prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -614,13 +635,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             presence_penalty=self.presence_penalty,
             seed=self.seed,
             stop=self.stop,
-            temperature=self.temperature,
+            temperature=(self.temperature
+                         if self.temperature is not None else 1.0),
+            prompt_ignore_length=self.prompt_ignore_length,
 
             # chat-completion-sampling-params
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
             top_k=self.top_k,
-            top_p=self.top_p,
+            top_p=(self.top_p if self.top_p is not None else 1.0),
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,

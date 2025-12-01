@@ -45,6 +45,7 @@ from tensorrt_llm.serve.scripts.benchmark_dataset import (
     SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
+from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -79,7 +80,13 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
-    avg_decoded_tokens_per_iter: float
+    # Statistics for avg_decoded_tokens_per_iter across all requests
+    mean_avg_decoded_tokens_per_iter: float
+    min_avg_decoded_tokens_per_iter: float
+    max_avg_decoded_tokens_per_iter: float
+    median_avg_decoded_tokens_per_iter: float
+    std_avg_decoded_tokens_per_iter: float
+    percentiles_avg_decoded_tokens_per_iter: list[tuple[float, float]]
 
 
 async def get_request(
@@ -143,7 +150,7 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
-    latest_avg_decoded_tokens_per_iter: float = 0.0
+    avg_decoded_tokens_per_iter_list: list[float] = []
     error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
         if outputs[i].exception_type:
@@ -176,11 +183,11 @@ def calculate_metrics(
             tput_user.append(output_len / (outputs[i].latency))
             completed += 1
 
-            # Track the latest avg_decoded_tokens_per_iter if available
+            # Collect avg_decoded_tokens_per_iter for all requests
             if hasattr(outputs[i], 'avg_decoded_tokens_per_iter'
                        ) and outputs[i].avg_decoded_tokens_per_iter is not None:
-                latest_avg_decoded_tokens_per_iter = outputs[
-                    i].avg_decoded_tokens_per_iter
+                avg_decoded_tokens_per_iter_list.append(
+                    outputs[i].avg_decoded_tokens_per_iter)
         else:
             actual_output_lens.append(0)
 
@@ -246,7 +253,20 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
-        avg_decoded_tokens_per_iter=latest_avg_decoded_tokens_per_iter,
+        mean_avg_decoded_tokens_per_iter=np.mean(
+            avg_decoded_tokens_per_iter_list or 0),
+        min_avg_decoded_tokens_per_iter=np.min(avg_decoded_tokens_per_iter_list)
+        if avg_decoded_tokens_per_iter_list else 0.0,
+        max_avg_decoded_tokens_per_iter=np.max(avg_decoded_tokens_per_iter_list)
+        if avg_decoded_tokens_per_iter_list else 0.0,
+        median_avg_decoded_tokens_per_iter=np.median(
+            avg_decoded_tokens_per_iter_list or 0),
+        std_avg_decoded_tokens_per_iter=np.std(avg_decoded_tokens_per_iter_list
+                                               or 0),
+        percentiles_avg_decoded_tokens_per_iter=[
+            (p, np.percentile(avg_decoded_tokens_per_iter_list or 0, p))
+            for p in selected_percentiles
+        ],
     )
     return metrics, actual_output_lens
 
@@ -465,10 +485,6 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
 
-    # Print last avg_decoded_tokens_per_iter value if available
-    if metrics.avg_decoded_tokens_per_iter > 0.0:
-        print("{:<40} {:<10.2f}".format("Avg Decoded Tokens per Iter:",
-                                        metrics.avg_decoded_tokens_per_iter))
     if len(outputs) - metrics.completed > 0:
         print(
             f"=======================!FAILED REQUESTS!=======================")
@@ -487,7 +503,17 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
-        "avg_decoded_tokens_per_iter": metrics.avg_decoded_tokens_per_iter,
+        "avg_decoded_tokens_per_iter": {
+            "mean": metrics.mean_avg_decoded_tokens_per_iter,
+            "min": metrics.min_avg_decoded_tokens_per_iter,
+            "max": metrics.max_avg_decoded_tokens_per_iter,
+            "median": metrics.median_avg_decoded_tokens_per_iter,
+            "std": metrics.std_avg_decoded_tokens_per_iter,
+            "percentiles": {
+                f"p{p}": v
+                for p, v in metrics.percentiles_avg_decoded_tokens_per_iter
+            }
+        },
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -503,30 +529,64 @@ async def benchmark(
         metric_name: str,
         # E.g., "Time to First Token"
         metric_header: str,
+        # E.g., "ms" or "" for no unit
+        unit_suffix: str = "ms",
     ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
+        # This function prints and adds statistics of the specified metric.
+        # Skip if not in selected metrics (except avg_decoded_tokens_per_iter which has its own condition)
+        if (metric_attribute_name not in selected_percentile_metrics
+                and metric_attribute_name != "avg_decoded_tokens_per_iter"):
             return
+
+        # Build attribute suffix (e.g., "_ms" or "")
+        attr_suffix = f"_{unit_suffix}" if unit_suffix else ""
+        # Build display unit (e.g., " (ms)" or "")
+        display_unit = f" ({unit_suffix})" if unit_suffix else ""
+
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
         print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
+            f"Mean {metric_name}{display_unit}:",
+            getattr(metrics, f"mean_{metric_attribute_name}{attr_suffix}")))
         print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
+            f"Median {metric_name}{display_unit}:",
+            getattr(metrics, f"median_{metric_attribute_name}{attr_suffix}")))
+        if hasattr(metrics, f"std_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Std Dev {metric_name}{display_unit}:",
+                getattr(metrics, f"std_{metric_attribute_name}{attr_suffix}")))
+            result[f"std_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"std_{metric_attribute_name}{attr_suffix}")
+        if hasattr(metrics, f"min_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Min {metric_name}{display_unit}:",
+                getattr(metrics, f"min_{metric_attribute_name}{attr_suffix}")))
+            result[f"min_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"min_{metric_attribute_name}{attr_suffix}")
+        if hasattr(metrics, f"max_{metric_attribute_name}{attr_suffix}"):
+            print("{:<40} {:<10.2f}".format(
+                f"Max {metric_name}{display_unit}:",
+                getattr(metrics, f"max_{metric_attribute_name}{attr_suffix}")))
+            result[f"max_{metric_attribute_name}{attr_suffix}"] = getattr(
+                metrics, f"max_{metric_attribute_name}{attr_suffix}")
+
+        result[f"mean_{metric_attribute_name}{attr_suffix}"] = getattr(
+            metrics, f"mean_{metric_attribute_name}{attr_suffix}")
+        result[f"median_{metric_attribute_name}{attr_suffix}"] = getattr(
+            metrics, f"median_{metric_attribute_name}{attr_suffix}")
+
+        for p, value in getattr(
+                metrics, f"percentiles_{metric_attribute_name}{attr_suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+            print("{:<40} {:<10.2f}".format(
+                f"P{p_word} {metric_name}{display_unit}:", value))
+            result[f"p{p_word}_{metric_attribute_name}{attr_suffix}"] = value
+
+    # Print avg_decoded_tokens_per_iter statistics if available
+    if metrics.mean_avg_decoded_tokens_per_iter > 0.0:
+        process_one_metric("avg_decoded_tokens_per_iter",
+                           "Avg Decoded Tokens per Iter",
+                           "Avg Decoded Tokens per Iter",
+                           unit_suffix="")
 
     process_one_metric("ttft", "TTFT", "Time to First Token")
     process_one_metric("tpot", "TPOT",
@@ -596,6 +656,34 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         # Don't use json suffix here as we don't want CI to pick it up
         pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
         write_to_json(pt_file, pt_records)
+
+
+async def fetch_perf_metrics(base_url: str) -> dict:
+    """
+    Fetch performance metrics from the /perf_metrics endpoint.
+
+    Args:
+        base_url: The base URL of the server
+
+    Returns:
+        Dictionary containing the performance metrics
+    """
+    perf_url = f"{base_url}/perf_metrics"
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(perf_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    print(
+                        f"Failed to fetch performance metrics. Status: {response.status}"
+                    )
+                    return {}
+        except Exception as e:
+            print(f"Error fetching performance metrics: {e}")
+            return {}
 
 
 def main(args: argparse.Namespace):
@@ -876,6 +964,55 @@ def main(args: argparse.Namespace):
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
+
+    # Save per-request breakdown if requested
+    if args.save_request_time_breakdown:
+        print("Fetching request performance metrics...")
+        perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
+
+        if perf_metrics:
+            # Generate filename for perf metrics
+            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+            base_model_id = model_id.split("/")[-1]
+            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                                   if args.max_concurrency is not None else "")
+            perf_filename = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}-perf_metrics.json"
+
+            if args.result_dir:
+                perf_filename = os.path.join(args.result_dir, perf_filename)
+
+            # Save perf metrics to JSON file
+            with open(perf_filename, "w", encoding='utf-8') as outfile:
+                try:
+                    json.dump(perf_metrics, outfile, indent=2)
+                except Exception as e:
+                    print(f"Failed to save perf metrics: {e}")
+
+            print(f"Request performance metrics saved to: {perf_filename}")
+
+            # Create timing diagram from the saved JSON file
+            try:
+                analyzer = RequestTimeBreakdown()
+
+                print("Creating time diagram from request time breakdown...")
+                timing_data = analyzer.parse_json_file(perf_filename)
+
+                if timing_data:
+                    # Generate HTML filename for the timing diagram
+                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
+                    analyzer.create_timing_diagram(timing_data,
+                                                   diagram_filename)
+
+                    print(f"Time diagram saved to: {diagram_filename}")
+                else:
+                    print(
+                        "No time data found in request time breakdown - skipping diagram creation."
+                    )
+            except Exception as e:
+                print(f"Failed to create time diagram: {e}")
+                print("Performance metrics were still saved successfully.")
+        else:
+            print("Failed to fetch per-request performance metrics.")
 
 
 if __name__ == "__main__":
@@ -1258,6 +1395,13 @@ if __name__ == "__main__":
         "--no-test-input",
         action="store_true",
         help="Skip initial test run with a single prompt.",
+    )
+
+    parser.add_argument(
+        "--save-request-time-breakdown",
+        action="store_true",
+        help=
+        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
     )
 
     args = parser.parse_args()

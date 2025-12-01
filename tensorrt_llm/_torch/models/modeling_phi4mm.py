@@ -32,8 +32,9 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -88,10 +89,10 @@ def _load_phi4mm_classes(local_path):
     # Add parent folder to sys.path to enable relative import.
     original_sys_path = sys.path.copy()
     package_folder = Path(local_path)
+    package_name = package_folder.name
     parent_folder = str(package_folder.parent)
     if parent_folder not in sys.path:
         sys.path.insert(0, parent_folder)
-
     try:
         # Import Phi4MMConfig from configuration_phi4mm.py.
         config_path = os.path.join(local_path, 'configuration_phi4mm.py')
@@ -111,8 +112,7 @@ def _load_phi4mm_classes(local_path):
         # `Phi-4-multimodal-instruct` as the package name to avoid relative import errors.
         # `hf_modeling_phi4mm` as the module name to avoid name conflicts.
         spec = importlib.util.spec_from_file_location(
-            "Phi-4-multimodal-instruct.hf_modeling_phi4mm",
-            modeling_phi4mm_path)
+            f"{package_name}.hf_modeling_phi4mm", modeling_phi4mm_path)
         hf_modeling_phi4mm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hf_modeling_phi4mm)
         Phi4MMAudioEmbedding = hf_modeling_phi4mm.Phi4MMAudioEmbedding
@@ -756,31 +756,34 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
         return self._encoding_batch_request(multimodal_params, mm_token_ids)
 
 
-class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: transformers.PretrainedConfig,
+                 config: transformers.PretrainedConfig,
                  tokenizer: transformers.AutoTokenizer,
-                 trust_remote_code: bool = True):
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         if not trust_remote_code:
             raise ValueError("trust_remote_code must be True for Phi4MM")
 
-        self.model_config = model_config
-        self.device = 'cpu'
-
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast)
-
-        self.processor = transformers.AutoProcessor.from_pretrained(
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else transformers.AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
+        self._processor = transformers.AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.torch_dtype
         # Bind the optimized methods to the image processor instance
         self.processor.image_processor.dynamic_preprocess = MethodType(
             dynamic_preprocess,
@@ -790,8 +793,27 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             image_preprocess,
             self.processor.image_processor,
         )
+        self.device = 'cpu'
 
-        self.dtype = model_config.torch_dtype
+    @property
+    def config(self) -> transformers.PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> transformers.AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> transformers.AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
         return torch.tensor([_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
@@ -989,12 +1011,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = {k: v for k, v in weights.items() if '.lora_' not in k}
         # Rename base layer weights.
         updated_weights = {}
+        base_layer_weight_names = [
+            'weight', 'input_scale', 'weight_scale', 'weight_scale_2'
+        ]
         for k in weights.keys():
-            if 'base_layer.weight' in k:
-                new_k = k.replace('base_layer.weight', 'weight')
-                updated_weights[new_k] = weights[k]
-            else:
-                updated_weights[k] = weights[k]
+            new_k = k
+            for weight_name in base_layer_weight_names:
+                if f'base_layer.{weight_name}' in k:
+                    new_k = k.replace(f'base_layer.{weight_name}', weight_name)
+                    break
+            updated_weights[new_k] = weights[k]
         weights = updated_weights
         self.llm.load_weights(weights)
 

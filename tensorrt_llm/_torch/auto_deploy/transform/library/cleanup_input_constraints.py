@@ -29,7 +29,7 @@ class CleanupInputConstraints(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
-        input_node = graph.find_nodes(op="placeholder")[0]
+        input_node = graph.find_nodes(op="placeholder")[1]
         sym_shape: torch.Size = input_node.meta["val"].shape
 
         # get expressions in the symbolic shape
@@ -52,6 +52,11 @@ class CleanupInputConstraints(BaseTransform):
             object.__setattr__(vr, "upper", max_total)
 
         # store info object about the transform
-        info = TransformInfo(skipped=False, num_matches=len(vrs))
+        info = TransformInfo(
+            skipped=False,
+            num_matches=len(vrs),
+            is_clean=len(vrs) == 0,
+            has_valid_shapes=len(vrs) == 0,
+        )
 
         return gm, info

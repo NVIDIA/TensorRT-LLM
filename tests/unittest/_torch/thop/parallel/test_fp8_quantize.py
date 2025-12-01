@@ -20,6 +20,9 @@ from parameterized import parameterized
 from utils.util import (getSMVersion, skip_pre_blackwell_unittest,
                         unittest_name_func)
 
+from tensorrt_llm.quantization.utils.fp8_utils import \
+    per_token_quant_and_transform
+
 
 def _dequant_fp8(input, scale, transpose_scale, block_m, block_n):
     input = input.to(torch.float)
@@ -196,3 +199,77 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
 
     mxfp8_quantize_check_accuracy(a_pt[:, :k].cpu().to(torch.float32),
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 103 and getSMVersion() != 90,
+    reason="Only test on Blackwell and Hopper",
+)
+@pytest.mark.parametrize("k", [128, 256, 512])
+@pytest.mark.parametrize("m", [4, 16, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
+    """Test fp8_quantize_1x128 with use_ue8m0=True against Triton reference."""
+    torch.random.manual_seed(42)
+
+    # Ensure alignment requirements
+    assert m % 4 == 0, "m must be divisible by 4"
+    assert k % 128 == 0, "k must be divisible by 128"
+
+    # Create input tensor
+    input_tensor = torch.randn((m, k), device='cuda', dtype=dtype)
+
+    # CUDA version with UE8M0
+    from tensorrt_llm.quantization.utils import fp8_utils
+    cuda_fp8, cuda_scale_float = fp8_utils.fp8_quantize_1x128_sf_transpose(
+        input_tensor, use_ue8m0=True)
+
+    # Triton reference with UE8M0
+    triton_fp8, triton_scale_int32 = per_token_quant_and_transform(
+        input_tensor.clone(), quant_group_size=128, scale_ue8m0=True)
+
+    # Convert CUDA float32 scale to int32 packed format for comparison
+    cuda_scale_int32 = fp8_utils.transform_sf_into_required_layout(
+        sf=cuda_scale_float,
+        mn=m,
+        k=k,
+        recipe=(1, 1, 128),
+        num_groups=None,
+        is_sfa=False)
+
+    # Compare quantized FP8 values (should match within FP8 precision)
+    torch.testing.assert_close(
+        cuda_fp8.to(torch.float32),
+        triton_fp8.to(torch.float32),
+        atol=1.0,
+        rtol=0.01,
+        msg=f"FP8 quantized values mismatch for shape ({m}, {k})")
+
+    # Compare packed int32 scales by decoding to float
+    def decode_ue8m0_int32_to_float(int32_tensor):
+        """Decode int32 packed UE8M0 scales to float32. Formula: value = 2^(exponent - 127)
+        """
+        # Extract 4 bytes from each int32
+        b0 = (int32_tensor >> 0) & 0xFF
+        b1 = (int32_tensor >> 8) & 0xFF
+        b2 = (int32_tensor >> 16) & 0xFF
+        b3 = (int32_tensor >> 24) & 0xFF
+
+        # Decode: value = 2^(exponent - 127)
+        s0 = torch.pow(2.0, b0.float() - 127.0)
+        s1 = torch.pow(2.0, b1.float() - 127.0)
+        s2 = torch.pow(2.0, b2.float() - 127.0)
+        s3 = torch.pow(2.0, b3.float() - 127.0)
+
+        return torch.stack([s0, s1, s2, s3], dim=-1)
+
+    cuda_scales_decoded = decode_ue8m0_int32_to_float(cuda_scale_int32)
+    triton_scales_decoded = decode_ue8m0_int32_to_float(triton_scale_int32)
+
+    # Compare: values should match, or both be tiny (< 1e-10 means zero-block)
+    torch.testing.assert_close(
+        cuda_scales_decoded,
+        triton_scales_decoded,
+        atol=1e-10,
+        rtol=0.01,
+        msg=f"UE8M0 decoded scales mismatch for shape ({m}, {k})")

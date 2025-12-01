@@ -186,7 +186,8 @@ class AccuracyTask:
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False):
+                 streaming: bool = False,
+                 is_integration_test: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -199,7 +200,8 @@ class AccuracyTask:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
             )
-        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+        is_integration_test = is_integration_test or os.getenv(
+            'INTEGRATION_TEST', '0') == '1'
 
         if is_integration_test:
             logger.info(
@@ -429,6 +431,29 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_BATCH_SIZE = 1
     MAX_INPUT_LEN = 128 * 1024
     MAX_OUTPUT_LEN = 50
+
+
+class LongBenchV2(AccuracyTask):
+    DATASET = "longbench_v2"
+    DATASET_DIR = f"{llm_models_root()}/zai-org/LongBench-v2"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 215
+
+    MAX_BATCH_SIZE = 32
+    MAX_INPUT_LEN = 1280000
+    MAX_OUTPUT_LEN = 32000
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.LongBenchV2
+    EVALUATOR_KWARGS = dict(
+        dataset_path=DATASET_DIR,
+        length="medium",
+        max_len=120000,
+        apply_chat_template=True,
+        random_seed=0,
+    )
 
 
 class CliFlowAccuracyTestHarness:
@@ -669,7 +694,8 @@ class CliFlowAccuracyTestHarness:
                 f"--max_tokens_in_paged_kv_cache={max_tokens_in_paged_kv_cache}"
             ])
 
-        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.max_num_tokens:
+        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.model_fields[
+                "max_num_tokens"].default:
             summarize_cmd.append("--enable_chunked_context")
 
         if self.extra_summarize_args:

@@ -871,7 +871,7 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
         }
     }
 
-    mMultiThreadWorker.reset(new MultiThreadWorker(numCopyThreads));
+    mMultiThreadWorker.reset(new MultiThreadWorker(numCopyThreads, mCudaDeviceId));
 }
 
 MoeLoadBalancer::~MoeLoadBalancer()
@@ -1064,8 +1064,9 @@ void MoeLoadBalancer::waitCopyTaskDone(int64_t taskId)
     }
 }
 
-MultiThreadWorker::MultiThreadWorker(int numThreads)
+MultiThreadWorker::MultiThreadWorker(int numThreads, int cudaDeviceId)
     : mNumThreads(numThreads)
+    , mCudaDeviceId(cudaDeviceId)
     , mRunning(false)
     , mNextTaskId(0)
 {
@@ -1139,6 +1140,7 @@ void MultiThreadWorker::stop()
 
 void MultiThreadWorker::workerLoop(int rank)
 {
+    TLLM_CUDA_CHECK(cudaSetDevice(mCudaDeviceId));
     auto& topologyDetector = TopologyDetector::getInstance();
     topologyDetector.bindThreadByCurrentGpu(); // use relaxed mode
     while (true)

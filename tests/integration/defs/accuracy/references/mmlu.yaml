@@ -192,6 +192,17 @@ deepseek-ai/DeepSeek-R1:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 87.573
+deepseek-ai/DeepSeek-V3.2-Exp:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 88.2
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 88.2
+  - quant_algo: NVFP4
+    accuracy: 87.2
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 87.2
 Qwen3/Qwen3-8B:
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 72.70
@@ -199,7 +210,7 @@ Qwen3/Qwen3-8B:
     accuracy: 72.70
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 76.12
-  - accuracy: 76.12
+  - accuracy: 76.0   # WAR for https://nvbugs/5575902
   - spec_dec_algo: Eagle
     accuracy: 76.12
 Qwen3/Qwen3-30B-A3B:
@@ -229,6 +240,13 @@ Qwen3/Qwen3-235B-A22B:
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 86
+Qwen3/Qwen3-Next-80B-A3B-Thinking:
+  - accuracy: 86
+Qwen3/Qwen3-Next-80B-A3B-Instruct:
+  - accuracy: 86.03
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.08
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 87.65
@@ -257,6 +275,11 @@ nvidia/Nemotron-H-56B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 83.82
+nvidia/Nemotron-MOE:
+  - accuracy: 77.802
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 73.879
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
   - quant_algo: FP8
@@ -292,6 +315,10 @@ mistralai/Ministral-8B-Instruct-2410:
     accuracy: 65.96
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
+  - quant_algo: FP8
+    accuracy: 68.86
+  - quant_algo: NVFP4
+    accuracy: 64.04
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
 microsoft/phi-4:

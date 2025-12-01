@@ -23,7 +23,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor
+from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
 
 # Perf heuristics thresholds.
@@ -384,6 +384,11 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 and self.floor_scale == 8192.0 \
                 and self.attn_scale == 0.1
 
+            qkv_shard_indices_mapping = {
+                "q": (0, self.q_size),
+                "k": (self.q_size, self.kv_size),
+                "v": (self.q_size + self.kv_size, self.kv_size),
+            }
             # When min-latency QKV gemm is enabled, override qkv_proj.
             self.qkv_proj = Llama4MinLatencyLinear(
                 self.hidden_size,
@@ -400,6 +405,7 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 enable_fused_gemm_attn_scaling=self.
                 enable_fused_gemm_attn_scaling,
                 enable_trtllm_gen=True,
+                fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             )
 
     def _forward_nope(
@@ -438,7 +444,8 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
@@ -452,7 +459,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
@@ -554,6 +561,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
         )
 
         self.router = Llama4MinLatencyLinear(
@@ -800,18 +808,19 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
         needs_post_allreduce = self.fusion_config.POST_MOE_FUSION \
             or self.fusion_config.POST_MLP_FUSION
         if needs_post_allreduce and self.next_layer_layernorm is not None:
-            if use_fp8_allreduce and self.next_attn is not None:
+            if use_fp8_allreduce and self.next_attn is not None \
+                and hasattr(self.next_attn.qkv_proj, 'input_scale'):
                 hidden_states, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
-                            self.next_attn.qkv_proj, 'input_scale') else None,
+                        scale=self.next_attn.qkv_proj.input_scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-            elif use_fp4_allreduce and self.next_attn is not None:
+            elif use_fp4_allreduce and self.next_attn is not None \
+                and hasattr(self.next_attn.qkv_proj, 'input_scale'):
                 act_fp4, act_sf, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -819,8 +828,7 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
-                            self.next_attn.qkv_proj, 'input_scale') else None,
+                        scale=self.next_attn.qkv_proj.input_scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:

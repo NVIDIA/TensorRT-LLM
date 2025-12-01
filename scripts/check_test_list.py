@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 This script is used to verify test lists for L0, QA, and waives file.
 
@@ -16,6 +17,9 @@ All the perf tests will be excluded since they are generated dynamically.
 import argparse
 import os
 import subprocess
+
+# The markers in our test lists, need to be preprocess before checking
+MARKER_LIST_IN_TEST = [" TIMEOUT"]
 
 
 def install_python_dependencies(llm_src):
@@ -51,16 +55,35 @@ def verify_l0_test_lists(llm_src):
         lines = f.readlines()
 
     for line in lines:
-        # Remove 'TIMEOUT (number)' and strip spaces
-        cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
-        cleaned_lines.add(cleaned_line)
+        # Remove markers and rest of the line if present
+        cleaned_line = line.strip()
+
+        # Handle ISOLATION marker removal (including comma patterns)
+        if 'ISOLATION,' in cleaned_line:
+            # Case: "ISOLATION,OTHER_MARKER" -> remove "ISOLATION,"
+            cleaned_line = cleaned_line.replace('ISOLATION,', '').strip()
+        elif ',ISOLATION' in cleaned_line:
+            # Case: "OTHER_MARKER,ISOLATION" -> remove ",ISOLATION"
+            cleaned_line = cleaned_line.replace(',ISOLATION', '').strip()
+        elif ' ISOLATION' in cleaned_line:
+            # Case: standalone "ISOLATION" -> remove " ISOLATION"
+            cleaned_line = cleaned_line.replace(' ISOLATION', '').strip()
+
+        # Handle other markers (like TIMEOUT) - remove marker and everything after it
+        for marker in MARKER_LIST_IN_TEST:
+            if marker in cleaned_line and marker != " ISOLATION":
+                cleaned_line = cleaned_line.split(marker, 1)[0].strip()
+                break
+
+        if cleaned_line:
+            cleaned_lines.add(cleaned_line)
 
     with open(test_list, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(cleaned_lines))
 
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --apply-test-list-correction --test-list={test_list} --co -q",
+        f"pytest --test-list={test_list} --output-dir={llm_src} -s --co -q",
         shell=True,
         check=True)
 
@@ -74,14 +97,65 @@ def verify_qa_test_lists(llm_src):
     for test_def_file in test_def_files:
         subprocess.run(
             f"cd {llm_src}/tests/integration/defs && "
-            f"pytest --apply-test-list-correction --test-list={test_def_file} --co -q",
+            f"pytest --test-list={test_def_file} --output-dir={llm_src} -s --co -q",
             shell=True,
             check=True)
+        # append all the test_def_file to qa_test.txt
+        with open(f"{llm_src}/qa_test.txt", "a") as f:
+            with open(test_def_file, "r") as test_file:
+                lines = test_file.readlines()
+                for line in lines:
+                    # Remove 'TIMEOUT' marker and strip spaces
+                    cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
+                    if cleaned_line:
+                        f.write(f"{cleaned_line}\n")
 
 
-def verify_waive_list(llm_src):
+def check_waive_duplicates(llm_src):
+    """Check for duplicate entries in waives.txt and write report."""
     waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
-    # Remove prefix and markers in wavies.txt
+    dup_cases_record = f"{llm_src}/dup_cases.txt"
+
+    # Track all occurrences: processed_line -> [(line_no, original_line), ...]
+    dedup_lines = {}
+
+    with open(waives_list_path, "r") as f:
+        lines = f.readlines()
+
+    for line_no, line in enumerate(lines, 1):
+        original_line = line.strip()
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Check for SKIP marker in waives.txt and split by the first occurrence
+        line = line.split(" SKIP", 1)[0].strip()
+
+        # Track all occurrences of each processed line
+        if line in dedup_lines:
+            dedup_lines[line].append((line_no, original_line))
+        else:
+            dedup_lines[line] = [(line_no, original_line)]
+
+    # Write duplicate report after processing all lines
+    for processed_line, occurrences in dedup_lines.items():
+        if len(occurrences) > 1:
+            with open(dup_cases_record, "a") as f:
+                f.write(
+                    f"Duplicate waive records found for '{processed_line}' ({len(occurrences)} occurrences):\n"
+                )
+                for i, (line_no, original_line) in enumerate(occurrences, 1):
+                    f.write(
+                        f"  Occurrence {i} at line {line_no}: '{original_line}'\n"
+                    )
+                f.write(f"\n")
+
+
+def verify_waive_list(llm_src, args):
+    waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
+    non_existent_cases_record = f"{llm_src}/nonexits_cases.json"
+
     processed_lines = set()
     with open(waives_list_path, "r") as f:
         lines = f.readlines()
@@ -97,11 +171,37 @@ def verify_waive_list(llm_src):
             continue
 
         # Check for SKIP marker in waives.txt and split by the first occurrence
-        line = line.split(" SKIP ", 1)[0].strip()
+        line = line.split(" SKIP", 1)[0].strip()
 
         # If the line starts with 'full:', process it
         if line.startswith("full:"):
             line = line.split("/", 1)[1].lstrip("/")
+
+        # Skip unittests due to we don't need to have an entry in test-db yml
+        if line.startswith("unittest/"):
+            continue
+
+        # Check waived cases also in l0_text.txt and qa_text.txt
+        found_in_l0_qa = False
+        if args.l0:
+            with open(f"{llm_src}/l0_test.txt", "r") as f:
+                l0_lines = f.readlines()
+                for l0_line in l0_lines:
+                    if line == l0_line.strip():
+                        found_in_l0_qa = True
+                        break
+        if args.qa:
+            with open(f"{llm_src}/qa_test.txt", "r") as f:
+                qa_lines = f.readlines()
+                for qa_line in qa_lines:
+                    if line == qa_line.strip():
+                        found_in_l0_qa = True
+                        break
+        if not found_in_l0_qa:
+            with open(non_existent_cases_record, "a") as f:
+                f.write(
+                    f"Non-existent test name in l0 or qa list found in waives.txt: {line}\n"
+                )
 
         processed_lines.add(line)
 
@@ -112,7 +212,7 @@ def verify_waive_list(llm_src):
 
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --apply-test-list-correction --test-list={tmp_waives_file} --co -q",
+        f"pytest --test-list={tmp_waives_file} --output-dir={llm_src} -s --co -q",
         shell=True,
         check=True)
 
@@ -129,31 +229,87 @@ def main():
     parser.add_argument("--waive",
                         action="store_true",
                         help="Enable test list verification for waive file.")
+    parser.add_argument(
+        "--check-duplicate-waives",
+        action="store_true",
+        help="Enable duplicate check in waives.txt (fails if duplicates found)."
+    )
     args = parser.parse_args()
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
-    install_python_dependencies(llm_src)
+    # Only skip installing dependencies if ONLY --check-duplicates is used
+    if args.l0 or args.qa or args.waive:
+        install_python_dependencies(llm_src)
+
+    pass_flag = True
     # Verify L0 test lists
     if args.l0:
-        print("Starting L0 test list verification...")
+        print("-----------Starting L0 test list verification...-----------",
+              flush=True)
         verify_l0_test_lists(llm_src)
     else:
-        print("Skipping L0 test list verification.")
+        print("-----------Skipping L0 test list verification.-----------",
+              flush=True)
 
     # Verify QA test lists
     if args.qa:
-        print("Starting QA test list verification...")
+        print("-----------Starting QA test list verification...-----------",
+              flush=True)
         verify_qa_test_lists(llm_src)
     else:
-        print("Skipping QA test list verification.")
+        print("-----------Skipping QA test list verification.-----------",
+              flush=True)
 
     # Verify waive test lists
     if args.waive:
-        print("Starting waive list verification...")
-        verify_waive_list(llm_src)
+        print("-----------Starting waive list verification...-----------",
+              flush=True)
+        verify_waive_list(llm_src, args)
     else:
-        print("Skipping waive list verification.")
+        print("-----------Skipping waive list verification.-----------",
+              flush=True)
+
+    # Check for duplicates in waives.txt if requested
+    if args.check_duplicate_waives:
+        print("-----------Checking for duplicates in waives.txt...-----------",
+              flush=True)
+        check_waive_duplicates(llm_src)
+
+    invalid_json_file = os.path.join(llm_src, "invalid_tests.json")
+    if os.path.isfile(invalid_json_file) and os.path.getsize(
+            invalid_json_file) > 0:
+        print("Invalid cases:")
+        with open(invalid_json_file, "r") as f:
+            print(f.read())
+        print("Invalid test names found, please correct them first!!!\n")
+        pass_flag = False
+
+    duplicate_cases_file = os.path.join(llm_src, "dup_cases.txt")
+    if os.path.isfile(duplicate_cases_file) and os.path.getsize(
+            duplicate_cases_file) > 0:
+        print("Duplicate cases found:")
+        with open(duplicate_cases_file, "r") as f:
+            print(f.read())
+        print(
+            "Duplicate test names found in waives.txt, please delete one or combine them first!!!\n"
+        )
+        if args.check_duplicate_waives:
+            pass_flag = False
+
+    non_existent_cases_file = os.path.join(llm_src, "nonexits_cases.json")
+    if os.path.isfile(non_existent_cases_file) and os.path.getsize(
+            non_existent_cases_file) > 0:
+        print("Non-existent cases found in waives.txt:")
+        with open(non_existent_cases_file, "r") as f:
+            print(f.read())
+        print(
+            "Non-unit test test name in waives.txt but not in l0 test list or qa list, please delete them first!!!\n"
+        )
+        pass_flag = False
+
+    if not pass_flag:
+        exit(1)
 
 
 if __name__ == "__main__":

@@ -42,17 +42,17 @@ meta-llama/Llama-4-Scout-17B-16E-Instruct:
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 64.74
   - quant_algo: NVFP4
-    accuracy: 63.71
+    accuracy: 62.14 # WAR: nvbugs/5503479
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 63.71
+    accuracy: 62.14 # WAR: nvbugs/5503479
   - quant_algo: NVFP4
     spec_dec_algo: MTP
-    accuracy: 63.71
+    accuracy: 62.14 # WAR: nvbugs/5503479
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
-    accuracy: 63.71
+    accuracy: 62.14 # WAR: nvbugs/5503479
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 64.74
   - quant_algo: FP8_BLOCK_SCALES
@@ -95,8 +95,21 @@ deepseek-ai/DeepSeek-R1:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.413
+deepseek-ai/DeepSeek-V3.2-Exp:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 95.6
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 95.6
+  - quant_algo: NVFP4
+    accuracy: 95.6
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 95.6
 Qwen3/Qwen3-8B:
   - accuracy: 87.1114
+  - spec_dec_algo: Eagle
+    accuracy: 87.1114
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 87.1114
@@ -123,6 +136,13 @@ Qwen3/Qwen3-235B-A22B:
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.78
+Qwen3/Qwen3-Next-80B-A3B-Thinking:
+  - accuracy: 81.577
+Qwen3/Qwen3-Next-80B-A3B-Instruct:
+  - accuracy: 92.72
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 90.86
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 94.84
@@ -146,6 +166,11 @@ nvidia/Nemotron-H-56B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 89.27
+nvidia/Nemotron-MOE:
+  - accuracy: 88.249
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 86.884
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 37.15
   - quant_algo: FP8
@@ -185,6 +210,10 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
     accuracy: 89.23
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 81.19
+  - quant_algo: FP8
+    accuracy: 80.82
+  - quant_algo: NVFP4
+    accuracy: 69.33
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
@@ -200,9 +229,14 @@ GPT-OSS/BF16:
   - accuracy: 90.3
   - kv_cache_quant_algo: FP8
     accuracy: 90.3
-GPT-OSS/MXFP4:
+GPT-OSS/120B-MXFP4:
   - accuracy: 90.3
+  - spec_dec_algo: Eagle
+    accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 90.3
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle
     accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
     kv_cache_quant_algo: FP8
@@ -215,7 +249,35 @@ GPT-OSS/MXFP4:
   - quant_algo: W4A16_MXFP4
     accuracy: 90.3
   - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
+    accuracy: 90.3
+  - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
     accuracy: 90.3
+GPT-OSS/20B-MXFP4:
+  - accuracy: 85.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 85.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    kv_cache_quant_algo: FP8
+    accuracy: 85.0
+  - quant_algo: W4A16_MXFP4
+    accuracy: 85.0
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.0
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36
+ByteDance-Seed/Seed-OSS-36B-Instruct:
+  - accuracy: 90.8
+zai-org/GLM-4.6:
+  - accuracy: 81.3
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 88.0
+bigcode/starcoder2-3b:
+  - accuracy: 20.2
+bigcode/starcoder2-7b:
+  - accuracy: 26.5
+bigcode/starcoder2-15b:
+  - accuracy: 54.5

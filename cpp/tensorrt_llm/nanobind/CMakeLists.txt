@@ -6,6 +6,7 @@ set(TRTLLM_NB_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
+    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
@@ -15,6 +16,7 @@ set(SRCS
     executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
@@ -46,7 +48,8 @@ target_link_libraries(
          torch_python
          ${CUDA_DRV_LIB}
          ${CUDA_NVML_LIB}
-         th_common)
+         th_common
+         pg_utils)
 target_compile_definitions(
   ${TRTLLM_NB_MODULE} PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
                              PYBIND11_DETAILED_ERROR_MESSAGES=1)

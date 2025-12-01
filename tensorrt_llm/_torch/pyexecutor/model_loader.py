@@ -6,20 +6,24 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
+from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import MetaInitMode, timing
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+                                     timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
-from .config import LoadFormat, PyTorchConfig
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -62,7 +66,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if not valid_pyt_quant:
         raise ValueError(
             "Overriding KV cache quantization with an invalid type "
-            f'"PyTorchConfig.kv_cache_dtype="{pyt_kv_cache_dtype}" '
+            f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
     # If we get to this point we have a valid quantization setting, but if
@@ -70,7 +74,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
         raise RuntimeError(
             "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with PyTorchConfig.kv_cache_dtype='
+            f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
             f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
             "pre-quantized KV cache that doesn't match.")
 
@@ -150,6 +154,31 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -157,9 +186,10 @@ class ModelLoader:
     """
 
     def __init__(self,
-                 pytorch_backend_config: PyTorchConfig,
+                 llm_args: TorchLlmArgs,
                  mapping: Mapping,
                  spec_config: Optional["DecodingBaseConfig"],
+                 sparse_attention_config: Optional["SparseAttentionConfig"],
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
                  lora_config: Optional[LoraConfig] = None):
@@ -167,16 +197,17 @@ class ModelLoader:
         Initializes the ModelLoader.
 
         Args:
-            pytorch_backend_config: Configuration for the PyTorch backend.
+            llm_args: Configuration for the PyTorch backend.
             mapping: The distributed mapping configuration.
             spec_config: Configuration for speculative decoding.
             max_num_tokens: The maximum number of tokens the engine will handle.
             max_seq_len: The maximum sequence length.
             lora_config: Configuration for LoRA.
         """
-        self.pytorch_backend_config = pytorch_backend_config
+        self.llm_args = llm_args
         self.mapping = mapping
         self.spec_config = spec_config
+        self.sparse_attention_config = sparse_attention_config
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
@@ -198,7 +229,7 @@ class ModelLoader:
         """
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
-        load_format = self.pytorch_backend_config.load_format
+        load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
@@ -238,19 +269,21 @@ class ModelLoader:
                 else:
                     weights = checkpoint_loader.load_weights(checkpoint_dir)
 
-                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 self._call_load_weights(model.load_weights, weights,
-                                        weight_mapper)
+                                        self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model_dir)
                     self._call_load_weights(model.load_draft_weights, weights,
-                                            weight_mapper)
+                                            self.weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
                 initialize_dummy_weights(model)
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -267,7 +300,8 @@ class ModelLoader:
                     f"No load support for load format: {load_format}")
 
             for module in model.modules():
-                if hasattr(module, 'post_load_weights'):
+                if hasattr(module, 'post_load_weights') and not getattr(
+                        module, '_weights_removed', False):
                     module.post_load_weights()
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
@@ -280,6 +314,16 @@ class ModelLoader:
 
         return model, moe_load_balancer
 
+    def reload(self,
+               model: DecoderModelForCausalLM,
+               weights: dict,
+               allow_partial_loading: bool = False):
+        self._call_load_weights(model.load_weights,
+                                weights,
+                                self.weight_mapper,
+                                allow_partial_loading=allow_partial_loading)
+        torch.cuda.current_stream().synchronize()
+
     def _load_and_validate_config(
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
@@ -288,29 +332,29 @@ class ModelLoader:
             checkpoint_dir,
             trust_remote_code=True,
             mapping=self.mapping,
-            enable_min_latency=self.pytorch_backend_config.enable_min_latency,
-            use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
-            force_dynamic_quantization=self.pytorch_backend_config.
-            force_dynamic_quantization,
+            enable_min_latency=self.llm_args.enable_min_latency,
+            use_cuda_graph=self.llm_args.cuda_graph_config is not None,
+            force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
+            sparse_attention_config=self.sparse_attention_config,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
-            moe_max_num_tokens=self.pytorch_backend_config.moe_max_num_tokens,
-            moe_load_balancer=self.pytorch_backend_config.moe_load_balancer,
+            moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
+            moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
-            allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
-            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
-            attn_backend=self.pytorch_backend_config.attn_backend,
-            moe_backend=self.pytorch_backend_config.moe_backend,
-            moe_disable_finalize_fusion=self.pytorch_backend_config.
-            moe_disable_finalize_fusion,
-            use_low_precision_moe_combine=self.pytorch_backend_config.
+            allreduce_strategy=self.llm_args.allreduce_strategy,
+            mm_encoder_only=self.llm_args.mm_encoder_only,
+            attn_backend=self.llm_args.attn_backend,
+            moe_backend=self.llm_args.moe_config.backend,
+            moe_disable_finalize_fusion=self.llm_args.moe_config.
+            disable_finalize_fusion,
+            use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine)
 
-        validate_and_set_kv_cache_quant(
-            config, self.pytorch_backend_config.kv_cache_dtype)
+        validate_and_set_kv_cache_quant(config,
+                                        self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
-            config, self.pytorch_backend_config.mamba_ssm_cache_dtype)
+            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
@@ -323,10 +367,18 @@ class ModelLoader:
                             sub_config).num_hidden_layers = num_layers_override
         return config
 
-    def _call_load_weights(self, load_method: Callable, weights, weight_mapper):
+    def _call_load_weights(self,
+                           load_method: Callable,
+                           weights,
+                           weight_mapper,
+                           allow_partial_loading: bool = False):
         """Calls the model's weight loading method with the correct arguments."""
         args = inspect.getfullargspec(load_method).args
+        kargs = {}
         if "weight_mapper" in args:
-            load_method(weights, weight_mapper=weight_mapper)
+            kargs["weight_mapper"] = weight_mapper
+        if "allow_partial_loading" in args:
+            kargs["allow_partial_loading"] = allow_partial_loading
         else:
-            load_method(weights)
+            assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"
+        load_method(weights, **kargs)

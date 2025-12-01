@@ -458,7 +458,7 @@ class MambaForCausalLM(PretrainedModel):
 
         if not os.path.exists(hf_model_dir):
             hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
+                hf_model_dir, dtype="auto", trust_remote_code=True)
 
             assert isinstance(hf_model, transformers.PreTrainedModel)
             weights = convert_hf_mamba(hf_model, dtype)

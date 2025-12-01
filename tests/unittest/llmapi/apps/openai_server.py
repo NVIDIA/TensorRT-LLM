@@ -16,7 +16,7 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
-    MAX_SERVER_START_WAIT_S = 600  # wait for server to start for 600 seconds
+    MAX_SERVER_START_WAIT_S = 7200  # wait for server to start for 7200 seconds (~ 2 hours) for LLM models weight loading
 
     def __init__(self,
                  model: str,
@@ -29,7 +29,8 @@ class RemoteOpenAIServer:
                  extra_config: Optional[dict] = None) -> None:
         self.host = host
         self.port = port if port is not None else find_free_port()
-        self.rank = rank if rank != -1 else os.environ.get("SLURM_PROCID", 0)
+        self.rank = rank if rank != -1 else int(
+            os.environ.get("SLURM_PROCID", 0))
         self.extra_config_file = None
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
         if cli_args:

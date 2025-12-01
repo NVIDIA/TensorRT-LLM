@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from omegaconf import DictConfig, OmegaConf
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, YamlConfigSettingsSource
 from pydantic_settings.sources.types import DEFAULT_PATH, PathType
 
@@ -161,23 +161,6 @@ class DynamicYamlMixInForSettings:
         'with higher priority. "Later" files have higher priority. Should be used with care!',
     )
 
-    # TODO: remove this field in a future version
-    yaml_configs: List[PathType] = Field(
-        default_factory=list,
-        description="DEPRECATED: Please use yaml_extra instead.",
-    )
-
-    @field_validator("yaml_configs")
-    @classmethod
-    def validate_yaml_configs_deprecated(cls, v):
-        """Throw error that yaml_configs is deprecated in favor of yaml_extra."""
-        if v:  # Only raise error if the field is actually being used (not empty)
-            raise ValueError(
-                "The 'yaml_configs' field is deprecated and no longer supported. "
-                "Please use 'yaml_extra' instead."
-            )
-        return v
-
     @model_validator(mode="after")
     def validate_mode_and_yaml_default_not_both_provided(self):
         """Validate that both mode and yaml_default are not provided simultaneously.
@@ -207,6 +190,7 @@ class DynamicYamlMixInForSettings:
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         """Customise settings sources."""
         deferred_yaml_settings = DynamicYamlWithDeepMergeSettingsSource(settings_cls)
+        env_settings.env_prefix = "AD_"  # NOTE: set prefix to avoid conflicts with other env vars
         return (
             init_settings,
             env_settings,

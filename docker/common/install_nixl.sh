@@ -4,7 +4,7 @@ set -ex
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="0.5.0"
+NIXL_VERSION="0.7.1"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
@@ -15,7 +15,11 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
   GDS_PATH="$CUDA_PATH/targets/sbsa-linux"
 fi
 
+if [ -n "${GITHUB_MIRROR}" ]; then
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
 pip3 install --no-cache-dir meson ninja pybind11
+
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
 

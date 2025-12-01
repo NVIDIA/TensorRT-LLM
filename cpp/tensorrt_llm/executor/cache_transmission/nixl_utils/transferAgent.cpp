@@ -28,6 +28,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <nixl_types.h>
+#include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -345,15 +346,27 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
+    std::string nixlBackend = common::getEnvNixlBackend();
+    // List of supported backends - extend this list as new backends are added
+    static const std::set<std::string> kSUPPORTED_BACKENDS = {"UCX"};
+
+    if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
+    {
+        TLLM_LOG_ERROR("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
+        nixlBackend = "UCX";
+    }
+
+    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());
+
     nixl_b_params_t init1;
     nixl_mem_list_t mems1;
-    status = mRawAgent->getPluginParams("UCX", mems1, init1);
+    status = mRawAgent->getPluginParams(nixlBackend.c_str(), mems1, init1);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
-    status = mRawAgent->createBackend("UCX", init1, mRawBackend);
+    status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)
     {
-        TLLM_THROW("Failed to create NIXL backend");
+        TLLM_THROW("Failed to create NIXL backend: %s", nixlBackend.c_str());
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
@@ -469,19 +482,19 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     return notifs;
 }
 
-ConnectionInfoType NixlTransferAgent::getConnectionInfo()
+ConnectionInfoType NixlTransferAgent::getLocalConnectionInfo()
 {
     return mAddress;
 }
 
-void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
+void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
     std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
     std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
         name.c_str());
-    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "connectRemoteAgent get empty ip or port, connectionInfo: %s",
+    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
     md_extra_params.ipAddr = ip;
@@ -506,7 +519,7 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
         }
     }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s success status: %s",
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s success status: %s",
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
 

@@ -18,6 +18,8 @@ easier for users to reproduce our officially published [performance overview](./
 the [in-flight batching section](../features/attention.md#inflight-batching) that describes the concept
 in further detail.
 
+To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
+
 ## Before Benchmarking
 
 For rigorous benchmarking where consistent and reproducible results are critical, proper GPU configuration is essential. These settings help maximize GPU utilization, eliminate performance variability, and ensure optimal conditions for accurate measurements. While not strictly required for normal operation, we recommend applying these configurations when conducting performance comparisons or publishing benchmark results.

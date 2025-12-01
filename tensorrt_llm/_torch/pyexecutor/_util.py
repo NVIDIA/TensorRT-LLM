@@ -1,6 +1,4 @@
 import os
-import random
-from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
@@ -8,21 +6,25 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import \
+    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SpeculativeConfig,
-                                          TorchLlmArgs)
+                                          SamplerType, SchedulerConfig,
+                                          SparseAttentionConfig,
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
+from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
-from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -42,6 +44,17 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
+def get_kv_cache_manager_cls(model_config: ModelConfig):
+    config = model_config.pretrained_config
+    sparse_attn_config = model_config.sparse_attention_config
+    if sparse_attn_config is not None:
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    elif is_nemotron_hybrid(config) or is_qwen3_next(config):
+        return MambaHybridCacheManager
+    else:
+        return KVCacheManager
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -58,9 +71,11 @@ class KvCacheCreator:
         tokens_per_block: int,
         max_seq_len: int,
         max_batch_size: int,
-        kv_cache_config: trtllm.KvCacheConfig,
-        pytorch_backend_config: PyTorchConfig,
+        kv_cache_config: KvCacheConfig,
+        llm_args: TorchLlmArgs,
         speculative_config: SpeculativeConfig,
+        sparse_attention_config: SparseAttentionConfig,
+        profiling_stage_data: Optional[dict],
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -70,68 +85,29 @@ class KvCacheCreator:
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
-        self._pytorch_backend_config = pytorch_backend_config
+        self._llm_args = llm_args
         self._speculative_config = speculative_config
+        self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
-
-    @staticmethod
-    def _get_cache_size_per_token(model_config: ModelConfig,
-                                  mapping: Mapping) -> int:
-        mem_per_token = 2
-        quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
-
-        config = model_config.pretrained_config
-
-        num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                      config.num_attention_heads)
-        if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
-
-        mla = is_mla(config)
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-
-        kv_factor = 2
-        if mla:
-            # MLA has kv_lora_rank and qk_rope_head_dim
-            head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-            kv_factor = 1
-        else:
-            _head_dim = getattr(config, 'head_dim', None)
-            if not isinstance(_head_dim, int):
-                _head_dim = config.hidden_size // config.num_attention_heads
-            head_dim = _head_dim * num_key_value_heads // tp_size
-
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
-        mem_per_token *= num_attention_layers * head_dim
-        # K and V
-        mem_per_token *= kv_factor
-        return mem_per_token
-
-    def _get_free_gpu_memory_fraction(self) -> float:
-        fraction = self._kv_cache_config.free_gpu_memory_fraction
-        if fraction is None:
-            fraction = 0.9
-        return fraction
+        self._profiling_stage_data = profiling_stage_data
+        self._kv_cache_manager_cls = get_kv_cache_manager_cls(
+            model_engine.model.model_config)
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
-        kv_size_per_token = self._get_cache_size_per_token(
-            model_config, mapping)
+        kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
+            model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._get_cache_size_per_token(
-                draft_model_config, mapping)
+            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                draft_model_config,
+                mapping,
+                tokens_per_block=self._tokens_per_block)
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -152,20 +128,94 @@ class KvCacheCreator:
             f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
         return int(available_kv_mem)
 
-    def _create_dummy_context_requests(
+    def _create_dummy_mm_context_request(
             self, input_seq_len: int) -> List[trtllm.Request]:
-        vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
+        requests = []
+        if isinstance(
+                self._profiling_stage_data,
+                dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
+            return requests
+
+        input_processor = self._model_engine.input_processor
+        if not (hasattr(input_processor, "get_dummy_prompt")):
+            logger.warning("The input processor of the model does not have the method [get_dummy_prompt] implemented." \
+            "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
+            "the image encoder")
+            return requests
+
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
+        vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
 
-        requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
-            input_tokens = [
-                random.randint(0, vocab_size - 1) for _ in range(input_seq_len)
-            ]
+            dummy_mm_prompt = input_processor.get_dummy_prompt(input_seq_len)
+
+            if dummy_mm_prompt is not None:
+                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor(
+                    dummy_mm_prompt, sampling_params=None)
+                multimodal_data = extra_processed_inputs.get('multimodal_data')
+
+                request = trtllm.Request(prompt_token_ids,
+                                         max_tokens=1,
+                                         streaming=False,
+                                         sampling_config=trtllm.SamplingConfig(
+                                             beam_width=max_beam_width, ),
+                                         output_config=trtllm.OutputConfig(),
+                                         end_id=-1)
+                request.py_multimodal_data = multimodal_data
+            else:
+                # Fall back to text-only prompt when we could not find the small image size.
+                prompt_token_ids = torch.randint(
+                    low=0, high=vocab_size, size=(input_seq_len, )).tolist()
+                request = trtllm.Request(prompt_token_ids,
+                                         max_tokens=1,
+                                         streaming=False,
+                                         sampling_config=trtllm.SamplingConfig(
+                                             beam_width=max_beam_width, ),
+                                         output_config=trtllm.OutputConfig(),
+                                         end_id=-1)
+                if self._model_engine.use_mrope:
+                    request.py_multimodal_data = {
+                        "mrope_config": {
+                            "mrope_position_ids":
+                            torch.zeros(3, 1, input_seq_len, dtype=torch.int32),
+                            "mrope_position_deltas":
+                            torch.zeros(1, 1, dtype=torch.int32)
+                        }
+                    }
+            remaining_tokens -= len(prompt_token_ids)
+            requests.append(request)
+
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
+
+        return requests
+
+    def _create_dummy_context_requests(
+            self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
+        if hasattr(self._model_engine.model,
+                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                       self._model_engine.model.original_arch, None):
+            requests = self._create_dummy_mm_context_request(input_seq_len)
+        # if succeed profiling with multimodal requests then return, otherwise profile
+        # with default case
+        if requests:
+            return requests
+        vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
+        max_num_tokens = self._max_num_tokens
+        max_beam_width = self._max_beam_width
+
+        input_seq_len = min(max_num_tokens, input_seq_len)
+        remaining_tokens = max_num_tokens
+        while remaining_tokens > 0:
+            input_seq_len = min(input_seq_len, remaining_tokens)
+            input_tokens = torch.randint(low=0,
+                                         high=vocab_size,
+                                         size=(input_seq_len, )).tolist()
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
@@ -197,15 +247,14 @@ class KvCacheCreator:
         # estimate_max_kv_cache_tokens submits self._dummy_reqs
         num_cache_blocks = 0
         num_extra_tokens_per_seq = 1  # account for generated tokens
-        pytorch_backend_config = self._pytorch_backend_config
         spec_cfg = self._speculative_config
-        if not pytorch_backend_config.disable_overlap_scheduler:
+        if not self._llm_args.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_len
+                num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_len
+            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
 
         if self._dummy_reqs is None:
@@ -231,6 +280,12 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+            estimating_kv_cache = False
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
@@ -244,7 +299,7 @@ class KvCacheCreator:
         # TODO: support CP by generating dummy requests for it.
         assert 'cp_type' not in mapping.cp_config
 
-        fraction = self._get_free_gpu_memory_fraction()
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -362,6 +417,8 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        if isinstance(self._profiling_stage_data, dict):
+            self._profiling_stage_data["activation_bytes"] = activation_bytes
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
@@ -374,6 +431,7 @@ class KvCacheCreator:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         spec_config = self._speculative_config
+        sparse_attn_config = self._sparse_attention_config
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -396,7 +454,7 @@ class KvCacheCreator:
         num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 self._kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -413,6 +471,8 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+                sparse_attn_config=sparse_attn_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:
@@ -434,8 +494,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
-
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.ssm_state_size,
                 config.conv_kernel,
@@ -460,6 +519,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         elif is_qwen3_next(config):
             if self._max_beam_width > 1:
@@ -485,7 +545,7 @@ class KvCacheCreator:
             num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
                 config.full_attention_interval - 1)
             num_layers = num_hidden_layers - num_mamba_layers
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.linear_key_head_dim,
                 config.linear_conv_kernel_dim,
@@ -510,6 +570,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         else:
             # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
@@ -518,7 +579,7 @@ class KvCacheCreator:
             binding_model_config = model_engine.model.model_config.get_bindings_model_config(
                 tokens_per_block=self._tokens_per_block) if is_vswa else None
 
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 self._kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -536,6 +597,8 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+                sparse_attn_config=sparse_attn_config,
+                is_estimating_kv_cache=estimating_kv_cache,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -592,7 +655,7 @@ def create_py_executor_instance(
     dist,
     resources,
     mapping,
-    pytorch_backend_config,
+    llm_args,
     ctx_chunk_config,
     model_engine,
     start_worker,
@@ -606,19 +669,22 @@ def create_py_executor_instance(
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
     max_num_tokens: Optional[int] = None,
-    peft_cache_config: Optional[trtllm.PeftCacheConfig] = None,
-    scheduler_config: Optional[trtllm.SchedulerConfig] = None,
-    cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
+    peft_cache_config: Optional[PeftCacheConfig] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
+    virtual_memory_pools: Optional[dict] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
 
+    max_num_sequences = max_batch_size * mapping.pp_size
+
     logger.info(
-        f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
+        f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
-    for key, value in pytorch_backend_config.extra_resource_managers.items():
+    for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
                 f"Cannot overwrite existing resource manager {key}.")
@@ -671,16 +737,14 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        peft_cache_config_model = PeftCacheConfig.from_pybind(
-            peft_cache_config
-        ) if peft_cache_config is not None else PeftCacheConfig()
+        peft_cache_config_model = PeftCacheConfig(
+        ) if peft_cache_config is None else peft_cache_config
         if lora_config.max_loras is not None:
             peft_cache_config_model.num_device_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_loras
         if lora_config.max_cpu_loras is not None:
             peft_cache_config_model.num_host_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
-        peft_cache_config = peft_cache_config_model._to_pybind()
 
         from tensorrt_llm.bindings import WorldConfig
         world_config = WorldConfig(
@@ -691,7 +755,7 @@ def create_py_executor_instance(
             gpus_per_node=dist.mapping.gpus_per_node,
         )
         peft_cache_manager = PeftCacheManager(
-            peft_cache_config=peft_cache_config,
+            peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
@@ -701,8 +765,6 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
-
-    max_num_sequences = max_batch_size * mapping.pp_size
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
@@ -745,11 +807,12 @@ def create_py_executor_instance(
         drafter=drafter,
         dist=dist,
         max_num_sequences=max_num_sequences,
-        disable_overlap_scheduler=pytorch_backend_config.
-        disable_overlap_scheduler,
+        disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
+        if spec_config is not None else 0,
+        max_total_draft_tokens=spec_config.max_total_draft_tokens
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
@@ -757,23 +820,20 @@ def create_py_executor_instance(
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
         max_seq_len=max_seq_len,
-        peft_cache_config=peft_cache_config)
+        peft_cache_config=peft_cache_config,
+        virtual_memory_pools=virtual_memory_pools)
 
 
 def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
                               max_batch_size: int,
                               speculative_config: SpeculativeConfig,
-                              max_beam_width: int):
+                              max_beam_width: int,
+                              disable_flashinfer_sampling: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
-    max_total_draft_tokens = 0
-    if speculative_config is None:
-        max_total_draft_tokens = 0
-    elif hasattr(speculative_config, 'max_total_draft_tokens'):
-        max_total_draft_tokens = speculative_config.max_total_draft_tokens
-    else:
-        max_total_draft_tokens = max_draft_len
+    max_total_draft_tokens = (0 if speculative_config is None else
+                              speculative_config.max_total_draft_tokens)
 
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
@@ -781,26 +841,36 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
     )
 
 
-def instantiate_sampler(engine: PyTorchModelEngine,
-                        pytorch_backend_config: PyTorchConfig, mapping: Mapping,
-                        max_batch_size: int, max_beam_width: int,
-                        max_seq_len: int, mm_encoder_only: bool,
-                        speculative_config: SpeculativeConfig,
-                        decoding_config: trtllm.DecodingConfig,
-                        kv_cache_config: trtllm.KvCacheConfig):
+def instantiate_sampler(
+    engine: PyTorchModelEngine,
+    llm_args: TorchLlmArgs,
+    mapping: Mapping,
+    *,
+    max_batch_size: int,
+    max_beam_width: int,
+    max_seq_len: int,
+    mm_encoder_only: bool,
+    speculative_config: SpeculativeConfig,
+    decoding_config: trtllm.DecodingConfig,
+    kv_cache_config: KvCacheConfig,
+    disable_flashinfer_sampling: bool,
+):
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
-        max_beam_width=max_beam_width)
+        max_beam_width=max_beam_width,
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
+    )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
     if mapping.cp_config.get('cp_type') == CpType.STAR:
-        assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
+        assert llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
@@ -809,15 +879,15 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
-    if pytorch_backend_config.sampler_type == SamplerType.TRTLLMSampler or (
-            pytorch_backend_config.sampler_type == SamplerType.auto
+    if llm_args.sampler_type == SamplerType.TRTLLMSampler or (
+            llm_args.sampler_type == SamplerType.auto
             and decoding_mode.isBeamSearch()):
         logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(engine.model,
                              engine.dtype,
                              mapping,
                              decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler,
+                             llm_args.disable_overlap_scheduler,
                              max_seq_len=max_seq_len,
                              max_batch_size=max_batch_size,
                              max_beam_width=max_beam_width,
@@ -879,7 +949,12 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
+def _adjust_torch_mem_fraction():
+    # If true, adjust PyTorch CUDA memory fraction to correspond to the
+    # total GPU memory minus the statically allocated engine memory.
+    # If false, set the PyTorch CUDA memory fraction to 1.0.
+    _limit_torch_cuda_mem_fraction: bool = True
+
     # FIXME: PyTorch only uses the garbage_collection_threshold setting
     #        if a memory fraction is set, cf.
     #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
@@ -890,7 +965,7 @@ def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
     #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
     #   or a similar API is available, the warning below should be removed
     #   and the allocator GC threshold be set via the new API instead.
-    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_allocator_config = os.environ.get("PYTORCH_ALLOC_CONF", "")
     torch_mem_threshold_advised = (
         torch.cuda.get_allocator_backend() == "native"
         and "expandable_segments:True" not in torch_allocator_config)
@@ -898,7 +973,7 @@ def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
     if torch_mem_threshold_advised and not torch_mem_threshold_set:
         logger.warning(
             "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
-            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+            " or 'expandable_segments:True' in PYTORCH_ALLOC_CONF.")
 
     # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
     #       fraction < 1.0 is beneficial, because
@@ -908,7 +983,7 @@ def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
     #       lead PyTorch to release all unused memory before hitting the set fraction. This
     #       still mitigates OOM, although at a higher performance impact, because it
     #       effectively resets the allocator cache.
-    if not pytorch_backend_config._limit_torch_cuda_mem_fraction:
+    if not _limit_torch_cuda_mem_fraction:
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()

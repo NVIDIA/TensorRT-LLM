@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -55,29 +56,48 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 class TransferSession
 {
 public:
+    // measures for each single transmission
     struct Measure
     {
-        double delay;     // from last token (ctx) or arrival time (gen), in ms
-        double duration;  // in ms
-        double bandwidth; // in Gbps
+        LlmRequest::TimePoint start;
+        LlmRequest::TimePoint end;
+        size_t size = 0;
+    };
+
+    enum TimeNames : uint8_t
+    {
+        kTimeRequestInfo = 0,
+        kTimeFormatter,
+        kTimePreprocess,
+        kTimeTransmissions,
+        kTimePostprocess,
+        kTimeCounts
+    };
+
+    struct KVCacheTimes
+    {
+        std::array<LlmRequest::TimePoint, kTimeCounts> times;
+        std::vector<Measure> measures;
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
         runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
-        , mMeasures()
-        , mRecordMeasure(recordMeasure)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
     {
         TLLM_CHECK(!mConnections.empty());
+        if (recordTiming)
+        {
+            mTimes = std::make_unique<KVCacheTimes>();
+        }
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
@@ -102,7 +122,9 @@ public:
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
 
-    void appendMeasure(double delay, double duration, size_t size);
+    void setTime(TimeNames name);
+
+    void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
@@ -124,8 +146,7 @@ private:
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
-    std::vector<Measure> mMeasures;
-    bool mRecordMeasure{false};
+    std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
@@ -144,6 +165,7 @@ struct TransceiverTag
     static constexpr int32_t kID_TAG{19};
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
+    static constexpr int32_t kREADY_SIGNAL_TAG{42};
 };
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
@@ -240,6 +262,16 @@ public:
     /// @param llmRequest The request object to which the data belongs.
     virtual RequestInfo recvRequestInfo();
 
+    /// @brief Cancel the request.
+    /// @param requestId The ID used in the context phase of the current request.
+    /// @return Whether the request is cancelled.
+    virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Send ready signal.
+    /// @param requestId The ID used in the context phase of the current request.
+    /// @param isReady Whether the request is ready to be received.
+    virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -272,6 +304,17 @@ public:
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
     virtual void receiveSync(TransferSession& session);
+
+    /// @brief Cancel the request.
+    /// @param llmRequest Request object.
+    /// @return Whether the request is cancelled.
+    virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Receive ready signal.
+    /// @param session The session object.
+    /// @return Whether the request is ready to be received.
+    virtual bool receiveReadySignal(TransferSession& session);
+
     /// @brief Destructor.
     virtual ~CacheReceiver();
 

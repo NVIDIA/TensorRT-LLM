@@ -639,7 +639,7 @@ if __name__ == '__main__':
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto")
+                                                    dtype="auto")
 
     config = {
         'architecture': hf_config.architectures[0],

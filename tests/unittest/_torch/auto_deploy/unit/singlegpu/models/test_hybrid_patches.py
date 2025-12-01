@@ -1,40 +1,68 @@
-import torch  # noqa
-import torch.export as te
-from torch.export import Dim  # noqa
+import copy
+
 import pytest
+import torch
+from _model_test_utils import get_small_model_config
+from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device  # noqa
-from _model_test_utils import get_small_model_config
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.models.modeling_nemotron_h import NemotronHForCausalLM
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
 EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
+@pytest.fixture
+def setup_custom_model_cls_registry(request):
+    # TODO: remove all this when the patches in `bamba.py` and `nemotron_h.py` can be removed.
+    old_mapping = copy.copy(AutoModelForCausalLMFactory._custom_model_mapping)
+    AutoModelForCausalLMFactory._custom_model_mapping = {}
+
+    register_custom_model = request.node.callspec.params.get("register_custom_model", False)
+    if register_custom_model:
+        AutoModelForCausalLMFactory.register_custom_model_cls(
+            config_cls_name="NemotronHConfig",
+            custom_model_cls=NemotronHForCausalLM,
+        )
+    yield
+    AutoModelForCausalLMFactory._custom_model_mapping = old_mapping
+
+
 @pytest.mark.parametrize(
-    "model_dir,run_verify_generation",
+    "model_dir,run_verify_generation,register_custom_model",
     [
-        pytest.param("ibm-ai-platform/Bamba-9B-v2", True),
-        pytest.param("nvidia/NVIDIA-Nemotron-Nano-12B-v2", False),
+        ("ibm-ai-platform/Bamba-9B-v2", True, False),
+        # This tests the incumbent patching approach.
+        ("nvidia/NVIDIA-Nemotron-Nano-12B-v2", True, False),
+        # This tests the new custom model implementation.
+        ("nvidia/NVIDIA-Nemotron-Nano-12B-v2", True, True),
     ],
 )
-def test_bamba_patches(model_dir: str, run_verify_generation: bool):
-    # NOTE: set to False if you want to locally test the full model
+def test_bamba_patches(
+    model_dir: str,
+    run_verify_generation: bool,
+    register_custom_model: bool,
+    setup_custom_model_cls_registry,
+):
+    # NOTE: set to False if you want to locally test the full model.
     use_small_config: bool = True
 
     model_on_meta_during_export = True
     use_cache: bool = True
-    export_func: str = "torch_export_to_gm"
 
     common_kwargs = {
         "world_size": 0,
         "runtime": "demollm",
-        "compile_backend": "torch-simple",
-        "attn_backend": "flashinfer",
         "model_factory": "AutoModelForCausalLM",
         "max_seq_len": 512,
+        "transforms": {
+            "insert_cached_attention": {"backend": "flashinfer"},
+            "compile_model": {"backend": "torch-simple"},
+        },
     }
 
     if use_small_config:
@@ -46,7 +74,7 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
             **common_kwargs,
             "model_kwargs": {
                 "use_cache": use_cache,
-                "torch_dtype": "bfloat16",
+                "dtype": "bfloat16",
             },
         }
     llm_args = AutoDeployConfig(**llm_args)
@@ -60,8 +88,9 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
     tokenizer = factory.init_tokenizer()
 
     # 1. Export wants min batch size of 2 (to avoid specialization during export).
-    # 2. Can't get `padding` / `truncation` to work without other steps so just use the same prompt
-    #    twice in order for the tokenizer not to complain when creating the tensor.
+    # 2. Can't get `padding` / `truncation` to work without other steps so just use the prompts
+    #    with the same tokenized length in order for the tokenizer not to complain when creating
+    #    the tensor.
     message = [EXAMPLE_INPUT] * 2
     inputs = tokenizer(message, return_tensors="pt", return_token_type_ids=False).to("cuda")
 
@@ -89,34 +118,15 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
             ],
         )
 
-    def _run_torch_export():
-        with apply_export_patches(patch_list=["bamba", "autocast_noop"]):
-            with torch.inference_mode():
-                ep = te.export(
-                    model,
-                    args=(),
-                    kwargs={"input_ids": input_ids, "position_ids": position_ids},
-                    dynamic_shapes=dynamic_shapes,
-                    strict=False,
-                )
-            egm = ep.module()
-        return egm
-
-    def _run_export():
-        if export_func == "torch_export_to_gm":
-            return _run_torch_export_to_gm()
-        else:
-            return _run_torch_export()
-
     if model_on_meta_during_export:
-        gm = _run_export()
+        gm = _run_torch_export_to_gm()
         factory.load_or_random_init(gm, device="cuda")
         move_to_device(gm, "cuda")
         factory._to_maybe_random(model, "cuda")
         model.load_state_dict(gm.state_dict())
     else:
         factory.load_or_random_init(model, device="cuda")
-        gm = _run_export()
+        gm = _run_torch_export_to_gm()
         move_to_device(gm, "cuda")
 
     if run_verify_generation:
@@ -165,10 +175,8 @@ def _generate(tokenizer, model):
             msg, return_tensors="pt", return_token_type_ids=False
         ).input_ids.shape[1]
         print(f"{msg=}, {num_tokens=}")
-    inputs = tokenizer(messages, return_tensors="pt", return_token_type_ids=False).to(model.device)
-    response = model.generate(**inputs, max_new_tokens=64)
+    input_ids = tokenizer(messages, return_tensors="pt", return_token_type_ids=False).input_ids.to(
+        model.device
+    )
+    response = model.generate(input_ids, max_new_tokens=64)
     print("\n".join(tokenizer.batch_decode(response, skip_special_tokens=True)))
-
-
-if __name__ == "__main__":
-    test_bamba_patches()

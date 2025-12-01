@@ -10,6 +10,7 @@ from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
 # yapf: disable
+from .chat_utils import make_tool_call_id
 from .harmony_adapter import (handle_non_streaming_response,
                               handle_streaming_response)
 from .openai_protocol import (ChatCompletionLogProbs,
@@ -23,9 +24,13 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionRequest, CompletionResponse,
                               CompletionResponseChoice,
                               CompletionResponseStreamChoice,
-                              CompletionStreamResponse, DeltaMessage,
-                              FunctionCall, StreamOptions, ToolCall, UsageInfo,
-                              to_disaggregated_params)
+                              CompletionStreamResponse, DeltaFunctionCall,
+                              DeltaMessage, DeltaToolCall, FunctionCall,
+                              PromptTokensDetails, StreamOptions, ToolCall,
+                              UsageInfo, to_disaggregated_params)
+from .tool_parser.base_tool_parser import BaseToolParser
+from .tool_parser.core_types import ToolCallItem
+from .tool_parser.tool_parser_factory import ToolParserFactory
 
 # yapf: enable
 
@@ -33,8 +38,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
-    role: str = None
-    model: str = None
+    role: str
+    model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
@@ -44,8 +49,11 @@ class ChatPostprocArgs(PostprocArgs):
     stream_options: Optional[StreamOptions] = None
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
+    tool_parser: Optional[str] = None
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
+    tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
+    has_tool_call: dict[int, bool] = field(default_factory=dict)
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -95,7 +103,7 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
 
 
 def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                           streaming: bool) -> Tuple[bool, str, str]:
+                           streaming: bool) -> Tuple[str, str]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
@@ -104,17 +112,41 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
                     args.reasoning_parser)
         reasoning_parser = args.reasoning_parser_dict[output_index]
 
-    in_reasoning = False
     if reasoning_parser is not None:
         if not streaming:
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
-        in_reasoning, content, reasoning_content = result.in_reasoning, result.content, result.reasoning_content
+        content, reasoning_content = result.content, result.reasoning_content
     else:
-        in_reasoning, content, reasoning_content = False, text, None
+        content, reasoning_content = text, ""
 
-    return in_reasoning, content, reasoning_content
+    return content, reasoning_content
+
+
+def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
+                      streaming: bool) -> Tuple[str, List[ToolCallItem]]:
+    tool_parser = None
+    tools = args.tools
+    if args.tool_parser is not None and tools is not None:
+        if output_index not in args.tool_parser_dict:
+            args.tool_parser_dict[
+                output_index] = ToolParserFactory.create_tool_parser(
+                    args.tool_parser)
+        tool_parser = args.tool_parser_dict[output_index]
+
+    if tool_parser is not None and tools is not None:
+        if not streaming:
+            result = tool_parser.detect_and_parse(text, tools)
+        else:
+            result = tool_parser.parse_streaming_increment(text, tools)
+        normal_text, calls = result.normal_text, result.calls
+        if result.calls:
+            args.has_tool_call[output_index] = True
+    else:
+        normal_text, calls = text, []
+
+    return normal_text, calls
 
 
 @nvtx_range_debug("chat_stream_post_processor")
@@ -123,8 +155,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     def yield_first_chat(num_tokens: int,
                          idx: int,
-                         role: str = None,
-                         content: str = None):
+                         role: str | None = None,
+                         content: str | None = None):
         choice_data = ChatCompletionResponseStreamChoice(index=idx,
                                                          delta=DeltaMessage(
                                                              role=role,
@@ -133,9 +165,13 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         chunk = ChatCompletionStreamResponse(choices=[choice_data],
                                              model=args.model)
         if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=num_tokens,
-                                    total_tokens=num_tokens,
-                                    completion_tokens=0)
+            chunk.usage = UsageInfo(
+                prompt_tokens=num_tokens,
+                total_tokens=num_tokens,
+                completion_tokens=0,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=rsp.cached_tokens),
+            )
         data = chunk.model_dump_json(exclude_none=True)
         return data
 
@@ -167,44 +203,78 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         delta_text = output.text_diff
 
-        in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
+        delta_text, reasoning_delta_text = apply_reasoning_parser(
             args, i, delta_text, True)
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
             delta_message = DeltaMessage(tool_calls=[
-                ToolCall(function=FunctionCall(
-                    name=args.tool_choice.function.name, arguments=delta_text))
-            ])
+                DeltaToolCall(
+                    function=DeltaFunctionCall(
+                        name=args.tool_choice.function.name,
+                        arguments=delta_text),
+                    index=i,
+                ),
+            ], )
         else:
-            if in_reasoning:
+            delta_text, calls = apply_tool_parser(args, i, delta_text, True)
+            tool_calls = []
+            for call_item in calls:
+                # Tool call ID should be generated only once per tool call
+                if call_item.name:
+                    # First chunk: include ID and function name
+                    tool_call_id = make_tool_call_id()
+                    function_name = call_item.name
+                else:
+                    # Subsequent chunks: null ID and name for argument deltas
+                    tool_call_id = None
+                    function_name = None
+
+                tool_calls.append(
+                    DeltaToolCall(
+                        id=tool_call_id,
+                        index=call_item.tool_index,
+                        function=DeltaFunctionCall(
+                            name=function_name,
+                            arguments=call_item.parameters,
+                        ),
+                    ))
+            if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
                 delta_message = DeltaMessage(
-                    reasoning_content=reasoning_delta_text)
+                    content=delta_text,
+                    reasoning_content=reasoning_delta_text,
+                    tool_calls=tool_calls if tool_calls else None)
             else:
-                delta_message = DeltaMessage(
-                    content=delta_text, reasoning_content=reasoning_delta_text)
+                continue
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,
             delta=delta_message,
-            finish_reason=None,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
-                                                None))
+                                                None),
+            stop_reason=output.stop_reason,
+        )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
             choice.logprobs = create_logprobs(token_ids, args.tokenizer,
                                               logprobs, args.top_logprobs)
         if output.finish_reason is not None:
-            choice.finish_reason = output.finish_reason
+            if output.finish_reason == "stop" and args.has_tool_call.get(
+                    i, False):
+                choice.finish_reason = "tool_calls"
+            else:
+                choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
         chunk = ChatCompletionStreamResponse(choices=[choice], model=args.model)
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens)
+                                    total_tokens=output.length + prompt_tokens,
+                                    prompt_tokens_details=PromptTokensDetails(
+                                        cached_tokens=rsp.cached_tokens))
         data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
 
@@ -214,6 +284,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=rsp.cached_tokens),
         )
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
@@ -231,8 +303,8 @@ def chat_response_post_processor(
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
     for output in rsp.outputs:
-        _, text, reasoning_text = apply_reasoning_parser(
-            args, output.index, output.text, False)
+        text, reasoning_text = apply_reasoning_parser(args, output.index,
+                                                      output.text, False)
 
         if args.tool_choice and isinstance(args.tool_choice,
                                            ChatCompletionNamedToolChoiceParam):
@@ -246,21 +318,32 @@ def chat_response_post_processor(
         else:
             if text is None:
                 text = ""
+            text, calls = apply_tool_parser(args, output.index, text, False)
+            tool_calls = [
+                ToolCall(function=FunctionCall(name=call.name or "",
+                                               arguments=call.parameters))
+                for call in calls
+            ]
             message = ChatMessage(role=role,
                                   content=text,
-                                  reasoning_content=reasoning_text)
+                                  reasoning_content=reasoning_text,
+                                  tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
-            finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
             disaggregated_params=disaggregated_params,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if output.finish_reason == "stop" and args.has_tool_call.get(
+                output.index, False):
+            choice.finish_reason = "tool_calls"
+        else:
+            choice.finish_reason = output.finish_reason
 
         if args.return_logprobs:
             choice.logprobs = create_logprobs(output.token_ids, args.tokenizer,
@@ -279,6 +362,8 @@ def chat_response_post_processor(
         prompt_tokens=num_prompt_tokens,
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=rsp.cached_tokens),
     )
     response = ChatCompletionResponse(
         model=args.model,
@@ -339,7 +424,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens)
+                                    total_tokens=output.length + prompt_tokens,
+                                    prompt_tokens_details=PromptTokensDetails(
+                                        cached_tokens=rsp.cached_tokens))
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
 
@@ -349,6 +436,8 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=rsp.cached_tokens),
         )
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
@@ -392,7 +481,9 @@ def completion_response_post_processor(
 
     usage = UsageInfo(prompt_tokens=prompt_tokens,
                       completion_tokens=completion_tokens,
-                      total_tokens=completion_tokens + prompt_tokens)
+                      total_tokens=completion_tokens + prompt_tokens,
+                      prompt_tokens_details=PromptTokensDetails(
+                          cached_tokens=rsp.cached_tokens))
     response = CompletionResponse(choices=choices,
                                   model=args.model,
                                   usage=usage)
