@@ -8,6 +8,42 @@
 #SBATCH -e logs/trtllm-bench.err
 #SBATCH -J trtllm-bench
 
+##############################################################################
+# OVERVIEW:
+# This script runs trtllm-bench throughput benchmarking on SLURM with multi-node,
+# multi-GPU setup. It prepares a synthetic dataset and then benchmarks the model
+# using the PyTorch backend with tensor parallelism.
+#
+# WHAT TO MODIFY:
+# 1. SLURM Parameters (lines 2-9):
+#    - Replace <account> with your SLURM account name
+#    - Replace <partition> with your SLURM partition name
+#    - Adjust -N (number of nodes) based on your TP size
+#    - Adjust --ntasks-per-node (GPUs per node) to match your setup
+#
+# 2. Environment Variables (set before running sbatch):
+#    - CONTAINER_IMAGE: Docker image with TensorRT-LLM installed
+#    - MOUNT_DIR: Host directory to mount in container
+#    - MOUNT_DEST: Container mount destination path
+#    - WORKDIR: Working directory inside container
+#    - SOURCE_ROOT: Path to TensorRT-LLM source code
+#    - PROLOGUE: Commands to run before main task (e.g., module loads)
+#    - LOCAL_MODEL: Path to your pre-downloaded model directory
+#    - MODEL_NAME: Name of the model to benchmark
+#    - EXTRA_ARGS: (Optional) Additional benchmark arguments
+#
+# 3. Model Configuration (lines 87-94):
+#    - --tp 16: Adjust tensor parallelism size to match your node/GPU setup
+#    - --num-requests (line 56): Change number of benchmark requests
+#    - --input-mean/output-mean (lines 57-58): Adjust token lengths
+#
+# EXAMPLE USAGE:
+#   export CONTAINER_IMAGE="nvcr.io/nvidia/tensorrt_llm:latest"
+#   export LOCAL_MODEL="/path/to/llama-model"
+#   export MODEL_NAME="meta-llama/Llama-2-7b-hf"
+#   sbatch llm_mgmn_trtllm_bench.sh
+##############################################################################
+
 ### :title Run trtllm-bench with pytorch backend on Slurm
 ### :order 1
 ### :section Slurm
@@ -16,8 +52,8 @@
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
 # Slurm-like systems, and can support multi-node and multi-GPU setups.
 
-# Note that, the number of MPI processes should be the same as the model world
-# size. e.g. For tensor_parallel_size=16, you may use 2 nodes with 8 gpus for
+# IMPORTANT: Total MPI processes (nodes × ntasks-per-node) must equal tensor_parallel_size.
+# e.g. For tensor_parallel_size=16, you may use 2 nodes with 8 gpus for
 # each, or 4 nodes with 4 gpus for each or other combinations.
 
 # This docker image should have tensorrt_llm installed, or you need to install
