@@ -254,7 +254,7 @@ def shard_weight_tensor(
     if update_param:
         modname, _, param_name = param_key.rpartition(".")
         submod = gm.get_submodule(modname)
-        param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
+        param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=False)
         setattr(submod, param_name, param_new)
 
     return sharded_weight, sharded_shape
@@ -1153,7 +1153,7 @@ def _slice_expert_dim(
     )
 
     # Replace the parameter with the sliced version
-    new_param = nn.Parameter(sliced_param, requires_grad=full_param.requires_grad)
+    new_param = nn.Parameter(sliced_param, requires_grad=False)
     setattr(submod, param_name, new_param)
 
     # Return the same node (it now points to the sliced parameter)
@@ -1199,7 +1199,7 @@ def _transform_bmm_moe_weight_param(
         sliced_param = torch.cat([w3, w1], dim=2)
 
     # Transpose: Llama4 (E, H, X) -> TRT-LLM (E, X, H)
-    transposed_param = sliced_param.transpose(1, 2).contiguous()
+    transposed_param = sliced_param.transpose(1, 2)
     transposed_shape = transposed_param.shape
 
     # Define transformation function for load hook
@@ -1223,7 +1223,7 @@ def _transform_bmm_moe_weight_param(
     )
 
     # Replace the parameter with the transformed version
-    new_param = nn.Parameter(transposed_param, requires_grad=full_param.requires_grad)
+    new_param = nn.Parameter(transposed_param, requires_grad=False)
     setattr(submod, param_name, new_param)
 
 
