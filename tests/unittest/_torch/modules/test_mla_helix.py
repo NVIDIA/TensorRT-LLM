@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import pickle
 import sys
 import time
@@ -132,8 +133,6 @@ all_scenarios = [
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[0],
-    all_scenarios[1],
-    all_scenarios[4],
     all_scenarios[7],
     all_scenarios[14],
     all_scenarios[17],
@@ -839,34 +838,58 @@ def _run_single_rank(func, *args, **kwargs):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize("use_nccl_for_helix", ["0", "1"], ids=["fifo", "nccl"])
 def test_mla_helix_distributed(
     scenario: Scenario,
+    use_nccl_for_helix: str,
     gen_steps: Optional[int] = None,
     max_mismatch_ratio: float = 0.02,
     mismatch_ratios: Optional[List[float]] = None,
 ):
+    # Set environment variable to control which codepath is used
+    old_env_value = os.environ.get("TRTLLM_USE_NCCL_FOR_HELIX")
+    os.environ["TRTLLM_USE_NCCL_FOR_HELIX"] = use_nccl_for_helix
+
     world_size = 2
+    print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={use_nccl_for_helix}.")
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
-    with MPIPoolExecutor(max_workers=world_size) as executor:
-        results = executor.map(
-            _run_single_rank,
-            *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] * world_size),
-        )
-        if mismatch_ratios is None:
-            for ratio_mismatch in results:
-                assert ratio_mismatch <= max_mismatch_ratio
+    try:
+        with MPIPoolExecutor(max_workers=world_size) as executor:
+            results = executor.map(
+                _run_single_rank,
+                *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] * world_size),
+            )
+            if mismatch_ratios is None:
+                for ratio_mismatch in results:
+                    assert ratio_mismatch <= max_mismatch_ratio
+            else:
+                mismatch_ratios.extend(results)
+    finally:
+        # Restore the original environment variable value
+        if old_env_value is None:
+            os.environ.pop("TRTLLM_USE_NCCL_FOR_HELIX", None)
         else:
-            mismatch_ratios.extend(results)
+            os.environ["TRTLLM_USE_NCCL_FOR_HELIX"] = old_env_value
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios[:11]:
-        timing_steps = 256
-        gen_steps = scenario.ref_steps + timing_steps
-        print(f"Running scenario: {scenario} and timing {timing_steps} steps")
-        mismatch_ratios = []
-        test_mla_helix_distributed(scenario, gen_steps=gen_steps, mismatch_ratios=mismatch_ratios)
-        if any(mismatch > 0 for mismatch in mismatch_ratios):
-            print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
-        else:
-            print("Numerical test passed")
+    for use_nccl in ["0", "1"]:
+        nccl_mode = "NCCL" if use_nccl == "1" else "FIFO"
+        print(f"\n{'=' * 60}")
+        print(f"Testing with TRTLLM_USE_NCCL_FOR_HELIX={use_nccl} ({nccl_mode} mode)")
+        print(f"{'=' * 60}\n")
+        for scenario in all_scenarios[:11]:
+            timing_steps = 256
+            gen_steps = scenario.ref_steps + timing_steps
+            print(f"Running scenario: {scenario} and timing {timing_steps} steps")
+            mismatch_ratios = []
+            test_mla_helix_distributed(
+                scenario,
+                use_nccl_for_helix=use_nccl,
+                gen_steps=gen_steps,
+                mismatch_ratios=mismatch_ratios,
+            )
+            if any(mismatch > 0 for mismatch in mismatch_ratios):
+                print(f"Numerical test failed with mismatch ratios: {mismatch_ratios}")
+            else:
+                print("Numerical test passed")

@@ -568,13 +568,12 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type is not None:
-            if cp_type in [CpType.ULYSSES, CpType.STAR]:
-                logger.info(
-                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
-                    cp_type.name)
-                return
+        if self.mapping.cp_size > 1:
+            cp_type = self.mapping.cp_config.get("cp_type", None)
+            logger.info(
+                f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
+            )
+            return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)

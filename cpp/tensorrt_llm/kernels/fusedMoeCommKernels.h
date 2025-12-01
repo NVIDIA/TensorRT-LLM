@@ -82,11 +82,11 @@ struct MoeCommFieldInfo
     static constexpr uint64_t kAlign16BytePtrMask = (1ULL << 4) - 1;
     static constexpr uint32_t kAligned16BMask = (1 << 4) - 1;
 
-    // Constants for memory alignment and access
-    static constexpr int BYTES_PER_128B_BLOCK = 128;
-    static constexpr int INTS_PER_128B_BLOCK = BYTES_PER_128B_BLOCK / sizeof(int);
-    static constexpr int UINT64_PER_128B_BLOCK = BYTES_PER_128B_BLOCK / sizeof(uint64_t);
-    static constexpr int BYTES_PER_16B_BLOCK = 16;
+    // Constants for memory alignment and access (reference common constants for consistency)
+    static constexpr int BYTES_PER_128B_BLOCK = tensorrt_llm::kernels::BYTES_PER_128B_BLOCK;
+    static constexpr int INTS_PER_128B_BLOCK = tensorrt_llm::kernels::INTS_PER_128B_BLOCK;
+    static constexpr int UINT64_PER_128B_BLOCK = tensorrt_llm::kernels::UINT64_PER_128B_BLOCK;
+    static constexpr int BYTES_PER_16B_BLOCK = tensorrt_llm::kernels::BYTES_PER_16B_BLOCK;
     // Will pad one 16 byte for each unaligned field, then head and tail 16 byte might not be aligned
 
     // Fill single field info, the fields that need global info is not filled here.
@@ -252,9 +252,11 @@ public:
     static constexpr int FIFO_ENTRY_128_BYTE_COUNT = FIFO_ENTRY_BYTES / 128;
     static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
     static constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
-    static constexpr int MAX_GROUP_COUNT_PER_BLOCK = 8;
+    // Reference common constant for consistency
+    static constexpr int MAX_GROUP_COUNT_PER_BLOCK = tensorrt_llm::kernels::MAX_GROUP_COUNT_PER_BLOCK;
 
-    static constexpr int WARP_SIZE = 32;
+    // Reference common constant for consistency
+    static constexpr int WARP_SIZE = tensorrt_llm::kernels::WARP_SIZE;
 
     static int maxSmCount;
     static bool maxSmCountUsed;

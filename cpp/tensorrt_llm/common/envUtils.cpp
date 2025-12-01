@@ -528,4 +528,10 @@ bool getEnvEplbForceGdrcopy()
     return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
 }
 
+bool getEnvUseNcclForHelix()
+{
+    static bool const useNcclForHelix = getBoolEnv("TRTLLM_USE_NCCL_FOR_HELIX");
+    return useNcclForHelix;
+}
+
 } // namespace tensorrt_llm::common
