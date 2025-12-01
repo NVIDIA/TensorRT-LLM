@@ -440,6 +440,8 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // 2
 
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
@@ -448,8 +450,13 @@ class TRTLLMGenFusedMoE(MoE):
                 x_sf.view(torch.float8_e4m3fn),
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w3_w1_bias,
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_bias,
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
                 self.fc2_alpha.data,
@@ -457,7 +464,10 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
+                self.hidden_size,  # valid_hidden_size_per_partition
+                self.quant_method.
+                intermediate_size_per_partition_lean,  # valid_intermediate_size_per_partition
                 self.slot_start,
                 self.expert_size_per_partition,
                 routed_scaling_factor,
