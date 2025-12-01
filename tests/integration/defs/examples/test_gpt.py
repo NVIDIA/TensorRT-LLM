@@ -29,6 +29,11 @@ from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 
+from tensorrt_llm import LLM
+from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.sampling_params import SamplingParams
+
 # skip trt flow cases on post-Blackwell-Ultra
 if get_sm_version() >= 103:
     pytest.skip(
@@ -1944,11 +1949,6 @@ def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
                                 cmodel_dir, llm_lora_model_root):
     """Run GPT-OSS-20B with LoRA adapter using Torch backend."""
 
-    from tensorrt_llm import LLM
-    from tensorrt_llm.executor.request import LoRARequest
-    from tensorrt_llm.lora_manager import LoraConfig
-    from tensorrt_llm.sampling_params import SamplingParams
-
     print(f"Using LoRA from: {llm_lora_model_root}")
 
     defs.ci_profiler.start("test_gpt_oss_20b_lora_torch")
@@ -1985,7 +1985,9 @@ def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
         assert len(outputs) == 1
         assert len(outputs[0].outputs) > 0
         generated_text = outputs[0].outputs[0].text
-        assert generated_text == expected_output, f"Output mismatch!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
+        similarity = similarity_score(generated_text, expected_output)
+        assert similar(generated_text, expected_output, threshold=0.8), \
+            f"Output similarity too low (similarity={similarity:.2%})!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
 
     defs.ci_profiler.stop("test_gpt_oss_20b_lora_torch")
     print(

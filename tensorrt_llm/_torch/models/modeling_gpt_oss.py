@@ -233,9 +233,12 @@ class MLPBlock(torch.nn.Module):
     def compute_gate_output(self,
                             x: torch.Tensor,
                             lora_params: Optional[dict] = None) -> torch.Tensor:
-        if get_sm_version() in [
-                90, 100, 103
-        ] and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
+        # Skip tinygemm2 optimization when LoRA is active (tinygemm2 doesn't support LoRA)
+        use_tinygemm = (get_sm_version() in [90, 100, 103]
+                        and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS
+                        and (lora_params is None or not bool(lora_params)))
+
+        if use_tinygemm:
             weight = self.gate.weight
             bias = self.gate.bias
             g = torch.ops.trtllm.tinygemm2(x, weight, bias)
