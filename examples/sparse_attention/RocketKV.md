@@ -1,6 +1,6 @@
 # RocketKV Sparse Attention
 
-This document details how to run RocketKV sparse attention with TensorRT-LLM.
+This document details enabling RocketKV sparse attention within TensorRT LLM.
 
 RocketKV is a training-free, two-stage KV cache compression method designed to accelerate long-context LLM inference. It combines permanent KV token eviction (coarse-grain) with dynamic KV token selection (fine-grain) to significantly reduce memory bandwidth usage and increase throughput while maintaining high accuracy.
 
@@ -8,12 +8,12 @@ For more technical details, please refer to the paper: [RocketKV: Accelerating L
 
 ## Overview
 
-In Transformer-based LLM inference, the KV cache grows linearly with sequence length, becoming a major bottleneck. RocketKV addresses this via two stages:
+In Transformer-based LLM inference, the KV cache grows linearly with sequence length, becoming a major bottleneck. RocketKV mitigates this issue through a two-stage process:
 
 1.  **Context Phase (Stage 1):** It performs **permanent KV cache eviction**. Instead of storing the full history, it selects and keeps a `prompt_budget` of the most important tokens based on attention scores.
 2.  **Generation Phase (Stage 2):** It utilizes a **fine-grain Top-K sparse attention**. It maintains a lightweight, compressed auxiliary cache (KT Cache) to dynamically predict which blocks of the KV cache are relevant for the current token, and loading only those blocks to do the attention computation.
 
-In TensorRT-LLM, RocketKV is implemented as a specialized attention backend within the PyTorch-based high-level API workflow. Specifically, the core sparse KV prediction kernels are implemented using **Triton** kernels, achieving highly optimized performance on modern NVIDIA GPUs.
+RocketKV is integrated into TensorRT LLM as a specialized attention backend, accessible via the LLM API. Specifically, the core sparse KV prediction kernels are implemented using **Triton** kernels, achieving highly optimized performance on modern NVIDIA GPUs.
 
 ## Support Matrix
 
@@ -27,11 +27,11 @@ In TensorRT-LLM, RocketKV is implemented as a specialized attention backend with
 
 ## Usage
 
-To use RocketKV, you need to configure the `RocketSparseAttentionConfig` and pass it to the `LLM` class.
+To enable RocketKV, configure `RocketSparseAttentionConfig` and pass it to the `LLM` class constructor.
 
 ### Python API
 
-You can integrate RocketKV into your own scripts using the `tensorrt_llm.llmapi` interface.
+Integrate RocketKV into your workflows using the `tensorrt_llm.llmapi` interface.
 
 
 ```python
