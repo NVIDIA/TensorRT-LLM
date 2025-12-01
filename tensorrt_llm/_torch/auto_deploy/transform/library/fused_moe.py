@@ -70,14 +70,15 @@ def _process_regular_moe_node(
     # Register the stacked weights as parameters
     param_w_up = torch.nn.Parameter(fused_w_up_experts)
     gm.register_parameter(new_key_w_up, param_w_up)
-    w_up_arg = graph.get_attr(new_key_w_up)
 
     param_w_down = torch.nn.Parameter(fused_w_down_experts)
     gm.register_parameter(new_key_w_down, param_w_down)
-    w_down_arg = graph.get_attr(new_key_w_down)
 
     # Create fused MoE node - kernel applies routing to output
     with graph.inserting_before(node):
+        w_up_arg = graph.get_attr(new_key_w_up)
+        w_down_arg = graph.get_attr(new_key_w_down)
+
         new_node = graph.call_function(
             replacement_op,
             args=(hidden_states, selected_experts, routing_weights, w_up_arg, w_down_arg),
@@ -122,12 +123,16 @@ def _process_llama4_stacked_moe_node(
         gate_up_weight = gm.get_parameter(w3_w1_stacked.target)
         down_weight = gm.get_parameter(w2_stacked.target)
 
-        # Detect format: Llama4 has gate_up[0] == down[1]
-        is_llama4 = gate_up_weight.shape[1] == down_weight.shape[0]
+        # Detect format:
+        # - Llama4: gate_up is (E, H, 2*I) and down is (E, I, H)
+        # - TRT-LLM: gate_up is (E, 2*I, H) and down is (E, H, I)
+        # If both have H in middle dimension, they're Llama4 format
+        is_llama4 = gate_up_weight.shape[1] == down_weight.shape[2]
 
         if is_llama4:
-            # Convert Llama4 (H, 2*I) -> TRT-LLM (2*I, H)
+            # Convert Llama4 (E, H, 2*I) -> TRT-LLM (E, 2*I, H)
             gate_up_trtllm = gate_up_weight.transpose(1, 2).contiguous()
+            # Convert Llama4 (E, I, H) -> TRT-LLM (E, H, I)
             down_trtllm = down_weight.transpose(1, 2).contiguous()
 
             # Register converted weights
@@ -137,31 +142,39 @@ def _process_llama4_stacked_moe_node(
             gm.register_parameter(new_key_w_up, torch.nn.Parameter(gate_up_trtllm))
             gm.register_parameter(new_key_w_down, torch.nn.Parameter(down_trtllm))
 
-            w_up_arg = graph.get_attr(new_key_w_up)
-            w_down_arg = graph.get_attr(new_key_w_down)
+            # Store keys to create get_attr nodes later in insertion context
+            needs_get_attr = True
+            w_up_key = new_key_w_up
+            w_down_key = new_key_w_down
         else:
             # Already TRT-LLM format, use directly
+            needs_get_attr = False
             w_up_arg = w3_w1_stacked
             w_down_arg = w2_stacked
     else:
         # Not get_attr nodes (might be intermediate ops), use directly
+        needs_get_attr = False
         w_up_arg = w3_w1_stacked
         w_down_arg = w2_stacked
-
-    # Get weight dtype to ensure dtype consistency for Llama4 stacked tensors
-    # The fused kernel requires input and weights to have matching dtypes
-    weight_dtype = None
-    if w_up_arg.op == "get_attr":
-        try:
-            weight_tensor = gm.get_parameter(w_up_arg.target)
-            weight_dtype = weight_tensor.dtype
-        except (AttributeError, KeyError):
-            pass
 
     # Llama4 INPUT-SIDE routing: apply routing to INPUT before kernel
     # Cast BOTH input and routing_weights to weight dtype if needed
     # Critical: BFloat16 * Float32 → Float32 (type promotion) so we cast both to same dtype
     with graph.inserting_before(node):
+        # Create get_attr nodes INSIDE insertion context for proper topological ordering
+        if needs_get_attr:
+            w_up_arg = graph.get_attr(w_up_key)
+            w_down_arg = graph.get_attr(w_down_key)
+
+        # Get weight dtype to ensure dtype consistency for Llama4 stacked tensors
+        # The fused kernel requires input and weights to have matching dtypes
+        weight_dtype = None
+        if w_up_arg.op == "get_attr":
+            try:
+                weight_tensor = gm.get_parameter(w_up_arg.target)
+                weight_dtype = weight_tensor.dtype
+            except (AttributeError, KeyError):
+                pass
         input_to_scale = hidden_states
         routing_to_scale = routing_weights
 
