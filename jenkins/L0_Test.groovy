@@ -1656,8 +1656,8 @@ def generateTimeoutTestResultXml(stageName, testFilePath) {
         <testsuite name="${stageName}" errors="${testList.size()}" failures="0" skipped="0" tests="${testList.size()}" time="1.00">"""
     testList.each { test ->
         xmlContent += """<testcase name="${test}" classname="${stageName}" time="1.0">
-        <failure message="Test timeout"> Test timeout
-        </failure></testcase>"""
+        <error message="Test terminated unexpectedly"> Test terminated unexpectedly
+        </error></testcase>"""
     }
     xmlContent += "</testsuite></testsuites>"
     return xmlContent
