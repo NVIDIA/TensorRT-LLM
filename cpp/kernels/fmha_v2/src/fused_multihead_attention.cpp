@@ -277,7 +277,7 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     float const scale_bmm1, float const scale_softmax, float const scale_bmm2, float const softcapping_scale_bmm1,
     // flags
     bool const use_int8_scale_max, bool const interleaved, bool const is_s_padded, bool const has_alibi,
-    float const skip_softmax_threshold)
+    float const skip_softmax_threshold_scale_factor)
 {
 
     memset(&params, 0, sizeof(params));
@@ -424,7 +424,7 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     }
 
     // Skip-softmax attention
-    params.skip_softmax_threshold = skip_softmax_threshold;
+    params.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -594,7 +594,7 @@ int main(int argc, char** argv)
     bool use_attention_sinks = false;
 
     // Skip-softmax attention
-    float skip_softmax_threshold = 0;
+    float skip_softmax_threshold_scale_factor = 0;
 
     // Read the parameters from the command-line.
     for (int ii = 1; ii < argc; ++ii)
@@ -892,9 +892,9 @@ int main(int argc, char** argv)
         {
             use_attention_sinks = true;
         }
-        else if (!strcmp(argv[ii], "-skip-softmax-threshold") && ++ii < argc)
+        else if (!strcmp(argv[ii], "-skip-softmax-threshold-scale-factor") && ++ii < argc)
         {
-            skip_softmax_threshold = strtof(argv[ii], nullptr);
+            skip_softmax_threshold_scale_factor = strtof(argv[ii], nullptr);
         }
         else
         {
@@ -1724,7 +1724,7 @@ int main(int argc, char** argv)
         tokens_per_block, qkv_d_view, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr, kv_cache_block_offsets_d,
         packed_mask_d, cu_mask_rows_d, attention_sinks_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d,
         softmax_stats_ptr, scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1,
-        use_int8_scale_max, interleaved, is_s_padded, has_alibi, skip_softmax_threshold);
+        use_int8_scale_max, interleaved, is_s_padded, has_alibi, skip_softmax_threshold_scale_factor);
 #ifdef SKIP_SOFTMAX_STAT
     FMHA_CHECK_CUDA(cudaMalloc(&params_v2.skip_softmax_total_blocks, sizeof(uint32_t)));
     FMHA_CHECK_CUDA(cudaMalloc(&params_v2.skip_softmax_skipped_blocks, sizeof(uint32_t)));

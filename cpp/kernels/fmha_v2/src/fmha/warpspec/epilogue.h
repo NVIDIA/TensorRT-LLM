@@ -126,7 +126,7 @@ struct Softmax_base
         , total_blocks(0)
         , skipped_blocks(0)
 #endif
-        , skip_softmax_threshold(params.skip_softmax_threshold)
+        , skip_softmax_threshold(0)
     {
 
         int warp = tidx / 32;

@@ -361,6 +361,9 @@ struct Compute
             // Contiguous QKV FMHA assumes q, and kv have the same sequence length.
             int const actual_kv_seqlen = SEPARATE_Q_KV_BUFFER ? head_info.actual_kv_seqlen : actual_q_seqlen;
 
+            // Update threshold of Skip-Softmax
+            softmax.skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+
             // Calculate the alibi head_scaling_factor.
             float alibi_head_scale
                 = APPLY_ALIBI ? get_alibi_head_scaling_factor<AlibiParams>(head_info.bidh, params.alibi_params) : 0.f;
