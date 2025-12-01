@@ -479,10 +479,12 @@ class FusedMoEMethodBase(ABC):
 
         dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
         if w1_weight is not None:
-            dst_w1_weight.copy_(w1_weight_shard.view(dst_w3_w1_weight.dtype),
+            dst_w1_weight.copy_(w1_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype),
                                 non_blocking=True)
         if w3_weight is not None:
-            dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_w1_weight.dtype),
+            dst_w3_weight.copy_(w3_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype),
                                 non_blocking=True)
 
     # Helper function
