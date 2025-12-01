@@ -89,21 +89,21 @@ def create_dataset_from_stream(
     while (line := stream.readline()) and len(task_ids) < max_requests:
         # We expect the data to come in as a JSON string.
         # For example:
-        # {"prompt": "Generate an infinite response to the following:
+        # {"task_id": 1, "prompt": "Generate an infinite response to the following:
         # There once was a man who.", "output_tokens": 1000}
         #
         # For multimodal data, the data should be of the form:
-        # {"prompt": "Generate an infinite response to the following:
+        # {"task_id": 1, "prompt": "Generate an infinite response to the following:
         # There once was a man who.", "output_tokens": 1000,
         # "media_paths": ["/path/to/image1.jpg", "/path/to/image2.jpg"]}
         #
         # For LoRA data, the data should be of the form:
-        # {"prompt": "Generate an infinite response to the following:
+        # {"task_id": 1, "prompt": "Generate an infinite response to the following:
         # There once was a man who.", "output_tokens": 1000,
         # "lora_request": {"lora_name": "my_lora", "lora_int_id": 1, "lora_path": "/path/to/lora"}}
         #
         # Each line should be a complete JSON dictionary with no indentation
-        # or newline characters.
+        # or newline characters. The task_id field is required.
         data = json.loads(line)
         prompts.append(data.get("prompt"))
         media_paths.append(data.get("media_paths", None))

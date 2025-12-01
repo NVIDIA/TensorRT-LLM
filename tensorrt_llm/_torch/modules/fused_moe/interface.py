@@ -1,7 +1,7 @@
 import weakref
 from abc import abstractmethod
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional, Union, final
+from typing import Dict, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
@@ -26,12 +26,14 @@ class MoEWeightLoadingMode(Enum):
 class AlltoallMethodType(IntEnum):
     # Not available
     NotEnabled = 0
-    # MNNVL
-    MNNVL = 1
+    # NVLink One-Sided
+    NVLinkOneSided = 1
+    # NVLink Two-Sided
+    NVLinkTwoSided = 2
     # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 2
+    DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 3
+    DeepEPLowLatency = 4
 
 
 def extract_extra_attrs(layer_idx: str):
@@ -145,6 +147,7 @@ class MoE(nn.Module):
         swiglu_limit: Optional[torch.Tensor] = None,
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
+        init_load_balancer: bool = True,
     ):
         from ...distributed import AllReduce
 
@@ -190,12 +193,31 @@ class MoE(nn.Module):
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=model_config.allreduce_strategy,
-                                    dtype=self.dtype)
+        self.all_reduce = None
+        if not self.use_dp and self.mapping.tp_size > 1:
+            self.all_reduce = AllReduce(
+                mapping=self.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=self.dtype)
 
         # Initialize load balancer related attributes
-        self._init_load_balancer(model_config, aux_stream_dict)
+        if init_load_balancer:
+            self._init_load_balancer(model_config, aux_stream_dict)
+        else:
+            # When init_load_balancer=False, initialize minimal attributes
+            # These will be synced from the parent wrapper (e.g., ConfigurableMoE) later
+            self.aux_stream_dict = aux_stream_dict
+            self.layer_load_balancer = None
+            self.repeat_idx = 0
+            self.repeat_count = 1
+            self.expert_size_per_partition = self.num_experts // self.ep_size
+            self.num_slots = self.num_experts
+            self.slot_start = self.ep_rank * self.expert_size_per_partition
+            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.initial_local_expert_ids = list(
+                range(self.slot_start, self.slot_end))
+            self.initial_global_assignments = list(range(self.num_experts))
+            self.allreduce = None
 
     def _init_load_balancer(
         self,
@@ -309,6 +331,10 @@ class MoE(nn.Module):
         """
         return False
 
+    def _using_load_balancer(self) -> bool:
+        """Check if this MoE is using load balancer."""
+        return self.layer_load_balancer is not None
+
     def _using_dynamic_load_balancer(self) -> bool:
         """Check if this MoE is using dynamic load balancer."""
         if self.layer_load_balancer:
@@ -346,7 +372,7 @@ class MoE(nn.Module):
             token_selected_experts: The selected experts of all tokens, has shape of [tokenCount * topK]
             is_first_call: Whether this is the first call for the same weights
             is_last_call: Whether this is the last call for the same weights
-            ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. NVLINK_TWO_SIDED supports this.
+            ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. NVLINKTwoSided supports this.
         """
         if self._using_dynamic_load_balancer():
             if ignore_allreduce:
@@ -485,6 +511,72 @@ class MoE(nn.Module):
 
     def post_load_weights(self):
         pass
+
+    @abstractmethod
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        **kwargs,
+    ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], Dict]:
+        """
+        Quantize input tensor - unified interface for all MoE backends
+
+        NOTE: This is a temporary interface. In the future, this method should be moved
+        to the MoEBackend interface as part of the backend abstraction layer.
+
+        This method handles quantization of input tensors before MoE computation.
+        All MoE backend implementations must override this method to implement their
+        specific quantization logic.
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size] or Fp4QuantizedTensor
+            **kwargs: Backend-specific arguments (e.g., token_selected_experts, workspace, etc.)
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor]] or Dict:
+                (quantized_x, scaling_factors)
+                where scaling_factors should be reshaped to 2D if applicable
+
+        Examples:
+            Simple backends (Cutlass, WideEP, TRTLLMGen):
+                return x_quantized, x_sf  # x_sf is 2D or None
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def run_moe(
+        self,
+        # ========== Common parameters (all backends use) ==========
+        x: torch.Tensor,
+        token_selected_experts: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+        # ========== Backend-specific parameters (via kwargs) ==========
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Unified MoE computation interface
+
+        NOTE: This is a TEMPORARY interface. In the future, this method should be moved
+        to the MoEBackend interface as part of the backend abstraction layer.
+
+        This method performs the core MoE computation. Different backends will implement
+        their specific computation logic while following this unified interface.
+
+        Common parameters (all backends use):
+            x: Input activations [num_tokens, hidden_size]
+            token_selected_experts: Expert IDs [num_tokens, top_k] (used by DeepGemm/TRTLLMGen).
+                                    If EPLB is enabled, this represents expert slots [num_tokens, top_k].
+            token_final_scales: Routing weights [num_tokens, top_k]
+            x_sf: Input scale factor (for quantization, if applicable)
+
+        Backend-specific parameters (passed via kwargs, obtained from _get_backend_kwargs()):
+            TODO: This is not finalized, will be updated later.
+
+        Returns:
+            torch.Tensor: MoE computation result [num_tokens, hidden_size]
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def forward_impl(

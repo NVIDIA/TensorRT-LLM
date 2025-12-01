@@ -49,19 +49,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             assert output_dtype == torch.bfloat16
 
-            if get_sm_version() != 100:
+            if get_sm_version() not in [100, 103]:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
                 )
 
-        # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
-        def __hash__(self):
-            return hash((self.output_dtype, ))
-
-        def __eq__(self, other):
-            if not isinstance(other, self.__class__):
-                return False
-            return self.output_dtype == other.output_dtype
+        def unique_id(self):
+            return (self.output_dtype, )
 
         def get_valid_tactics(
             self,
@@ -86,12 +80,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # full shamoo
             mma_tiler_mn_candidates = [
-                (256, 128),
+                (128, 64),
+                (256, 64),
                 (128, 128),
+                (256, 128),
+                (128, 192),
+                (256, 192),
                 (128, 256),
                 (256, 256),
-                (256, 64),
-                (128, 64),
             ]
             cluster_shape_mn_candidates = [
                 (1, 1),
@@ -105,37 +101,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 4),
             ]
             swap_ab_candidates = [True, False]
+            use_prefetch_candidates = [True, False]
 
             valid_tactics = []
-            for swap_ab in swap_ab_candidates:
-                for mma_tiler_mn in mma_tiler_mn_candidates:
-                    for cluster_shape_mn in cluster_shape_mn_candidates:
-                        if swap_ab:
-                            c_major = "m"
-                            kernel_m = n
-                            kernel_n = m
-                        else:
-                            c_major = "n"
-                            kernel_m = m
-                            kernel_n = n
+            for mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    swap_ab_candidates, use_prefetch_candidates):
+                if swap_ab:
+                    c_major = "m"
+                    kernel_m = n
+                    kernel_n = m
+                else:
+                    c_major = "n"
+                    kernel_m = m
+                    kernel_n = n
 
-                        if self.__class__.kernel_class.can_implement(
-                                cutlass.Float4E2M1FN,  # ab_dtype,
-                                cutlass.Float8E4M3FN,  # sf_dtype
-                                sf_vec_size,  # sf_vec_size,
-                                cutlass.BFloat16,  # c_dtype,
-                                mma_tiler_mn,
-                                cluster_shape_mn,
-                                kernel_m,
-                                kernel_n,
-                                real_k,
-                                batch_size,
-                                a_major,
-                                b_major,
-                                c_major,
-                        ):
-                            valid_tactics.append(
-                                (mma_tiler_mn, cluster_shape_mn, swap_ab))
+                if self.__class__.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype,
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        sf_vec_size,  # sf_vec_size,
+                        cutlass.BFloat16,  # c_dtype,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                ):
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
 
             return valid_tactics
 
@@ -164,7 +161,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
                     inputs[4]: Alpha scaling factor. dtype: float32.
                     inputs[5]: Output dtype, expected to be torch.bfloat16.
-                tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn).
+                tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch).
 
             Returns:
                 torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
@@ -172,12 +169,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_vec_size = 16
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, swap_ab = tactic
+                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = tactic
             else:
                 # fallback to default tactic
-                mma_tiler_mn, cluster_shape_mn, swap_ab = [
+                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = [
                     (128, 128),
                     (1, 1),
+                    False,
                     False,
                 ]
 
@@ -214,7 +212,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab)
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch)
             if swap_ab:
                 kernel_a_ptr = b_ptr
                 kernel_a_sf_ptr = b_sf_ptr
@@ -239,6 +238,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
+                    use_prefetch,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -263,6 +263,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     swap_ab,
+                    options=f"--opt-level 2",
                 )
 
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -536,6 +537,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -576,7 +588,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -812,6 +824,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -852,7 +875,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -1129,6 +1152,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1169,7 +1202,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -1448,6 +1481,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1457,7 +1500,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return [128]
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = FusedMoEInputsHelper(self.num_experts, self.top_k,
                                               self.num_local_experts,

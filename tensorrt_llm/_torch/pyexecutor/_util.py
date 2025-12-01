@@ -678,8 +678,10 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
+    max_num_sequences = max_batch_size * mapping.pp_size
+
     logger.info(
-        f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
+        f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
     for key, value in llm_args.extra_resource_managers.items():
@@ -764,8 +766,6 @@ def create_py_executor_instance(
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
 
-    max_num_sequences = max_batch_size * mapping.pp_size
-
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
@@ -824,11 +824,16 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools)
 
 
-def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
-                              max_batch_size: int,
-                              speculative_config: SpeculativeConfig,
-                              max_beam_width: int,
-                              disable_flash_infer_sampling: bool):
+def create_torch_sampler_args(
+    mapping: Mapping,
+    *,
+    max_seq_len: int,
+    max_batch_size: int,
+    speculative_config: SpeculativeConfig,
+    max_beam_width: int,
+    disable_overlap_scheduler: bool,
+    disable_flashinfer_sampling: bool,
+):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
@@ -841,8 +846,8 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
-        disable_flash_infer_sampling=disable_flash_infer_sampling,
-    )
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
+        disable_overlap_scheduler=disable_overlap_scheduler)
 
 
 def instantiate_sampler(
@@ -857,7 +862,7 @@ def instantiate_sampler(
     speculative_config: SpeculativeConfig,
     decoding_config: trtllm.DecodingConfig,
     kv_cache_config: KvCacheConfig,
-    disable_flash_infer_sampling: bool,
+    disable_flashinfer_sampling: bool,
 ):
     sampler_args = create_torch_sampler_args(
         mapping,
@@ -865,7 +870,8 @@ def instantiate_sampler(
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
-        disable_flash_infer_sampling=disable_flash_infer_sampling,
+        disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
@@ -965,7 +971,7 @@ def _adjust_torch_mem_fraction():
     #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
     #   or a similar API is available, the warning below should be removed
     #   and the allocator GC threshold be set via the new API instead.
-    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_allocator_config = os.environ.get("PYTORCH_ALLOC_CONF", "")
     torch_mem_threshold_advised = (
         torch.cuda.get_allocator_backend() == "native"
         and "expandable_segments:True" not in torch_allocator_config)
@@ -973,7 +979,7 @@ def _adjust_torch_mem_fraction():
     if torch_mem_threshold_advised and not torch_mem_threshold_set:
         logger.warning(
             "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
-            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+            " or 'expandable_segments:True' in PYTORCH_ALLOC_CONF.")
 
     # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
     #       fraction < 1.0 is beneficial, because

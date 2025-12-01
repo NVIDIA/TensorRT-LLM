@@ -63,8 +63,8 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     x_ref = x.clone()
-    # Run CUDA cached op
-    y = torch.ops.auto_deploy.cuda_cached_causal_conv1d(
+    # Run CUDA cached op (modifies x in-place and returns None)
+    torch.ops.auto_deploy.cuda_cached_causal_conv1d(
         # INPUTS
         x,
         w,
@@ -84,6 +84,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
         pm,
         None,
     )
+    y = x  # The op modifies x in-place
 
     assert y.shape == (batch, seq, c)
     assert torch.isfinite(y).all()

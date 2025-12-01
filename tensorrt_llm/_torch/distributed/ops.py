@@ -338,6 +338,7 @@ def alltoall_helix(
         inputs (List[Tensor]): The input tensors.
             Its length must be a multiple of the group size,
             and all tensors in a group must have the same shape.
+            All input tensors must be contiguous.
         group (List[int]): The group of ranks to participate in the all-to-all.
     Returns:
         The output tensors.
@@ -646,7 +647,10 @@ class AllReduce(nn.Module):
             if self.strategy != AllReduceStrategy.UB:
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
-                self.workspace = get_allreduce_workspace(self.mapping)
+                if self.strategy not in (AllReduceStrategy.UB,
+                                         AllReduceStrategy.NCCL,
+                                         AllReduceStrategy.NCCL_SYMMETRIC):
+                    self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL if using AUTO or MNNVL strategy
             if self.strategy in (AllReduceStrategy.AUTO,

@@ -76,7 +76,7 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['factory','heuristic']
+    sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
     allreduce_strategy: 'AUTO'
@@ -153,6 +153,9 @@ transforms:
   insert_cached_causal_conv:
     stage: cache_init
     backend: cuda_causal_conv
+  insert_cached_delta_rule:
+    stage: cache_init
+    backend: fla_delta
   initialize_cache:
     stage: cache_init
     run_per_gm: false
@@ -165,6 +168,9 @@ transforms:
   ############################################################################################
   fuse_causal_conv_activation:
     stage: compile
+  multi_stream_moe:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     run_per_gm: false

@@ -19,7 +19,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   cutlass
   GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-  GIT_TAG v4.2.1 # f3fde58372d33e9a5650ba7b80fc48b3b49d40c8
+  GIT_TAG v4.3.0 # e67e63c331d6e4b729047c95cf6b92c8454cba89
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)

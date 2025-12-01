@@ -1,4 +1,5 @@
 import copy
+import gc
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -532,7 +533,7 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flash_infer_sampling=llm_args._disable_flash_infer_sampling,
+            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -698,6 +699,9 @@ def create_py_executor(
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
+
+            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
@@ -727,6 +731,8 @@ def create_py_executor(
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
+
+    logger.info(f"{llm_args}")
 
     py_executor.start_worker()
     return py_executor
