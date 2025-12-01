@@ -755,14 +755,14 @@ def stress_test(config,
 
 
 def create_aiperf_command(model_name,
-                              model_path,
-                              request_count,
-                              concurrency,
-                              input_len_mean=PerformanceParams.input_len_mean,
-                              input_len_std=PerformanceParams.input_len_std,
-                              output_len_mean=PerformanceParams.output_len_mean,
-                              output_len_std=PerformanceParams.output_len_std,
-                              warmup_request_count=10):
+                          model_path,
+                          request_count,
+                          concurrency,
+                          input_len_mean=PerformanceParams.input_len_mean,
+                          input_len_std=PerformanceParams.input_len_std,
+                          output_len_mean=PerformanceParams.output_len_mean,
+                          output_len_std=PerformanceParams.output_len_std,
+                          warmup_request_count=10):
     """
     Create a command list for aiperf with standardized parameters.
 
@@ -810,10 +810,10 @@ def create_aiperf_command(model_name,
 
 
 def run_aiperf_process(cmd,
-                           test_start_time,
-                           test_timeout,
-                           server_config,
-                           request_counter=None):
+                       test_start_time,
+                       test_timeout,
+                       server_config,
+                       request_counter=None):
     """
     Run a aiperf process and monitor both the process and server health.
 
@@ -934,9 +934,9 @@ def measure_capacity_stage(model_name,
             warmup_request_count=10)
 
         # Run aiperf process
-        process_completed = run_aiperf_process(
-            cmd, test_start_time, performance_params.test_timeout,
-            server_config, request_counter)
+        process_completed = run_aiperf_process(cmd, test_start_time,
+                                               performance_params.test_timeout,
+                                               server_config, request_counter)
 
         # Increment completed tests counter if the process completed successfully
         if process_completed:
@@ -1029,9 +1029,8 @@ def stress_stage(model_name,
         warmup_request_count=10)
 
     # Start aiperf process
-    process_completed = run_aiperf_process(cmd, test_start_time,
-                                               test_timeout, server_config,
-                                               request_counter)
+    process_completed = run_aiperf_process(cmd, test_start_time, test_timeout,
+                                           server_config, request_counter)
 
     test_end_time = time.time()
     duration = int(test_end_time - test_start_time)
@@ -1307,8 +1306,7 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
 
         range_val = max_val - min_val
         if range_val == 0:
-            raise ValueError(
-                "Please check OutputTokenThroughput from aiperf")
+            raise ValueError("Please check OutputTokenThroughput from aiperf")
         else:
             normalized_df.loc[
                 normalized_df["Model"] == model_name,
