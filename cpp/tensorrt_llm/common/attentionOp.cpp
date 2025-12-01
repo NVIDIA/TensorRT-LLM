@@ -296,7 +296,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Parameters for sparse attention
     xqaParams.sparse_params = mRuntimeSparseAttentionParams;
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
-
+    // Skip softmax threshold.
+    xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactor;
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
 
