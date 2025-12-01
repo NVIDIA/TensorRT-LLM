@@ -52,6 +52,7 @@ for concurrency in ${concurrency_list}; do
         --dataset-path ${dataset_file} \
         --num-prompts ${num_prompts} \
         --max-concurrency ${concurrency} \
+        --trust-remote-code \
         --ignore-eos \
         --no-test-input \
         --save-result \

@@ -117,7 +117,8 @@ async def test_invalid_max_tokens(async_client: openai.AsyncOpenAI,
             max_tokens=0,
         )
     error_msg = str(exc_info.value).lower()
-    assert any(keyword in error_msg for keyword in ("mMaxNewTokens", "failed"))
+    assert any(keyword in error_msg
+               for keyword in ("max_tokens", "must be greater than 0"))
 
 
 @pytest.mark.asyncio

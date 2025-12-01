@@ -1077,7 +1077,7 @@ class TestBatchedSampling:
                 max_beam_width=1,  # currently the only supported value
                 max_num_sequences=num_seq_slots,
                 max_total_draft_tokens=max_draft_len,
-                disable_flash_infer_sampling=(not use_flashinfer),
+                disable_flashinfer_sampling=(not use_flashinfer),
             )
         )
 

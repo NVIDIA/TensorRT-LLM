@@ -1,6 +1,6 @@
 import os
 from functools import cached_property
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -74,6 +74,7 @@ class CutlassFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        init_load_balancer: bool = True,
     ):
 
         super().__init__(
@@ -90,6 +91,7 @@ class CutlassFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
         )
 
         # Store original hidden size before any potential padding
@@ -105,11 +107,12 @@ class CutlassFusedMoE(MoE):
         # slot_start, slot_end, initial_local_expert_ids are all initialized by
         # base class's _init_load_balancer() method
 
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < moe_max_num_tokens:
+        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        if self.moe_max_num_tokens < default_moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
@@ -143,34 +146,29 @@ class CutlassFusedMoE(MoE):
         if self.enable_alltoall:
             self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
-                    MnnvlMemory.initialize()
-                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                        model_config.mapping)
-                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                        model_config.mapping)
-                elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
-                    workspace_mb = int(
-                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
-                    self.moe_a2a = MoeAlltoAll(
-                        mapping=self.mapping,
-                        max_num_tokens=model_config.max_num_tokens,
-                        top_k=self.routing_method.experts_per_token,
-                        num_experts=self.num_slots,
-                        workspace_size_per_rank=workspace_mb * 1024 * 1024,
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
-                    )
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
+                MnnvlMemory.initialize()
+                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    model_config.mapping)
+                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                    model_config.mapping)
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                workspace_mb = int(
+                    os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
+                self.moe_a2a = MoeAlltoAll(
+                    mapping=self.mapping,
+                    max_num_tokens=model_config.max_num_tokens,
+                    top_k=self.routing_method.experts_per_token,
+                    num_experts=self.num_slots,
+                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                )
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
                     "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
                 )
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
+                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
@@ -236,15 +234,11 @@ class CutlassFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return AlltoallMethodType.NotEnabled
-
-        # TODO: We found that MNNVL performs better than NCCL AllGather/ReduceScatter,
-        # regardless of the relationship between EP size and topK. We favor AlltoAll for now.
+        # TODO: We found that NVLinkOneSided performs better than NCCL AllGather/ReduceScatter,
+        # regardless of the relationship between EP size and topK. We favor NVLinkOneSided for now.
         # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
         #     return AlltoallMethodType.NotEnabled
-
-        return AlltoallMethodType.MNNVL
+        return AlltoallMethodType.NVLinkOneSided
 
     @cached_property
     def enable_alltoall(self):
@@ -252,11 +246,65 @@ class CutlassFusedMoE(MoE):
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
-    @cached_property
-    def moe_alltoall_backend(self):
-        # "NVLINK_ONE_SIDED" (default) or "NVLINK_TWO_SIDED"
-        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "NVLINK_ONE_SIDED").strip().upper()
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Quantize input tensor - CutlassFusedMoE implementation
+
+        Handles all quantization cases for Cutlass backend.
+        """
+        # Determine if this is post-quant communication scenario
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
+
+        x_sf = None
+        if self.has_any_quant:
+            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
+                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, self.fc31_input_dequant)
+            elif self.has_deepseek_fp8_block_scales:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_w4afp8:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_w4a16_mxfp4:
+                pad_size = self.hidden_size - x.shape[1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
+            elif self.has_int8_woq_per_channel:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_nvfp4:
+                if run_post_quant_allgather or self.enable_alltoall:
+                    if isinstance(x, Fp4QuantizedTensor):
+                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                    else:
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, False)
+                    # Reshape x_sf to 2D
+                    x_sf = x_sf.view((x.shape[0], -1))
+                else:
+                    if not isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, True)
+            elif self.has_w4a8_mxfp4_mxfp8:
+                if run_post_quant_allgather or self.enable_alltoall:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, False, alignment=self.quant_method.weight_alignment)
+                else:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, True, alignment=self.quant_method.weight_alignment)
+            else:
+                raise ValueError(
+                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+
+        return x, x_sf
 
     def _supports_load_balancer(self) -> bool:
         """CutlassFusedMoE supports load balancer."""
@@ -329,7 +377,7 @@ class CutlassFusedMoE(MoE):
 
         if self.layer_load_balancer:
             self._load_balancer_done_wait_gpu_stage(is_first_call)
-            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type == AlltoallMethodType.MNNVL and self.moe_alltoall_backend == "NVLINK_TWO_SIDED"
+            ignore_allreduce = self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided
             self._load_balancer_update_statistic(
                 token_selected_experts,
                 is_first_call,
@@ -440,7 +488,7 @@ class CutlassFusedMoE(MoE):
                 token_final_scales = torch.ones_like(token_selected_slots,
                                                      dtype=torch.float32)
 
-            if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
                 if is_last_call:
                     loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
@@ -473,7 +521,7 @@ class CutlassFusedMoE(MoE):
                     token_selected_slots, alltoall_info.recv_rank_count_cumsum,
                     runtime_max_tokens_per_rank, top_k, self.num_slots,
                     self.ep_size)
-            elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 # Python MoeAlltoAll path
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,
@@ -511,7 +559,7 @@ class CutlassFusedMoE(MoE):
                     -1, token_final_scales_recv.shape[-1])
             else:
                 raise ValueError(
-                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    f"Unsupported moe alltoall method type: {self.alltoall_method_type}"
                 )
 
         elif run_post_quant_allgather:
@@ -533,7 +581,7 @@ class CutlassFusedMoE(MoE):
 
         # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output: Optional[torch.Tensor] = None
-        if self.enable_alltoall and self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
             # Retrieve a workspace-backed output tensor sized by runtime tokens
             runtime_max_tokens_per_rank = max(
                 all_rank_num_tokens) if all_rank_num_tokens else x.shape[0]
@@ -584,7 +632,7 @@ class CutlassFusedMoE(MoE):
 
         # Combine results if using alltoall
         if self.enable_alltoall:
-            if self.moe_alltoall_backend == "NVLINK_TWO_SIDED":
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if alltoall_info is not None:
                     top_k = self.routing_method.experts_per_token
                     final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
@@ -597,7 +645,7 @@ class CutlassFusedMoE(MoE):
                         use_low_precision_combine=self.
                         use_low_precision_combine,
                         token_count=token_count)
-            elif self.moe_alltoall_backend == "NVLINK_ONE_SIDED":
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 output_hidden_size = final_hidden_states.shape[-1]
                 runtime_max_tokens_per_rank = max(
                     all_rank_num_tokens) if all_rank_num_tokens else token_count
@@ -609,7 +657,7 @@ class CutlassFusedMoE(MoE):
                     payload_in_workspace=True)
             else:
                 raise ValueError(
-                    f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}"
+                    f"Unsupported moe alltoall method type: {self.alltoall_method_type}"
                 )
 
         self._load_balancer_done_set_cpu_stage(is_last_call)
@@ -709,7 +757,10 @@ class CutlassFusedMoE(MoE):
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
-                if not (self.alltoall_method_type == AlltoallMethodType.MNNVL):
+                if not (self.alltoall_method_type
+                        == AlltoallMethodType.NVLinkOneSided
+                        or self.alltoall_method_type
+                        == AlltoallMethodType.NVLinkTwoSided):
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
                             outputs = _forward_chunk(x, router_logits,
@@ -727,7 +778,10 @@ class CutlassFusedMoE(MoE):
 
                 outputs_list.append(outputs)
 
-            if not (self.alltoall_method_type == AlltoallMethodType.MNNVL):
+            if not (self.alltoall_method_type
+                    == AlltoallMethodType.NVLinkOneSided
+                    or self.alltoall_method_type
+                    == AlltoallMethodType.NVLinkTwoSided):
                 if num_chunks % 2 == 0:
                     outputs_list[-1] = _reducescatter_or_allreduce(
                         outputs_list[-1], -1)

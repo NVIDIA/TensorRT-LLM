@@ -49,19 +49,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             assert output_dtype == torch.bfloat16
 
-            if get_sm_version() != 100:
+            if get_sm_version() not in [100, 103]:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
                 )
 
-        # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
-        def __hash__(self):
-            return hash((self.output_dtype, ))
-
-        def __eq__(self, other):
-            if not isinstance(other, self.__class__):
-                return False
-            return self.output_dtype == other.output_dtype
+        def unique_id(self):
+            return (self.output_dtype, )
 
         def get_valid_tactics(
             self,
@@ -536,6 +530,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -576,7 +581,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -812,6 +817,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -852,7 +868,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -1129,6 +1145,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1169,7 +1195,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -1448,6 +1474,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1457,7 +1493,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return [128]
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = FusedMoEInputsHelper(self.num_experts, self.top_k,
                                               self.num_local_experts,

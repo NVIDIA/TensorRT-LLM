@@ -16,7 +16,7 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
-    MAX_SERVER_START_WAIT_S = 600  # wait for server to start for 600 seconds
+    MAX_SERVER_START_WAIT_S = 7200  # wait for server to start for 7200 seconds (~ 2 hours) for LLM models weight loading
 
     def __init__(self,
                  model: str,
