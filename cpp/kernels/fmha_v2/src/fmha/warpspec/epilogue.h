@@ -364,15 +364,19 @@ struct Softmax_base
             }
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
-            // AND(&) the CORES_M results, then `skip` means whether to skip
-            // the CORES_M(=2) rows
-            if constexpr (!EXP2F_OPTIMIZATION)
+
+            if (may_skip)
             {
-                skip &= expf(local_max_[mi] - global_max[mi]) < skip_softmax_threshold;
-            }
-            else
-            {
-                skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < skip_softmax_threshold;
+                // AND(&) the CORES_M results, then `skip` means whether to skip
+                // the CORES_M(=2) rows
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
+                    skip &= expf(local_max_[mi] - global_max[mi]) < skip_softmax_threshold;
+                }
+                else
+                {
+                    skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < skip_softmax_threshold;
+                }
             }
             if (!IS_FIRST_COL)
             {
