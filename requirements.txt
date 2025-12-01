@@ -10,7 +10,7 @@ mpi4py
 numpy<2
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
-openai
+openai==2.8.1
 polygraphy
 psutil
 nvidia-ml-py>=13
