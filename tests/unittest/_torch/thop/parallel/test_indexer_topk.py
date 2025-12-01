@@ -159,7 +159,7 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
 
 @pytest.mark.parametrize("batch_size", [1, 64, 512, 2048])
 @pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [2048, 128])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     torch.manual_seed(24)
@@ -179,7 +179,7 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
     # Run CUDA implementation
-    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n)
+    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n, index_topk)
 
     torch.cuda.synchronize()
 
@@ -198,7 +198,7 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
 
 
 @pytest.mark.parametrize("batch_size", [1, 512, 2048])
-@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("index_topk", [2048, 128])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     torch.manual_seed(24)
@@ -214,7 +214,7 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     indices = torch.empty((batch_size, index_topk), dtype=torch.int32, device="cuda")
 
     # Run CUDA implementation
-    torch.ops.trtllm.indexer_topk_prefill(logits, row_starts, row_ends, indices)
+    torch.ops.trtllm.indexer_topk_prefill(logits, row_starts, row_ends, indices, index_topk)
 
     # Run reference implementation
     torch_indices = logits.topk(min(index_topk, max(row_ends)), dim=-1)[1]
