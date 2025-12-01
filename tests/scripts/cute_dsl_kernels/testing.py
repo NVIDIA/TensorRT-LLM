@@ -57,8 +57,7 @@ class CuptiProfiler:
             start = activity.start if hasattr(activity, "start") else "nil"
             end = activity.end if hasattr(activity, "end") else "nil"
             duration = end - start if start != "nil" and end != "nil" else "nil"
-            name = activity.name[:100] if hasattr(activity,
-                                                  "name") else "unknown"
+            name = activity.name[:100] if hasattr(activity, "name") else "unknown"
             # Convert to milliseconds
             if duration != "nil":
                 self.timings.append((name, duration / 1e6))
@@ -90,8 +89,9 @@ class CuptiProfiler:
         self._buffer_requested_callback = self._buffer_requested
         self._buffer_completed_callback = partial(self._buffer_completed)
 
-        cupti.activity_register_callbacks(self._buffer_requested_callback,
-                                          self._buffer_completed_callback)
+        cupti.activity_register_callbacks(
+            self._buffer_requested_callback, self._buffer_completed_callback
+        )
 
         self._is_active = True
 
@@ -120,11 +120,8 @@ class CuptiProfiler:
         return sum(timing[1] for timing in self.timings)
 
 
-def _cuda_success(err: Union[tuple, cuda_runtime.cudaError_t,
-                             cuda_driver.CUresult], message: str):
-    """
-    Helper function to check CUDA API errors.
-    """
+def _cuda_success(err: Union[tuple, cuda_runtime.cudaError_t, cuda_driver.CUresult], message: str):
+    """Helper function to check CUDA API errors."""
     if isinstance(err, tuple):
         _cuda_success(err[0], message)
     elif isinstance(err, cuda_runtime.cudaError_t):
@@ -136,16 +133,14 @@ def _cuda_success(err: Union[tuple, cuda_runtime.cudaError_t,
             error_message = cuda_driver.cuGetErrorString(err)[1].decode("utf-8")
             raise RuntimeError(f"{message} : {error_message}")
     else:
-        raise TypeError(
-            f"{err} is an unexpected type : it should be a cudaError_t or CUresult"
-        )
+        raise TypeError(f"{err} is an unexpected type : it should be a cudaError_t or CUresult")
 
 
-def _does_kernel_use_stream(kernel: Callable, stream: cuda_driver.CUstream,
-                            *args, **kwargs):
-    """
-    This function checks if the kernel uses the provided non-default stream.
+def _does_kernel_use_stream(kernel: Callable, stream: cuda_driver.CUstream, *args, **kwargs):
+    """Check if the kernel uses the provided non-default stream.
+
     It does this by capturing the stream and then checking if any kernels were launched.
+
     :param kernel: The kernel to check
     :type kernel: Callable
     :param stream: The stream to check
@@ -153,13 +148,13 @@ def _does_kernel_use_stream(kernel: Callable, stream: cuda_driver.CUstream,
     :return: True if the kernel uses the stream, False otherwise
     :rtype: bool
     """
-
     assert int(stream) != int(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT), (
-        "Stream must be a non-default stream")
+        "Stream must be a non-default stream"
+    )
 
     err = cuda_runtime.cudaStreamBeginCapture(
-        stream,
-        cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal)
+        stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
+    )
     _cuda_success(err, "Error on stream capture")
 
     kernel(*args, **kwargs)
@@ -208,25 +203,31 @@ def benchmark(
 
         from cutlass.cute.testing import benchmark
 
+
         @cute.jit
         def user_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
             # contents of the function
             pass
 
+
         def workspace_generator():
             # create a, b, and c
             return JitArguments(a, b, c)
 
-        time_us = benchmark(user_function,
-                            workspace_generator=workspace_generator,
-                            workspace_count=10,
-                            warmup_iterations=10000,
-                            iterations=1000)
+
+        time_us = benchmark(
+            user_function,
+            workspace_generator=workspace_generator,
+            workspace_count=10,
+            warmup_iterations=10000,
+            iterations=1000,
+        )
 
     To benchmark you may always configure the function being profiled (callable), the warmup iterations, and
     the number of profiling iterations.
 
-    Whenever the kernel being benchmarked runs in a non-default stream, the stream must be provided through the stream parameter.
+    Whenever the kernel being benchmarked runs in a non-default stream, the stream must be provided
+    through the stream parameter.
 
     To use CUDA graphs, the callable must be a compiled @cute.jit annotated function.
     When using CUDA graphs, the kernel must be launched in a non-default stream.
@@ -243,7 +244,8 @@ def benchmark(
     :type kernel_arguments: JitArguments, None
     :param workspace_generator: Function that returns kernel arguments, defaults to None
     :type workspace_generator: Callable
-    :param workspace_count: Number of workspaces (arguments) to loop through, looping through enough workspaces will keep the L2 cache cold
+    :param workspace_count: Number of workspaces (arguments) to loop through, looping through enough
+        workspaces will keep the L2 cache cold
     :type workspace_count: int, optional
     :param use_cuda_graphs: Whether to use cuda graphs, defaults to False
     :type use_cuda_graphs: bool, optional
@@ -251,31 +253,29 @@ def benchmark(
     :return: The benchmark time in microseconds
     :rtype: float
     """
-
     if stream is None:
-        stream = cuda_driver.CUstream(
-            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
+        stream = cuda_driver.CUstream(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT)
 
     if workspace_count < 1:
         raise ValueError("workspace_count must be at least 1")
 
     float("nan")
-    if workspace_generator == None:
+    if workspace_generator is None:
         # If no workspace generator is provided, we need a single workspace
         if workspace_count != 1:
-            raise ValueError(
-                "Need a single workspace if not providing a generator")
+            raise ValueError("Need a single workspace if not providing a generator")
 
         # If no workspace generator is provided, we need a kernel_argument
-        if kernel_arguments == None:
-            raise ValueError(
-                "Please pass a kernel argument if not providing a generator")
-        workspace_generator = lambda: kernel_arguments
+        if kernel_arguments is None:
+            raise ValueError("Please pass a kernel argument if not providing a generator")
+
+        def workspace_generator():
+            return kernel_arguments
 
     workspaces = [workspace_generator() for _ in range(workspace_count)]
 
     for workspace in workspaces:
-        if type(workspace) != JitArguments:
+        if not isinstance(workspace, JitArguments):
             raise TypeError(
                 "workspace_generator and/or kernel_arguments should use JitArguments type"
             )
@@ -288,11 +288,9 @@ def benchmark(
         return workspace_index
 
     # Create CUDA events for timing
-    err, start_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT)
+    err, start_event = cuda_driver.cuEventCreate(cuda_driver.CUevent_flags.CU_EVENT_DEFAULT)
     _cuda_success(err, "Error on creating event")
-    err, end_event = cuda_driver.cuEventCreate(
-        cuda_driver.CUevent_flags.CU_EVENT_DEFAULT)
+    err, end_event = cuda_driver.cuEventCreate(cuda_driver.CUevent_flags.CU_EVENT_DEFAULT)
     _cuda_success(err, "Error on creating event")
 
     elapsed_time = float("nan")
@@ -305,8 +303,7 @@ def benchmark(
             cutlass.base_dsl.jit_executor.JitExecutor,
         )
         if not isinstance(callable, compiled_types):
-            raise TypeError(
-                "Function must be precompiled to be used with CUDA Graphs")
+            raise TypeError("Function must be precompiled to be used with CUDA Graphs")
 
         # Check if the stream is a non-default stream
         if int(stream) == int(cuda_driver.CUstream_flags.CU_STREAM_DEFAULT):
@@ -318,8 +315,8 @@ def benchmark(
 
         # Capture warmup graph
         err = cuda_runtime.cudaStreamBeginCapture(
-            stream,
-            cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal)
+            stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
+        )
         _cuda_success(err, "Error on stream capture")
 
         workspace_index = _loop_and_call_kernel(warmup_iterations)
@@ -337,8 +334,8 @@ def benchmark(
 
         # Capture profiling graph
         err = cuda_runtime.cudaStreamBeginCapture(
-            stream,
-            cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal)
+            stream, cuda_runtime.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
+        )
         _cuda_success(err, "Error on stream capture")
         _loop_and_call_kernel(iterations, workspace_index)
         err, gprofile = cuda_runtime.cudaStreamEndCapture(stream)
@@ -369,8 +366,7 @@ def benchmark(
         _cuda_success(err, "Error on synchronizing event")
 
         # Get elapsed time
-        err, elapsed_time = cuda_driver.cuEventElapsedTime(
-            start_event, end_event)
+        err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
         _cuda_success(err, "Error on querying event")
 
         # Destroy graphs
@@ -398,9 +394,10 @@ def benchmark(
 
     else:
         if int(stream) != int(
-                cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
-        ) and not _does_kernel_use_stream(callable, stream, *workspaces[0].args,
-                                          **workspaces[0].kwargs):
+            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
+        ) and not _does_kernel_use_stream(
+            callable, stream, *workspaces[0].args, **workspaces[0].kwargs
+        ):
             raise ValueError(
                 "CUDA stream passed to benchmark does not match the stream the kernel was launched in"
             )
@@ -418,8 +415,7 @@ def benchmark(
         # Synchronize end event
         err = cuda_driver.cuEventSynchronize(end_event)
         _cuda_success(err, "Error on synchronizing event")
-        err, elapsed_time = cuda_driver.cuEventElapsedTime(
-            start_event, end_event)
+        err, elapsed_time = cuda_driver.cuEventElapsedTime(start_event, end_event)
         _cuda_success(err, "Error on querying event")
 
     # Destroy events
