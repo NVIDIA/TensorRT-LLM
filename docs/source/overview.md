@@ -33,7 +33,7 @@ TensorRT LLM supports the latest and most popular LLM [architectures](https://nv
 TensorRT LLM strives to support the most popular models on **Day 0**.
 
 ### 🚀 **Advanced Optimization & Production Features**
-- **[In-Flight Batching & Paged Attention](./features/paged-attention-ifb-scheduler.md)**: {ref}`inflight-batching` eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
+- **[In-Flight Batching & Paged Attention](./features/paged-attention-ifb-scheduler.md)**: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
 - **[Multi-GPU Multi-Node Inference](./features/parallel-strategy.md)**: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.
 - **[Advanced Quantization](./features/quantization.md)**: 
   - **FP4 Quantization**: Native support on NVIDIA B200 GPUs with optimized FP4 kernels
