@@ -83,7 +83,7 @@ BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
-BUILD_JOBS = "8"
+BUILD_JOBS = "4"
 
 SLURM_CORES_REQUEST = "1"
 SLURM_CORES_LIMIT = "1"
@@ -972,8 +972,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if(nodeCount > 1) {
                     srunArgs.add("--mpi=pmi2")
                 }
+
+                def exemptionComment = ""
+                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
+                    exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
+                }
                 def scriptContent = """#!/bin/bash
-                    #SBATCH --output=${outputPath}
+                    #SBATCH ${exemptionComment} --output=${outputPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
@@ -1049,7 +1054,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        scriptExecPathNode
+                        "\"${scriptExecPathNode}\""
                     ),
                     numRetries: 3
                 )
@@ -1525,7 +1530,7 @@ def runLLMDocBuild(pipeline, config)
     if (env.alternativeTRT) {
         sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     // Step 3: build doc
@@ -1946,19 +1951,41 @@ def generateRerunReport(stageName, llmSrc) {
     def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
     def regularRerunDir = "${rerunBaseDir}/regular"
 
-    // Check if regular rerun directory exists
-    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+    // Check if regular rerun directory has rerun_results_*.xml files
+    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && find '${regularRerunDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
 
-    // Find all isolated rerun directories (isolated_0, isolated_1, etc.)
-    def isolatedRerunDirs = []
-    def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
-    if (isolatedDirsOutput) {
-        isolatedRerunDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+    // Check if any isolated rerun directories have rerun_results_*.xml files
+    def hasIsolatedReruns = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' -exec find {} -name 'rerun_results_*.xml' \\; 2>/dev/null | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+    // Find isolated tests that have actual rerun results and build mapping
+    def isolatedTestsWithReruns = []
+    if (hasIsolatedReruns) {
+        def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
+        if (isolatedDirsOutput) {
+            def isolatedDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+            isolatedDirs.each { isolatedDir ->
+                // Extract the isolated number from directory name (e.g., isolated_0 -> 0)
+                def isolatedNum = isolatedDir.split('/').last().replace('isolated_', '')
+
+                // Check if this isolated directory has any rerun results
+                def hasRerunResults = sh(script: "find '${isolatedDir}' -name 'rerun_results_*.xml' | head -1 | grep -q . && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+                if (hasRerunResults) {
+                    isolatedTestsWithReruns.add([
+                        dir: isolatedDir,
+                        num: isolatedNum,
+                        originalResult: "${WORKSPACE}/${stageName}/results_isolated_${isolatedNum}.xml"
+                    ])
+                }
+            }
+        }
     }
-    def hasIsolatedReruns = isolatedRerunDirs.size() > 0
+
+    // Collect rerun result files and corresponding original result files
+    def rerunResultFiles = []
 
     echo "Found regular reruns: ${hasRegularReruns}"
-    echo "Found isolated rerun directories: ${isolatedRerunDirs}"
+    echo "Found isolated tests with reruns: ${isolatedTestsWithReruns.collect { "isolated_${it.num}" }}"
 
     if (!hasRegularReruns && !hasIsolatedReruns) {
         echo "No rerun results found, skipping rerun report generation"
@@ -1974,14 +2001,32 @@ def generateRerunReport(stageName, llmSrc) {
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
+        // Add to rerunResultFiles only if it has reruns
+        if (hasRegularReruns) {
+            rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
+        }
     }
 
-    // Add isolated test results
+    // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
         isolatedResults.split('\n').each { file ->
             if (file.trim()) {
                 allInputFiles.add(file.trim())
+            }
+        }
+        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
+        isolatedTestsWithReruns.each { isolatedTest ->
+            if (fileExists(isolatedTest.originalResult)) {
+                rerunResultFiles.add(isolatedTest.originalResult)
+                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+            }
+            for (times in [1, 2]) {
+                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
+                if (fileExists(rerunFile)) {
+                    allInputFiles.add(rerunFile)
+                    rerunResultFiles.add(rerunFile)
+                }
             }
         }
     }
@@ -1992,19 +2037,7 @@ def generateRerunReport(stageName, llmSrc) {
             def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
-            }
-        }
-    }
-
-    // Add isolated rerun results from all isolated directories
-    if (hasIsolatedReruns) {
-        isolatedRerunDirs.each { isolatedDir ->
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedDir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    echo "Added isolated rerun result: ${rerunFile}"
-                }
+                rerunResultFiles.add(rerunFile)
             }
         }
     }
@@ -2014,14 +2047,14 @@ def generateRerunReport(stageName, llmSrc) {
         return
     }
 
-    echo "Generating rerun report with input files: ${allInputFiles.join(',')}"
+    echo "Generating rerun report with input files: ${rerunResultFiles.join(',')}"
 
     // Generate comprehensive rerun report
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
-        --input-files=${allInputFiles.join(",")}
+        --input-files=${rerunResultFiles.join(",")}
     """
 
     // Update original results xml file with all rerun results for junit
@@ -2122,7 +2155,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (env.alternativeTRT) {
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
         if (stageName.contains("-Ray-")) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
         }
@@ -2693,7 +2726,8 @@ def launchTestJobs(pipeline, testFilter)
         // "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
         // "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-PyTorch-Post-Merge-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         // "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
         // "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
@@ -2995,7 +3029,13 @@ def launchTestJobs(pipeline, testFilter)
                         // Extra PyTorch CUDA 13.0 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130")
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
+                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
+                            if (k8s_arch == "amd64") {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.0+cu130 torchvision==0.24.0 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
+                            }
                         }
 
                         def libEnv = []

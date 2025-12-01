@@ -107,6 +107,10 @@ struct MlaParams
 
     // for Helix parallelism: the rotary position offsets [b]
     int32_t const* helix_position_offsets{nullptr};
+
+    // for Helix parallelism: whether the current rank is inactive, shape [b]
+    // (the current query tokens are not appended to this rank's KV cache)
+    bool const* helix_is_inactive_rank{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>

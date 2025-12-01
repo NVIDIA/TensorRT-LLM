@@ -828,7 +828,7 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
                               max_batch_size: int,
                               speculative_config: SpeculativeConfig,
                               max_beam_width: int,
-                              disable_flash_infer_sampling: bool):
+                              disable_flashinfer_sampling: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
@@ -841,7 +841,7 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
-        disable_flash_infer_sampling=disable_flash_infer_sampling,
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
     )
 
 
@@ -857,7 +857,7 @@ def instantiate_sampler(
     speculative_config: SpeculativeConfig,
     decoding_config: trtllm.DecodingConfig,
     kv_cache_config: KvCacheConfig,
-    disable_flash_infer_sampling: bool,
+    disable_flashinfer_sampling: bool,
 ):
     sampler_args = create_torch_sampler_args(
         mapping,
@@ -865,7 +865,7 @@ def instantiate_sampler(
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
-        disable_flash_infer_sampling=disable_flash_infer_sampling,
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)

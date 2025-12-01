@@ -80,7 +80,7 @@ class DeepEPLowLatency(Communication):
         self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens, hidden_size, num_slots)
 
     @staticmethod
-    def is_platform_supported(mapping: Mapping) -> bool:
+    def is_platform_supported() -> bool:
         """
         Check if DeepEP Low Latency is supported on the current platform
         """
@@ -113,7 +113,7 @@ class DeepEPLowLatency(Communication):
             return False
         if self.weight_dtype != torch.bfloat16:
             return False
-        return self.is_platform_supported(self.mapping)
+        return True
 
     def dispatch(
         self,

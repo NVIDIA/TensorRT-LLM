@@ -84,11 +84,12 @@ class WideEPMoE(MoE):
 
         self.use_cuda_graph = model_config.use_cuda_graph
 
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < moe_max_num_tokens:
+        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        if self.moe_max_num_tokens < default_moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
@@ -955,3 +956,30 @@ class WideEPMoE(MoE):
 
     def post_load_weights(self):
         self.quant_method.post_load_weights(self)
+
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        moe_output = super().forward_fake(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs)
+        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            shape = moe_output.shape
+            top_k = self.routing_method.experts_per_token
+            new_shape = [shape[0], top_k, shape[1]]
+            return moe_output.new_empty(new_shape)
+        else:
+            return moe_output
