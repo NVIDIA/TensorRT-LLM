@@ -3,7 +3,7 @@
 set -e
 
 # Generate open source attribution file with parameterized URL
-# Usage: ./generate_oss_attribution.sh <image_name> <tag> <arch> [output_file]
+# Usage: ./generate_container_oss_attribution.sh <image_name> <tag> <arch> [output_file]
 
 show_usage() {
   local error_msg="${1}"
