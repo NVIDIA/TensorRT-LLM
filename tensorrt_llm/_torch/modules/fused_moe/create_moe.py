@@ -328,7 +328,7 @@ def create_moe(
 
     # Check if ENABLE_CONFIGURABLE_MOE environment variable is set
     enable_configurable_moe = os.environ.get('ENABLE_CONFIGURABLE_MOE',
-                                             '0') == '1'
+                                             '1') == '1'
 
     if enable_configurable_moe:
         # ConfigurableMoE is only supported for TRTLLMGenFusedMoE backend
