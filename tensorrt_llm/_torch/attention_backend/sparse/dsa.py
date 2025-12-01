@@ -556,9 +556,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             ).item() <= self.sparse_mla_topk
             if self.skip_indexer_for_ctx_reqs:
                 seq_lens = kv_lens[:self.num_contexts]
+                ctx_kv_lens = kv_lens[:self.num_contexts]
+                # for causal mask
+                ends = torch.cumsum(ctx_kv_lens, dim=0)
+                starts = ends - ctx_kv_lens
+                repeated_starts = torch.repeat_interleave(starts, seq_lens)
+                global_indices = torch.arange(self.num_ctx_tokens)
+                position_ids = global_indices - repeated_starts
+                # get the dense topk indices with causal mask
                 range_row = torch.arange(self.sparse_mla_topk)
-                per_token_limit = torch.repeat_interleave(seq_lens, seq_lens)
-                mask = range_row < per_token_limit.unsqueeze(1)
+                mask = range_row <= position_ids.unsqueeze(1)
                 ctx_range = slice(self.num_ctx_tokens)
                 self.host_topk_indices_buffer[ctx_range, :] = torch.where(
                     mask, range_row, -1)
@@ -574,9 +581,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                      ) <= self.sparse_mla_topk
             if self.skip_indexer_for_gen_reqs:
                 seq_lens = self.seq_lens[self.num_contexts:self.num_seqs]
+                gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
+                next_n = self.max_draft_tokens + 1
+                num_gen_tokens = self.num_tokens - self.num_ctx_tokens
+                # for causal mask
+                row_indices = torch.arange(num_gen_tokens) // next_n
+                next_n_offset = torch.arange(num_gen_tokens) % next_n
+                index_end_pos = gen_kv_lens[row_indices] - next_n + next_n_offset
+                # get the dense topk indices with causal mask
                 range_row = torch.arange(self.sparse_mla_topk)
-                per_token_limit = torch.repeat_interleave(seq_lens, seq_lens)
-                mask = range_row < per_token_limit.unsqueeze(1)
+                mask = range_row <= index_end_pos.unsqueeze(1)
                 gen_range = slice(self.num_ctx_tokens, self.num_tokens)
                 self.host_topk_indices_buffer[gen_range, :] = torch.where(
                     mask, range_row, -1)
@@ -1332,7 +1346,7 @@ class Indexer(nn.Module):
                     topk_indices_buffer[:num_ctx_tokens, :topk_indices.
                                         shape[-1]] = topk_indices.to(
                                             dtype=torch.int32)
-        elif has_prefill and metadata.skip_indexer_for_gen_reqs:
+        elif has_prefill and metadata.skip_indexer_for_ctx_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[:num_ctx_tokens, :] = \
                 metadata.topk_indices_buffer[:num_ctx_tokens, :]
