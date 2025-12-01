@@ -383,7 +383,8 @@ def _create_mock_metadata(request_ids,
                           num_tokens,
                           indexer_max_chunk_size=8194,
                           max_draft_tokens=0,
-                          enable_context_mla_with_cached_kv=False):
+                          enable_context_mla_with_cached_kv=False,
+                          index_topk=2048):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -398,7 +399,9 @@ def _create_mock_metadata(request_ids,
             self.request_ids = request_ids
             self.num_contexts = num_contexts
             self.num_generations = num_generations
+            self.num_seqs = num_contexts + num_generations
             self.max_draft_tokens = max_draft_tokens
+            self.sparse_mla_topk = index_topk
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
@@ -467,6 +470,7 @@ def _create_mock_metadata(request_ids,
                 dtype=torch.int64)
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
+            self.num_gen_tokens = num_tokens - num_ctx_tokens
             # Also set private attributes used by DSAtrtllmAttentionMetadata
             self._num_contexts = num_contexts
             self._num_generations = num_generations
@@ -508,6 +512,60 @@ def _create_mock_metadata(request_ids,
                     self.chunked_prefill_buffer_batch_size = 4
 
             self.runtime_features = RuntimeFeatures()
+
+            # Add skip indexer attributes
+            self.topk_indices_buffer = torch.zeros(
+                (num_tokens, self.sparse_mla_topk),
+                device='cuda',
+                dtype=torch.int32)
+            if self.num_contexts > 0:
+                self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
+                ).item() <= self.sparse_mla_topk
+                if self.skip_indexer_for_ctx_reqs:
+                    ctx_seq_lens = kv_lens[:self.num_contexts]
+                    ctx_kv_lens = kv_lens[:self.num_contexts]
+                    # for causal mask
+                    ends = torch.cumsum(ctx_kv_lens, dim=0)
+                    starts = ends - ctx_kv_lens
+                    repeated_starts = torch.repeat_interleave(
+                        starts, ctx_seq_lens)
+                    global_indices = torch.arange(self.num_ctx_tokens)
+                    position_ids = global_indices - repeated_starts
+                    # get the dense topk indices with causal mask
+                    range_row = torch.arange(self.sparse_mla_topk)
+                    mask = range_row <= position_ids.unsqueeze(1)
+                    ctx_range = slice(self.num_ctx_tokens)
+                    # get the dense topk indices with causal mask
+                    host_topk_indices_buffer = torch.where(mask, range_row, -1)
+                    self.topk_indices_buffer[ctx_range, :].copy_(
+                        host_topk_indices_buffer, non_blocking=True)
+            else:
+                self.skip_indexer_for_ctx_reqs = False
+
+            if self.num_generations > 0:
+                next_n = self.max_draft_tokens + 1
+                self.skip_indexer_for_gen_reqs = kv_lens[
+                    self.num_contexts:self.num_seqs].max().item(
+                    ) <= self.sparse_mla_topk
+                if self.skip_indexer_for_gen_reqs:
+                    gen_seq_lens = self.seq_lens[self.num_contexts:self.
+                                                 num_seqs]
+                    gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
+                    # for causal mask
+                    row_indices = torch.arange(self.num_gen_tokens) // next_n
+                    next_n_offset = torch.arange(self.num_gen_tokens) % next_n
+                    index_end_pos = gen_kv_lens[
+                        row_indices] - next_n + next_n_offset
+                    # get the dense topk indices with causal mask
+                    range_row = torch.arange(self.sparse_mla_topk)
+                    mask = range_row <= index_end_pos.unsqueeze(1)
+                    print(f"mask: {mask}")
+                    gen_range = slice(self.num_ctx_tokens, self.num_tokens)
+                    host_topk_indices_buffer = torch.where(mask, range_row, -1)
+                    self.topk_indices_buffer[gen_range, :].copy_(
+                        host_topk_indices_buffer, non_blocking=True)
+            else:
+                self.skip_indexer_for_gen_reqs = False
 
     return MockMetadata()
 
