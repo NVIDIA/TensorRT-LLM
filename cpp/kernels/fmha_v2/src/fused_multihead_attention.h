@@ -284,11 +284,8 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
         } q, k, v;
     } sage;
 
-    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold.
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
     // A positive value means skip-softmax is enabled.
-    // Possibly, a value larger than 1 is allowed, which means we skip even if local_max > global_max.
-    // Now dynamic threshold is enabled. For a given request, the actual skip_softmax_threshold =
-    //    skip_softmax_threshold_scale_factor / seqlen.
     float skip_softmax_threshold_scale_factor = 0;
 
 #ifdef SKIP_SOFTMAX_STAT

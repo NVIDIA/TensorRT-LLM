@@ -2119,7 +2119,7 @@ int main(int argc, char** argv)
             total_bytes / (fused_elapsed / float(runs) / 1e-6));
     }
 #ifdef SKIP_SOFTMAX_STAT
-    if (!isnan(skip_softmax_threshold))
+    if (skip_softmax_threshold_scale_factor != 0)
     {
         uint32_t total_blocks, skipped_blocks;
         FMHA_CHECK_CUDA(

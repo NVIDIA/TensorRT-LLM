@@ -288,7 +288,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.sage.v.max_nblock = runnerParams.vMaxNBlock;
 
     // for skip-softmax attention
-    mKernelParams.skip_softmax_threshold = runnerParams.skipSoftmaxThreshold;
+    mKernelParams.skip_softmax_threshold_scale_factor = runnerParams.skipSoftmaxThresholdScaleFactor;
 #ifdef SKIP_SOFTMAX_STAT
     mKernelParams.skip_softmax_total_blocks = runnerParams.skipSoftmaxTotalBlocks;
     mKernelParams.skip_softmax_skipped_blocks = runnerParams.skipSoftmaxSkippedBlocks;

@@ -65,7 +65,7 @@ void initBindings(nb::module_& m)
         nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_kv_indices") = std::nullopt,
         nb::arg("sparse_kv_offsets") = std::nullopt, nb::arg("sparse_attn_indices") = std::nullopt,
         nb::arg("sparse_attn_offsets") = std::nullopt, nb::arg("sparse_attn_indices_block_size"),
-        nb::arg("sparse_mla_topk") = std::nullopt, nb::arg("skip_softmax_threshold") = std::nullopt,
+        nb::arg("sparse_mla_topk") = std::nullopt, nb::arg("skip_softmax_threshold_scale_factor") = std::nullopt,
         nb::arg("skip_softmax_stat") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
         nb::arg("cu_kv_seqlens") = std::nullopt, nb::arg("fmha_scheduler_counter") = std::nullopt,
         nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
