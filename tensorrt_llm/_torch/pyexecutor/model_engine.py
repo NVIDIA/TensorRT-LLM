@@ -888,6 +888,9 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(
             self.runtime_draft_len)
         available_blocks = kv_cache_manager.get_num_free_blocks()
+        print(
+            f"available_tokens: {available_tokens}, num_tokens: {num_tokens}, num_gen_requests: {num_gen_requests}"
+        )
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
 
@@ -927,6 +930,8 @@ class PyTorchModelEngine(ModelEngine):
                     num_full_seqs = max_bs - 1
                 max_seq_len = num_ctx_tokens // num_full_seqs
                 num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
+            num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens > 0
+                                                else 0)
 
         if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
