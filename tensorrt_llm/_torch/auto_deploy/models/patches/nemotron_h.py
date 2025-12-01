@@ -203,8 +203,8 @@ _nemotron_h_base_model_tp_plan = {
     # latent projections at all, keeping them replicated.
     # To do so, comment out the corresponding entries.
     # moe layer: SHARED experts
-    "up_proj": "colwise",
-    "down_proj": "rowwise",
+    # "up_proj": "colwise",
+    # "down_proj": "rowwise",
     # MoLE: latent projections: simple shard
     "fc1_latent_proj": "gather",
     "fc2_latent_proj": "gather",
