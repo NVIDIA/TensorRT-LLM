@@ -160,7 +160,8 @@ class CutlassFusedMoE(MoE):
                 dtype = self.dtype or torch.float16
 
                 workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                    ep_size, max_num_tokens, hidden_size, dtype)
+                    ep_size, self.routing_method.experts_per_token,
+                    max_num_tokens, hidden_size, dtype)
 
                 self.moe_a2a = MoeAlltoAll(
                     mapping=self.mapping,

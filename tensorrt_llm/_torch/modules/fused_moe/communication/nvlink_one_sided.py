@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ruff: noqa: E501
+
+
 """
 NVLINK One-Sided AllToAll Communication Strategy
 
@@ -30,6 +33,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication
 
@@ -69,21 +73,40 @@ class NVLinkOneSided(Communication):
 
     @staticmethod
     def calculate_required_workspace_size(
-        ep_size: int, max_num_tokens: int, hidden_size: int, dtype: torch.dtype
+        ep_size: int,
+        top_k: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        extra_payload_bytes_per_token: int = 0,
     ) -> int:
         element_size = dtype.itemsize
+        # Auxiliary data size
         aux_size = NVLinkOneSided.get_aux_data_size(ep_size, max_num_tokens)
+
+        # Dispatch needs workspace for [ep_size, max_tokens] tokens,
+        # but due to the variety of quantization recipes, we cannot know the exact size,
+        # so we conservatively estimate assuming no quantization.
+        payload_size_dispatch = (
+            ep_size
+            * max_num_tokens
+            * (
+                hidden_size * element_size  # (Unquantized) token hidden states
+                + top_k * 4  # token_selected_experts
+                + top_k * 4  # token_final_scales
+                + extra_payload_bytes_per_token  # extra payload bytes per token
+            )
+        )
 
         # Required workspace for combine [ep_size, max_tokens] tokens
         payload_size_combine = ep_size * max_num_tokens * hidden_size * element_size
 
-        # Dispatch also needs workspace for [ep_size, max_tokens] tokens,
-        # but due to the variety of quantization recipes, we cannot know the exact size,
-        # so we conservatively estimate assuming no quantization.
-        # We additionally add 32 bytes for considering small payloads like token_selected_experts, token_final_scales etc.  # noqa: E501
-        payload_size_dispatch = ep_size * max_num_tokens * (hidden_size * element_size + 32)
-
-        return aux_size + payload_size_combine + payload_size_dispatch
+        # Pad to 128 bytes to ensure alignment. This matches the implementation of C++ torch OP code.
+        return (
+            pad_up(aux_size, 128)
+            + pad_up(payload_size_dispatch, 128)
+            + pad_up(payload_size_combine, 128)
+        )
 
     @classmethod
     def _init_constants(cls):
@@ -141,29 +164,24 @@ class NVLinkOneSided(Communication):
         self._init_constants()
 
         # Get workspace size
+        auto_workspace_size = None
+        if hidden_size is not None and dtype is not None:
+            auto_workspace_size = self.calculate_required_workspace_size(
+                self.ep_size, self.top_k, max_num_tokens_per_rank, hidden_size, dtype
+            )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
             self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
-            if (
-                hidden_size is not None
-                and dtype is not None
-                and max_num_tokens_per_rank is not None
-            ):
-                auto_size = self.calculate_required_workspace_size(
-                    self.ep_size, max_num_tokens_per_rank, hidden_size, dtype
-                )
-                tllm_logger.warning(
-                    f"Overriding automatically calculated workspace_size_per_rank ({auto_size} bytes) with "
-                    f"TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env} ({self.workspace_size_per_rank} bytes). "
-                    f"Auto calculation is conservative, so only consider overriding it if you have a specific reason."
-                )
-        elif hidden_size is not None and dtype is not None:
-            self.workspace_size_per_rank = self.calculate_required_workspace_size(
-                self.ep_size, self.max_num_tokens_per_rank, hidden_size, dtype
-            )
+            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env})."
+            if auto_workspace_size is not None:
+                msg += f"Automatically calculated workspace size is {auto_workspace_size} bytes."
+                msg += "Auto calculation is conservative, so only consider overriding it if you have a specific reason."
+            tllm_logger.warning(msg)
+        elif auto_workspace_size is not None:
+            self.workspace_size_per_rank = auto_workspace_size
         else:
             tllm_logger.warning(
-                "hidden_size and dtype are not provided (which are required for calculating workspace size)."
+                "NVLinkOneSided: hidden_size and dtype are not provided (which are required for calculating workspace size)."
                 "Using default workspace size 2048MB."
             )
             self.workspace_size_per_rank = 2048 * 1024 * 1024
@@ -173,9 +191,8 @@ class NVLinkOneSided(Communication):
 
         if self._WORKSPACE is None:
             tllm_logger.info(
-                f"MoE AlltoAll: Allocating workspace with size {self.workspace_size_per_rank} bytes. "
-                f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, "
-                f"max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
+                f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
+                f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
             mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
