@@ -914,9 +914,6 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        # Backend selection: 'auto' (default) | 'cutlass' | 'cublaslt' | 'cutedsl'
-        backend = getattr(module, 'nvfp4_backend', 'auto')
-
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         output = torch.ops.trtllm.nvfp4_gemm(act_fp4,
                                              module.weight,
@@ -925,7 +922,7 @@ class NVFP4LinearMethod(LinearMethodBase):
                                              module.alpha,
                                              module.dtype,
                                              to_userbuffers=False,
-                                             backend=backend)
+                                             backend=module.nvfp4_backend)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -2000,6 +1997,12 @@ class Linear(nn.Module):
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_backend: str = "auto",
     ):
+        """
+        Args:
+            nvfp4_backend: Backend selection for NVFP4 GEMM operations.
+                Supported values: "auto", "cutlass", "cublaslt", "cutedsl".
+                Default is "auto" which automatically selects the best backend.
+        """
         from ..distributed import AllReduce
 
         super().__init__()

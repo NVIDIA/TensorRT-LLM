@@ -50,8 +50,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      to_userbuffers: bool = False):
             super().__init__()
 
-
-
             if output_dtype != torch.bfloat16:
                 raise ValueError(
                     f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
@@ -242,7 +240,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Allocate output tensor from UserBuffers or regular CUDA memory
             if self.to_userbuffers:
-                c_tensor, _ = torch.ops.trtllm.create_userbuffers_tensor(
+                c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
                     [m, n], self.output_dtype)
             else:
                 c_tensor = torch.empty(*(m, n),
