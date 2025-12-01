@@ -13,7 +13,7 @@ With the chunked context feature, there are two benefits:
 
 Chunked context is now **enabled by default** in TensorRT LLM for better usability and performance. With this default setting:
 - Long sequences that exceed `max_num_tokens` will be automatically chunked instead of throwing an error
-- Short sequences are still processed as a single chunk, so there's no performance impact
+- Short sequences are generally processed as a single chunk. However, when multiple short sequences in a batch collectively fill up `max_num_tokens`, the last sequence may be chunked.
 - For models that don't support chunked context (e.g., RNN-based models like Mamba), it will be automatically disabled with a warning
 
 To explicitly control chunked context:
