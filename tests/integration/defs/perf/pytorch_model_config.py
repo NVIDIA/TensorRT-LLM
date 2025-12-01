@@ -79,6 +79,36 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        {
+            'patterns': [
+                # TODO: Verify the case name here use the to_string() method
+                'deepseek_r1_nvfp4-bench-pytorch'
+            ],
+            'config': {
+                'enable_iter_perf_stats': True,
+                'print_iter_log': False,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                    'enable_padding': False
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'max_num_tokens': 32768
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3
+                },
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.6,
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': False
+                },
+                'enable_chunked_prefill': True
+            }
+        },
         # DeepSeek R1 models with large batch sizes and cuda graph padding
         {
             'patterns': [
