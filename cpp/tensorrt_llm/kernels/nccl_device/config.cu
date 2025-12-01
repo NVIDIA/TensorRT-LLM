@@ -35,52 +35,52 @@ std::pair<int, int> LaunchConfig::pickLaunchCombo(std::vector<std::pair<int, int
     return options.at(0); // Experimenting found that using less unroll and more threads per block is better
 }
 
-LaunchConfig::LaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks,
-    bool useResidual, bool useBias, int const num_sms)
-    : hidden_dim(hidden_dim)
-    , num_tokens(num_tokens)
+LaunchConfig::LaunchConfig(int const hiddenDim, int const numTokens, int const rank, int const nRanks, bool useResidual,
+    bool useBias, int const numSms)
+    : hiddenDim(hiddenDim)
+    , numTokens(numTokens)
     , rank(rank)
     , nRanks(nRanks)
     , useResidual(useResidual)
     , useBias(useBias)
     , oneShot(false)
-    , token_per_rank(-1)
-    , start_token(-1)
-    , num_sms(num_sms)
+    , tokenPerRank(-1)
+    , startToken(-1)
+    , numSms(numSms)
     , valid(false)
     , threadsPerBlock(0)
     , unrollFactor(0)
 {
     // No grid-stride
-    int const base_tokens = num_tokens / nRanks;
-    this->num_sms = base_tokens;
-    int const remainder = num_tokens % nRanks;
+    int const baseTokens = numTokens / nRanks;
+    this->numSms = baseTokens;
+    int const remainder = numTokens % nRanks;
     if (remainder > 0)
-        this->num_sms += 1;
+        this->numSms += 1;
 
     // TODO hard coded value for now. Maybe some tuning possible
-    if (num_tokens <= 32)
+    if (numTokens <= 32)
         this->oneShot = true;
 
     if (this->oneShot)
     {
         // In one shot mode, each rank processes all tokens
-        this->token_per_rank = num_tokens;
-        this->start_token = 0;
-        this->num_sms = num_tokens;
+        this->tokenPerRank = numTokens;
+        this->startToken = 0;
+        this->numSms = numTokens;
     }
     else
     {
         // Distribute tokens across ranks: first 'remainder' ranks get one extra token
-        this->token_per_rank = base_tokens + (rank < remainder ? 1 : 0);
-        this->start_token = rank * base_tokens + std::min(rank, remainder);
+        this->tokenPerRank = baseTokens + (rank < remainder ? 1 : 0);
+        this->startToken = rank * baseTokens + std::min(rank, remainder);
     }
 
     auto maxCTAEnv = tensorrt_llm::common::getIntEnv("TLLM_NCCL_DEVICE_AR_RMS_MAX_CTA");
     if (maxCTAEnv.has_value())
     {
         if (maxCTAEnv.value() > 0)
-            this->num_sms = maxCTAEnv.value();
+            this->numSms = maxCTAEnv.value();
         else
         {
             TLLM_LOG_WARNING("TLLM_NCCL_DEVICE_AR_RMS_MAX_CTA was detected as <= 0 and is ignored.");
@@ -102,12 +102,12 @@ std::string LaunchConfig::getLoggingString() const
     oss << "\tConfiguration:\n";
     oss << "\t\t ThreadsPerBlock: " << this->getThreadsPerBlock() << "\n";
     oss << "\t\t UnrollFactor: " << this->getUnrollFactor() << "\n";
-    oss << "\t\t TokensPerRank: " << this->token_per_rank << "\n";
+    oss << "\t\t TokensPerRank: " << this->tokenPerRank << "\n";
     oss << "\t\t NumSMs: " << this->getNumSMs() << "\n";
     oss << "\t\t VectorInfo: " << this->getElementsPerVector() << "\n";
     oss << "\t\t HiddenDim: " << this->getElementsPerVector() * this->getUnrollFactor() * this->getThreadsPerBlock()
-        << " = " << this->hidden_dim << "\n";
-    oss << "\t\t NumTokens: " << this->num_tokens << "\n";
+        << " = " << this->hiddenDim << "\n";
+    oss << "\t\t NumTokens: " << this->numTokens << "\n";
     oss << "\t\t StartToken: " << this->getStartToken() << "\n";
 
     return oss.str();
@@ -115,16 +115,16 @@ std::string LaunchConfig::getLoggingString() const
 
 // Template class implementation
 template <typename T>
-TypedLaunchConfig<T>::TypedLaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks,
-    bool useResidual, bool useBias, int const num_sms)
-    : LaunchConfig(hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms)
+TypedLaunchConfig<T>::TypedLaunchConfig(int const hiddenDim, int const numTokens, int const rank, int const nRanks,
+    bool useResidual, bool useBias, int const numSms)
+    : LaunchConfig(hiddenDim, numTokens, rank, nRanks, useResidual, useBias, numSms)
 {
 
     // Calculate optimal block size to achieve better coverage
     int const maxThreadsPerBlock = kMaxThreadsPerBlock; // Maximum allowed block size
     int const minThreadsPerBlock = kMinThreadsPerBlock; // Minimum block size (warp size)
 
-    std::vector<std::pair<int, int>> valid_launch_combo;
+    std::vector<std::pair<int, int>> validLaunchCombo;
 
     // Try to find a block size that gives optimal coverage
     for (int testThreadsPerBlock = maxThreadsPerBlock; testThreadsPerBlock >= minThreadsPerBlock;
@@ -134,42 +134,42 @@ TypedLaunchConfig<T>::TypedLaunchConfig(int const hidden_dim, int const num_toke
         {
             size_t const elementsProcessedPerBlock = elementsPerVector * testUnrollFactor * testThreadsPerBlock;
 
-            if (elementsProcessedPerBlock == hidden_dim)
+            if (elementsProcessedPerBlock == hiddenDim)
             {
                 // Validate that this configuration can actually be launched
                 if (isValidConfig(testThreadsPerBlock, testUnrollFactor))
                 {
-                    valid_launch_combo.push_back(std::make_pair(testThreadsPerBlock, testUnrollFactor));
+                    validLaunchCombo.push_back(std::make_pair(testThreadsPerBlock, testUnrollFactor));
                 }
             }
         }
     }
 
-    if (valid_launch_combo.size() > 0)
+    if (validLaunchCombo.size() > 0)
     {
-        std::pair<int, int> optimal_launch_combo = pickLaunchCombo(valid_launch_combo);
+        std::pair<int, int> optimalLaunchCombo = pickLaunchCombo(validLaunchCombo);
 
         // Set the calculated optimal values
-        this->threadsPerBlock = optimal_launch_combo.first;
-        this->unrollFactor = optimal_launch_combo.second;
+        this->threadsPerBlock = optimalLaunchCombo.first;
+        this->unrollFactor = optimalLaunchCombo.second;
         this->valid = true;
     }
 }
 
-std::shared_ptr<LaunchConfig> makeLaunchConfig(nvinfer1::DataType dataType, int const hidden_dim, int const num_tokens,
-    int const rank, int const nRanks, bool useResidual, bool useBias, int const num_sms)
+std::shared_ptr<LaunchConfig> makeLaunchConfig(nvinfer1::DataType dataType, int const hiddenDim, int const numTokens,
+    int const rank, int const nRanks, bool useResidual, bool useBias, int const numSms)
 {
     switch (dataType)
     {
     case nvinfer1::DataType::kHALF:
         return std::make_shared<TypedLaunchConfig<half>>(
-            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms);
+            hiddenDim, numTokens, rank, nRanks, useResidual, useBias, numSms);
     case nvinfer1::DataType::kBF16:
         return std::make_shared<TypedLaunchConfig<__nv_bfloat16>>(
-            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms);
+            hiddenDim, numTokens, rank, nRanks, useResidual, useBias, numSms);
     case nvinfer1::DataType::kFLOAT:
         return std::make_shared<TypedLaunchConfig<float>>(
-            hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, num_sms);
+            hiddenDim, numTokens, rank, nRanks, useResidual, useBias, numSms);
     default: TLLM_THROW("Unimplemented data type for fused NCCL AllReduce launches.");
     }
     return nullptr;
@@ -385,8 +385,8 @@ void TypedLaunchConfig<T>::launchKernelForUnrollImpl(ncclWindow_t inWindow, nccl
     using TN = typename VectorType<T>::type;
 
     // Calculate grid and block dimensions from config members
-    // Use num_sms for grid dimension to match available hardware parallelism
-    dim3 const gridDim(this->num_sms, 1, 1);
+    // Use numSms for grid dimension to match available hardware parallelism
+    dim3 const gridDim(this->numSms, 1, 1);
     dim3 const blockDim(this->threadsPerBlock, 1, 1);
     size_t const sharedMemSize = 0;
 
@@ -397,29 +397,29 @@ void TypedLaunchConfig<T>::launchKernelForUnrollImpl(ncclWindow_t inWindow, nccl
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, true>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
         else if (this->useResidual && !this->useBias)
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, true>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
         else if (!this->useResidual && this->useBias)
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, true>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
         else
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, true>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
     }
     else
@@ -428,29 +428,29 @@ void TypedLaunchConfig<T>::launchKernelForUnrollImpl(ncclWindow_t inWindow, nccl
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, true, false>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
         else if (this->useResidual && !this->useBias)
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, true, false, false>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
         else if (!this->useResidual && this->useBias)
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, true, false>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
         else
         {
             fusedAllReduceRMSNormKernel<T, TN, Nunroll, false, false, false>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(inWindow, outWindow, static_cast<const TN*>(residual),
-                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->start_token,
-                    this->hidden_dim, this->token_per_rank, devComm, eps);
+                    residualOutWindow, static_cast<const TN*>(weight), static_cast<const TN*>(bias), this->startToken,
+                    this->hiddenDim, this->tokenPerRank, devComm, eps);
         }
     }
 #else

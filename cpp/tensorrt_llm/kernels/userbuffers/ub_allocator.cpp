@@ -442,11 +442,11 @@ bool NCCLHelper::isLoaded() const
 bool UserBufferAllocator::use_nccl_symmetric = false;
 
 std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig>
-NCCLUserBufferAllocator::getCachedNCCLDeviceLaunchConfig(nvinfer1::DataType dataType, int const hidden_dim,
-    int const num_tokens, int const rank, int const nRanks, bool useResidual, bool useBias)
+NCCLUserBufferAllocator::getCachedNCCLDeviceLaunchConfig(nvinfer1::DataType dataType, int const hiddenDim,
+    int const numTokens, int const rank, int const nRanks, bool useResidual, bool useBias)
 {
     // Create cache key
-    LaunchConfigKey key{dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias};
+    LaunchConfigKey key{dataType, hiddenDim, numTokens, rank, nRanks, useResidual, useBias};
 
     // Check if config already exists in cache
     auto it = mLaunchConfigCache.find(key);
@@ -457,7 +457,7 @@ NCCLUserBufferAllocator::getCachedNCCLDeviceLaunchConfig(nvinfer1::DataType data
 
     // Create new config and cache it
     auto config = tensorrt_llm::kernels::nccl_device::makeLaunchConfig(
-        dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias);
+        dataType, hiddenDim, numTokens, rank, nRanks, useResidual, useBias);
 
     mLaunchConfigCache[key] = config;
     return config;

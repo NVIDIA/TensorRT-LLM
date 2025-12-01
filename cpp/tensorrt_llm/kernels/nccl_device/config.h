@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef TRTLLM_NCCL_DEVICE_CONFIG_H
-#define TRTLLM_NCCL_DEVICE_CONFIG_H
+#pragma once
 
 #include "constants.h"
 #include "nccl.h"
@@ -48,8 +47,8 @@ namespace tensorrt_llm::kernels::nccl_device
 class LaunchConfig
 {
 public:
-    int const hidden_dim;
-    int const num_tokens;
+    int const hiddenDim;
+    int const numTokens;
     int const nRanks;
     int const rank;
     bool const useResidual;
@@ -57,9 +56,9 @@ public:
 
 protected:
     bool oneShot;
-    int token_per_rank;
-    int start_token;
-    int num_sms;
+    int tokenPerRank;
+    int startToken;
+    int numSms;
     bool valid;
     int threadsPerBlock;
     int unrollFactor;
@@ -68,8 +67,8 @@ protected:
 
 public:
     // Constructor with dynamic block size calculation
-    LaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks, bool useResidual,
-        bool useBias, int const num_sms = -1);
+    LaunchConfig(int const hiddenDim, int const numTokens, int const rank, int const nRanks, bool useResidual,
+        bool useBias, int const numSms = -1);
 
     inline int getThreadsPerBlock() const
     {
@@ -83,19 +82,19 @@ public:
 
     int getNumSMs() const
     {
-        return this->num_sms;
+        return this->numSms;
     }
 
     virtual bool getValid() const = 0;
 
     int getBlocksPerRank() const
     {
-        return this->token_per_rank;
+        return this->tokenPerRank;
     }
 
     int getStartToken() const
     {
-        return this->start_token;
+        return this->startToken;
     }
 
     virtual int getElementsPerVector() const = 0;
@@ -161,8 +160,8 @@ public:
         float const eps, cudaStream_t stream) const override;
 
     // Constructor with dynamic block size calculation
-    TypedLaunchConfig(int const hidden_dim, int const num_tokens, int const rank, int const nRanks, bool useResidual,
-        bool useBias, int const num_sms = -1);
+    TypedLaunchConfig(int const hiddenDim, int const numTokens, int const rank, int const nRanks, bool useResidual,
+        bool useBias, int const numSms = -1);
 
     nvinfer1::DataType getDataType() const
     {
@@ -180,9 +179,7 @@ public:
     }
 };
 
-std::shared_ptr<LaunchConfig> makeLaunchConfig(nvinfer1::DataType dataType, int const hidden_dim, int const num_tokens,
-    int const rank, int const nRanks, bool useResidual, bool useBias, int const num_sms = -1);
+std::shared_ptr<LaunchConfig> makeLaunchConfig(nvinfer1::DataType dataType, int const hiddenDim, int const numTokens,
+    int const rank, int const nRanks, bool useResidual, bool useBias, int const numSms = -1);
 
 } // namespace tensorrt_llm::kernels::nccl_device
-
-#endif // TRTLLM_NCCL_DEVICE_CONFIG_H

@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef TRTLLM_NCCL_DEVICE_CONSTANTS_H
-#define TRTLLM_NCCL_DEVICE_CONSTANTS_H
+#pragma once
 
 #include <cstdint>
 
@@ -29,5 +28,3 @@ constexpr int kMinThreadsPerBlock = kWarpSize; // Minimum block size is a warp.
 constexpr int kMaxUnrollFactor = 8; // We require manual instantiation and switches. Changing the number is not good
                                     // enough, see launcher function for details
 } // namespace tensorrt_llm::kernels::nccl_device
-
-#endif // TRTLLM_NCCL_DEVICE_CONSTANTS_H

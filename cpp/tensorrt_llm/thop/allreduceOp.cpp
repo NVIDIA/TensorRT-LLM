@@ -540,14 +540,14 @@ private:
             TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
 
             int const hidden_size = input.size(-1);
-            int const num_tokens = size / hidden_size;
+            int const numTokens = size / hidden_size;
 
-            TLLM_LOG_DEBUG("NCCL_DEVICE RESIDUAL_RMS_NORM: rank=%d, hidden_size=%d, num_tokens=%d, nRanks=%d, dtype=%d",
-                myRank, hidden_size, num_tokens, nRanks, static_cast<int>(mType));
+            TLLM_LOG_DEBUG("NCCL_DEVICE RESIDUAL_RMS_NORM: rank=%d, hidden_size=%d, numTokens=%d, nRanks=%d, dtype=%d",
+                myRank, hidden_size, numTokens, nRanks, static_cast<int>(mType));
 
             std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
                 = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
-                    mType, hidden_size, num_tokens, myRank, nRanks, true, false);
+                    mType, hidden_size, numTokens, myRank, nRanks, true, false);
 
             // Check if multimem is supported for this data type
             bool multimemSupported = launchConfig->supportsMultimem();
