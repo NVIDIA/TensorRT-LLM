@@ -182,6 +182,8 @@ def setup_llm(args, **kwargs):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
         tokens_per_block=args.tokens_per_block,
+        event_buffer_max_size=1024,
+        onboard_blocks=True,
     )
 
     spec_decode_algo = args.spec_decode_algo.upper(

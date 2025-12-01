@@ -78,9 +78,7 @@ using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
-
-// Type alias for multimodal hash key (hash array + start offset)
-using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
+using MmKey = tensorrt_llm::executor::MmKey;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
@@ -324,6 +322,8 @@ public:
     void setHash();
 
     size_t getHash() const;
+
+    std::vector<MmKey> getExtraKeys() const;
 
 private:
     // Linear ID of block independent of pool

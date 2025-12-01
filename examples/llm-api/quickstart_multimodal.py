@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 
 from quickstart_advanced import add_llm_args, setup_llm
 
@@ -131,6 +132,10 @@ def add_multimodal_args(parser):
         type=int,
         default=2,
         help="Number of conversation turns for automated testing.")
+    parser.add_argument("--log_kv_cache_events",
+                        action="store_true",
+                        default=False,
+                        help="Log the KV cache events.")
     return parser
 
 
@@ -264,6 +269,14 @@ def main():
             print(
                 f"[{i}] Prompt: {output['user_input']!r}, Generated text: {output['assistant_response']!r}"
             )
+
+        if args.log_kv_cache_events:
+            time.sleep(1)  # Wait for events to be dispatched
+            events = llm.get_kv_cache_events(5)
+            print("=== KV_CACHE_EVENTS_START ===")
+            print(json.dumps(events, indent=2))
+            print("=== KV_CACHE_EVENTS_END ===")
+
         return
 
     # Original single-turn processing logic
@@ -272,6 +285,7 @@ def main():
         args.prompt = example_medias_and_prompts[args.modality]["prompt"]
     if args.media is None:
         args.media = example_medias_and_prompts[args.modality]["media"]
+
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=str(llm._hf_model_dir),
                                              model_type=model_type,
@@ -281,7 +295,6 @@ def main():
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
                                              device=args.device)
-
     lora_request = None
     if args.load_lora:
         lora_request = model_class.lora_request(len(inputs), args.modality,
@@ -305,6 +318,13 @@ def main():
             )
         if args.logprobs:
             print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
+
+    if args.log_kv_cache_events:
+        time.sleep(1)  # Wait for events to be dispatched
+        events = llm.get_kv_cache_events(5)
+        print("=== KV_CACHE_EVENTS_START ===")
+        print(json.dumps(events, indent=2))
+        print("=== KV_CACHE_EVENTS_END ===")
 
 
 if __name__ == "__main__":
