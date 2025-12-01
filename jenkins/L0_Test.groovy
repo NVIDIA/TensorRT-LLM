@@ -1271,7 +1271,9 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
-    println "Using type: ${type} to create Kubernetes Pod config"
+    if ( type == "gb10x" ) {
+        println "Using type: ${type} to create Kubernetes Pod config"
+    }
 
     switch(type)
     {
@@ -1500,6 +1502,58 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 ${pvcVolume}
         """.stripIndent(),
     ]
+    if (type.contains("gb10x")) {
+        print(podConfig)
+
+        podConfig = [
+            cloud:'nvks-sparks-cloud',
+            label: nodeLabel,
+            slaveConnectTimeout: 1000,
+            envVars:[envVar(key:"JENKINS_URL", value:"${env.JENKINS_URL}")],
+            yaml: """
+            apiVersion: v1
+            kind: Pod
+            spec:
+                nodeSelector:
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu.machine: NVIDIA_DGX_Spark
+                    nvidia.com/tenant: blossom_trt
+                containers:
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['nvidia-smi', '-l']
+                    resources:
+                      requests:
+                        nvidia.com/gpu: 1
+                      limits:
+                        nvidia.com/gpu: 1
+                    env:
+                    - name: NVIDIA_VISIBLE_DEVICES
+                      value: "all"
+                    - name: NVIDIA_DRIVER_CAPABILITIES
+                      value: "compute,utility"
+                    securityContext:
+                      privileged: true
+                    tty: true
+                  - name: jnlp
+                    image: ${jnlpImage}
+                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 10Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 10Gi
+                        ephemeral-storage: 25Gi
+                  tolerations:
+                  - key: "node_for_blossom_trt"
+                    operator: "Exists"
+                    effect: "NoSchedule"
+        """.stripIndent(),
+        ]
+    }
 
     return podConfig
 }
