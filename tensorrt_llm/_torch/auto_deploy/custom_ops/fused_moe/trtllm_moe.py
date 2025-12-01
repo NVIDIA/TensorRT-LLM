@@ -288,9 +288,9 @@ def trtllm_quant_nvfp4_moe_fused(
 
     Computes (per expert):
         For gated_mlp:
-            y = act(x @ w1.T) @ (x @ w3.T) @ w2.T  # act := SiLU
+            y = (act(x @ w1.T) * (x @ w3.T)) @ w2.T  # act := SiLU
         For mlp:
-            y = act(x @ w1.T) @ w2.T               # act := ReLU^2
+            y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
 
     """
     NVFP4_BLOCK_SIZE = 16
