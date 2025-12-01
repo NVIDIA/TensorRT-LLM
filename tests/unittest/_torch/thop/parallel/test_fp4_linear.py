@@ -87,8 +87,8 @@ def test_fp4_linear(dtype, mnk):
 @pytest.mark.skipif(sys.version_info < (3, 12),
                     reason="cutlass-dsl 4.1.0 requires Python 3.12+")
 @pytest.mark.skipif(
-    get_sm_version() != 100,
-    reason="This test is only supported in Blackwell architecture",
+    get_sm_version() not in [100, 103],
+    reason="This test is only supported in sm100 and sm103 architecture",
 )
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
                     reason="cutlass-dsl is not available")

@@ -99,6 +99,8 @@ class Scenario:
 
 
 all_scenarios = [
+    Scenario(batch=1, ctx_len=64),
+    Scenario(batch=1, ctx_len=512),
     Scenario(batch=1, ctx_len=1024),
     Scenario(batch=1, ctx_len=2048),
     Scenario(batch=1, ctx_len=4096),
@@ -129,14 +131,14 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    # note: tests with ctx_len=1024 (or less) are currently failing, most likely due to
-    # bad numerics especially with bf16. We ignore those tests for now.
-    all_scenarios[2],
-    all_scenarios[5],
-    all_scenarios[12],
-    all_scenarios[15],
-    all_scenarios[21],
-    all_scenarios[22],
+    all_scenarios[0],
+    all_scenarios[1],
+    all_scenarios[4],
+    all_scenarios[7],
+    all_scenarios[14],
+    all_scenarios[17],
+    all_scenarios[23],
+    all_scenarios[24],
 ]
 
 
@@ -501,9 +503,16 @@ def _run_mla_distributed(
     start = time.time()
 
     for step in range(gen_steps):
+        helix_is_inactive_rank = []
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
-        cache_add = step if rank == world_size - 1 else 0
+            # Assume last rank is active for all gen steps.
+            if rank == world_size - 1:
+                helix_is_inactive_rank.append(False)
+                cache_add = step
+            else:
+                helix_is_inactive_rank.append(True)
+                cache_add = 0
         cached_tokens_per_seq = [ctx_len_per_gpu + cache_add for _ in range(scenario.batch)]
         if step == 0:
             attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -519,11 +528,17 @@ def _run_mla_distributed(
                     num_cached_tokens_per_seq=cached_tokens_per_seq,
                 ),
                 enable_context_mla_with_cached_kv=True,
+                helix_is_inactive_rank=torch.tensor(
+                    helix_is_inactive_rank, dtype=torch.bool, device="cuda"
+                ),
             )
         else:
             attn_metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=cached_tokens_per_seq,
+            )
+            attn_metadata.helix_is_inactive_rank = torch.tensor(
+                helix_is_inactive_rank, dtype=torch.bool, device="cuda"
             )
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)

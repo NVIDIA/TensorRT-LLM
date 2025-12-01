@@ -25250,7 +25250,7 @@ License: `NVIDIA Proprietary Software`
   - `Homepage`: https://developer.nvidia.com/cusparselt
 
 
-## nvidia-cutlass-dsl (4.3.0)
+## nvidia-cutlass-dsl (4.3.1)
 
 ### Licenses
 License: `None`

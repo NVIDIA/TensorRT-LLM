@@ -51,7 +51,9 @@ def create_nemotron_h_llm(use_cuda_graph,
             if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype),
         sampler_type="TRTLLMSampler",
         enable_chunked_prefill=enable_chunked_prefill,
-        max_num_tokens=max_num_tokens,
+        **({} if max_num_tokens is None else {
+            "max_num_tokens": max_num_tokens
+        }),
     )
 
 

@@ -761,7 +761,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
                             beam_output.finish_reason = 'stop'
                             beam_output.stop_reason = stop_reason
-                            self.abort()
                             self._done = True
                             break
 

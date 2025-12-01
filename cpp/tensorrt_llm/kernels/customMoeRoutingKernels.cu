@@ -120,6 +120,11 @@ __global__ void customMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues
     auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
     BaseType minScore = BaseType{-INFINITY};
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
     for (uint32_t tokenId = warpIdx; tokenId < numTokens; tokenId += warpNum)
     {
         auto scoreOffset = tokenId * numExperts;
@@ -168,6 +173,10 @@ __global__ void customMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues
             }
         }
     } // end for tokenId
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 int nextPowerOfTwo(int num)

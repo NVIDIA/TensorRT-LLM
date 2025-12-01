@@ -215,6 +215,14 @@ SERVER_CONFIG_METRICS = {
     "enable_padding": (True, str_to_bool),
 }
 
+# Nested under 'speculative_config' in YAML
+SPECULATIVE_CONFIG_METRICS = {
+    "decoding_type": (True, str),
+    "max_draft_len": (True, int),
+    "speculative_model_dir": (True, str),
+    "eagle3_one_model": (True, str_to_bool),
+}
+
 CLIENT_CONFIG_METRICS = {
     "concurrency": (False, int),
     "iterations": (False, int),
@@ -250,6 +258,10 @@ class ServerConfig:
         enable_block_reuse: bool = False,
         free_gpu_memory_fraction: float = 0.8,
         enable_padding: bool = True,
+        decoding_type: str = "",
+        max_draft_len: int = 0,
+        speculative_model_dir: str = "",
+        eagle3_one_model: bool = False,
     ):
         self.name = name
         self.model_name = model_name
@@ -272,13 +284,16 @@ class ServerConfig:
         self.free_gpu_memory_fraction = free_gpu_memory_fraction
         self.max_batch_size = max_batch_size
         self.enable_padding = enable_padding
+        self.decoding_type = decoding_type
+        self.max_draft_len = max_draft_len
+        self.speculative_model_dir = speculative_model_dir
+        self.eagle3_one_model = eagle3_one_model
 
-        self.model_path = ""
-
-    def to_cmd(self, working_dir: str) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
+
+    def to_cmd(self, working_dir: str) -> List[str]:
         config_path = os.path.join(working_dir,
                                    f"extra-llm-api-config.{self.name}.yml")
         return [
@@ -294,6 +309,7 @@ class ServerConfig:
             f"moe_expert_parallel_size: {self.ep}",
             f"pipeline_parallel_size: {self.pp}",
             f"max_num_tokens: {self.max_num_tokens}",
+            f"max_batch_size: {self.max_batch_size}",
             f"enable_attention_dp: {str(self.enable_attention_dp).lower()}",
             f"disable_overlap_scheduler: {str(self.disable_overlap_scheduler).lower()}",
             f"stream_interval: {self.stream_interval}",
@@ -323,6 +339,19 @@ class ServerConfig:
             config_lines.append(
                 f"  batching_wait_iters: {self.batching_wait_iters}")
             config_lines.append(f"  timeout_iters: {self.timeout_iters}")
+
+        # Add speculative_config if decoding_type is specified
+        if self.decoding_type:
+            config_lines.append("speculative_config:")
+            config_lines.append(f"  decoding_type: {self.decoding_type}")
+            if self.max_draft_len > 0:
+                config_lines.append(f"  max_draft_len: {self.max_draft_len}")
+            if self.speculative_model_dir:
+                config_lines.append(
+                    f"  speculative_model_dir: {self.speculative_model_dir}")
+            if self.eagle3_one_model:
+                config_lines.append(
+                    f"  eagle3_one_model: {str(self.eagle3_one_model).lower()}")
 
         return "\n".join(config_lines)
 
@@ -467,7 +496,15 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
             free_gpu_memory_fraction=server_config_data.get(
                 'free_gpu_memory_fraction', 0.8),
             max_batch_size=server_config_data.get('max_batch_size', 256),
-            enable_padding=server_config_data.get('enable_padding', True))
+            enable_padding=server_config_data.get('enable_padding', True),
+            decoding_type=server_config_data.get('speculative_config',
+                                                 {}).get('decoding_type', ''),
+            max_draft_len=server_config_data.get('speculative_config',
+                                                 {}).get('max_draft_len', 0),
+            speculative_model_dir=server_config_data.get(
+                'speculative_config', {}).get('speculative_model_dir', ''),
+            eagle3_one_model=server_config_data.get(
+                'speculative_config', {}).get('eagle3_one_model', False))
 
         server_id = len(server_configs)
         server_configs.append(server_config)

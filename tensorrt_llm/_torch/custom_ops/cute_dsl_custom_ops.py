@@ -49,19 +49,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             assert output_dtype == torch.bfloat16
 
-            if get_sm_version() != 100:
+            if get_sm_version() not in [100, 103]:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
                 )
 
         # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
-        def __hash__(self):
-            return hash((self.output_dtype, ))
-
-        def __eq__(self, other):
-            if not isinstance(other, self.__class__):
-                return False
-            return self.output_dtype == other.output_dtype
+        def unique_id(self):
+            return (self.output_dtype, )
 
         def get_valid_tactics(
             self,
