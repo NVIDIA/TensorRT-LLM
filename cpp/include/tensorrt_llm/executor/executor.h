@@ -71,6 +71,7 @@ public:
         std::optional<FloatType> const& repetitionPenalty = std::nullopt,
         std::optional<FloatType> const& presencePenalty = std::nullopt,
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
+        std::optional<SizeType32> const& promptIgnoreLength = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
         std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
@@ -94,6 +95,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
+    [[nodiscard]] std::optional<SizeType32> getPromptIgnoreLength() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
@@ -114,6 +116,7 @@ public:
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
     void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
     void setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty);
+    void setPromptIgnoreLength(std::optional<SizeType32> const& promptIgnoreLength);
     void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -133,6 +136,8 @@ private:
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
     static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& repetitionpenalty);
+    static std::optional<SizeType32> const& checkPromptIgnoreLength(
+        std::optional<SizeType32> const& promptIgnoreLength);
     static std::optional<FloatType> const& checkLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     static std::optional<SizeType32> const& checkEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -174,6 +179,9 @@ private:
     /// @brief Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can
     /// have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
     std::optional<FloatType> mFrequencyPenalty;
+    /// @brief Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have
+    /// no effect. Values > input (prompt) length will be clamped. Default is 0.
+    std::optional<SizeType32> mPromptIgnoreLength;
     /// @brief Controls how to penalize longer sequences in beam search. Default is 0.f
     std::optional<FloatType> mLengthPenalty;
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
@@ -582,14 +590,13 @@ public:
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
-        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
-        std::optional<std::string> directory = std::nullopt);
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
     [[nodiscard]] KvCacheTransferMode getTransferMode() const;
-    [[nodiscard]] std::optional<std::string> getDirectory() const;
+    [[nodiscard]] std::string const& getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -616,7 +623,7 @@ private:
     /// @brief The transfer mode for the block.
     KvCacheTransferMode mTransferMode;
     /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
-    std::optional<std::string> mDirectory;
+    std::string mDirectory;
 };
 
 /// @brief A class that holds information about the request
@@ -670,7 +677,7 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    // 34 parameters
+    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -697,7 +704,8 @@ public:
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -745,6 +753,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
+    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
 
     void setStreaming(bool streaming);
@@ -780,6 +789,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
+    void setCacheSaltID(CacheSaltIDType cacheSaltID);
 
 private:
     friend class Serialization;
@@ -1454,15 +1464,20 @@ public:
         UCX = 2,
         NIXL = 3
     };
-    explicit CacheTransceiverConfig(
-        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
+    explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
+        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
+    void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
+    void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
+    [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1470,13 +1485,18 @@ private:
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
+    std::optional<int> mKvTransferTimeoutMs;
+    // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
+    // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+    std::optional<int> mKvTransferSenderFutureTimeoutMs;
 };
 
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
 public:
-    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds = 180000000;
+    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds
+        = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::minutes(3)).count();
 
     static constexpr SizeType32 kDefaultIterStatsMaxIterations = 1000;
 

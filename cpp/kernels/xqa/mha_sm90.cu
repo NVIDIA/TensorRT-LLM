@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "cuda_hint.cuh"
@@ -632,6 +637,8 @@ CUBIN_EXPORT __global__
 #ifdef NDEBUG
 #if !OPTIMIZE_FOR_LATENCY
     __launch_bounds__(128 * 3, headElems* ctaNbQHeads <= 128 * 16 ? 3 : 2)
+#else
+    __launch_bounds__(128 * 3)
 #endif
 #else
     __launch_bounds__(128 * 3, 1)
@@ -1086,6 +1093,23 @@ CUBIN_EXPORT __global__
                     }
                     printf("\n\n");
                 }
+            }
+            smem.gemm1WarpGrpBar.arrive_and_wait();
+#else
+            if (blockIdx.y == 1 && threadIdx.x == 0)
+            {
+                printf("rowMax:\n");
+                for (int i = 0; i < ctaNbQHeads; i++)
+                {
+                    printf("%f, ", smem.xRowMax[idxXBuf][i]);
+                }
+                printf("\n");
+                printf("rowSum:\n");
+                for (int i = 0; i < ctaNbQHeads; i++)
+                {
+                    printf("%f, ", smem.xRowSum[idxXBuf][i]);
+                }
+                printf("\n");
             }
             smem.gemm1WarpGrpBar.arrive_and_wait();
 #endif
@@ -2059,9 +2083,13 @@ __device__ inline RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gme
     for (uint32_t i = 0; i < exactDiv(ShmQWiseVec::size, gmma::instNBase); i++)
     {
         static_assert(nbThrdsPerInstNBase * RegColWiseVec::size == exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols));
-        ret[i] = reinterpret_cast<
-            Vec<Vec<float, GmmaAccCoreMat::cols>, exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols)> const&>(
-            gmemVec)[mha::min(i * nbThrdsPerInstNBase + idx, bound)];
+        uint32_t const clampedIdx = mha::min(i * nbThrdsPerInstNBase + idx, bound);
+        uint32_t const baseOffset = clampedIdx * GmmaAccCoreMat::cols;
+#pragma unroll
+        for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
+        {
+            ret[i][j] = gmemVec[baseOffset + j];
+        }
     }
     return ret;
 }

@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -15,6 +20,10 @@
 #include "tensorrt_llm/executor/serialization.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 using namespace tensorrt_llm::executor::kv_cache;
 
@@ -76,8 +85,8 @@ TEST_F(TransferAgentTest, Basic)
     RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -112,8 +121,8 @@ TEST_F(TransferAgentTest, Basic2)
     RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -155,8 +164,8 @@ TEST_F(TransferAgentTest, DeviceMemory)
         MemoryDescs{MemoryType::kVRAM, {MemoryDesc{dev_ptr1, size, deviceId}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -197,8 +206,8 @@ TEST_F(TransferAgentTest, Connect)
     nixlAgent2->registerMemory(memDescs0);
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -209,7 +218,7 @@ TEST_F(TransferAgentTest, Connect)
     status->wait();
 
     TLLM_CHECK(memory0 == memory1);
-    nixlAgent2->connectRemoteAgent(agent1, connectionInfo);
+    nixlAgent2->loadRemoteAgent(agent1, connectionInfo);
     checked = false;
     do
     {
@@ -247,17 +256,17 @@ TEST_F(TransferAgentTest, SyncMessage)
     RegisteredHostMemory regMem3(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, nixlAgent1.get());
 
     // nixlAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = nixlAgent1->getConnectionInfo();
-    nixlAgent0->connectRemoteAgent(agent1, connectionInfo);
+    auto connectionInfo = nixlAgent1->getLocalConnectionInfo();
+    nixlAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
         checked = nixlAgent0->checkRemoteDescs(agent1, regMem3.getDescs());
     } while (!checked);
     auto syncMessage = std::string("agent_sync_message");
-    nixlAgent0->notifySyncMessage(agent1, syncMessage);
     TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem3.getDescs(), agent1};
     auto status = nixlAgent0->submitTransferRequests(writeReq);
+    nixlAgent0->notifySyncMessage(agent1, syncMessage);
 
     auto notif = nixlAgent1->getNotifiedSyncMessages();
     for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif.size() == 0; i++)
@@ -283,8 +292,8 @@ TEST_F(TransferAgentTest, SyncMessage)
     TLLM_CHECK(notif2[agent0][0] == syncMessage2);
 
     // nixlAgent1->loadRemoteAgent(agent0);
-    auto connectionInfo2 = nixlAgent0->getConnectionInfo();
-    nixlAgent1->connectRemoteAgent(agent0, connectionInfo2);
+    auto connectionInfo2 = nixlAgent0->getLocalConnectionInfo();
+    nixlAgent1->loadRemoteAgent(agent0, connectionInfo2);
     std::string syncMessage3 = "three_agent_sync_message";
     nixlAgent1->notifySyncMessage(agent0, syncMessage3);
     auto notif3 = nixlAgent0->getNotifiedSyncMessages();
@@ -303,9 +312,10 @@ TEST_F(TransferAgentTest, SyncMessage)
     } while (!checked2);
 
     std::string syncMessage4 = "four_agent_sync_message";
-    nixlAgent1->notifySyncMessage(agent0, syncMessage4);
     TransferRequest writeReq1{TransferOp::kWRITE, regMem2.getDescs(), regMem1.getDescs(), agent0};
     auto status1 = nixlAgent1->submitTransferRequests(writeReq1);
+    nixlAgent1->notifySyncMessage(agent0, syncMessage4);
+
     auto notif4 = nixlAgent0->getNotifiedSyncMessages();
     for (std::size_t i = 0; i < MAX_QUERY_TIMES && notif4.size() == 0; i++)
     {
@@ -341,3 +351,118 @@ TEST_F(TransferAgentTest, SyncMessage)
     nixlAgent0->invalidateRemoteAgent(agent1);
     nixlAgent1->invalidateRemoteAgent(agent0);
 }
+
+class LoopbackAgentTest : public ::testing::Test,
+                          public ::testing::WithParamInterface<bool> // NOLINT(cppcoreguidelines-pro-type-member-init)
+{
+public:
+    void SetUp() override
+    {
+        static int file_num = 0;
+        std::string filename = std::string("test_agent") + std::to_string(file_num++);
+        auto dirPath = fs::absolute(filename);
+        std::error_code ec;
+        fs::create_directories(dirPath, ec);
+        TLLM_CHECK_WITH_INFO(!ec, "Failed to create test directory: %s", ec.message().c_str());
+        mDirectory = dirPath.string();
+    }
+
+    void TearDown() override
+    {
+        std::error_code ec;
+        fs::remove_all(mDirectory, ec);
+        if (ec)
+            std::cerr << "Warning: Failed to clean up test directory: " << ec.message() << std::endl;
+    }
+
+    [[nodiscard]] std::shared_ptr<BaseLoopbackAgent> makeLoopbackAgent(BaseAgentConfig const& config)
+    {
+        return tensorrt_llm::executor::kv_cache::makeLoopbackAgent("nixl", &config);
+    }
+
+    [[nodiscard]] std::string getDirectory() const
+    {
+        return mDirectory;
+    }
+
+private:
+    std::string mDirectory;
+};
+
+TEST_P(LoopbackAgentTest, FileToGpu)
+{
+    std::string const agentName{"loopbackAgent"};
+    BaseAgentConfig config{agentName, true, GetParam()};
+    auto loopbackAgent = makeLoopbackAgent(config);
+
+    TLLM_CHECK(loopbackAgent);
+
+    std::vector<char> memory(100, 1);
+    char* cuda_mem;
+    TLLM_CUDA_CHECK(cudaMalloc(&cuda_mem, 100));
+    TLLM_CUDA_CHECK(cudaMemcpy(cuda_mem, memory.data(), 100, cudaMemcpyHostToDevice));
+    std::string filename = getDirectory() + std::string("/file2gpu.bin");
+
+    int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0664);
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for writing", filename.c_str());
+
+    std::vector<char> fileData(100, 10);
+    ssize_t bytesWritten = ::write(fd, fileData.data(), fileData.size());
+    TLLM_CHECK_WITH_INFO(bytesWritten == static_cast<ssize_t>(fileData.size()), "Failed to write to file");
+    ::close(fd);
+
+    {
+        MemoryDesc mem_desc(cuda_mem, 100, 0);
+        MemoryDescs memDescs{MemoryType::kVRAM, {mem_desc}};
+
+        std::vector<FileDesc> fileDescVec;
+        fileDescVec.emplace_back(filename, O_RDONLY, 0664, 100);
+        FileDescs fileDescs{std::move(fileDescVec)};
+
+        loopbackAgent->executeLoopbackRequest(memDescs, fileDescs, false);
+    }
+
+    TLLM_CUDA_CHECK(cudaMemcpy(memory.data(), cuda_mem, 100, cudaMemcpyDeviceToHost));
+
+    TLLM_CHECK(memory == fileData);
+    TLLM_CUDA_CHECK(cudaFree(cuda_mem));
+}
+
+TEST_P(LoopbackAgentTest, GpuToFile)
+{
+    std::string const agentName{"loopbackAgent"};
+    BaseAgentConfig config{agentName, true, GetParam()};
+    auto loopbackAgent = makeLoopbackAgent(config);
+
+    TLLM_CHECK(loopbackAgent);
+
+    std::vector<char> memory(100, 1);
+    char* cuda_mem;
+    TLLM_CUDA_CHECK(cudaMalloc(&cuda_mem, 100));
+    TLLM_CUDA_CHECK(cudaMemcpy(cuda_mem, memory.data(), 100, cudaMemcpyHostToDevice));
+    std::string filename = getDirectory() + std::string("/gpu2file.bin");
+
+    {
+        MemoryDesc mem_desc(cuda_mem, 100, 0);
+        MemoryDescs memDescs{MemoryType::kVRAM, {mem_desc}};
+
+        std::vector<FileDesc> fileDescVec;
+        fileDescVec.emplace_back(filename, O_CREAT | O_WRONLY, 0664, 100);
+        FileDescs fileDescs{std::move(fileDescVec)};
+
+        loopbackAgent->executeLoopbackRequest(memDescs, fileDescs, true);
+    }
+
+    int fd = ::open(filename.c_str(), O_RDONLY, 0664);
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for reading", filename.c_str());
+
+    std::vector<char> fileData(100);
+    ssize_t bytesRead = ::read(fd, fileData.data(), fileData.size());
+    TLLM_CHECK_WITH_INFO(bytesRead == static_cast<ssize_t>(fileData.size()), "Failed to read from file");
+    ::close(fd);
+
+    TLLM_CHECK(fileData == memory);
+    TLLM_CUDA_CHECK(cudaFree(cuda_mem));
+}
+
+INSTANTIATE_TEST_SUITE_P(, LoopbackAgentTest, ::testing::Values(true, false));

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-from importlib.metadata import version
 from pathlib import Path
 from random import choices, shuffle
 from typing import Dict, List, Tuple, Union
 
 import yaml
 
-from tensorrt_llm._torch.pyexecutor.model_engine import \
+from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
@@ -44,16 +43,8 @@ def get_settings_from_engine(
     with open(config_path, "r") as config_json:
         config = json.load(config_json)
 
-    engine_world_map = config["pretrained_config"]["mapping"]
+    mapping = config["pretrained_config"]["mapping"]
     engine_build_cfg = config["build_config"]
-    engine_parallel_map = engine_build_cfg["auto_parallel_config"]
-
-    world_config = {
-        "pp_size": engine_world_map["pp_size"],
-        "tp_size": engine_world_map["tp_size"],
-        "world_size": engine_world_map["world_size"],
-        "gpus_per_node": engine_parallel_map["gpus_per_node"],
-    }
 
     executor_settings = {
         "max_batch_size": engine_build_cfg["max_batch_size"],
@@ -64,7 +55,7 @@ def get_settings_from_engine(
         "sw_version": config["version"],
         "engine_dir": str(engine_path.absolute()),
         "settings_config": executor_settings,
-        "world_config": world_config,
+        "mapping": mapping,
     })
 
     runtime_config["performance_options"] = {}
@@ -104,12 +95,13 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
 
-    world_config = {
+    mapping = {
         "pp_size": params.get("pp"),
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
-        "ep_size": params.get("ep"),
-        "cluster_size": params.get("cluster_size"),
+        "moe_ep_size": params.get("ep"),
+        "moe_cluster_size": params.get("cluster_size"),
+        "gpus_per_node": params.get("gpus_per_node"),
     }
 
     if params.get("max_batch_size") and params.get("max_num_tokens"):
@@ -177,14 +169,14 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     backend = params.get("backend", "pytorch")
     return {
-        "sw_version": version("tensorrt_llm"),
+        "sw_version": "1.2",
         "model_path": model_path,
         "settings_config": {
             "max_batch_size": int(max_batch_size),
             "max_num_tokens": int(max_num_tokens),
             "chunking": enable_chunked_prefill,
         },
-        "world_config": world_config,
+        "mapping": mapping,
         "backend": backend,
         "decoding_config": {},
         "performance_options": {

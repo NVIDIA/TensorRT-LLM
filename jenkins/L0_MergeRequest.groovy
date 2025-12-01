@@ -155,6 +155,8 @@ def globalVars = [
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
+    !testFilter[DISABLE_MULTI_GPU_TEST] &&
+    !testFilter[DEBUG_MODE] &&
     testFilter[GPU_TYPE_LIST] == null &&
     testFilter[TEST_STAGE_LIST] == null &&
     testFilter[TEST_BACKEND] == null
@@ -232,11 +234,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 10Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 10Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -335,33 +337,40 @@ def mergeWaiveList(pipeline, globalVars)
     sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
     sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
 
-    // Get TOT waive list
-    LLM_TOT_ROOT = "llm-tot"
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
-    echo "Target branch: ${targetBranch}"
-    withCredentials([string(credentialsId: 'default-sync-llm-repo', variable: 'DEFAULT_SYNC_LLM_REPO')]) {
-        trtllm_utils.checkoutSource(DEFAULT_SYNC_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
+    try {
+        // Get TOT waive list
+        LLM_TOT_ROOT = "llm-tot"
+        targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        echo "Target branch: ${targetBranch}"
+        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+            trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
+        }
+        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+        sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+
+        // Get waive list diff in current MR
+        def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+        // Write diff to a temporary file to avoid shell escaping issues
+        writeFile file: 'diff_content.txt', text: diff
+
+        // Merge waive lists
+        sh """
+            python3 mergeWaiveList.py \
+            --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
+            --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+            --diff-file=diff_content.txt \
+            --output-file=waives.txt
+        """
+        trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+        echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Merge test waive list failed. Error: ${e.toString()}"
+        echo "Fallback to use the default test waive list from the PR"
     }
-    targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
-    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-    sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
-
-    // Get waive list diff in current MR
-    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
-
-    // Write diff to a temporary file to avoid shell escaping issues
-    writeFile file: 'diff_content.txt', text: diff
-
-    // Merge waive lists
-    sh """
-        python3 mergeWaiveList.py \
-        --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
-        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
-        --diff-file=diff_content.txt \
-        --output-file=waives.txt
-    """
-    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
-    echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
 }
 
 def preparation(pipeline, testFilter, globalVars)
@@ -381,9 +390,7 @@ def preparation(pipeline, testFilter, globalVars)
 def launchReleaseCheck(pipeline)
 {
     stages = {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            python3-pip \
-            -y""")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: Clone TRT-LLM source codes
@@ -516,16 +523,17 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
     def result = null
     def pageId = 0
     withCredentials([
-        string(
-            credentialsId: 'github-token-trtllm-ci',
-            variable: 'GITHUB_API_TOKEN'
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'
         ),
     ]) {
         while(true) {
             pageId += 1
             def rawDataJson = pipeline.sh(
                 script: """
-                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
                 """,
                 returnStdout: true
@@ -629,6 +637,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     }
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "cpp/kernels/fmha_v2/": ["-FMHA-"],
+        "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
     ]
     for (file in changedFileList) {
         for (String key : specialFileToTagMap.keySet()) {
@@ -697,12 +707,15 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
+        "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/evaluate/json_mode_eval.py",
+        "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
         "tensorrt_llm/functional.py",
         "tensorrt_llm/llmapi/",
@@ -1229,7 +1242,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': true,
+                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
                     ]
 
                     launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
@@ -1246,6 +1259,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
         echo "Will run Build-Docker-Images job"
+        stages.remove("x86_64-linux")
+        stages.remove("SBSA-linux")
+        echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {

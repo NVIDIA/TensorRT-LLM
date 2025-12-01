@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -30,7 +35,13 @@
 #include <cuda_fp8.h>
 
 inline constexpr float log2e = 1.4426950408889634; // std::log2(M_E)
-inline constexpr float safeInitRowMax = -1e+30F;
+// we used an optimization where exp(x-rowMax) is computed as:
+/*  bias = rowMax * log2e  // shared for the whole row
+    exp(x-rowMax) = exp2f(x * log2e - bias)
+*/
+// But this optimization is not numerically stable when (x * log2e - bias) is computed with FMA and x is too large. For
+// this reason, don't set safeInitRowMax with a huge absolute value.
+inline constexpr float safeInitRowMax = -1e+5F;
 inline constexpr int32_t kBAD_PAGE_INDEX = -1;
 __constant__ constexpr float kE4M3_MAX = 448.F;
 

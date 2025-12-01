@@ -1,4 +1,4 @@
-set(DEEP_EP_COMMIT 515a311f290eb6d9592fcccfcc80c40f5123ca72)
+get_property(DEEP_EP_COMMIT GLOBAL PROPERTY DEEP_EP_COMMIT)
 set(NVSHMEM_URL_HASH
     SHA256=eb2c8fb3b7084c2db86bd9fd905387909f1dfd483e7b45f7b3c3d5fcf5374b5a)
 
@@ -21,7 +21,14 @@ foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   if(${CUDA_ARCH_MAJOR} GREATER_EQUAL 9)
     # The FP4-related conversion instructions in DeepEP require SM100a, SM110a,
     # or SM120a.
-    if(${CUDA_ARCH_MAJOR} GREATER_EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
+    if(${CUDA_ARCH_MAJOR} EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
+      if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.31)
+        list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100f${CUDA_ARCH_POSTFIX}")
+      else()
+        list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100a${CUDA_ARCH_POSTFIX}"
+             "103a${CUDA_ARCH_POSTFIX}")
+      endif()
+    elseif(${CUDA_ARCH_MAJOR} GREATER_EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
       list(APPEND DEEP_EP_CUDA_ARCHITECTURES
            "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}a${CUDA_ARCH_POSTFIX}")
     else()
@@ -51,15 +58,6 @@ find_library(MLX5_lib NAMES mlx5 REQUIRED)
 
 # Download DeepEP
 include(FetchContent)
-if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
-  set(GITHUB_URL "$ENV{GITHUB_MIRROR}")
-else()
-  set(GITHUB_URL "https://github.com")
-endif()
-set(DEEP_EP_URL
-    "${GITHUB_URL}/deepseek-ai/DeepEP/archive/${DEEP_EP_COMMIT}.tar.gz")
-message(STATUS "deep_ep DEEP_EP_URL: ${DEEP_EP_URL}")
-FetchContent_Declare(deep_ep_download URL ${DEEP_EP_URL})
 FetchContent_MakeAvailable(deep_ep_download)
 set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 
@@ -134,6 +132,8 @@ ExternalProject_Add(
                 ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
+  COMMAND sed "s/_STANDARD 11/_STANDARD 17/" -i src/device/CMakeLists.txt
+  COMMAND sed "s/_STANDARD 11/_STANDARD 17/" -i src/CMakeLists.txt
   COMMAND patch -p1 --forward --batch -i
           ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
   CMAKE_CACHE_ARGS

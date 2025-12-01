@@ -43,15 +43,11 @@ public:
             .deleter(
                 [ptr = std::move(tensor)](void* data) mutable
                 {
-                    try
+                    if (data != ptr->data())
                     {
-                        TLLM_CHECK(data == ptr->data());
-                        ptr.reset();
+                        TLLM_LOG_WARNING("Torch tensor refers to deallocated memory.");
                     }
-                    catch (std::exception const& e)
-                    {
-                        TLLM_LOG_EXCEPTION(e);
-                    }
+                    ptr.reset();
                 })
             .make_tensor();
     }

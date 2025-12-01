@@ -84,13 +84,11 @@ class QwenMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=False)
 
         shared_expert_output = self.shared_expert(hidden_states)

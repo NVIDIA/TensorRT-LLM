@@ -41,14 +41,14 @@ namespace tg = trtllm::gen;
 #ifdef TLLM_ENABLE_CUDA
 
 inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, std::vector<uint64_t> const& shapes,
-    std::vector<uint64_t> const& strides, int32_t tileSizeMn, int32_t tileSizeK, void* gmemAddr, bool doSwizzle = true)
+    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr, bool doSwizzle = true)
 {
     // The multiplication factor of the data padding in SMEM.
     int32_t padMultiplier = 1;
     CUtensorMap desc{};
     // The data type.
     CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
-    if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3)
+    if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0)
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     }
@@ -71,15 +71,11 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
             padMultiplier = 2;
             tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
         }
-        else if (mmaKind == tg::MmaKind::MxFp4NvFp4 || mmaKind == tg::MmaKind::Auto)
-        {
-            tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
-        }
         else
         {
-            std::cerr << "Invalid dtype / mmaKind combination " << tg::dtypeToString(dtype) << "/"
-                      << tg::mmaKindToString(mmaKind) << std::endl;
-            assert(false);
+            // Note: this is used with the MMA kind MxFp4NvFp4 and also when casting to a higher-precision
+            // type such as Bfloat16 before the MMA.
+            tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
         }
     }
     else if (dtype == tg::Dtype::Fp32)
@@ -94,24 +90,30 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
 
     // The swizzle type.
     CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
-    int32_t tileKSizeInBytes = (tileSizeK * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
+    int32_t fastestDimTileSizeBytes = (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
     if (doSwizzle)
     {
-        if ((tileKSizeInBytes % 128) == 0)
+        if ((fastestDimTileSizeBytes % 128) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
         }
-        else if ((tileKSizeInBytes % 64) == 0)
+        else if ((fastestDimTileSizeBytes % 64) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
         }
-        else if ((tileKSizeInBytes % 32) == 0)
+        else if ((fastestDimTileSizeBytes % 32) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
+            // This path is only for the scaling factors.
+        }
+        else if ((fastestDimTileSizeBytes % 16) == 0 && (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3))
+        {
+            swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
         }
         else
         {
-            std::cerr << "buildNdTmaDescriptor: unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
+            std::cerr << "buildNdTmaDescriptor: unexpected fastestDimTileSizeBytes " << fastestDimTileSizeBytes
+                      << std::endl;
             assert(false);
         }
     }
@@ -121,8 +123,9 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
 
     // Check shape must be in range [1, 2^32]
     int32_t dim = shapes.size();
-    // Expect 2 dimensions.
-    assert(dim == 2 || dim == 3);
+    // Expect 2 dimensions for regular gemm, 3 dimensions for batched gemm or blocked layout, and 4
+    // dimensions for batched gemm with blocked layout.
+    assert(dim == 2 || dim == 3 || dim == 4);
     // Check shape range.
     for (int32_t ii = 0; ii < dim; ++ii)
     {
@@ -147,59 +150,74 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
     // The number of elements in 128B.
     auto const numEltsIn128B = numEltsPerUInt32 /*4B*/ * 32;
     // The number of tile K hidden size (per token) in each block of shared memory.
-    auto const numEltsInClampedTileKSize = std::min(numEltsIn128B, tileSizeK);
+    auto const numEltsInClampedFastestTileSize = std::min(numEltsIn128B, tileShapes[0]);
 
-    // Build tile shapes.
-    std::vector<uint32_t> tileShapes(dim, 1);
-    tileShapes[0] = numEltsInClampedTileKSize; // tileSizeK
-    tileShapes[1] = tileSizeMn;                // tileSizeMn
+    // Build box dim array. If tileShapes is smaller than dim, just fill with 1s.
+    assert(static_cast<int32_t>(tileShapes.size()) <= dim);
+    std::vector<uint32_t> boxDim(dim, 1);
+    boxDim[0] = numEltsInClampedFastestTileSize;
+    for (size_t ii = 1; ii < tileShapes.size(); ++ii)
+    {
+        if (tileShapes[ii] > 256)
+        {
+            std::cerr << "buildNdTmaDescriptor: boxDim too large " << tileShapes[ii] << std::endl;
+            assert(false);
+        }
+        else
+        {
+            boxDim[ii] = tileShapes[ii];
+        }
+    }
 
     // Set tile strides to 1;
     std::vector<uint32_t> tileStrides(dim, 1);
 
     // Build the descriptor.
     CUresult result = cuTensorMapEncodeTiled(&desc, tmaDataFormat,
-        /*tensorRank=*/dim, gmemAddr, shapes.data(), stridesInBytes.data(), tileShapes.data(), tileStrides.data(),
+        /*tensorRank=*/dim, gmemAddr, shapes.data(), stridesInBytes.data(), boxDim.data(), tileStrides.data(),
         /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE, swizzleType,
         /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
     if (result != CUDA_SUCCESS)
     {
-        std::cerr << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+        char const* errorString;
+        cuGetErrorString(result, &errorString);
+        std::stringstream ss;
+        ss << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
 
-        std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
-                  << std::endl;
+        ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 
-        std::cerr << "Shape: ";
+        ss << "Shape: ";
         for (int ii = 0; ii < dim; ++ii)
         {
-            std::cerr << shapes[ii] << " ";
+            ss << shapes[ii] << " ";
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "Stride: ";
+        ss << "Stride: ";
         for (int ii = 0; ii < dim - 1; ++ii)
         {
-            std::cerr << stridesInBytes[ii] << " ";
+            ss << stridesInBytes[ii] << " ";
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "tileShapes: ";
+        ss << "tileShapes: ";
         for (int ii = 0; ii < dim; ++ii)
         {
-            std::cerr << tileShapes[ii] << " ";
+            ss << boxDim[ii] << " ";
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "tileStrides: ";
+        ss << "tileStrides: ";
         for (int ii = 0; ii < dim; ++ii)
         {
-            std::cerr << tileStrides[ii] << " ";
+            ss << tileStrides[ii] << " ";
         }
-        std::cerr << std::endl;
-        std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
-        assert(false);
+        ss << std::endl;
+        ss << "swizzleType: " << int(swizzleType) << std::endl;
+        ss << "(in " << __FILE__ << ":" << __LINE__ << ")" << std::endl;
+        throw std::runtime_error(ss.str());
     }
 
     return desc;
@@ -267,41 +285,44 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 
     if (result != CUDA_SUCCESS)
     {
-        std::cerr << "Error: Failed to initialize the TMA descriptor for SF " << result << std::endl;
+        char const* errorString;
+        cuGetErrorString(result, &errorString);
+        std::stringstream ss;
+        ss << "Error: Failed to initialize the TMA descriptor for SF " << errorString << std::endl;
 
-        std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
-                  << std::endl;
+        ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 
-        std::cerr << "shape:";
+        ss << "shape:";
         for (uint32_t shape_i : shapes)
         {
-            std::cerr << " " << shape_i;
+            ss << " " << shape_i;
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "stridesInBytes:";
+        ss << "stridesInBytes:";
         for (uint32_t stride_i : stridesInBytes)
         {
-            std::cerr << " " << stride_i;
+            ss << " " << stride_i;
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "tileShapes:";
+        ss << "tileShapes:";
         for (uint32_t tileShape_i : tileShapes)
         {
-            std::cerr << " " << tileShape_i;
+            ss << " " << tileShape_i;
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "tileStrides:";
+        ss << "tileStrides:";
         for (uint32_t tileStride_i : tileStrides)
         {
-            std::cerr << " " << tileStride_i;
+            ss << " " << tileStride_i;
         }
-        std::cerr << std::endl;
+        ss << std::endl;
 
-        std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
-        assert(false);
+        ss << "swizzleType: " << int(swizzleType) << std::endl;
+        ss << "(in " << __FILE__ << ":" << __LINE__ << ")" << std::endl;
+        throw std::runtime_error(ss.str());
     }
 
     return desc;

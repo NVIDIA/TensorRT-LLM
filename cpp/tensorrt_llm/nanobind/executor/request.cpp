@@ -76,12 +76,12 @@ void initRequestBindings(nb::module_& m)
         return nb::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
             self.getTopPResetIds(), self.getTopPDecay(), self.getSeed(), self.getTemperature(), self.getMinTokens(),
             self.getBeamSearchDiversityRate(), self.getRepetitionPenalty(), self.getPresencePenalty(),
-            self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize(),
-            self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
+            self.getFrequencyPenalty(), self.getPromptIgnoreLength(), self.getLengthPenalty(), self.getEarlyStopping(),
+            self.getNoRepeatNgramSize(), self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
     };
     auto samplingConfigSetstate = [](tle::SamplingConfig& samplingConfig, nb::tuple const& state)
     {
-        if (state.size() != 19)
+        if (state.size() != 20)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -98,12 +98,13 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<FloatType>>(state[10]),                        // RepetitionPenalty
             nb::cast<std::optional<FloatType>>(state[11]),                        // PresencePenalty
             nb::cast<std::optional<FloatType>>(state[12]),                        // FrequencyPenalty
-            nb::cast<std::optional<FloatType>>(state[13]),                        // LengthPenalty
-            nb::cast<std::optional<SizeType32>>(state[14]),                       // EarlyStopping
-            nb::cast<std::optional<SizeType32>>(state[15]),                       // NoRepeatNgramSize
-            nb::cast<std::optional<SizeType32>>(state[16]),                       // NumReturnSequences
-            nb::cast<std::optional<FloatType>>(state[17]),                        // MinP
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[18])           // BeamWidthArray
+            nb::cast<std::optional<SizeType32>>(state[13]),                       // PromptIgnoreLength
+            nb::cast<std::optional<FloatType>>(state[14]),                        // LengthPenalty
+            nb::cast<std::optional<SizeType32>>(state[15]),                       // EarlyStopping
+            nb::cast<std::optional<SizeType32>>(state[16]),                       // NoRepeatNgramSize
+            nb::cast<std::optional<SizeType32>>(state[17]),                       // NumReturnSequences
+            nb::cast<std::optional<FloatType>>(state[18]),                        // MinP
+            nb::cast<std::optional<std::vector<SizeType32>>>(state[19])           // BeamWidthArray
         );
     };
     nb::class_<tle::SamplingConfig>(m, "SamplingConfig")
@@ -120,6 +121,7 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::FloatType> const&,              // repetitionPenalty
                  std::optional<tle::FloatType> const&,              // presencePenalty
                  std::optional<tle::FloatType> const&,              // frequencyPenalty
+                 std::optional<tle::SizeType32> const&,             // promptIgnoreLength
                  std::optional<tle::FloatType> const&,              // lengthPenalty
                  std::optional<tle::SizeType32> const&,             // earlyStopping
                  std::optional<tle::SizeType32> const&,             // noRepeatNgramSize
@@ -142,6 +144,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("repetition_penalty") = nb::none(),
             nb::arg("presence_penalty") = nb::none(),
             nb::arg("frequency_penalty") = nb::none(),
+            nb::arg("prompt_ignore_length") = nb::none(),
             nb::arg("length_penalty") = nb::none(),
             nb::arg("early_stopping") = nb::none(),
             nb::arg("no_repeat_ngram_size") = nb::none(),
@@ -165,6 +168,8 @@ void initRequestBindings(nb::module_& m)
             [](tle::SamplingConfig& self, std::optional<FloatType> v) { self.setPresencePenalty(v); })
         .def_prop_rw(
             "frequency_penalty", &tle::SamplingConfig::getFrequencyPenalty, &tle::SamplingConfig::setFrequencyPenalty)
+        .def_prop_rw("prompt_ignore_length", &tle::SamplingConfig::getPromptIgnoreLength,
+            &tle::SamplingConfig::setPromptIgnoreLength)
         .def_prop_rw("length_penalty", &tle::SamplingConfig::getLengthPenalty, &tle::SamplingConfig::setLengthPenalty)
         .def_prop_rw("early_stopping", &tle::SamplingConfig::getEarlyStopping, &tle::SamplingConfig::setEarlyStopping)
         .def_prop_rw("no_repeat_ngram_size", &tle::SamplingConfig::getNoRepeatNgramSize,
@@ -394,7 +399,7 @@ void initRequestBindings(nb::module_& m)
         new (&kvCacheRetentionConfig) tle::KvCacheRetentionConfig(
             nb::cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(state[0]),
             nb::cast<tle::RetentionPriority>(state[1]), nb::cast<std::optional<std::chrono::milliseconds>>(state[2]),
-            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::optional<std::string>>(state[4]));
+            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::string>(state[4]));
     };
 
     auto kvCacheRetentionConfig = nb::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -417,7 +422,7 @@ void initRequestBindings(nb::module_& m)
     // TokenRangeRetentionPriority bindings have been defined.
     kvCacheRetentionConfig
         .def(nb::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
+                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::string>(),
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
@@ -573,11 +578,11 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams());
+            self.getGuidedDecodingParams(), self.getCacheSaltID());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 33)
+        if (state.size() != 34)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -601,7 +606,8 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]));
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]),
+            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
@@ -641,7 +647,8 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::Tensor>,                    // skipCrossAttnBlocks
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
-                 std::optional<tle::MillisecondsType>           // allottedTimeMs
+                 std::optional<tle::MillisecondsType>,          // allottedTimeMs
+                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
                  >(),
             // clang-format off
         nb::arg("input_token_ids"),
@@ -680,8 +687,9 @@ void initRequestBindings(nb::module_& m)
         nb::arg("skip_cross_attn_blocks") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
-        nb::arg("allotted_time_ms") = nb::none()
-    )          // clang-format on
+        nb::arg("allotted_time_ms") = nb::none(),
+        nb::arg("cache_salt_id") = nb::none()
+    )             // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -723,6 +731,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
+        .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
@@ -885,19 +894,20 @@ void initRequestBindings(nb::module_& m)
         .def(nb::init<>())
         .def_rw("is_final", &tle::Result::isFinal)
         .def_rw("output_token_ids", &tle::Result::outputTokenIds)
-        .def_rw("cum_log_probs", &tle::Result::cumLogProbs)
-        .def_rw("log_probs", &tle::Result::logProbs)
-        .def_rw("context_logits", &tle::Result::contextLogits)
-        .def_rw("generation_logits", &tle::Result::generationLogits)
-        .def_rw("spec_dec_fast_logits_info", &tle::Result::specDecFastLogitsInfo)
-        .def_rw("encoder_output", &tle::Result::encoderOutput)
+        .def_rw("cum_log_probs", &tle::Result::cumLogProbs, nb::arg("cum_log_probs").none())
+        .def_rw("log_probs", &tle::Result::logProbs, nb::arg("log_probs").none())
+        .def_rw("context_logits", &tle::Result::contextLogits, nb::arg("context_logits").none())
+        .def_rw("generation_logits", &tle::Result::generationLogits, nb::arg("generation_logits").none())
+        .def_rw("spec_dec_fast_logits_info", &tle::Result::specDecFastLogitsInfo,
+            nb::arg("spec_dec_fast_logits_info").none())
+        .def_rw("encoder_output", &tle::Result::encoderOutput, nb::arg("encoder_output").none())
         .def_rw("finish_reasons", &tle::Result::finishReasons)
         .def_rw("sequence_index", &tle::Result::sequenceIndex)
         .def_rw("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_rw("decoding_iter", &tle::Result::decodingIter)
         .def_rw("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
-        .def_rw("context_phase_params", &tle::Result::contextPhaseParams)
-        .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics)
+        .def_rw("context_phase_params", &tle::Result::contextPhaseParams, nb::arg("context_phase_params").none())
+        .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics, nb::arg("request_perf_metrics").none())
         .def_rw("additional_outputs", &tle::Result::additionalOutputs)
         .def("__getstate__", resultGetstate)
         .def("__setstate__", resultSetstate);

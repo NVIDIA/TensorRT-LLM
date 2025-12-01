@@ -25,7 +25,6 @@
 
 namespace tensorrt_llm::executor
 {
-// 36 parameters
 Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, SamplingConfig const& samplingConfig,
     OutputConfig const& outputConfig, std::optional<SizeType32> const& endId, std::optional<SizeType32> const& padId,
     std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
@@ -41,7 +40,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
     SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs)
+    std::optional<MillisecondsType> allottedTimeMs, std::optional<CacheSaltIDType> cacheSaltID)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
@@ -50,7 +49,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask,
         numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid,
-        allottedTimeMs))
+        allottedTimeMs, cacheSaltID))
 {
 }
 
@@ -249,6 +248,11 @@ std::optional<SizeType32> Request::getLanguageAdapterUid() const
     return mImpl->getLanguageAdapterUid();
 }
 
+std::optional<CacheSaltIDType> Request::getCacheSaltID() const
+{
+    return mImpl->getCacheSaltID();
+}
+
 void Request::setStreaming(bool streaming)
 {
     mImpl->setStreaming(streaming);
@@ -412,5 +416,10 @@ void Request::setAllottedTimeMs(MillisecondsType allottedTimeMs)
 void Request::setLanguageAdapterUid(SizeType32 languageAdapterUid)
 {
     return mImpl->setLanguageAdapterUid(languageAdapterUid);
+}
+
+void Request::setCacheSaltID(CacheSaltIDType cacheSaltID)
+{
+    return mImpl->setCacheSaltID(cacheSaltID);
 }
 } // namespace tensorrt_llm::executor

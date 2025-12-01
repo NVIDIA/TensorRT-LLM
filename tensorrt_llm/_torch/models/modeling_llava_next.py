@@ -1,80 +1,98 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
-                          LlavaNextConfig, PretrainedConfig, PreTrainedModel)
-from transformers.modeling_utils import load_sharded_checkpoint
+from transformers import (AutoProcessor, AutoTokenizer, LlavaNextConfig,
+                          PretrainedConfig, PreTrainedModel)
 from transformers.models.llava_next.modeling_llava_next import (
     LlavaNextMultiModalProjector, get_anyres_image_grid_shape,
     image_size_to_num_patches, unpad_image)
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
+    LlavaNextHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
-                       register_input_processor)
-from ...llmapi.utils import download_hf_model
+                       register_input_processor,
+                       support_multimodal_disaggregated)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
-from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import (filter_weights, register_auto_model,
-                             register_vision_encoder)
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
+from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-class LlavaNextInputProcessor(InputProcessor):
+class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
+                              BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: PretrainedConfig,
+                 config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True):
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast)
-        self.processor = AutoProcessor.from_pretrained(
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
-        self.model_config = model_config
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.text_config.torch_dtype
 
-        self.image_token_index = model_config.image_token_index
-        self.vocab_size = model_config.vocab_size
-        self.config = model_config.vision_config
+        self.image_token_index = config.image_token_index
+        self.vocab_size = config.vocab_size
 
-    def get_num_tokens_per_image(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-    ) -> int:
-        image_size = (image_height, image_width)
-        num_image_tokens = self.processor._get_num_multimodal_tokens(
-            [image_size])["num_image_tokens"][0]
-        return num_image_tokens
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
                                                           List[torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Define model specific variables here before shared logic
-        mm_tokens = torch.tensor([self.model_config.image_token_index
+        mm_tokens = torch.tensor([self.config.image_token_index
                                   ]).to(input_ids.device)
-        model_hidden_size = self.model_config.text_config.hidden_size
+        model_hidden_size = self.config.text_config.hidden_size
         start_len = end_len = 0  # for llava, need not append start/end token around each image token
         # End model specific variables
 
@@ -148,6 +166,81 @@ class LlavaNextInputProcessor(InputProcessor):
         # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
+
+    def get_prompt_token_ids(
+        self, inputs: TextPrompt,
+        mm_handles: List[Dict[str,
+                              Any]]) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Build input token ids with multimodal placeholders expanded to the number of MM tokens.
+
+        Args:
+            inputs: Text prompt input container. Must contain a non-empty prompt string.
+            mm_handles: List of multimodal embedding handles. Currently only a single handle is supported.
+
+        Returns:
+            Tuple[List[int], List[int], List[int]]:
+                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
+                - mm_token_length: per-image MM token lengths
+                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+        """
+        # TODO: Move this function to the base input processor class when extending for more models
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+        if not isinstance(mm_handles, list):
+            raise ValueError("mm_handles must be a list")
+
+        if len(mm_handles) != 1:
+            # TODO: only support single multimodal item within a request for now
+            raise NotImplementedError(
+                "Only one mm_handle is supported for LlavaNext for now")
+        hidden_size = mm_handles[0]['tensor_size'][1]
+        assert hidden_size == self.config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
+        input_ids = self.tokenizer(text_prompt,
+                                   return_tensors="pt").input_ids[0]
+
+        vocab_size = self.config.text_config.vocab_size
+        image_token_index = self.config.image_token_index
+
+        image_mask = input_ids == image_token_index
+        image_positions = torch.where(image_mask)[0]
+        num_images = len(image_positions)
+        assert num_images == len(
+            mm_handles), "Number of images must match number of mm_handles"
+        total_mm_tokens = sum(mm_handle["tensor_size"][0]
+                              for mm_handle in mm_handles)
+        final_length = len(input_ids) - num_images + total_mm_tokens
+        # Create output tensor
+        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
+        placeholder_id = vocab_size + 1
+
+        # Fill the expanded sequence
+        write_pos = 0
+        image_cnt = 0
+        mm_token_length = []
+        mm_token_offsets = []
+        for read_pos in range(len(input_ids)):
+            if input_ids[read_pos] == image_token_index:
+                # Replace with placeholder id
+                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
+                expanded_ids[write_pos:write_pos + mm_token_num] = \
+                    placeholder_id
+                mm_token_offsets.append(write_pos)
+                mm_token_length.append(mm_token_num)
+                write_pos += mm_token_num
+                image_cnt += 1
+            else:
+                # Copy text token as-is
+                expanded_ids[write_pos] = input_ids[read_pos]
+                write_pos += 1
+
+        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
+        assert mm_token_length[-1] + mm_token_offsets[
+            -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
+        return expanded_ids.to(
+            torch.int32).tolist(), mm_token_length, mm_token_offsets
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt,
@@ -229,65 +322,39 @@ class LlavaNextVisionModel(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.pretrained_config = model_config.pretrained_config
-        self.device = f"cuda:{model_config.mapping.rank}"
-        model_path = self.pretrained_config._name_or_path
 
-        # Determine the actual local path for model files
-        if os.path.isdir(model_path):
-            local_model_path = model_path
-        else:
-            local_model_path = download_hf_model(model_path)
-
-        # Partially load the model to reduce memory usage(Vision tower and multi-modal projector)
-        hf_model_config = AutoConfig.from_pretrained(local_model_path)
-        self.dtype = hf_model_config.text_config.torch_dtype
-        module_dict = nn.ModuleDict({
-            "vision_tower":
-            AutoModel.from_config(hf_model_config.vision_config),
-            "multi_modal_projector":
-            LlavaNextMultiModalProjector(hf_model_config)
-        })
-        module_dict.register_parameter(
-            "image_newline",
-            nn.Parameter(torch.empty(hf_model_config.text_config.hidden_size)))
-
-        missing_keys, _ = load_sharded_checkpoint(module_dict,
-                                                  local_model_path,
-                                                  strict=False)
-        assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
-        hf_vision_tower = module_dict["vision_tower"].to(self.dtype)
-        hf_mm_projector = module_dict["multi_modal_projector"].to(
-            self.dtype).to(self.device)
-        hf_image_newline = module_dict.image_newline.to(self.dtype).to(
-            self.device)
-
-        # For A100 GPU, fallback to HF vision tower due to accuracy issue in TRT-LLM CLIPAttention
-        # Otherwise, use TRTLLM vision tower(CLIPVisionModel)
-        prop = torch.cuda.get_device_properties(0)
-        sm_version = prop.major * 10 + prop.minor
-        self.use_hf_vision_tower = sm_version == 80
-        if self.use_hf_vision_tower:
-            self.vision_tower = hf_vision_tower.to(self.device)
-        else:
-            vision_model_config = ModelConfig(
-                pretrained_config=self.pretrained_config.vision_config,
-                attn_backend="TRTLLM")
-            self.vision_tower = CLIPVisionModel(vision_model_config).to(
-                self.device).to(self.dtype)
-            self.vision_tower.load_weights(hf_vision_tower.state_dict())
-
-        # Use HF multi-modal projector
-        self.mm_projector = hf_mm_projector
-        self.image_newline = hf_image_newline
+        clip_model_config = copy.deepcopy(self.model_config)
+        clip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
+        self.dtype = self.model_config.pretrained_config.text_config.torch_dtype
+        self.vision_model = CLIPVisionModel(clip_model_config).to(self.dtype)
+        self.mm_projector = LlavaNextMultiModalProjector(
+            self.pretrained_config).to(self.dtype)
+        self.image_newline = nn.Parameter(torch.empty(
+            self.pretrained_config.text_config.hidden_size),
+                                          requires_grad=False).to(self.dtype)
         self.vision_feature_select_strategy = getattr(
             self.pretrained_config, "vision_feature_select_strategy", "default")
-
         self.post_config()
+
+    def load_weights(self, weights):
+
+        def filter_weights(prefix, weights: Dict):
+            result = {}
+            for key, weight in weights.items():
+                if key.startswith(prefix):
+                    new_key = key[len(prefix):]
+                    result[new_key] = weight
+            return result
+
+        visual_model_weights = filter_weights("vision_tower.", weights)
+        self.vision_model.load_weights(visual_model_weights)
+        mm_projector_weights = filter_weights("multi_modal_projector.", weights)
+        self.mm_projector.load_state_dict(mm_projector_weights, strict=True)
+        self.image_newline.data.copy_(weights["image_newline"])
 
     def post_config(self):
         self.config = self.pretrained_config.vision_config
 
-    # Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_next/modeling_llava_next.py#L284
     def pack_image_features(self,
                             image_features,
                             image_sizes,
@@ -313,7 +380,8 @@ class LlavaNextVisionModel(nn.Module):
                     logger.warning_once(
                         "Image feature shape does not line up with the provided patch size. "
                         "You may be using the `default` vision_feature_select_strategy with a"
-                        " visual encoder that does not have CLS.")
+                        " visual encoder that does not have CLS.",
+                        key="llava_next_vision_model_pack_image_features")
 
                 image_feature = image_feature.view(num_patch_height,
                                                    num_patch_width, height,
@@ -349,6 +417,43 @@ class LlavaNextVisionModel(nn.Module):
                                     device=image_features[0].device)
         return new_image_features, feature_lens
 
+    def _pad_for_batching(
+        self,
+        pixel_values: list[torch.Tensor],
+    ):
+        """
+        Pads images on the `num_of_patches` dimension with zeros to form a batch of same number of patches.
+
+        Args:
+            pixel_values (`list[torch.Tensor]`):
+                A list of pixel value tensors, each of shape (`batch`, `num_patches`, `channels`, `height`, `width`)
+
+        Returns:
+            list[`torch.Tensor`]: The padded image tensors.
+        """
+        if not pixel_values:
+            return pixel_values
+
+        # Find max patches across all images
+        max_patches = max(tensor.shape[1] for tensor in pixel_values)
+
+        # Pad each tensor by concatenating zeros on dim=1 (num_patches)
+        padded_values = []
+
+        for pixel_value in pixel_values:
+            current_patches = pixel_value.shape[1]
+            if current_patches < max_patches:
+                pad_len = max_patches - current_patches
+                zeros = pixel_value.new_zeros(
+                    (pixel_value.shape[0], pad_len, *pixel_value.shape[2:]))
+                padded_pixel_value = torch.cat([pixel_value, zeros], dim=1)
+            else:
+                padded_pixel_value = pixel_value
+
+            padded_values.append(padded_pixel_value)
+
+        return padded_values
+
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
         pixel_values = [
@@ -359,6 +464,7 @@ class LlavaNextVisionModel(nn.Module):
             multimodal_param.multimodal_data["image"]["image_sizes"]
             for multimodal_param in multimodal_params
         ]
+        pixel_values = self._pad_for_batching(pixel_values)
         pixel_values = torch.cat(pixel_values, dim=0)
         image_sizes = torch.cat(image_sizes, dim=0)
 
@@ -378,23 +484,18 @@ class LlavaNextVisionModel(nn.Module):
             ]
             pixel_values = torch.cat(_pixel_values_list, dim=0)
 
-        if self.use_hf_vision_tower:
-            image_features = self.vision_tower(
-                pixel_values, output_hidden_states=True).hidden_states
-        else:
-            attn_metadata = self.vision_tower.prepare_attn_metadata(
-                pixel_values.shape[0])
-            image_features = self.vision_tower(
-                pixel_values,
-                attn_metadata=attn_metadata,
-            )
+        attn_metadata = self.vision_model.prepare_attn_metadata(
+            pixel_values.shape[0])
+        image_features = self.vision_model(
+            pixel_values,
+            attn_metadata=attn_metadata,
+        )
         selected_image_feature = image_features[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
-
         image_features = torch.split(image_features, image_num_patches, dim=0)
 
-        # NOTE: 'pack_image_features' is directly copied from the HF's code
-        image_features, feature_lens = self.pack_image_features(
+        # NOTE: 'pack_image_features' is from the HF's code
+        image_features, _ = self.pack_image_features(
             image_features,
             image_sizes,
             vision_feature_select_strategy=self.vision_feature_select_strategy,
@@ -404,6 +505,7 @@ class LlavaNextVisionModel(nn.Module):
         return [image_features]
 
 
+@support_multimodal_disaggregated
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
 @register_input_processor(
@@ -419,6 +521,7 @@ class LlavaNextModel(PreTrainedModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs) -> None:
         config = model_config.pretrained_config
+        self._supports_sdpa = True
         super().__init__(config)
         if hasattr(self, "llm"):
             return
@@ -436,16 +539,29 @@ class LlavaNextModel(PreTrainedModel):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.model_config = model_config
-        self.model_dtype = getattr(config.text_config, "torch_dtype",
-                                   torch.float16)
-        logger.info(f"{self.dtype=} {self.model_dtype=}")
-
         self.post_config()
-        self.is_loaded = True
 
-    def load_weights(self, weights):
-        weights = filter_weights("language_model", weights)
-        self.llm.load_weights(weights)
+    def load_weights(self, weights, weight_mapper: BaseWeightMapper):
+        if isinstance(weight_mapper, LlavaNextHfWeightMapper):
+            weights = weight_mapper.preprocess_weights(weights)
+
+        self.mm_encoder.load_weights(weights)
+
+        def filter_weights(weights: Dict):
+            transformed_weights = {}
+            for key, weight in weights.items():
+                if key.startswith("language_model."):
+                    if isinstance(weight_mapper, LlavaNextHfWeightMapper):
+                        new_key = "model." + key[len("language_model."):]
+                    else:
+                        new_key = key[len("language_model."):]
+                    transformed_weights[new_key] = weight
+                elif key.startswith("lm_head."):
+                    transformed_weights[key] = weight
+            return transformed_weights
+
+        language_model_weights = filter_weights(weights)
+        self.llm.load_weights(language_model_weights)
 
     def post_config(self):
         self.config = self.llm.config
@@ -471,22 +587,18 @@ class LlavaNextModel(PreTrainedModel):
         mm_embeds = []
         if len(multimodal_params) > 0:
             if not DISAGG:
-                if multimodal_params[0].multimodal_data.get(
-                        "multimodal_embedding", None) is not None:
-                    mm_embeds = [
-                        multimodal_param.multimodal_data["multimodal_embedding"]
-                        for multimodal_param in multimodal_params
-                    ]
-                else:
-                    mm_embeds = self.mm_encoder.forward(multimodal_params)
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "LlavaNextModel does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embeds = find_input_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds)
-
+            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

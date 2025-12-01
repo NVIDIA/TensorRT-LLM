@@ -46,7 +46,10 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    , mUseTllmGen(tensorrt_llm::common::getSMVersion() == 100)
+    // TRTLLM-GEN only supports power of 2 head sizes.
+    // The exception will fall back to fmha v2.
+    // Please update fmha_v2/setup.py if you want to add more supported head sizes.
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 80 && fixedParams.headSize != 72)
 {
     if (mUseTllmGen)
     {
@@ -114,6 +117,13 @@ bool FmhaDispatcher::isSupported()
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        // Set the kernel type and mask type if sparseMLA is used.
+        if (mFixedParams.useSparseMLA)
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -139,6 +149,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         // Convert from MHAFixedParams + MHARunnerParams to TllmGenFmhaRunnerParams
         void const* kvPoolPtr = nullptr;
+        void const* kvSfPoolPtr = nullptr;
         void const* kvPageIdxPtr = nullptr;
         auto qkvLayout = kernels::QkvLayout::PackedQkv;
         int32_t maxBlocksPerSeq = 0;
@@ -148,6 +159,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             qkvLayout = kernels::QkvLayout::PagedKv;
             auto pagedKvCache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
             kvPoolPtr = pagedKvCache.mPrimaryPoolPtr;
+            kvSfPoolPtr = runnerParams.pagedKvSfCache.mPrimaryPoolPtr;
             kvPageIdxPtr = reinterpret_cast<int const*>(pagedKvCache.data);
             maxBlocksPerSeq = pagedKvCache.mMaxBlocksPerSeq;
             numTokensPerBlock = pagedKvCache.mTokensPerBlock;
@@ -172,6 +184,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.kPtr = runnerParams.kPtr;
         tllmRunnerParams.vPtr = runnerParams.vPtr;
         tllmRunnerParams.kvPtr = kvPoolPtr;
+        tllmRunnerParams.kvSfPtr = kvSfPoolPtr;
         tllmRunnerParams.qkvPtr = runnerParams.qkvPtr;
         tllmRunnerParams.attentionSinksPtr = runnerParams.attentionSinksPtr;
         tllmRunnerParams.cumSeqLensQPtr = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
@@ -211,6 +224,17 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
+        // Set the sparse attention parameters if sparseMLA is used.
+        if (mFixedParams.useSparseMLA)
+        {
+            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+            tllmRunnerParams.kvPageIdxPtr
+                = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+        }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

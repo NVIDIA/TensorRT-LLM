@@ -27,17 +27,16 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 class MLACacheFormatter final : public BaseCacheFormatter
 {
 public:
-    MLACacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+    MLACacheFormatter(BaseKVCacheManager* cacheManager, std::vector<CacheTransBufferManager*> cacheTransBufferManagers)
         : mCacheManager{cacheManager}
-        , mCacheTransBufferManager{cacheTransBufferManager}
+        , mCacheTransBufferManagers{cacheTransBufferManagers}
     {
         TLLM_CHECK(mCacheManager);
-        TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void format(TransferSession& session) override;
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
 
-    void unformat(TransferSession& session) override;
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 
@@ -58,7 +57,7 @@ public:
 
 private:
     BaseKVCacheManager* mCacheManager;
-    CacheTransBufferManager* mCacheTransBufferManager;
+    std::vector<CacheTransBufferManager*> mCacheTransBufferManagers;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

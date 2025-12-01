@@ -3,6 +3,7 @@
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
+import yaml
 from omegaconf import OmegaConf
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -14,6 +15,7 @@ from pydantic_settings import (
 )
 
 from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
     deep_merge_dicts,
@@ -26,6 +28,9 @@ from tensorrt_llm.sampling_params import SamplingParams
 # Global torch config, set the torch compile cache to fix up to llama 405B
 torch._dynamo.config.cache_size_limit = 20
 
+# simple string, TRT-LLM style text-only prompt or full-scale HF message template
+PromptInput = Union[str, Dict, List[Dict]]
+
 
 class PromptConfig(BaseModel):
     """Prompt configuration.
@@ -35,16 +40,30 @@ class PromptConfig(BaseModel):
     """
 
     batch_size: int = Field(default=2, description="Number of queries")
-    queries: Union[str, List[str]] = Field(
+    queries: Union[PromptInput, List[PromptInput]] = Field(
         default_factory=lambda: [
+            # OPTION 1: simple text prompt
             "How big is the universe? ",
-            "In simple words and in a single sentence, explain the concept of gravity: ",
-            "How to fix slicing in golf? ",
-            "Where is the capital of Iceland? ",
-        ]
+            # OPTION 2: wrapped text prompt for TRT-LLM
+            {"prompt": "In simple words and a single sentence, explain the concept of gravity: "},
+            # OPTION 3: a full-scale HF message template (this one works for text-only models!)
+            # Learn more about chat templates: https://huggingface.co/docs/transformers/en/chat_templating
+            # and multi-modal templates: https://huggingface.co/docs/transformers/en/chat_templating_multimodal
+            [
+                {
+                    "role": "user",
+                    "content": "How to fix slicing in golf?",
+                }
+            ],
+            # More prompts...
+            {"prompt": "Where is the capital of Iceland? "},
+        ],
+        description="Example queries to prompt the model with. We support both TRT-LLM text-only "
+        "queries via the 'prompt' key and full-scale HF message template called via "
+        "apply_chat_template.",
     )
     sp_kwargs: Dict[str, Any] = Field(
-        default_factory=lambda: {"max_tokens": 100, "top_k": 200, "temperature": 1.0},
+        default_factory=lambda: {"max_tokens": 100, "top_k": None, "temperature": 1.0},
         description="Sampling parameter kwargs passed on the SamplingParams class. "
         "Defaults are set to the values used in the original model.",
     )
@@ -55,10 +74,28 @@ class PromptConfig(BaseModel):
         NOTE (lucaslie): has to be done with model_post_init to ensure it's always run. field
         validators are only run if a value is provided.
         """
-        queries = [self.queries] if isinstance(self.queries, str) else self.queries
+        queries = self.queries if isinstance(self.queries, list) else [self.queries]
         batch_size = self.batch_size
         queries = queries * (batch_size // len(queries) + 1)
-        self.queries = queries[:batch_size]
+        queries = queries[:batch_size]
+
+        # now let's standardize the queries for the LLM api to understand them
+        queries_processed = []
+        for query in queries:
+            if isinstance(query, str):
+                queries_processed.append({"prompt": query})
+            elif isinstance(query, dict):
+                queries_processed.append(query)
+            elif isinstance(query, list):
+                queries_processed.append(
+                    {
+                        "prompt": "Fake prompt. Check out messages field for the HF chat template.",
+                        "messages": query,  # contains the actual HF chat template
+                    }
+                )
+            else:
+                raise ValueError(f"Invalid query type: {type(query)}")
+        self.queries = queries_processed
 
     @field_validator("sp_kwargs", mode="after")
     @classmethod
@@ -103,9 +140,10 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     ### CORE ARGS ##################################################################################
     # The main AutoDeploy arguments - contains model, tokenizer, backend configs, etc.
-    args: AutoDeployConfig = Field(
+    args: LlmArgs = Field(
         description="The main AutoDeploy arguments containing model, tokenizer, backend configs, etc. "
-        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.AutoDeployConfig` for more details."
+        "Contains all the fields from `AutoDeployConfig` and `BaseLlmArgs`. "
+        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` for more details."
     )
 
     # Optional model field for convenience - if provided, will be used to initialize args.model
@@ -208,7 +246,7 @@ def build_llm_from_config(config: ExperimentConfig) -> LLM:
         "demollm": DemoLLM,
         "trtllm": LLM,
     }
-    llm = llm_lookup[config.args.runtime](**config.args.to_dict())
+    llm = llm_lookup[config.args.runtime](**config.args.to_llm_kwargs())
     return llm
 
 
@@ -225,8 +263,8 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
-        config = CliApp.run(ExperimentConfig)
-    ad_logger.info(f"{config=}")
+        config: ExperimentConfig = CliApp.run(ExperimentConfig)
+    ad_logger.info(f"AutoDeploy Experiment Config:\n{yaml.dump(config.model_dump())}")
 
     if config.dry_run:
         return
@@ -244,7 +282,7 @@ def main(config: Optional[ExperimentConfig] = None):
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
         ad_logger.info("Running benchmark...")
-        keys_from_args = ["compile_backend", "attn_backend", "mla_backend"]
+        keys_from_args = []
         fields_to_show = [f"benchmark={config.benchmark}"]
         fields_to_show.extend([f"{k}={getattr(config.args, k)}" for k in keys_from_args])
         results["benchmark_results"] = benchmark(
@@ -268,6 +306,7 @@ def main(config: Optional[ExperimentConfig] = None):
         store_benchmark_results(results, config.benchmark.results_path)
 
     llm.shutdown()
+    return results
 
 
 if __name__ == "__main__":

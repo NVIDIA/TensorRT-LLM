@@ -19,7 +19,9 @@
 #include "Enums.h"
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/MmaDecl.h"
 #include <cassert>
+#include <stdexcept>
 
 namespace gemm
 {
@@ -77,30 +79,35 @@ public:
     }
 
     // Returns the offset of the ith chunk
-    int32_t getChunkOffset(int32_t ii) const
+    int32_t getChunkOffsetByName(std::string const& name) const
     {
-        if (mFirstChunkReuse[ii])
+        for (size_t ii = 0; ii < mSmemChunkNames.size(); ++ii)
         {
-            // Reuse the offset of the 0th chunk.
-            return getChunkOffset(0);
+            if (mSmemChunkNames[ii] == name)
+            {
+                return getChunkOffset(ii);
+            }
         }
+        throw std::runtime_error("Name not found: " + name);
+    }
 
-        // Get offset of ii chunks.
-        auto offset = getOffsetBeforeChunk(ii);
-        // Ensure alignment for the current chunk
-        return getSizePaddedToAlignment(offset, mNumBytesAndAlignmentPerSmemChunk[ii].second);
+    // Returns the first chunk reuse flag given chunk name.
+    int getFirstChunkReuseFlagByName(std::string const& name) const
+    {
+        for (size_t ii = 0; ii < mSmemChunkNames.size(); ++ii)
+        {
+            if (mSmemChunkNames[ii] == name)
+            {
+                return getFirstChunkReuseFlag(ii);
+            }
+        }
+        throw std::runtime_error("Name not found: " + name);
     }
 
     // Function to calculate the total size of the SMEM array
     int32_t getTotalSize() const
     {
         return getOffsetBeforeChunk(static_cast<int32_t>(mNumBytesAndAlignmentPerSmemChunk.size()));
-    }
-
-    // Returns the first chunk reuse flag for the ith chunk.
-    int getFirstChunkReuseFlag(int32_t ii) const
-    {
-        return mFirstChunkReuse[ii];
     }
 
     // Print the contents of this object.
@@ -115,6 +122,26 @@ public:
     }
 
 private:
+    int32_t getChunkOffset(int32_t ii) const
+    {
+        if (mFirstChunkReuse[ii])
+        {
+            // Reuse the offset of the 0th chunk.
+            return getChunkOffset(0);
+        }
+
+        // Get offset of ii chunks.
+        auto offset = getOffsetBeforeChunk(ii);
+        // Ensure alignment for the current chunk
+        return getSizePaddedToAlignment(offset, mNumBytesAndAlignmentPerSmemChunk[ii].second);
+    }
+
+    // Returns the first chunk reuse flag for the ith chunk.
+    int getFirstChunkReuseFlag(int32_t ii) const
+    {
+        return mFirstChunkReuse[ii];
+    }
+
     // Helper function to calculate padded size
     int32_t getSizePaddedToAlignment(int32_t size, int32_t alignment) const
     {
@@ -139,9 +166,7 @@ int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind)
 {
     if (mmaKind == tg::MmaKind::Auto)
     {
-        std::cout << "mmaKind != tg::MmaKind::Auto" << std::endl;
-        assert(false);
-        return -1;
+        throw std::runtime_error("mmaKind != tg::MmaKind::Auto");
     }
     if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
     {
@@ -162,11 +187,12 @@ public:
     KernelTraits() {}
 
     // The constructor.
-    KernelTraits(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeAcc, tg::MmaKind mmaKind,
-        int32_t tileM, int32_t tileN, int32_t tileK, int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages,
-        int32_t numStagesMma, int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
+    KernelTraits(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeAcc, tg::Dtype dtypeMmaA,
+        tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, int32_t mmaK, int32_t tileM, int32_t tileN, int32_t tileK,
+        int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages, int32_t numStagesMma,
+        int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
         bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool usePersistentScheduler, bool useDeepSeekFp8,
-        bool usePerTokenSfA, bool usePerTokenSfB)
+        bool usePerTokenSfA, bool usePerTokenSfB, BiasType biasType)
         : mMmaKind{mmaKind}
     {
         //
@@ -181,16 +207,17 @@ public:
             // [rowMax       ] (16B aligned) (if needed)
             // [sliceK       ] (16B aligned) (if needed)
             // [per-token SF ] (16B aligned) (if needed)
+            // [bias         ] (16B aligned) (if needed)
             //
             // SMEM for smemA and smemB might be repurposed and used for gmemC0 and gmemC1:
             //
             // [..smemA..][..smemB..][..smemBShuffle..]
-            // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..]
+            // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..][..per-token SF..][..bias..]
             //
 
             if (mMmaKind == tg::MmaKind::Auto)
             {
-                mMmaKind = dtypeGetMmaKind(dtypeA, dtypeB);
+                mMmaKind = dtypeGetMmaKind(dtypeMmaA, dtypeMmaB);
             }
 
             std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerSmemChunk;
@@ -344,6 +371,29 @@ public:
                 firstChunkReuseSmem.emplace_back(false);
             }
 
+            // Bias
+            {
+                int32_t numBytesSmemBias = 0;
+                if (isBiasTypeN(biasType))
+                {
+                    numBytesSmemBias = tileN * sizeof(float);
+                }
+                else if (isBiasTypeM(biasType))
+                {
+                    numBytesSmemBias = tileM * sizeof(float);
+                }
+                else if (isBiasTypeMn(biasType))
+                {
+                    numBytesSmemBias = tileM * tileN * sizeof(float);
+                }
+                // Number of bytes alignment for bias
+                auto const numBytesAlignmentBias = 16;
+                // Add info.
+                smemChunkNames.emplace_back("smemBias");
+                numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemBias, numBytesAlignmentBias));
+                firstChunkReuseSmem.emplace_back(false);
+            }
+
             // Per-block absolute maximum for multi-warp reduction.
             {
                 // Number of bytes: number of epilogue warps * number of tile columns.
@@ -356,6 +406,25 @@ public:
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numBytesSmemBlockAmax, numBytesAlignmentBlockAmax));
                 firstChunkReuseSmem.emplace_back(false);
+            }
+
+            // SmemConstSfBuf
+            // A buffer used to copy constant values to TMEM.
+            {
+                // Do we need the buffer?
+                bool const useConstSfBuf = dtypeB == tg::Dtype::E4m3 && dtypeMmaB == tg::Dtype::MxE4m3;
+                // Number of bytes for the buffer.
+                auto const numSmemBytesConstSfBuf = useConstSfBuf ? 512 : 0;
+                // Number of bytes for the alignment of the buffer.
+                auto const numBytesAlignmentConstSfBuf = 16;
+                // No need to reuse the first chunk.
+                auto const reuseChunksSmemConstSfBuf = false;
+
+                // Add info.
+                smemChunkNames.emplace_back("smemConstSfBuf");
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numSmemBytesConstSfBuf, numBytesAlignmentConstSfBuf));
+                firstChunkReuseSmem.emplace_back(reuseChunksSmemConstSfBuf);
             }
 
             // Create SMEM helper object.
@@ -401,10 +470,12 @@ public:
 
             // Matrix A
             {
+                // We use TMEM for A if we use slice-K or if we need to cast A.
+                bool const useTmemA = (numSlicesForSliceK > 1) || (dtypeMmaA != dtypeA);
                 // Number of columns for A.
-                auto const numTmemColsA = numSlicesForSliceK > 1 ? numStages * tileK
-                        / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeA))
-                                                                 : 0;
+                auto const numTmemColsA = useTmemA ? numStages * tileK
+                        / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeMmaA))
+                                                   : 0;
                 // Number of columns for A alignment.
                 auto const numColsAlignmentA = 4;
                 // No need to reuse TMEM.
@@ -418,12 +489,16 @@ public:
 
             // Sf A
             {
-                bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeA);
+                // Does the MMA require block scales in TMEM for A?
+                bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeMmaA);
+                // Are the block scales constant?
+                bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
                 // Number of columns for scaling factors of A.
-                auto const numTmemColsSfA
-                    = useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0;
+                auto const numTmemColsSfA = useConstSfA
+                    ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK), 4)
+                    : (useBlockScalingA ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK)) * numStages : 0);
                 // Number of columns for Sf alignment.
-                auto const numColsAlignmentSfA = 2;
+                auto const numColsAlignmentSfA = 4;
                 // No need to reuse TMEM.
                 auto const reuseChunksTmemSfA = false;
 
@@ -435,12 +510,16 @@ public:
 
             // Sf B
             {
-                bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeB);
+                // Does the MMA require block scales in TMEM for B?
+                bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeMmaB);
+                // Are the block scales constant?
+                bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
                 // Number of columns for scaling factors of B.
-                auto const numTmemColsSfB
-                    = useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0;
+                auto const numTmemColsSfB = useConstSfB
+                    ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK), 4)
+                    : (useBlockScalingB ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK)) * numStages : 0);
                 // Number of columns for Sf alignment.
-                auto const numColsAlignmentSfB = 2;
+                auto const numColsAlignmentSfB = 4;
                 // No need to reuse TMEM.
                 auto const reuseChunksTmemSfB = false;
 
@@ -487,14 +566,14 @@ inline int32_t getTmemBufferSize(KernelTraits traits)
 
 inline int32_t getSmemOffsetLoadA(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(0);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemLoadA");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetLoadB(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(1);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemLoadB");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -508,50 +587,63 @@ inline int32_t getSmemOffsetLoadAb(KernelTraits traits)
 
 inline int32_t getSmemOffsetLoadShuffleB(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(2);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemBShuffle");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetGmemC(KernelTraits traits, int resIdx = 0)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(3 + resIdx);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemGmemC" + std::to_string(resIdx));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetRowMax(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(5);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemRowMax");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetSliceK(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(6);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemSliceK");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetPerTokenSf(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(7);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSf");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetBias(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemBias");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetBlockAmax(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(8);
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemBlockAmax");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetConstSfBuf(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemConstSfBuf");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t isSmemAbRepurposedToGmemC(KernelTraits traits, int resIdx = 0)
 {
-    // Be conscious that the index (3 + resIdx) should match the index in getSmemOffsetGmemC().
-    return traits.mSmemAllocatorHelper.getFirstChunkReuseFlag(3 + resIdx);
+    return traits.mSmemAllocatorHelper.getFirstChunkReuseFlagByName("smemGmemC" + std::to_string(resIdx));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -562,28 +654,28 @@ inline int32_t isSmemAbRepurposedToGmemC(KernelTraits traits, int resIdx = 0)
 
 inline int32_t getTmemOffsetD(KernelTraits traits)
 {
-    return traits.mTmemAllocatorHelper.getChunkOffset(0);
+    return traits.mTmemAllocatorHelper.getChunkOffsetByName("tmemD");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getTmemOffsetA(KernelTraits traits)
 {
-    return traits.mTmemAllocatorHelper.getChunkOffset(1);
+    return traits.mTmemAllocatorHelper.getChunkOffsetByName("tmemA");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getTmemOffsetSfA(KernelTraits traits)
 {
-    return traits.mTmemAllocatorHelper.getChunkOffset(2);
+    return traits.mTmemAllocatorHelper.getChunkOffsetByName("tmemSfA");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getTmemOffsetSfB(KernelTraits traits)
 {
-    return traits.mTmemAllocatorHelper.getChunkOffset(3);
+    return traits.mTmemAllocatorHelper.getChunkOffsetByName("tmemSfB");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

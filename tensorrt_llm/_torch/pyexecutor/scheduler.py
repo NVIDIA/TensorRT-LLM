@@ -1,11 +1,13 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from typing import Optional
+from typing import Optional, Tuple
 
-from tensorrt_llm.bindings import executor as tb_executor
+from strenum import StrEnum
+
 from tensorrt_llm.bindings import internal as tb_internal
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
 
@@ -74,8 +76,8 @@ class BindCapacityScheduler(CapacityScheduler):
         max_num_requests: int,
         kv_cache_manager,
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
-        scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
-        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
+        GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
     ):
         super(BindCapacityScheduler, self).__init__()
@@ -84,7 +86,7 @@ class BindCapacityScheduler(CapacityScheduler):
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
-            capacity_scheduler_policy=scheduler_policy,
+            capacity_scheduler_policy=scheduler_policy._to_pybind(),
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
@@ -172,21 +174,23 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: int = None,
-        ctx_chunk_config: Optional[
-            tb_internal.batch_manager.ContextChunkingConfig] = None,
+        ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+
+        ctx_chunk_config_cpp = None
+        if ctx_chunk_config is not None:
+            ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
+                ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
+
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
-            ctx_chunk_config, max_num_tokens)
+            ctx_chunk_config_cpp, max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
-        for request in active_requests:
-            if get_draft_token_length(request) > 0:
-                request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)
 

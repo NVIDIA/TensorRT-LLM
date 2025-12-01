@@ -80,8 +80,44 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 
+using tensorrt_llm::batch_manager::CacheTransceiverFactory;
+
 namespace tensorrt_llm::batch_manager
 {
+
+std::map<SizeType32, SizeType32> TrtGptModelInflightBatching::calculateCacheSizePerTokenForDisagg(
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    std::vector<SizeType32> const& maxAttentionWindowVec, bool isCrossAttention, SizeType32 kvFactor)
+{
+    // These are the number of attention layers on this PP rank.
+    auto const numLocalAttnLayers
+        = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
+    // These are the number of attention layers on all previous PP ranks.
+    auto const numLowerRankAttnLayers = modelConfig.countLowerRankLayers(ModelConfig::LayerType::kATTENTION,
+        worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
+    // Use global ranks of attention layers to lookup from maxAttentionWindowVec.
+    auto const startAttnLayerId = numLowerRankAttnLayers;
+    auto const endAttnLayerId = numLowerRankAttnLayers + numLocalAttnLayers;
+    auto const numNonUniqueWindowSizes = static_cast<SizeType32>(maxAttentionWindowVec.size());
+    std::map<SizeType32, std::vector<SizeType32>> uniqueWindowSizeToLayers;
+    for (SizeType32 layerIdx = startAttnLayerId; layerIdx < endAttnLayerId; layerIdx++)
+    {
+        // maxAttentionWindowVec may or may not be stretched to the length of numLayers yet.
+        // If not stretched yet, we cycle through the window sizes.
+        auto const windowSize = maxAttentionWindowVec.at(layerIdx % numNonUniqueWindowSizes);
+        uniqueWindowSizeToLayers[windowSize].push_back(layerIdx);
+    }
+    std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
+    for (auto const& [windowSize, globalLayerIds] : uniqueWindowSizeToLayers)
+    {
+        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
+            modelConfig, globalLayerIds, isCrossAttention, kvFactor);
+        auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(modelConfig.getKvDataType()).getSize();
+        cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
+    }
+
+    return cacheSizeBytesPerTokenPerWindow;
+};
 
 bool TrtGptModelInflightBatching::executorConfigIsValid(
     ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
@@ -264,35 +300,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
-
-        auto calculateCacheSizePerToken
-            = [](ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-                  std::vector<SizeType32> const& maxAttentionWindowVec, bool isCrossAttention, SizeType32 kvFactor)
-        {
-            auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = modelConfig.getNumKvHeadsPerLayerLocalRange(
-                worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank(), isCrossAttention);
-            auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
-            auto windowSizeLayers
-                = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, modelConfig.getNbLayers());
-            std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
-            for (auto const& [windowSize, managedLayers] : windowSizeLayers)
-            {
-                auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
-                    modelConfig, managedLayers, isCrossAttention, kvFactor);
-                auto const cacheSizeBytesPerToken
-                    = cacheSizePerToken * BufferDataType(modelConfig.getKvDataType()).getSize();
-                cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
-            }
-
-            return cacheSizeBytesPerTokenPerWindow;
-        };
         auto cacheTransceiverConfig
             = executorConfig.getCacheTransceiverConfig().value_or(executor::CacheTransceiverConfig());
 
-        auto const cacheSizeBytesPerTokenPerWindow = calculateCacheSizePerToken(
+        auto const cacheSizeBytesPerTokenPerWindow = calculateCacheSizePerTokenForDisagg(
             mModelConfig, mWorldConfig, getMaxAttentionWindowVec(), mModelConfig.useCrossAttention(), 2);
         auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
-            cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
+            cacheSizeBytesPerTokenPerWindow, mModelConfig.getTokensPerBlock(), cacheTransceiverConfig);
 
         auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
             = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), kvCacheConfig);
@@ -338,15 +352,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableWindow(), "Rewinding KV cache blocks for variable SWA models isn't supported");
         auto const maxBlocksPerSeq = blockManager.getMaxBlockPerSeqWhenSingleWindowSize();
-        auto const isUseOneMoreBlock = kv_cache_manager::BlockManager::isUseOneMoreBlock(
-            getMaxAttentionWindow(), getMaxSequenceLen(), getMaxBeamWidth());
 
         // TODO(oargov): VGQA is not supported, assume all layers have the same num_kv_heads
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableGQA(), "Rewinding KV cache blocks for variable GQA models isn't supported");
         auto const numKvHeads = mModelConfig.getNbKvHeads(0);
 
-        mRewindInputs = RewindInputs{maxBlocksPerSeq, isUseOneMoreBlock, numKvHeads};
+        mRewindInputs = RewindInputs{maxBlocksPerSeq, /*isUseOneMoreBlock*/ false, numKvHeads};
     }
 
     if (mWorldConfig.isPipelineParallel())
@@ -634,19 +646,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    bool enableCyclicKvCache = false;
-    for (SizeType32 maxAttenWin : getMaxAttentionWindowVec())
-    {
-        if (maxAttenWin != getMaxSequenceLen())
-        {
-            enableCyclicKvCache = true;
-            break;
-        }
-    }
-    // Below assertion should be removed once SWA/VSWA is no longer cyclic.
-    TLLM_CHECK_WITH_INFO(
-        getMaxBeamWidth() == 1 || !enableCyclicKvCache, "Can't support cyclic kv cache with beam search.");
-
     // init KV cache block manager
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
@@ -688,7 +687,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
+        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(),
+        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(), enableBlockReuse,
         kvCacheConfig.getOnboardBlocks(), kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
@@ -881,8 +881,6 @@ void TrtGptModelInflightBatching::forwardSync()
             }
         }
 
-        (*mPauseRequests)(currRequests.contextRequests, mInflightReqIds, mReqIdsToPause, true, *mSeqSlotManager,
-            mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
         (*mPauseRequests)(currRequests.generationRequests, mInflightReqIds, mReqIdsToPause, true, *mSeqSlotManager,
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
 
@@ -1051,13 +1049,22 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 NVTX3_SCOPED_RANGE(updateInflightReqIds);
                 // Add requests to in-flight set, so they can be skipped in other micro batches
-                for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
+                for (auto const& llmReq : currRequests.contextRequests)
                 {
-                    for (auto const& llmReq : requests)
+                    // Context requests that are chunking are not added to inflight set, so they are scheduled in the
+                    // next micro batch.
+                    if (llmReq->isLastContextChunk())
                     {
-                        TLLM_LOG_DEBUG("request with ID %lu added to DECODER model inflight set", llmReq->mRequestId);
+                        TLLM_LOG_DEBUG(
+                            "Context request with ID %lu added to DECODER model inflight set", llmReq->mRequestId);
                         mInflightReqIds.insert(llmReq->mRequestId);
                     }
+                }
+                for (auto const& llmReq : currRequests.generationRequests)
+                {
+                    TLLM_LOG_DEBUG(
+                        "Generation request with ID %lu added to DECODER model inflight set", llmReq->mRequestId);
+                    mInflightReqIds.insert(llmReq->mRequestId);
                 }
             }
 
@@ -1556,8 +1563,6 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
         mSlotDecoderBuffers.emplace_back(std::make_unique<SlotDecoderBuffers>(
             mOperatingBeamWidth, getMaxSequenceLen(), mRuntime->getBufferManager()));
     }
-
-    mDecodingInputs.resize(mNumMicroBatches);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -2071,11 +2076,9 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto const fusedBufferId = getFusedBufferId();
     auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
 
-    auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
-    decodingInput = (*mMakeDecodingBatchInputOutput)(mDecoderInputBuffers.at(fusedBufferId), *mDecoderState,
-        mModelConfig, getMaxNumSequences(), *fusedRuntimeBuffers);
+    (*mMakeDecodingBatchInputOutput)(decoderInputBuffers, *mDecoderState, mModelConfig, *fusedRuntimeBuffers);
 
-    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, *decodingInput);
+    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, decoderInputBuffers);
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
     auto updateDecoderBuffersEvent = (*mUpdateDecoderBuffers)(mModelConfig, mDecoderOutputBuffers.at(fusedBufferId),

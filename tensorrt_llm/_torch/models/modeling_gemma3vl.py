@@ -4,13 +4,15 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
-from transformers import AutoProcessor, Gemma3Config, PreTrainedModel
+from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
+                          PretrainedConfig, PreTrainedModel)
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 
 from ..._utils import nvtx_range
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
@@ -33,15 +35,48 @@ def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
-class Gemma3InputProcessor(InputProcessor):
+class Gemma3InputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
-    def __init__(self, model_path, model_config, tokenizer, trust_remote_code):
+    def __init__(self,
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._tokenizer = tokenizer
+        self._model_path = model_path
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._dtype = self.config.torch_dtype
 
-        self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code, use_fast=True)
-        self.model_config = model_config
-        self.device = 'cuda'
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
@@ -59,7 +94,7 @@ class Gemma3InputProcessor(InputProcessor):
             images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
-            device=self.device).to(dtype=torch.bfloat16)
+        ).to(dtype=self.dtype)
 
         input_ids = processor_output["input_ids"]
         pixel_values = processor_output.get("pixel_values")
@@ -263,7 +298,9 @@ class Gemma3VLM(PreTrainedModel):
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=self.image_token_ids)
+            mm_token_ids=self.image_token_ids,
+            **kwargs,
+        )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -285,16 +322,6 @@ class Gemma3VLM(PreTrainedModel):
             image_features = self.mm_projector(image_features)
         return image_features
 
-
-def _load_weights_into_hf_module(
-    model: torch.nn.Module,
-    weights: dict,
-    prefix: str,
-    model_name: str,
-) -> None:
-    filtered_weights = filter_weights(prefix, weights)
-    missing_keys, _ = model.load_state_dict(filtered_weights)
-    if len(missing_keys) > 0:
-        raise KeyError(
-            f"Missing the following keys for the {model_name} in the checkpoint: "
-            f"[{', '.join(missing_keys)}].")
+    @property
+    def mm_token_ids(self):
+        return self.image_token_ids

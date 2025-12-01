@@ -34,7 +34,7 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 bool LogitsPostProcessor::operator()(DecoderInputBuffers& inputBuffers, bool replicateLogitsPostProcessor,
     tr::WorldConfig const& worldConfig, CudaStreamPtr const& stream,
-    std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
+    std::optional<LogitsPostProcessorBatched> const& logitsPostProcessorBatched) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(LogitsPostProcessor);
@@ -49,7 +49,7 @@ bool LogitsPostProcessor::operator()(DecoderInputBuffers& inputBuffers, bool rep
     for (size_t batchIdx = 0; batchIdx < inputBuffers.decoderRequests.size(); ++batchIdx)
     {
         auto const& llmReq = inputBuffers.decoderRequests.at(batchIdx);
-        auto& logits = inputBuffers.logits.at(batchIdx);
+        auto& logits = inputBuffers.decoderLogits.at(batchIdx);
 
         // Invoke non-batched processor or collect arguments for batched processor
         if (llmReq->mLogitsPostProcessor)

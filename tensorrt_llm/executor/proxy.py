@@ -16,11 +16,10 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, print_colored,
-                            print_colored_debug)
+                            enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -63,13 +62,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                print_colored_debug('create comm session ...\n', "yellow")
+                logger_debug('create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                print_colored_debug('create pool session ...\n', "yellow")
+                logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            print_colored_debug('using external mpi session ...\n', "yellow")
+            logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
@@ -117,7 +116,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
-            is_server=True, name="worker_init_status_queue")
+            is_server=True,
+            socket_type=zmq.ROUTER,
+            name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -177,8 +178,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
+            # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
+            #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
             if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
+                    res,
+                    ErrorResponse) or (isinstance(res, PostprocWorker.Output)
+                                       and res.is_final):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
@@ -190,15 +195,21 @@ class GenerationExecutorProxy(GenerationExecutor):
             process_res(i)
 
         if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.warning(
+                    "proxy.py: EventLoopShutdownError because event loop is not running"
+                )
 
         return True  # success
 
-    def _iteration_result_task(self, queue: Union[FusedIpcQueue,
-                                                  IntraProcessQueue],
-                               result_singleton: IterationResult) -> bool:
-        # iteration result is not urgent, so we can sleep a bit
-        time.sleep(0.2)
+    def _iteration_result_task(self,
+                               queue: Union[FusedIpcQueue, IntraProcessQueue],
+                               result_singleton: IterationResult,
+                               urgent: bool = False) -> bool:
+        if not urgent:
+            time.sleep(0.2)
 
         try:
             data = queue.get()
@@ -256,7 +267,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def dispatch_kv_cache_events_task(self) -> bool:
         return self._iteration_result_task(self.kv_cache_events_queue,
-                                           self._iter_kv_events_result)
+                                           self._iter_kv_events_result,
+                                           urgent=True)
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:
@@ -317,6 +329,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         while True:
             if self.worker_init_status_queue.poll(1):
                 ready_signal, error_trace = self.worker_init_status_queue.get()
+                # Send ACK to the worker
+                self.worker_init_status_queue.put("ACK")
+                logger.info("get signal from executor worker")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -337,7 +352,7 @@ class GenerationExecutorProxy(GenerationExecutor):
     def pre_shutdown(self):
         if not self.workers_started:
             return
-        print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
+        logger_debug('Proxy.pre_shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
@@ -348,7 +363,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None)
+            self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
         if not self.workers_started:
@@ -357,7 +372,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.doing_shutdown:
             self.pre_shutdown()
 
-        print_colored_debug('Proxy.shutdown...\n', "yellow")
+        logger_debug('Proxy.shutdown...\n', "yellow")
 
         for f in self.mpi_futures:
             try:

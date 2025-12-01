@@ -15,8 +15,9 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, RenormalizeMoeRoutingMethod,
-                                 VanillaMoE, create_moe)
+from ..modules.fused_moe import (CutlassFusedMoE, MoE,
+                                 RenormalizeMoeRoutingMethod, VanillaMoE,
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -57,7 +58,7 @@ class HunyuanMoE(nn.Module):
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
-            aux_stream=aux_stream,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
             model_config=model_config)
@@ -174,7 +175,6 @@ class HunYuanAttention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -185,7 +185,6 @@ class HunYuanAttention(Attention):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=attention_mask,
-            mrope_config=mrope_config,
             all_reduce_params=all_reduce_params,
             lora_params=lora_params,
             **kwargs,
@@ -366,6 +365,17 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                         "lm_head"):
                     continue
                 names = name.split('.')
+
+                # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+                # Currently saved MoE weights don't include 'backend' in their names.
+                # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+                # and weights loading is done in the backend, so module name includes '.backend'.
+                # We need to use parent module name (without .backend) to match saved weight names.
+                # After MoE refactoring is fully complete, all paths will follow this branch.
+                if names[-1] == "backend" and isinstance(module, MoE):
+                    name = '.'.join(names[:-1])
+                    names = name.split('.')
+
                 if names[-1] in params_map:
                     # model.layers.{idx}.mlp.shared_mlp.gate_up_proj or model.layers.{idx}.self_attn.qkv_proj
                     module_weights = []

@@ -110,7 +110,16 @@ def test_llmapi_example_inference_async_streaming(llm_root, engine_dir,
 
 
 def test_llmapi_example_multilora(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py")
+    cmd_line_args = [
+        "--chatbot_lora_dir",
+        f"{llm_models_root()}/llama-models-v2/sft-tiny-chatbot",
+        "--mental_health_lora_dir",
+        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0-mental-health-conversational",
+        "--tarot_lora_dir",
+        f"{llm_models_root()}/llama-models-v2/tinyllama-tarot-v1"
+    ]
+    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py",
+                        *cmd_line_args)
 
 
 def test_llmapi_example_guided_decoding(llm_root, engine_dir, llm_venv):
@@ -155,11 +164,27 @@ def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
                         "llm_speculative_decoding.py", "NGRAM")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip(reason="https://nvbugs/5365825"
+                  )  # maybe unrelated, but this test will always timeout
 def test_llmapi_sampling(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_sampling.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip(reason="https://nvbugs/5365825"
+                  )  # maybe unrelated, but this test will always timeout
 def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
+
+
+@pytest.mark.parametrize("model", ["Qwen2-0.5B"])
+def test_llmapi_kv_cache_connector(llm_root, llm_venv, model):
+    script_path = Path(
+        llm_root) / "examples" / "llm-api" / "llm_kv_cache_connector.py"
+    model_path = f"{llm_models_root()}/{model}"
+
+    venv_check_call(llm_venv, [str(script_path), model_path])
+
+
+def test_llmapi_tensorrt_engine(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "_tensorrt_engine/quickstart_example.py")

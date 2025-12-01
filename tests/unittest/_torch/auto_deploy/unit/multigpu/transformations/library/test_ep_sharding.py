@@ -10,9 +10,14 @@ from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.library.sharding import EPShardingInfo
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
+    EPShardingInfo,
+    FP8EPShardingInfo,
+    NVFP4EPShardingInfo,
+)
+from tensorrt_llm.functional import AllReduceStrategy
 
 
 def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
@@ -83,19 +88,34 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     # if world_size == 1, no sharding transformations should be detected
     if world_size > 1:
         for node in gm.graph.nodes:
-            if is_op(
-                node,
-                (
-                    torch.ops.auto_deploy.torch_moe,
-                    torch.ops.auto_deploy.torch_quant_fp8_moe,
-                    torch.ops.auto_deploy.torch_quant_fp4_moe,
-                ),
-            ):
+            if is_op(node, torch.ops.auto_deploy.torch_moe):
                 expected_transformations.append(
                     EPShardingInfo(
                         target_node=node.name,
                         rank=rank,
                         world_size=world_size,
+                        allreduce_strategy=AllReduceStrategy.AUTO,
+                        dist_backend="auto",
+                    )
+                )
+            elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
+                expected_transformations.append(
+                    FP8EPShardingInfo(
+                        target_node=node.name,
+                        rank=rank,
+                        world_size=world_size,
+                        allreduce_strategy=AllReduceStrategy.AUTO,
+                        dist_backend="auto",
+                    )
+                )
+            elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
+                expected_transformations.append(
+                    NVFP4EPShardingInfo(
+                        target_node=node.name,
+                        rank=rank,
+                        world_size=world_size,
+                        allreduce_strategy=AllReduceStrategy.AUTO,
+                        dist_backend="auto",
                     )
                 )
 
@@ -112,7 +132,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_config.ep_transforms
+    detected_transformations = optimizer.shared_config.sharding_transform_container.ep_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)

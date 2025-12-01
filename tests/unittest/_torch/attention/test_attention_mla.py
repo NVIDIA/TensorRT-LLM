@@ -389,11 +389,6 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
     dtype = scenario.dtype
     kv_cache_dtype = scenario.kv_cache_dtype
 
-    FAILED_CSL = [777, 912, 431, 42, 266, 989, 524]
-    if (kv_cache_dtype is torch.float8_e4m3fn
-            and context_sequence_lengths == FAILED_CSL):
-        pytest.skip("https://nvbugs/5453806")
-
     print(
         f"--------------------------------Test for scenario: {scenario} start--------------------------------"
     )
@@ -718,6 +713,44 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     "gen_compressed_kv_list"][step - 1]
                 k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+
+                num_tokens = fused_q.size(0)
+                num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+                cu_q_seqlens = torch.empty(num_seqs + 1,
+                                           dtype=torch.int32,
+                                           device=q.device)
+                cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                            dtype=torch.int32,
+                                            device=q.device)
+                fmha_scheduler_counter = torch.empty(1,
+                                                     dtype=torch.uint32,
+                                                     device=q.device)
+                has_fp8_kv_cache = gen_layers[
+                    layer_idx].has_fp8_kv_cache if hasattr(
+                        gen_layers[layer_idx], 'has_fp8_kv_cache') else False
+
+                if has_fp8_kv_cache:
+                    mla_bmm1_scale = torch.empty(2,
+                                                 dtype=torch.float32,
+                                                 device=q.device)
+                    mla_bmm2_scale = torch.empty(1,
+                                                 dtype=torch.float32,
+                                                 device=q.device)
+                    quant_q_buffer = torch.empty(
+                        num_tokens,
+                        num_heads * (kv_lora_rank + qk_rope_head_dim),
+                        dtype=torch.uint8,
+                        device=q.device)
+                else:
+                    mla_bmm1_scale = None
+                    mla_bmm2_scale = None
+                    quant_q_buffer = None
+
+                gen_layers[layer_idx].mla_rope_generation(
+                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
+                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+                    mla_bmm2_scale, quant_q_buffer)
+
                 result = gen_layers[layer_idx].forward(
                     fused_q,
                     None,
@@ -726,6 +759,12 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     attention_input_type=AttentionInputType.generation_only,
                     latent_cache=latent_cache,
                     q_pe=q_pe,
+                    cu_q_seqlens=cu_q_seqlens,
+                    cu_kv_seqlens=cu_kv_seqlens,
+                    fmha_scheduler_counter=fmha_scheduler_counter,
+                    mla_bmm1_scale=mla_bmm1_scale,
+                    mla_bmm2_scale=mla_bmm2_scale,
+                    quant_q_buffer=quant_q_buffer,
                 )
                 ref_result, latent_cache_ref = calculate_ref_result_gen(
                     fused_q,

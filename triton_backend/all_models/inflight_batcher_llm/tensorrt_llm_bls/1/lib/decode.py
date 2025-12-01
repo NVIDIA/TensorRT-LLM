@@ -98,6 +98,8 @@ class Request:
     lora_config: Optional[np.ndarray] = None
     exclude_input_in_output: Optional[np.ndarray] = None
     return_perf_metrics: Optional[np.ndarray] = None
+    return_num_input_tokens: Optional[np.ndarray] = None
+    return_num_output_tokens: Optional[np.ndarray] = None
     guided_decoding_guide_type: Optional[np.ndarray] = None
     guided_decoding_guide: Optional[np.ndarray] = None
     request_id: Optional[str] = None
@@ -194,6 +196,8 @@ class GenerationResponse:
     acceptance_rate: Optional[np.ndarray] = None
     total_accepted_draft_tokens: Optional[np.ndarray] = None
     total_draft_tokens: Optional[np.ndarray] = None
+    num_input_tokens: Optional[np.ndarray] = None
+    num_output_tokens: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -215,6 +219,8 @@ class Response:
     acceptance_rate: Optional[np.ndarray] = None
     total_accepted_draft_tokens: Optional[np.ndarray] = None
     total_draft_tokens: Optional[np.ndarray] = None
+    num_input_tokens: Optional[np.ndarray] = None
+    num_output_tokens: Optional[np.ndarray] = None
 
     def __eq__(self, o) -> bool:
         """Just for testing"""

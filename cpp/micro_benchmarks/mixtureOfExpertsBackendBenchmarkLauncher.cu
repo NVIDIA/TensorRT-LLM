@@ -160,6 +160,10 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
      */
 
     std::ifstream file{workloadFile};
+    if (!file.is_open())
+    {
+        throw std::invalid_argument("Failed to open benchmark file: " + std::string(workloadFile));
+    }
     std::stringstream buffer;
     buffer << file.rdbuf();
     auto file_contents = buffer.str();
@@ -294,7 +298,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         int gemm_to_profile = get_or("gemm_to_profile", (int) GemmToProfile::LAYER);
         TLLM_CHECK_WITH_INFO(world_rank < tp_size * ep_size, "Rank is out of bounds of tp*ep");
 
-        if (gemm_to_profile != (int) GemmToProfile::LAYER && routing_config != UNIFORM_ROUTING_CONFIG)
+        if (gemm_to_profile != (int) GemmToProfile::LAYER)
         {
             static bool info_printed = false;
             if (!info_printed && LOG_LEVEL >= INFO)
@@ -304,13 +308,14 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             }
 
             static bool printed = false;
-            if (LOG_LEVEL >= ERROR && !printed)
+            if (routing_config != UNIFORM_ROUTING_CONFIG && LOG_LEVEL >= ERROR && !printed)
             {
                 std::cerr << "Warning: Profiling a specific GEMM will always use uniform random token distribution"
                           << std::endl;
                 printed = true;
             }
             routing_config = UNIFORM_ROUTING_CONFIG;
+
             if (gemm_to_profile == (int) GemmToProfile::GEMM_1)
             {
                 tactic_ids2 = {-1};
@@ -531,8 +536,8 @@ void help()
            "- \"num_tokens\" - The total number of tokens to benchmark\n"
            "- \"bias\" - If bias should be used, 0 = no bias, 1 = bias\n"
            "- \"do_final_scale\" - If final scales should be applied, 0 = no scale, 1 = scale\n"
-           "- \"act_fn\" - The activation function to use, 0 = identity, 1 = relu, 2 = gelu, 3 = silu, 4 = geglu, 5 = "
-           "swiglu\n"
+           "- \"act_fn\" - The activation function to use, 1 = identity, 2 = gelu, 3 = relu, 4 = silu, 5 = swiglu, 6 = "
+           "geglu, 7 = swiglu_bias, 8 = relu2\n"
            "- \"tactic_id1, tactic_id2\"\n"
            "The config for the CUTLASS GEMM. tactic_idX sets the tactic for the corresponding GEMM"
            "Valid tactics are:\n"

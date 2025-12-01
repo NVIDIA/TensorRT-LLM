@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
 namespace tensorrt_llm
 {
@@ -140,6 +141,8 @@ struct MHARunnerFixedParams
     int sageBlockSizeK = 0;
     // v tensor quant block size in sage attention
     int sageBlockSizeV = 0;
+    // Use sparse MLA ?
+    bool useSparseMLA = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -267,6 +270,8 @@ struct MHARunnerParams
     void const* vPtr;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
+    // The paged kv cache array for scaling factor.
+    KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
     // The output scaling factor buffer ptr. (only used for FP4 output)
@@ -305,6 +310,8 @@ struct MHARunnerParams
     int qMaxNBlock;
     int kMaxNBlock;
     int vMaxNBlock;
+    // sparse attention parameters
+    SparseAttentionParams sparse_params;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

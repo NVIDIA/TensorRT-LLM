@@ -73,13 +73,18 @@ def add_llm_args(parser):
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
+    parser.add_argument(
+        '--use_low_precision_moe_combine',
+        default=False,
+        action='store_true',
+        help='Use low precision combine in MoE (only for NVFP4 quantization)')
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
     parser.add_argument('--disable_kv_cache_reuse',
                         default=False,
                         action='store_true')
-    parser.add_argument("--kv_cache_fraction", type=float, default=None)
+    parser.add_argument("--tokens_per_block", type=int, default=32)
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -128,6 +133,11 @@ def add_llm_args(parser):
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
     parser.add_argument('--use_one_model', default=False, action='store_true')
+    parser.add_argument('--eagle_choices', type=str, default=None)
+    parser.add_argument('--use_dynamic_tree',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -146,7 +156,14 @@ def add_llm_args(parser):
     parser.add_argument('--return_generation_logits',
                         default=False,
                         action='store_true')
+    parser.add_argument('--prompt_logprobs', default=False, action='store_true')
     parser.add_argument('--logprobs', default=False, action='store_true')
+
+    parser.add_argument('--additional_model_outputs',
+                        type=str,
+                        default=None,
+                        nargs='+')
+
     return parser
 
 
@@ -154,6 +171,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
     args = parser.parse_args()
     return args
 
@@ -163,6 +181,7 @@ def setup_llm(args, **kwargs):
         enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
+        tokens_per_block=args.tokens_per_block,
     )
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -170,21 +189,23 @@ def setup_llm(args, **kwargs):
 
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
-            print(
-                "MTP only supports one model style spec decode; ignoring default use_one_model=False"
-            )
-
+            print("Running MTP eagle with two model style.")
         spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
-            relaxed_delta=args.relaxed_delta)
+            relaxed_delta=args.relaxed_delta,
+            mtp_eagle_one_model=args.use_one_model,
+            speculative_model_dir=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model_dir=args.draft_model_dir,
-            eagle3_one_model=args.use_one_model)
+            eagle3_one_model=args.use_one_model,
+            eagle_choices=args.eagle_choices,
+            use_dynamic_tree=args.use_dynamic_tree,
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -229,7 +250,7 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend),
+        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
@@ -265,9 +286,11 @@ def setup_llm(args, **kwargs):
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
+        prompt_logprobs=args.prompt_logprobs,
         n=args.n,
         best_of=best_of,
-        use_beam_search=use_beam_search)
+        use_beam_search=use_beam_search,
+        additional_model_outputs=args.additional_model_outputs)
     return llm, sampling_params
 
 
@@ -304,8 +327,22 @@ def main():
                 print(
                     f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
                 )
+            if args.prompt_logprobs:
+                print(
+                    f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
+                )
             if args.logprobs:
                 print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
+
+            if args.additional_model_outputs:
+                for output_name in args.additional_model_outputs:
+                    if sequence.additional_context_outputs:
+                        print(
+                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
+                        )
+                    print(
+                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                    )
 
 
 if __name__ == '__main__':

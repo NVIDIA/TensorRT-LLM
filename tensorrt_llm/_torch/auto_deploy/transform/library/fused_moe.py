@@ -1,62 +1,106 @@
 from collections import defaultdict
-from typing import Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
-from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
-from ...utils.quantization_utils import get_scales_and_type_from_node
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
-def _insert_fused_moe_ops(gm: GraphModule) -> int:
+def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
     fused_key_counter = 0
     graph = gm.graph
+    backend = backend.lower()
 
-    for node in list(graph.nodes):
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_moe_fused,
+    }[backend]
+
+    for node in graph.nodes:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
-
-        fused_w3_w1_experts = torch.stack(
-            [
-                torch.cat(
-                    [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)], dim=-2
-                )
-                for w1_node, w3_node in zip(w1_list, w3_list)
-            ],
-            dim=0,
+        (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
+        assert backend != "triton" or mlp_style_val == "mlp", (
+            "Triton backend only supports mlp style."
         )
 
-        fused_w2_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+        hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = (
+            extract_op_args(
+                node,
+                "x",
+                "selected_experts",
+                "routing_weights",
+                "w1_weight",
+                "w2_weight",
+                "w3_weight",
+            )
+        )
+        if mlp_style_val == "gated_mlp":
+            fused_w_up_experts = torch.stack(
+                [
+                    torch.cat(
+                        [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)], dim=-2
+                    )
+                    for w1_node, w3_node in zip(w1_list, w3_list)
+                ],
+                dim=0,
+            )
+            new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
 
-        new_key_w3_w1 = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-        new_key_w2 = f"fused_moe_w2_stacked_{fused_key_counter}"
+        elif mlp_style_val == "mlp":
+            fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
+            new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
+        else:
+            raise ValueError(f"Unknown mlp_style: {mlp_style_val}")
+
+        fused_w_down_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+
+        new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
         fused_key_counter += 1
-        param_w3_w1 = torch.nn.Parameter(fused_w3_w1_experts)
-        param_w2 = torch.nn.Parameter(fused_w2_experts)
-        gm.register_parameter(new_key_w3_w1, param_w3_w1)
-        gm.register_parameter(new_key_w2, param_w2)
+        param_w_up = torch.nn.Parameter(fused_w_up_experts)
+        param_w_down = torch.nn.Parameter(fused_w_down_experts)
+        gm.register_parameter(new_key_w_up, param_w_up)
+        gm.register_parameter(new_key_w_down, param_w_down)
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
                 # TODO(Fridah-nv): torch.ops.auto_deploy.trtllm_moe_fused for quantized models
-                torch.ops.auto_deploy.trtllm_moe_fused,
+                replacement_op,
                 args=(
                     hidden_states,
                     selected_experts,
                     routing_weights,
-                    graph.get_attr(new_key_w3_w1),
-                    graph.get_attr(new_key_w2),
+                    graph.get_attr(new_key_w_up),
+                    graph.get_attr(new_key_w_down),
                 ),
+                kwargs={
+                    "mlp_style": mlp_style_val,
+                    "act_fn": act_fn_val,
+                },
             )
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
+
+        # Delete the unstacked weights immediately to save GPU memory
+        # This will happen automatically after the graph is canonicalized, but for large models we'll run out of memory
+        # during the transformation itself.
+        gm.graph.eliminate_dead_code()
+        gm.delete_all_unused_submodules()
 
     return fused_key_counter
 
@@ -126,33 +170,42 @@ def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
     return common
 
 
-def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, Optional[dict], str]:
+def _extract_linear_parameters(
+    linear_node: Node,
+    target_op,
+    scale_arg_indices: Dict[str, int],
+) -> Tuple[Node, Node, Dict[str, Node]]:
     """
-    Given a linear op node, extract the input tensor node, weight tensor,
-    any quantization scales (if the op is quantized), and return a weight type.
+    Extract (input_node, weight_node, scales) from a *specific* linear op variant.
 
-    For a torch.ops.auto_deploy.torch_linear_simple.default op:
-      - Returns (input_node, weight, None, "simple")
-
-    For a torch.ops.auto_deploy.torch_quant_fp8_linear op:
-      - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8")
-       For a torch.ops.auto_deploy.torch_quant_fp4_linear op:
-      - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha}, "fp4")
+    Returns (None, None, {}) if `linear_node` is not the expected target_op.
     """
+    if not is_op(linear_node, target_op):
+        return None, None, {}
+
+    # Expected argument layout:
+    #   input, weight, (optional bias), then scale args at provided indices.
+    if not linear_node.args or not isinstance(linear_node.args[0], Node):
+        return None, None, {}
     input_node = linear_node.args[0]
-    if is_op(linear_node, torch.ops.auto_deploy.torch_linear_simple):
-        weight = linear_node.args[1]
-        return input_node, weight, None, ""
-    elif {
-        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear)
-        or is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear),
-    }:
-        weight = linear_node.args[1]
-        scales, quant_type = get_scales_and_type_from_node(linear_node)
-        return input_node, weight, scales or {}, quant_type
+    weight = linear_node.args[1]
+
+    scales: Dict[str, Node] = {}
+    for k, idx in scale_arg_indices.items():
+        try:
+            scales[k] = linear_node.args[idx]
+        except Exception:
+            return None, None, {}
+
+    return input_node, weight, scales
 
 
-def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
+def _match_expert_compute_pattern(
+    start_boundary: Node,
+    end_boundary: Node,
+    target_op,
+    scale_arg_indices: Dict[str, int],
+):
     """
     Match the expert compute pattern between the given boundaries.
 
@@ -166,7 +219,7 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     This function supports both:
       - torch.ops.auto_deploy.torch_linear_simple.default ops, and
       - torch.ops.auto_deploy.torch_quant_fp8_linear ops (also extracts quantization scales).
-      - torch.ops.auto_deploy.torch_quant_fp4_linear ops (also extracts quantization scales).
+      - torch.ops.auto_deploy.torch_quant_nvfp4_linear ops (also extracts quantization scales).
 
     Returns:
         A tuple:
@@ -182,14 +235,12 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     pattern_input_nodes, pattern_output_nodes = [], []
     expert_weights = defaultdict(list)
     expert_scales = defaultdict(list)
-    weight_type = "simple"  # default
 
     nodes = list(start_boundary.graph.nodes)
     region_nodes = nodes[nodes.index(start_boundary) + 1 : nodes.index(end_boundary)]
 
     for node in region_nodes:
-        # Accept both simple and quantized linear ops.
-        if not is_linear_op(node, include_quantization=True):
+        if not is_op(node, target_op):
             continue
 
         final_linear = node
@@ -211,31 +262,28 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
         if silu_node is None:
             continue
 
-        if not (silu_node.args and is_linear_op(silu_node.args[0], include_quantization=True)):
+        if not (silu_node.args and is_op(silu_node.args[0], target_op)):
             continue
         linear_w1_node = silu_node.args[0]
 
         # The other branch should be a linear op (w3 branch).
         linear_w3_node = arg_b if arg_a is silu_node else arg_a
-        if not is_linear_op(linear_w3_node, include_quantization=True):
+        if not is_op(linear_w3_node, target_op):
             continue
         if not (linear_w1_node.args and linear_w3_node.args):
             continue
 
         # Extract parameters from each linear op.
-        input_node_w1, weight_w1, quant_params_w1, wt_type_w1 = _extract_linear_parameters(
-            linear_w1_node
+        input_node_w1, weight_w1, s_w1 = _extract_linear_parameters(
+            linear_w1_node, target_op, scale_arg_indices
         )
-        _, weight_w3, quant_params_w3, wt_type_w3 = _extract_linear_parameters(linear_w3_node)
-        _, weight_w2, quant_params_w2, wt_type_w2 = _extract_linear_parameters(final_linear)
+        _, weight_w3, s_w3 = _extract_linear_parameters(
+            linear_w3_node, target_op, scale_arg_indices
+        )
+        _, weight_w2, s_w2 = _extract_linear_parameters(final_linear, target_op, scale_arg_indices)
 
         if None in (weight_w1, weight_w3, weight_w2):
             continue
-
-        # Ensure the weight type is consistent across branches.
-        if wt_type_w1 != wt_type_w3 or wt_type_w1 != wt_type_w2:
-            continue
-        weight_type = wt_type_w1
 
         pattern_input_nodes.append(input_node_w1)
         pattern_output_nodes.append(final_linear)
@@ -243,26 +291,15 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
         expert_weights["w3"].append(weight_w3)
         expert_weights["w2"].append(weight_w2)
 
-        # TODO: sanity check that all experts have same weight type
-        if weight_type == "fp8":
-            expert_scales["w1_input_scale"].append(quant_params_w1["input_scale"])
-            expert_scales["w1_weight_scale"].append(quant_params_w1["weight_scale"])
-            expert_scales["w3_input_scale"].append(quant_params_w3["input_scale"])
-            expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
-            expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
-            expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
-        elif weight_type == "fp4":
-            expert_scales["w1_input_scale"].append(quant_params_w1["input_scale"])
-            expert_scales["w1_weight_scale"].append(quant_params_w1["weight_scale"])
-            expert_scales["w1_alpha"].append(quant_params_w1["alpha"])
-            expert_scales["w3_input_scale"].append(quant_params_w3["input_scale"])
-            expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
-            expert_scales["w3_alpha"].append(quant_params_w3["alpha"])
-            expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
-            expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
-            expert_scales["w2_alpha"].append(quant_params_w2["alpha"])
+        # Collect scales per-branch with keys "w{1|2|3}_<scale_key>"
+        for key, node_scale in s_w1.items():
+            expert_scales[f"w1_{key}"].append(node_scale)
+        for key, node_scale in s_w3.items():
+            expert_scales[f"w3_{key}"].append(node_scale)
+        for key, node_scale in s_w2.items():
+            expert_scales[f"w2_{key}"].append(node_scale)
 
-    return pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type
+    return pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales
 
 
 def _find_final_hidden_state_node(
@@ -296,7 +333,7 @@ def _find_final_hidden_state_node(
         if not (hasattr(mul_node, "args") and len(mul_node.args) >= 2):
             return None
         index_node = mul_node.args[1]
-        index_add_node = bfs(
+        index_add_node, _ = bfs(
             index_node, lambda n: is_op(n, torch.ops.aten.index_add_), boundary=end_boundary
         )
         if not index_add_node:
@@ -362,15 +399,31 @@ def _remove_dead_inplace_nodes_in_region(
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
-        node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+        node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
         graph.erase_node(node_to_remove)
         return True
     except RuntimeError:
         return False
 
 
-@TransformRegistry.register("match_moe_pattern")
 class MatchMoePattern(BaseTransform):
+    """Base MoE pattern matcher; subclasses specify linear and fused MoE ops and scale layouts."""
+
+    # Subclasses must implement:
+    def target_op(self):  # linear op to match
+        raise NotImplementedError
+
+    def moe_op(self):  # fused MoE op to insert
+        raise NotImplementedError
+
+    def scale_arg_indices(self) -> Dict[str, int]:
+        """Map scale names -> arg index in the matched linear op."""
+        raise NotImplementedError
+
+    def scale_keys(self) -> List[str]:
+        """Order of scale keys to emit into fused MoE op (e.g., ['input_scale','weight_scale',...])."""
+        raise NotImplementedError
+
     def _apply(
         self,
         gm: GraphModule,
@@ -385,6 +438,11 @@ class MatchMoePattern(BaseTransform):
 
         num_moe_patterns = 0
 
+        lin_op = self.target_op()
+        scale_idx = self.scale_arg_indices()
+        scale_keys = self.scale_keys()
+        fused_moe = self.moe_op()
+
         for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
             # Step 1: Identify Expert Compute pattern
             (
@@ -392,8 +450,12 @@ class MatchMoePattern(BaseTransform):
                 pattern_output_nodes,
                 expert_weights,
                 expert_scales,
-                weight_type,
-            ) = _match_expert_compute_pattern(start_boundary, end_boundary)
+            ) = _match_expert_compute_pattern(
+                start_boundary,
+                end_boundary,
+                target_op=lin_op,
+                scale_arg_indices=scale_idx,
+            )
             if not expert_weights:
                 continue
             # TODO: naming convention to verify the order of the weight nodes
@@ -412,7 +474,7 @@ class MatchMoePattern(BaseTransform):
                 lambda node: is_op(node, torch.ops.aten.one_hot),
                 attr_next="all_input_nodes",
                 boundary=start_boundary,
-            ).args[0]
+            )[0].args[0]
             if not selected_experts:
                 continue
 
@@ -434,57 +496,26 @@ class MatchMoePattern(BaseTransform):
                 w2_list = expert_weights["w2"]
                 w3_list = expert_weights["w3"]
 
-                if weight_type == "fp8":
-                    fused_moe_node = graph.call_function(
-                        torch.ops.auto_deploy.torch_quant_fp8_moe,
-                        args=(
-                            hidden_states,
-                            selected_experts,
-                            normalized_routing_weights,
-                            w1_list,
-                            w2_list,
-                            w3_list,
-                            expert_scales["w1_input_scale"],
-                            expert_scales["w2_input_scale"],
-                            expert_scales["w3_input_scale"],
-                            expert_scales["w1_weight_scale"],
-                            expert_scales["w2_weight_scale"],
-                            expert_scales["w3_weight_scale"],
-                        ),
+                fused_args = [
+                    hidden_states,
+                    selected_experts,
+                    normalized_routing_weights,
+                    w1_list,
+                    w2_list,
+                    w3_list,
+                ]
+
+                # Append scales as: for each key -> (w1_key_list, w2_key_list, w3_key_list)
+                for key in scale_keys:
+                    fused_args.extend(
+                        [
+                            expert_scales[f"w1_{key}"],
+                            expert_scales[f"w2_{key}"],
+                            expert_scales[f"w3_{key}"],
+                        ]
                     )
-                elif weight_type == "fp4":
-                    fused_moe_node = graph.call_function(
-                        torch.ops.auto_deploy.torch_quant_fp4_moe,
-                        args=(
-                            hidden_states,
-                            selected_experts,
-                            normalized_routing_weights,
-                            w1_list,
-                            w2_list,
-                            w3_list,
-                            expert_scales["w1_input_scale"],
-                            expert_scales["w2_input_scale"],
-                            expert_scales["w3_input_scale"],
-                            expert_scales["w1_weight_scale"],
-                            expert_scales["w2_weight_scale"],
-                            expert_scales["w3_weight_scale"],
-                            expert_scales["w1_alpha"],
-                            expert_scales["w2_alpha"],
-                            expert_scales["w3_alpha"],
-                        ),
-                    )
-                else:
-                    fused_moe_node = graph.call_function(
-                        torch.ops.auto_deploy.torch_moe,
-                        args=(
-                            hidden_states,
-                            selected_experts,
-                            normalized_routing_weights,
-                            w1_list,
-                            w2_list,
-                            w3_list,
-                        ),
-                    )
+
+                fused_moe_node = graph.call_function(fused_moe, args=tuple(fused_args))
 
             final_hidden_state_node.replace_all_uses_with(fused_moe_node)
             graph.erase_node(final_hidden_state_node)
@@ -495,9 +526,293 @@ class MatchMoePattern(BaseTransform):
             num_moe_patterns += 1
 
         info = TransformInfo(
-            skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
+            skipped=False,
+            num_matches=num_moe_patterns,
+            is_clean=num_moe_patterns == 0,
+            has_valid_shapes=num_moe_patterns == 0,
         )
         return gm, info
+
+
+@TransformRegistry.register("match_moe_pattern")
+class MatchSimpleMoePattern(MatchMoePattern):
+    """Match and fuse simple (unquantized) MoE subgraph."""
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_linear_simple
+
+    def moe_op(self):
+        return torch.ops.auto_deploy.torch_moe.default
+
+    def scale_arg_indices(self) -> Dict[str, int]:
+        return {}
+
+    def scale_keys(self) -> List[str]:
+        return []
+
+
+@TransformRegistry.register("match_fp8_moe_pattern")
+class MatchFP8MoePattern(MatchMoePattern):
+    """Match and fuse FP8-quantized MoE subgraph."""
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_quant_fp8_linear
+
+    def moe_op(self):
+        return torch.ops.auto_deploy.torch_quant_fp8_moe.default
+
+    def scale_arg_indices(self) -> Dict[str, int]:
+        return {"input_scale": 3, "weight_scale": 4}
+
+    def scale_keys(self) -> List[str]:
+        return ["input_scale", "weight_scale"]
+
+
+@TransformRegistry.register("match_nvfp4_moe_pattern")
+class MatchNVFP4MoePattern(MatchMoePattern):
+    """Match and fuse NVFP4-quantized MoE subgraph."""
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_quant_nvfp4_linear
+
+    def moe_op(self):
+        return torch.ops.auto_deploy.torch_quant_nvfp4_moe.default
+
+    def scale_arg_indices(self) -> Dict[str, int]:
+        return {"input_scale": 3, "weight_scale": 4, "alpha": 5}
+
+    def scale_keys(self) -> List[str]:
+        return ["input_scale", "weight_scale", "alpha"]
+
+
+def _stack_fp8_moe_weights(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
+    """
+    Stack per-expert FP8 weights and scales by materializing stacked tensors as parameters.
+    This is fast because we directly stack the tensor values (not graph nodes).
+    Similar to _insert_fused_moe_ops but for quantized MoE.
+    """
+    fused_key_counter = 0
+    graph = gm.graph
+
+    backend = backend.lower()
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_quant_fp8_moe,
+    }[backend]
+
+    for node in graph.nodes:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
+            continue
+
+        # Extract weight and scale lists from args
+        try:
+            (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                w1_list,
+                w2_list,
+                w3_list,
+                w1_input_scale,
+                w2_input_scale,
+                w3_input_scale,
+                w1_weight_scale,
+                w2_weight_scale,
+                w3_weight_scale,
+            ) = extract_op_args(
+                node,
+                "x",
+                "selected_experts",
+                "routing_weights",
+                "w1_weight",
+                "w2_weight",
+                "w3_weight",
+                "w1_input_scale",
+                "w2_input_scale",
+                "w3_input_scale",
+                "w1_weight_scale",
+                "w2_weight_scale",
+                "w3_weight_scale",
+            )
+        except Exception:
+            continue
+
+        # Helper to get parameter or buffer
+        def get_param_or_buffer(target):
+            """Get parameter or buffer by target name."""
+            try:
+                return gm.get_parameter(target)
+            except AttributeError:
+                # It's a buffer, not a parameter
+                parts = target.rsplit(".", 1)
+                if len(parts) == 2:
+                    mod = gm.get_submodule(parts[0])
+                    return getattr(mod, parts[1])
+                else:
+                    return getattr(gm, target)
+
+        # Stack the actual tensor values (fast, like in quantize_moe.py)
+        w1_stacked = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
+        w2_stacked = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
+        w3_stacked = (
+            torch.stack([gm.get_parameter(n.target) for n in w3_list], dim=0)
+            if w3_list
+            else torch.empty(0, device=w1_stacked.device, dtype=w1_stacked.dtype)
+        )
+
+        # Scales are buffers, not parameters
+        w1_input_scale_stacked = torch.stack(
+            [get_param_or_buffer(n.target) for n in w1_input_scale], dim=0
+        )
+        w2_input_scale_stacked = torch.stack(
+            [get_param_or_buffer(n.target) for n in w2_input_scale], dim=0
+        )
+        w3_input_scale_stacked = (
+            torch.stack([get_param_or_buffer(n.target) for n in w3_input_scale], dim=0)
+            if w3_input_scale
+            else torch.empty(
+                0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
+            )
+        )
+
+        w1_weight_scale_stacked = (
+            torch.stack([get_param_or_buffer(n.target) for n in w1_weight_scale], dim=0)
+            .to(torch.float32)
+            .contiguous()
+        )
+        w2_weight_scale_stacked = (
+            torch.stack([get_param_or_buffer(n.target) for n in w2_weight_scale], dim=0)
+            .to(torch.float32)
+            .contiguous()
+        )
+        w3_weight_scale_stacked = (
+            (
+                torch.stack([get_param_or_buffer(n.target) for n in w3_weight_scale], dim=0)
+                if w3_weight_scale
+                else torch.empty(
+                    0, device=w1_weight_scale_stacked.device, dtype=w1_weight_scale_stacked.dtype
+                )
+            )
+            .to(torch.float32)
+            .contiguous()
+        )
+        assert torch.all(w1_input_scale_stacked[0] == w1_input_scale_stacked), (
+            "All w1 scales should have the same value."
+        )
+        assert torch.all(w2_input_scale_stacked[0] == w2_input_scale_stacked), (
+            "All w2 scales should have the same value."
+        )
+        # Register stacked tensors as new parameters
+        new_key_w1 = f"quant_moe_w1_stacked_{fused_key_counter}"
+        new_key_w2 = f"quant_moe_w2_stacked_{fused_key_counter}"
+        new_key_w3 = f"quant_moe_w3_stacked_{fused_key_counter}"
+        new_key_w1_input_scale = f"quant_moe_w1_input_scale_stacked_{fused_key_counter}"
+        new_key_w2_input_scale = f"quant_moe_w2_input_scale_stacked_{fused_key_counter}"
+        new_key_w3_input_scale = f"quant_moe_w3_input_scale_stacked_{fused_key_counter}"
+        new_key_w1_weight_scale = f"quant_moe_w1_weight_scale_stacked_{fused_key_counter}"
+        new_key_w2_weight_scale = f"quant_moe_w2_weight_scale_stacked_{fused_key_counter}"
+        new_key_w3_weight_scale = f"quant_moe_w3_weight_scale_stacked_{fused_key_counter}"
+
+        fused_key_counter += 1
+
+        # Register as parameters (not buffers, to match the original per-expert params)
+        gm.register_parameter(new_key_w1, torch.nn.Parameter(w1_stacked, requires_grad=False))
+        gm.register_parameter(new_key_w2, torch.nn.Parameter(w2_stacked, requires_grad=False))
+        gm.register_parameter(new_key_w3, torch.nn.Parameter(w3_stacked, requires_grad=False))
+        gm.register_parameter(
+            new_key_w1_input_scale, torch.nn.Parameter(w1_input_scale_stacked, requires_grad=False)
+        )
+        gm.register_parameter(
+            new_key_w2_input_scale, torch.nn.Parameter(w2_input_scale_stacked, requires_grad=False)
+        )
+        gm.register_parameter(
+            new_key_w3_input_scale, torch.nn.Parameter(w3_input_scale_stacked, requires_grad=False)
+        )
+        gm.register_parameter(
+            new_key_w1_weight_scale,
+            torch.nn.Parameter(w1_weight_scale_stacked, requires_grad=False),
+        )
+        gm.register_parameter(
+            new_key_w2_weight_scale,
+            torch.nn.Parameter(w2_weight_scale_stacked, requires_grad=False),
+        )
+        gm.register_parameter(
+            new_key_w3_weight_scale,
+            torch.nn.Parameter(w3_weight_scale_stacked, requires_grad=False),
+        )
+
+        additional_nodes = []
+        if backend == "trtllm":
+            # For optimization reasons, we precompute a few additional arguments to the trtllm_quant_fp8_moe_fused op
+            # to avoid computing them at runtime.
+            gemm1_dequant = (w1_weight_scale_stacked * w1_input_scale_stacked[0]).squeeze()
+            gemm2_act_quant = (1.0 / w2_input_scale_stacked[0]).to(torch.float32)
+            gemm2_dequant = (w2_weight_scale_stacked * w2_input_scale_stacked[0]).squeeze()
+
+            new_key_gemm1_dequant = f"quant_moe_gemm1_dequant_stacked_{fused_key_counter}"
+            new_key_gemm2_act_quant = f"quant_moe_gemm2_act_quant_stacked_{fused_key_counter}"
+            new_key_gemm2_dequant = f"quant_moe_gemm2_dequant_stacked_{fused_key_counter}"
+            gm.register_parameter(
+                new_key_gemm1_dequant,
+                torch.nn.Parameter(gemm1_dequant, requires_grad=False),
+            )
+            gm.register_parameter(
+                new_key_gemm2_act_quant,
+                torch.nn.Parameter(gemm2_act_quant, requires_grad=False),
+            )
+            gm.register_parameter(
+                new_key_gemm2_dequant,
+                torch.nn.Parameter(gemm2_dequant, requires_grad=False),
+            )
+            additional_nodes = [
+                new_key_gemm1_dequant,
+                new_key_gemm2_act_quant,
+                new_key_gemm2_dequant,
+            ]
+
+        # Create new node with get_attr for stacked parameters
+        with graph.inserting_before(node):
+            args = (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                graph.get_attr(new_key_w1),
+                graph.get_attr(new_key_w2),
+                graph.get_attr(new_key_w3),
+                graph.get_attr(new_key_w1_input_scale),
+                graph.get_attr(new_key_w2_input_scale),
+                graph.get_attr(new_key_w3_input_scale),
+                graph.get_attr(new_key_w1_weight_scale),
+                graph.get_attr(new_key_w2_weight_scale),
+                graph.get_attr(new_key_w3_weight_scale),
+            )
+            additional_args = (graph.get_attr(node) for node in additional_nodes)
+            new_node = graph.call_function(
+                replacement_op,
+                args=(*args, *additional_args),
+                kwargs=node.kwargs,
+            )
+
+        node.replace_all_uses_with(new_node)
+        graph.erase_node(node)
+
+    # Clean up after processing all nodes
+    # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
+    # will remove the parameters/buffers that are no longer referenced
+    gm.graph.eliminate_dead_code()
+    gm.delete_all_unused_submodules()
+
+    return fused_key_counter
+
+
+class FuseMoeConfig(TransformConfig):
+    """Configuration for MoE fusion transform."""
+
+    backend: str = Field(
+        default="auto",
+        description="Backend to use for MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
+    )
 
 
 @TransformRegistry.register("fuse_moe")
@@ -505,6 +820,45 @@ class FuseMoe(BaseTransform):
     """
     Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
     torch.ops.auto_deploy.trtllm_moe_fused.
+    """
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseMoeConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        with cuda_memory_tracker():
+            fused_key_counter = _insert_fused_moe_ops(gm, backend=self.config.backend)
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=fused_key_counter,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
+        )
+        return gm, info
+
+
+class FuseFP8MoeConfig(TransformConfig):
+    """Configuration for FP8 MoE fusion transform."""
+
+    backend: str = Field(
+        default="auto",
+        description="Backend to use for FP8 MoE computation ('auto', 'trtllm' or 'triton'. default: 'auto').",
+    )
+
+
+@TransformRegistry.register("fuse_fp8_moe")
+class FuseFP8Moe(BaseTransform):
+    """
+    Stack per-expert FP8 MoE weights and scales to avoid runtime stacking overhead.
+    This runs after weights are loaded, similar to FuseMoe for unquantized MoE.
     """
 
     def _apply(
@@ -515,9 +869,12 @@ class FuseMoe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _insert_fused_moe_ops(gm)
+            fused_key_counter = _stack_fp8_moe_weights(gm, backend=self.config.backend)
 
         info = TransformInfo(
-            skipped=False, num_matches=fused_key_counter, is_clean=False, has_valid_shapes=False
+            skipped=(fused_key_counter == 0),
+            num_matches=fused_key_counter,
+            is_clean=fused_key_counter == 0,
+            has_valid_shapes=fused_key_counter == 0,
         )
         return gm, info

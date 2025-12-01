@@ -1,0 +1,35 @@
+# This is the set of transforms running in "transformers" mode. In this mode, we hook into the
+# HF attention mechanism and replace it with our custom cached attention mechanism.
+transforms:
+  ############################################################################################
+  # BUILD MODEL, LOAD WEIGHTS, AND WRAP IT INTO FAKE GRAPH MODULE
+  ############################################################################################
+  build_and_load_factory_model:
+    stage: factory
+    run_per_gm: false
+  ############################################################################################
+  # MOVE ARGUMENTS TO DEVICE
+  ############################################################################################
+  move_inputs_to_device:
+    stage: weight_load
+    run_per_gm: false
+  ############################################################################################
+  # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+  ############################################################################################
+  detect_hf_attn_layers:
+    stage: cache_init
+    run_per_gm: false
+  transformers_replace_cached_attn:
+    stage: cache_init
+    backend: flashinfer
+    run_per_gm: false
+  initialize_cache:
+    stage: cache_init
+    run_per_gm: false
+  resize_kv_cache:
+    stage: cache_init
+    run_per_gm: false
+    free_mem_ratio: 0.0
+  ############################################################################################
+  # COMPILE MODEL
+  ############################################################################################

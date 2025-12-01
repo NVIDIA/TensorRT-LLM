@@ -248,7 +248,7 @@ def test_fp4_moe_op_run(dtype):
 
     # run FP4 MoE op
     with torch.inference_mode():
-        output_torch_fp4_moe = torch.ops.auto_deploy.torch_quant_fp4_moe(
+        output_torch_fp4_moe = torch.ops.auto_deploy.torch_quant_nvfp4_moe(
             x,
             selected_experts,
             final_scales,

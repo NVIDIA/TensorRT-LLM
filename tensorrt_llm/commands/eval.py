@@ -21,7 +21,7 @@ import tensorrt_llm.profiler as profiler
 from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
 from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
-                        GPQAExtended, GPQAMain, JsonModeEval)
+                        GPQAExtended, GPQAMain, JsonModeEval, LongBenchV2)
 from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
@@ -39,33 +39,34 @@ from ..logger import logger, severity_map
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "tensorrt"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "tensorrt"]),
+    default="pytorch",
+    help="The backend to use for evaluation. Default is pytorch backend.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.max_beam_width,
+              default=BuildConfig.model_fields["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.max_batch_size,
+              default=BuildConfig.model_fields["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.max_num_tokens,
+    default=BuildConfig.model_fields["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.max_seq_len,
+    default=BuildConfig.model_fields["max_seq_len"].default,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
@@ -91,17 +92,30 @@ from ..logger import logger, severity_map
               is_flag=True,
               default=False,
               help="Flag for HF transformers.")
-@click.option("--extra_llm_api_options",
+@click.option("--revision",
               type=str,
               default=None,
-              help="Path to a YAML file that overwrites the parameters")
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--config",
+              "--extra_llm_api_options",
+              "extra_llm_api_options",
+              type=str,
+              default=None,
+              help="Path to a YAML file that overwrites the parameters. "
+              "Can be specified as either --config or --extra_llm_api_options.")
+@click.option("--disable_kv_cache_reuse",
+              is_flag=True,
+              default=False,
+              help="Flag for disabling KV cache reuse.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          backend: str, max_beam_width: int, max_batch_size: int,
          max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
-         extra_llm_api_options: Optional[str]):
+         revision: Optional[str], extra_llm_api_options: Optional[str],
+         disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
@@ -109,10 +123,8 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
                                max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
-
-    if backend == "tensorrt":
-        backend = None
+        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        enable_block_reuse=not disable_kv_cache_reuse)
 
     llm_args = {
         "model": model,
@@ -122,9 +134,9 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "moe_expert_parallel_size": ep_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
+        "revision": revision,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
-        "backend": backend,
     }
 
     if extra_llm_api_options is not None:
@@ -133,9 +145,14 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     profiler.start("trtllm init")
     if backend == 'pytorch':
+        llm_args.pop("build_config", None)
         llm = PyTorchLLM(**llm_args)
-    else:
+    elif backend == 'tensorrt':
         llm = LLM(**llm_args)
+    else:
+        raise click.BadParameter(
+            f"{backend} is not a known backend, check help for available options.",
+            param_hint="backend")
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     logger.info(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")
@@ -153,6 +170,7 @@ main.add_command(GPQAMain.command)
 main.add_command(GPQAExtended.command)
 main.add_command(JsonModeEval.command)
 main.add_command(MMMU.command)
+main.add_command(LongBenchV2.command)
 
 if __name__ == "__main__":
     main()

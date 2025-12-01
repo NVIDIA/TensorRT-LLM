@@ -10,15 +10,16 @@
                 "--model=meta-llama/Meta-Llama-3.1-8B-Instruct",
                 "--args.world-size=2",
                 "--args.runtime=demollm",
-                "--args.compile-backend=torch-simple",
+                "--args.transforms.compile-model.backend=torch-simple",
                 "--args.attn-page-size=16",
-                "--args.attn-backend=flashinfer",
+                "--args.transforms.insert-cached-attention.backend=flashinfer",
                 "--args.model-factory=AutoModelForCausalLM",
                 "--benchmark.enabled=false",
                 "--prompt.batch-size=2",
                 "--args.model-kwargs.num-hidden-layers=3",
                 "--args.model-kwargs.num-attention-heads=32",
                 "--prompt.sp-kwargs.max-tokens=128",
+                // "--yaml-extra=config.yaml", // uncomment to load a custom extra yaml config file
                 // "--dry-run", // uncomment to print the final config and return
             ],
             "console": "integratedTerminal",

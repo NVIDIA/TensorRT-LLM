@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -94,9 +95,12 @@ class GenerationRequest:
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt_id: Optional[int] = None,
+        arrival_time: Optional[float] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -121,7 +125,10 @@ class GenerationRequest:
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
+        self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
+        self.cache_salt_id = cache_salt_id
+        self.arrival_time = arrival_time
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

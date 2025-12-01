@@ -9,9 +9,11 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
+from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
+from .interface import AlltoallMethodType
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -220,7 +222,7 @@ def _preprocess_after_permute_kernel(
     expert_offsets_ptr,
     masked_m_ptr,
     token_map_ptr,
-    TOTAL_TOKENS: tl.constexpr,
+    total_tokens,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
@@ -228,7 +230,7 @@ def _preprocess_after_permute_kernel(
     pid_y = tl.program_id(1)
     if pid_y == 0:
         token_offsets = pid_x * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        token_mask = token_offsets < TOTAL_TOKENS
+        token_mask = token_offsets < total_tokens
         # get expert_id for each token in the block
         expert_ids = tl.full((BLOCK_SIZE_M, ), NUM_EXPERTS - 1, dtype=tl.int32)
         found_mask = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.int1)
@@ -287,7 +289,7 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
         expert_first_token_offset_tensor,
         masked_m,
         token_to_expert_map,
-        TOTAL_TOKENS=total_tokens,
+        total_tokens,
         NUM_EXPERTS=num_experts,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
     )
@@ -346,8 +348,7 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
 
 
 class DeepGemmFusedMoE(CutlassFusedMoE):
-    """
-    Python Flow of Fused Mixture of Experts (MoE) Layer.
+    """DeepGEMM flow of fused mixture of experts (MoE) Layer.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -358,12 +359,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-
-    This backend is composed of multiple custom ops:
-    1. moe_permute_op: permute the input tensor and the expert selected tensor.
-    2. cute_dsl_fp8_group_blockwise_gemm_ref: a reference implementation of the cute_dsl_fp8_group_blockwise_gemm.
-    3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
+
+    # To reuse pytorch memory segments allocated during graph capture.
+    buffers = get_memory_buffers()
 
     def __init__(
         self,
@@ -382,18 +381,19 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
     ):
-        if model_config.moe_max_num_tokens is None:
-            moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-            # The default moe_max_num_tokens is calculated from the following formula:
-            # max_isl = 8196, max_batch_size = 1024, mtp = 0
-            # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
-            # moe_max_num_tokens = max_num_tokens * 2 = 18688
-            # It can avoid OOM for 8k/1k cases.
-            default_moe_max_num_tokens = 18688
-            if moe_max_num_tokens > default_moe_max_num_tokens:
-                model_config._frozen = False
-                model_config.moe_max_num_tokens = default_moe_max_num_tokens
-                model_config._frozen = True
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        # For DeepGemm, we need to limit moe_max_num_tokens to avoid OOM
+        # The default moe_max_num_tokens is calculated from the following formula:
+        # max_isl = 8196, max_batch_size = 1024, mtp = 0
+        # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
+        # moe_max_num_tokens = max_num_tokens * 2 = 18688
+        # It can avoid OOM for 8k/1k cases.
+        default_moe_max_num_tokens = 18688
+        if model_config.moe_max_num_tokens > default_moe_max_num_tokens:
+            model_config._frozen = False
+            model_config.moe_max_num_tokens = default_moe_max_num_tokens
+            model_config._frozen = True
 
         super().__init__(
             routing_method=routing_method,
@@ -410,28 +410,34 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
     def get_workspace(self, m_max: int, group_size: int):
+        capture_graph = torch.cuda.is_current_stream_capturing()
         hidden_size = self.hidden_size
-        intermediate_size = self.intermediate_size
+        intermediate_size = self.intermediate_size_per_partition
         num_experts = self.expert_size_per_partition
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = torch.empty((num_experts * m_max * fp8_dim),
-                                  dtype=torch.float8_e4m3fn,
-                                  device='cuda')
-        workspace_1 = torch.empty(
-            (num_experts * m_max * max(intermediate_size * 2, hidden_size)),
+        workspace_0 = DeepGemmFusedMoE.buffers.get_buffer(
+            (num_experts * m_max * fp8_dim, ),
+            dtype=torch.float8_e4m3fn,
+            buffer_name='workspace_0',
+            reserve_buffer=capture_graph)
+        workspace_1 = DeepGemmFusedMoE.buffers.get_buffer(
+            (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
-            device='cuda')
+            buffer_name='workspace_1',
+            reserve_buffer=capture_graph)
 
         # create workspace for scaling factors
         m_padded = fp8_utils.align(m_max, 4)
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
-        workspace_sf = torch.empty(
-            (num_experts * (scale_k_padded // 4) * m_padded),
+
+        workspace_sf = DeepGemmFusedMoE.buffers.get_buffer(
+            (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
-            device='cuda')
+            buffer_name='workspace_sf',
+            reserve_buffer=capture_graph)
 
         workspace = {
             "workspace_0": workspace_0,
@@ -452,6 +458,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         else:
             return UnquantizedFusedMoEMethod()
 
+    def select_alltoall_method_type(self) -> AlltoallMethodType:
+        """DeepGEMM backend currently doesn't support alltoall; honor overrides but default to disabled."""
+        return AlltoallMethodType.NotEnabled
+
     @nvtx_range("[DG] forward")
     def forward_chunk(
         self,
@@ -464,7 +474,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
@@ -564,7 +573,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # grouped gemm 1
         h1 = set_strides(workspace["workspace_1"],
                          self.expert_size_per_partition, m_max,
-                         self.intermediate_size * 2)
+                         self.intermediate_size_per_partition * 2)
 
         deepgemm_fp8_group_blockwise_gemm(
             d=h1,
@@ -579,9 +588,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # activation and quantization
         act_input_fp8 = set_strides(workspace["workspace_0"],
                                     self.expert_size_per_partition, m_max,
-                                    self.intermediate_size)
+                                    self.intermediate_size_per_partition)
 
-        scale_k = fp8_utils.ceil_div(self.intermediate_size, 128)
+        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition, 128)
         scale_k_padded = fp8_utils.align(scale_k, 4)
         act_input_sf = set_strides(workspace["workspace_sf"],
                                    self.expert_size_per_partition,
@@ -637,15 +646,16 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         return final_hidden_states
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
@@ -663,7 +673,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                           1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
@@ -695,7 +705,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 all_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
-                chunk_size_list = all_rank_chunk_size_list[self.rank]
+                chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
             else:
                 all_rank_num_tokens_list = [None] * num_chunks
                 chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
@@ -767,6 +777,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             outputs = torch.cat(outputs_list)
 
         if self.use_dp and self.parallel_size > 1:
-            rank = self.mapping.tp_rank
+            rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs

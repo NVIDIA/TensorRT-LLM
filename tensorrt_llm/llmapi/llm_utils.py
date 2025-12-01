@@ -1,20 +1,20 @@
-import copy
 import json
 import os
 import shutil
 import tempfile
 import time
 import weakref
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
+import transformers
+from pydantic import BaseModel
 from tqdm import tqdm
 
-from .._utils import (global_mpi_rank, mpi_barrier, mpi_broadcast, mpi_rank,
-                      release_gc)
-from ..auto_parallel import AutoParallelConfig
+from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
+                      mpi_broadcast, mpi_rank, release_gc)
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
@@ -41,8 +41,8 @@ from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (download_hf_model, download_hf_pretrained_config,
-                    enable_llm_debug, get_directory_size_in_gb, print_colored,
-                    print_colored_debug, print_traceback_on_error)
+                    enable_llm_debug, get_directory_size_in_gb, logger_debug,
+                    print_colored, print_traceback_on_error)
 
 
 @dataclass
@@ -133,18 +133,6 @@ class ModelLoader:
             assert self.llm_args.build_config
             self.build_config = self.llm_args.build_config
 
-            self.auto_parallel_config = AutoParallelConfig(
-                world_size=llm_args.parallel_config.world_size if llm_args.
-                parallel_config.auto_parallel else 1)
-
-            default_config = self.llm_args.auto_parallel_config
-            self.auto_parallel_config.set_defaults(
-                cluster_key=default_config.cluster_key,
-                cluster_info=default_config.cluster_info,
-                same_buffer_io=default_config.same_buffer_io,
-                sharded_io_allowlist=default_config.sharded_io_allowlist,
-            )
-
         self._gather_build_steps()
 
     def _gather_build_steps(self):
@@ -152,7 +140,7 @@ class ModelLoader:
         if isinstance(self.llm_args.model, Module):
             # Build engine from user provided model
             self._build_pipeline.append(
-                ("Build TensorRT-LLM engine",
+                ("Build TensorRT LLM engine",
                  self._build_engine_from_inmemory_model))
             return
 
@@ -395,14 +383,16 @@ class ModelLoader:
                     )
             else:
                 if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8
+                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
                 ]:
                     raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                     )
 
             for key, value in hf_quant_config.items():
-                logger.info(f"Setting {key}={value} from HF quant config.")
+                logger.info(
+                    f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
+                )
                 setattr(quant_config, key, value)
 
             # Update the quant_config in llm_args for pytorch
@@ -539,17 +529,12 @@ class ModelLoader:
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
 
-        print_colored_debug(f"rank{mpi_rank()} begin to build engine...\n",
-                            "green")
+        logger_debug(f"rank{mpi_rank()} begin to build engine...\n", "green")
 
-        # avoid the original build_config is modified, avoid the side effect
-        copied_build_config = copy.deepcopy(self.build_config)
+        # avoid side effects by copying the original build_config
+        copied_build_config = self.build_config.model_copy(deep=True)
 
-        copied_build_config.update(
-            auto_parallel_config=self.auto_parallel_config)
         copied_build_config.update_kv_cache_type(self._model_info.architecture)
-        if self.auto_parallel_config.enabled:
-            self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
 
         self._engine = build(self.model, copied_build_config)
@@ -557,7 +542,7 @@ class ModelLoader:
 
         # delete the model explicitly to free all the build-time resources
         self.model = None
-        print_colored_debug(f"rank{mpi_rank()} build engine done\n", "green")
+        logger_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
         '''
@@ -588,6 +573,32 @@ class ModelLoader:
             logger.warning(f"Failed to load tokenizer from {model_dir}")
             return None
 
+    @staticmethod
+    def load_hf_generation_config(
+            model_dir, **kwargs) -> Optional[transformers.GenerationConfig]:
+        try:
+            return transformers.GenerationConfig.from_pretrained(
+                model_dir, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf generation config from {model_dir}, encounter error: {e}"
+            )
+            return None
+
+    @staticmethod
+    def load_hf_model_config(
+            model_dir,
+            trust_remote_code: bool = True,
+            **kwargs) -> Optional[transformers.PretrainedConfig]:
+        try:
+            return transformers.PretrainedConfig.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf model config from {model_dir}, encounter error: {e}"
+            )
+            return None
+
 
 class CachedModelLoader:
     '''
@@ -616,6 +627,17 @@ class CachedModelLoader:
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
 
+    def _submit_to_all_workers(
+        self,
+        task: Callable[..., Any],
+        *args,
+        **kwargs,
+    ) -> List[Any]:
+        if self.llm_args.parallel_config.is_multi_gpu:
+            return self.mpi_session.submit_sync(task, *args, **kwargs)
+        else:
+            return [task(*args, **kwargs)]
+
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
@@ -636,9 +658,11 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                self._hf_model_dir = download_hf_model(
-                    self.model_loader.model_obj.model_name,
-                    self.llm_args.revision)
+                hf_model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=self.model_loader.model_obj.model_name,
+                    revision=self.llm_args.revision)
+                self._hf_model_dir = hf_model_dirs[0]
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
@@ -693,9 +717,9 @@ class CachedModelLoader:
     def build_cache_enabled(self) -> bool:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
-        return (self.llm_args.enable_build_cache or _enable_build_cache) and (
-            self.llm_args.model_format is _ModelFormatKind.HF
-        ) and not self.llm_args.parallel_config.auto_parallel
+        return (self.llm_args.enable_build_cache
+                or _enable_build_cache) and (self.llm_args.model_format
+                                             is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
         ''' Get the cache stage for engine building. '''
@@ -704,15 +728,19 @@ class CachedModelLoader:
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
 
         def serialize(d) -> str:
-            dic = asdict(d) if not isinstance(
-                d, PretrainedConfig) else d.to_dict()
+            if hasattr(d, "to_dict"):
+                dic = d.to_dict()
+            elif is_dataclass(d):
+                dic = asdict(d)
+            elif isinstance(d, BaseModel):
+                dic = d.model_dump(mode="json")
+            else:
+                raise ValueError(f"Could not serialize type: {type(d)}")
             return json.dumps(dic, sort_keys=True)
 
         parallel_config = self.llm_args.parallel_config
 
         force_rebuild = False
-        if parallel_config.auto_parallel:
-            force_rebuild = True
         if self.llm_args.model_format is not _ModelFormatKind.HF:
             force_rebuild = True
 
@@ -814,6 +842,17 @@ class CachedModelLoader:
             build_task(self.get_engine_dir())
 
         return self.get_engine_dir()
+
+    @print_traceback_on_error
+    @staticmethod
+    def _node_download_hf_model(
+        model: str,
+        revision: Optional[str] = None,
+    ) -> Optional[Path]:
+        if local_mpi_rank() == 0:
+            return download_hf_model(model, revision)
+        else:
+            return None
 
     @print_traceback_on_error
     @staticmethod

@@ -1,0 +1,5 @@
+cuda_graph_config:
+    enable_padding: True
+    max_batch_size: 16
+moe_config:
+    backend: trtllm

@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "unknown-package"
+version = "0.1.0"
+description = ""
+authors = ["TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+flax = ">=0.8.2"
+jax = ">=0.4.23,<0.5.0"
+orbax-checkpoint = "0.5.7"
+transformers = ">=4.56.0"
+datasets = "3.1.0"
+evaluate = "^0.4.6"
+rouge-score = "^0.1.2"
+sentencepiece = "^0.2.1"
+jaxtyping = "<=0.2.34"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

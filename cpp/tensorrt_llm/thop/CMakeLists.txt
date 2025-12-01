@@ -40,11 +40,15 @@ add_library(
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
+  alltoallOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
+  cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  cublasFp4ScaledMM.cpp
+  cudaNvfp4MM.cpp
   cudaScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
@@ -56,6 +60,7 @@ add_library(
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
+  fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
@@ -64,19 +69,24 @@ add_library(
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
+  helixPostProcessOp.cpp
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
   moeCommOp.cpp
+  moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
+  moeAlignOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  IndexerKCacheScatterOp.cpp
+  IndexerTopKOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
@@ -90,12 +100,15 @@ add_library(
   virtualMemoryAllocator.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
-  mtpOp.cpp
+  specDecOp.cpp
   loraOp.cpp
-  finegrained_mixed_dtype_gemm_thop.cpp)
+  finegrained_mixed_dtype_gemm_thop.cpp
+  tinygemm2.cpp
+  dsv3RopeOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
-                                        ${Python3_LIBRARIES} ${SHARED_TARGET})
+target_link_libraries(
+  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                    ${SHARED_TARGET} pg_utils)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
@@ -109,6 +122,11 @@ endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(th_common PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+endif()
+
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
+  target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
 endif()
 
 if(ENABLE_MULTI_DEVICE)

@@ -14,10 +14,8 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch yaml config for trtllm-bench perf tests
+Model pytorch/TRT yaml config for trtllm-bench perf tests
 """
-
-from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def recursive_update(d, u):
@@ -38,12 +36,18 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    base_config = {
-        'print_iter_log': True,
-        'cuda_graph_config': {
-            'enable_padding': True,
-        },
-    }
+    if 'pytorch' in model_label:
+        # Pytorch backend config
+        base_config = {
+            'print_iter_log': True,
+            'cuda_graph_config': {
+                'enable_padding': True,
+            },
+        }
+    else:
+        # TRT backend config
+        base_config = {}
+
     if 'kv_cache_dtype' in model_label:
         base_config.update({
             'kv_cache_dtype':
@@ -53,6 +57,13 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
@@ -93,6 +104,42 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        # Deepseek R1 model with chunked prefill
+        {
+            'patterns': [
+                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
+                'deepseek_v3_lite_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Deepseek R1 model with CUTLASS backend
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                    'max_num_tokens': 3072,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64],
+                },
+            }
+        },
         # Deepseek_v3_lite_cases
         {
             'patterns':
@@ -103,13 +150,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'batch_sizes': [1, 512, 1024, 2048]
                 }
-            }
-        },
-        # Deepseek default cases
-        {
-            'patterns': 'deepseek_r1',
-            'config': {
-                'enable_attention_dp': True,
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
@@ -168,6 +208,79 @@ def get_model_yaml_config(model_label: str,
                     ]
                 }
             }
+        },
+        # GPT-OSS 120B max throughput test
+        {
+            'patterns': [
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:1280-con:256',
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:2560-con:512',
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:5120-con:1024',
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:20480-con:4096'
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 720,
+                },
+                'moe_config': {
+                    'backend': 'CUTLASS'
+                },
+                'stream_interval': 10,
+                'num_postprocess_workers': 4
+            }
+        },
+        # GPT-OSS 120B min latency test
+        {
+            'patterns': [
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:8-con:1',
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:100-con:32'
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 720,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                },
+                'stream_interval': 10,
+                'num_postprocess_workers': 4
+            }
+        },
+        # Phi-4-multimodal-instruct with chunked prefill and kv_cache_reuse
+        {
+            'patterns': [
+                'phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:500,2000-con:250',
+                'phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,1000-con:250'
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Mistral-Small-3.1-24B-Instruct-2503 with chunked prefill and kv_cache_reuse
+        {
+            'patterns': [
+                'mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:48-maxnt:256-input_output_len:1000,2000-reqs:500-con:200',
+                'mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:128-maxnt:512-input_output_len:1000,2000-reqs:500-con:200'
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Llama-v3.3 models with xgrammar guided decoding
+        {
+            'patterns': [
+                "llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8-extra"
+            ],
+            'config': {
+                'extended_runtime_perf_knob_config': {
+                    'cuda_graph_cache_size': 1.0,
+                    'cuda_graph_mode': True,
+                },
+                'guided_decoding_backend': 'xgrammar'
+            }
         }
     ]
 
@@ -178,15 +291,25 @@ def get_model_yaml_config(model_label: str,
             patterns = [patterns]
         for pattern in patterns:
             if pattern in model_label.lower():
-                recursive_update(base_config, pattern_config['config'])
+                if pattern_config.get('config'):
+                    recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
+        # Derive the requested number of adapters from model_label (segment like "loras:X")
+        lora_count = 1
+        for part in model_label.split('-'):
+            if part.startswith('loras:'):
+                lora_count = max(1, int(part.split(':', 1)[1]))
+                break
+
         lora_config = {
             'lora_config': {
                 'lora_dir': lora_dirs if lora_dirs is not None else [],
-                'max_lora_rank': 64
+                'max_lora_rank': 64,
+                'max_loras': lora_count,
+                'max_cpu_loras': lora_count,
             }
         }
         if 'phi_4_multimodal_instruct' in model_label:
@@ -204,9 +327,10 @@ def get_model_yaml_config(model_label: str,
                 'swap_gate_up_proj_lora_b_weight'] = False
         base_config.update(lora_config)
 
-    kv_cache_config = base_config.get('kv_cache_config', KvCacheConfig())
+    kv_cache_config = base_config.get('kv_cache_config', {})
     if 'kv_cache_dtype' in base_config:
-        kv_cache_config.dtype = base_config.pop('kv_cache_dtype', 'auto')
+        kv_cache_dtype = base_config.pop('kv_cache_dtype', 'auto')
+        kv_cache_config['dtype'] = kv_cache_dtype
         base_config.update({'kv_cache_config': kv_cache_config})
 
     return base_config

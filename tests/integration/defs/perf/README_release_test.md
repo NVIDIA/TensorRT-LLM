@@ -1,12 +1,12 @@
-# TensorRT-LLM Performance Test Flow (Default PyTorch Flow)
+# TensorRT LLM Performance Test Flow (Default PyTorch Flow)
 
 ## Overview
-This document describes the complete TensorRT-LLM performance testing workflow, particularly for the default PyTorch backend testing process for release testing.
+This document describes the complete TensorRT LLM performance testing workflow, particularly for the default PyTorch backend testing process for release testing.
 
 ## 1. Test Scripts
 
 ### Main Test Script
-The main script for TensorRT-LLM performance testing is `test_perf.py`, which is responsible for executing all performance test cases.
+The main script for TensorRT LLM performance testing is `test_perf.py`, which is responsible for executing all performance test cases.
 
 ### Performance Metrics
 For trtllm-bench, the test extracts the following key performance metrics from logs:

@@ -35,7 +35,7 @@ QuantizeTensorPlugin::QuantizeTensorPlugin(void const* data, size_t length)
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }

@@ -76,7 +76,7 @@ def processor_setup(request):
         mock_auto_processor.from_pretrained.return_value = mock_processor
 
         processor = config["processor_class"](model_path="dummy_path",
-                                              model_config=mock_config,
+                                              config=mock_config,
                                               tokenizer=mock_tokenizer,
                                               trust_remote_code=True)
 

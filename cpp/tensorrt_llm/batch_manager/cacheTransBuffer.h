@@ -57,10 +57,11 @@ private:
 class CacheTransBufferManager
 {
 public:
-    CacheTransBufferManager(
-        KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
+    CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+        SizeType32 tokensPerBlock,
         std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
 
     std::optional<int> assignBufferIndexForSend();
@@ -69,17 +70,22 @@ public:
     void freeBufferIndexForRecv(std::optional<int> bufferId);
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateSendBuffers(
-        std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
         runtime::BufferManager const& bufferManagerToUse);
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateRecvBuffers(
-        std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
         runtime::BufferManager const& bufferManagerToUse);
 
     runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
     size_t getRecvBufferCount();
     size_t getSendBufferCount();
+
+    std::optional<size_t> getMaxNumTokens()
+    {
+        return mMaxNumTokens;
+    }
 
 private:
     struct ConcurrenceResource
@@ -92,8 +98,8 @@ private:
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
-        int targetNum, size_t targetBufferEleSize, runtime::BufferManager const& bufferManagerToUse,
-        ConcurrenceResource& concurrenceResource);
+        int targetNum, std::vector<size_t> const& requestedNumberOfElements,
+        runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
     std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
@@ -106,13 +112,14 @@ private:
     size_t mTransferBufferSize;
     bool mOnlyUseDynamicBuffer;
     bool mUseFabricMemory;
-    size_t mBufferEleSize;
+    size_t mNumberOfElements;
     nvinfer1::DataType mDataType;
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;
     KVCacheManager::BaseKVCacheManager* mCacheManager;
     runtime::BufferManager mBufferManager;
     std::vector<std::unique_ptr<FabricMemory>> mFabricMemory;
+    std::optional<size_t> mMaxNumTokens;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

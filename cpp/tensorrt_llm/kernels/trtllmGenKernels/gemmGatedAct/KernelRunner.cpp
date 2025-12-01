@@ -26,14 +26,14 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-
-static gemmGatedAct::GemmGatedActInterface::ModuleCache globalTrtllmGenGemmGatedActModuleCache;
+using namespace gemmGatedAct::gemmGatedAct;
+static GemmGatedActInterface::ModuleCache globalTrtllmGenGemmGatedActModuleCache;
 
 TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRunnerOptions const& options_)
     : mOptions(options_)
 {
     // Select a GEMM kernel config to use
-    auto const gemm = gemmGatedAct::GemmGatedActInterface();
+    auto const gemm = GemmGatedActInterface();
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
@@ -43,7 +43,7 @@ TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRu
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == mOptions.eltType && options.mDtypeC == mOptions.outputType
+        if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
         {
@@ -56,14 +56,14 @@ TrtllmGenGemmGatedActRunner::TrtllmGenGemmGatedActRunner(TrtllmGenGemmGatedActRu
 
 size_t TrtllmGenGemmGatedActRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k)
 {
-    gemmGatedAct::GemmGatedActData gemmData;
+    GemmGatedActData gemmData;
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
 
     selectGemmConfig(m, n, k);
 
-    auto gemm = gemmGatedAct::GemmGatedActInterface();
+    auto gemm = GemmGatedActInterface();
     auto const configs = gemm.getGemmConfigs();
     TLLM_CHECK_WITH_INFO(
         mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
@@ -76,9 +76,9 @@ void TrtllmGenGemmGatedActRunner::run(int32_t m, int32_t n, int32_t k, void cons
     void const* b, float const* bScale, void* c, float* cScale, float* cScaleGate, void* workspace, CUstream stream,
     int device)
 {
-    auto gemm = gemmGatedAct::GemmGatedActInterface();
+    auto gemm = GemmGatedActInterface();
 
-    gemmGatedAct::GemmGatedActData gemmData;
+    GemmGatedActData gemmData;
 
     auto const configs = gemm.getGemmConfigs();
     TLLM_CHECK_WITH_INFO(
@@ -107,7 +107,7 @@ void TrtllmGenGemmGatedActRunner::run(int32_t m, int32_t n, int32_t k, void cons
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        globalTrtllmGenGemmGatedActModuleCache);
+        /*usePdl=*/true, globalTrtllmGenGemmGatedActModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
@@ -120,10 +120,10 @@ void TrtllmGenGemmGatedActRunner::run(int32_t m, int32_t n, int32_t k, void cons
 
 void TrtllmGenGemmGatedActRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
 {
-    auto const gemm = gemmGatedAct::GemmGatedActInterface();
+    auto const gemm = GemmGatedActInterface();
     auto const configs = gemm.getGemmConfigs();
 
-    gemmGatedAct::GemmGatedActData gemmData;
+    GemmGatedActData gemmData;
     // Dims
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;

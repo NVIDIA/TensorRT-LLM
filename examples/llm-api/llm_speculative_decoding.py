@@ -6,8 +6,8 @@ from typing import Optional
 import click
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (EagleDecodingConfig, MTPDecodingConfig,
-                                 NGramDecodingConfig)
+from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
+                                 MTPDecodingConfig, NGramDecodingConfig)
 
 prompts = [
     "What is the capital of France?",
@@ -38,9 +38,12 @@ def run_Eagle3():
         speculative_model_dir="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         eagle3_one_model=True)
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
     llm = LLM(
         model="meta-llama/Llama-3.1-8B-Instruct",
         speculative_config=spec_config,
+        kv_cache_config=kv_cache_config,
     )
 
     for prompt in prompts:

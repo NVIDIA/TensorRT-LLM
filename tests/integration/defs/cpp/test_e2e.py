@@ -263,6 +263,7 @@ def test_model(build_google_tests, model, prepare_model, run_model_tests,
     run_model_tests(model, run_fp8)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5601670")
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("model", ["bart", "gpt", "t5"])

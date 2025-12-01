@@ -9,15 +9,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
+from _model_test_utils import FakeFP8Linear
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     SplitDimension,
-    TPShardingInfo,
+    WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
+from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
     "q_proj": "colwise",
@@ -88,7 +91,7 @@ class GQA_Block(nn.Module):
         k = self.k_proj(x).view(b, s, -1, self.head_dim)
         v = self.v_proj(x).view(b, s, -1, self.head_dim)
 
-        y = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(q, k, v, is_causal=True)
+        y = torch.ops.auto_deploy.torch_attention(q, k, v, is_causal=True, layout="bsnd")
         y = y.contiguous().view(b, s, -1)
 
         return self.o_proj(y)
@@ -101,6 +104,19 @@ class MLP(nn.Module):
         self.out_features = out_features
         self.linear1 = nn.Linear(in_features, 4 * in_features, bias=bias)
         self.linear2 = nn.Linear(4 * in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
+
+
+class FP8MLP(nn.Module):
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.linear1 = FakeFP8Linear(in_features, 4 * in_features, bias=bias)
+        self.linear2 = FakeFP8Linear(4 * in_features, out_features, bias=bias)
 
     def forward(self, x):
         y = F.relu(self.linear1(x))
@@ -130,6 +146,8 @@ def _run_job(
             hidden_size=num_features,
             num_key_value_heads=num_key_value_heads,
         ).to(device="cuda", dtype=torch.float16)
+    elif model_cls == FP8MLP:
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -243,7 +261,7 @@ def _run_pattern_detection_job(
         if model_cls == GQA_Block:
             min_local_shape = num_features // num_heads
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_linear_op(node):
                     # for Q, K, V layers, we expect:
                     # dim = 0, add_dist = False
                     # for O layer, we expect:
@@ -255,18 +273,20 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.COLUMN
                         dist_op = None
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == MLP:
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_linear_op(node):
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:
@@ -276,27 +296,54 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == nn.Linear:
             # expect simple shard only (dim=0, add_dist=True, min_local_shape=1)
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_linear_op(node):
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
                             rank=rank,
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
+                        )
+                    )
+        elif model_cls == FP8MLP:
+            for node in gm.graph.nodes:
+                if is_op(node, torch.ops.auto_deploy.torch_fake_quant_fp8_linear):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.COLUMN
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.ROW
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        FP8TPShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=dist_op,
+                            min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
 
@@ -313,7 +360,9 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
+    detected_transformations = (
+        optimizer.shared_config.sharding_transform_container.weight_sharding_transforms
+    )
 
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")
@@ -328,6 +377,7 @@ def _run_pattern_detection_job(
     "model_cls, dist_op_expected",
     (
         (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
     ),
@@ -352,6 +402,7 @@ def test_sharding(
     "model_cls, dist_op_expected",
     (
         (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
     ),

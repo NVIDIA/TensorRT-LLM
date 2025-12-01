@@ -3,7 +3,8 @@ from typing import List
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState)
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -72,6 +73,9 @@ class HandleLogits:
 
         total_context_logits = num_context_logits_prefix_sum[-1]
         for batch_index, llm_req in enumerate(generation_requests):
+            if llm_req.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+
             logits_begin = total_context_logits + batch_index * beam_width
             logits_end = logits_begin + beam_width
 
@@ -79,3 +83,8 @@ class HandleLogits:
                 logits_view = logits[logits_begin:logits_end].reshape(
                     1, beam_width, -1)
                 llm_req.py_result.append_generation_logits(logits_view)
+
+        # Finalize any remaining logits transfers for all requests in chunked mode
+        for llm_req in chain(context_requests, generation_requests):
+            if llm_req.py_use_chunked_generation_logits and llm_req.py_return_generation_logits:
+                llm_req.py_result.transfer_remaining_device_logits()

@@ -56,7 +56,10 @@ class FlashInferWrappers:
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
 
-    kv_layout: Literal["NHD", "HND"] = "NHD"
+    # cache concat/split kernels when using PD disaggregation
+    # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
+    # so set kv_layout as "HND" here
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -124,14 +127,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _post_init_with_buffers(self, buffers) -> None:
+        capture_graph = torch.cuda.is_current_stream_capturing()
 
         if self.workspace_buffer is None:
             # Note: even though flashinfer only recommends 128 MB, we have to push it
             # a bit higher to cover all possible CUDA graph cases. If it's too small,
             # warmup will crash.
-            self.workspace_buffer = torch.empty(320 * 1024 * 1024,
-                                                dtype=torch.uint8,
-                                                device="cuda")
+            self.workspace_buffer = self.get_empty(
+                buffers,
+                (320 * 1024 * 1024, ),
+                dtype=torch.uint8,
+                cache_name="workspace_buffer",
+                capture_graph=capture_graph,
+            )
 
         self.paged_kv_indptr_decode = torch.empty((self.max_num_requests + 1, ),
                                                   device='cuda',
@@ -163,14 +174,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         if self.kv_cache_manager is not None:
             max_num_pages = self.kv_cache_manager.blocks_in_primary_pool
-            self._paged_kv_indices = torch.empty((max_num_pages, ),
-                                                 device='cuda',
-                                                 dtype=torch.int)
+            self._paged_kv_indices = self.get_empty(
+                buffers,
+                (max_num_pages, ),
+                dtype=torch.int,
+                cache_name="_paged_kv_indices",
+                capture_graph=capture_graph,
+            )
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0) -> Self:
+                                   max_draft_tokens: int = 0,
+                                   buffers=None) -> Self:
         metadata = super().create_cuda_graph_metadata(max_batch_size,
                                                       sub_cross_metadata,
                                                       max_draft_tokens)
@@ -493,7 +509,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         q = q.view(-1, self.num_heads, self.head_dim)
 
         # Key and Value
-        kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        kv_cache = metadata.kv_cache_manager.get_buffers(
+            self.layer_idx, kv_layout=metadata.kv_layout)
 
         if k is not None and v is not None:
             k = k.view(-1, self.num_kv_heads, self.head_dim)

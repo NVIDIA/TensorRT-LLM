@@ -45,7 +45,7 @@ def cu_seqlens_to_chunk_indices_offsets(
     Example:
     cu_seqlens = [0, 5, 10]
     chunk_size = 8
-    -> chunk_indices = [0, 1, 0]
+    -> chunk_indices = [0, 0, 1]
     -> chunk_offsets = [0, 5, 0]
 
     In this example, we have 2 sequences, each with 5 tokens. The physical chunk size is 8 tokens.
@@ -78,7 +78,7 @@ def cu_seqlens_to_chunk_indices_offsets(
         # - this shifting is not needed if chunk_size divides e
         _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size > 0)
 
-        # adjust inidces and offsets
+        # adjust indices and offsets
         chunk_indices[_s:_e] -= p
         chunk_offsets[_s] = s % chunk_size
 

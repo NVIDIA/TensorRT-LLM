@@ -67,6 +67,7 @@ def _run_job(
             "detect_sharding": {
                 "stage": "sharding",
                 "use_sharding_from_factory": False,
+                "sharding_dims": ["bmm"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -118,6 +119,7 @@ def _run_pattern_detection_job(
                         world_size=world_size,
                         start_idx=start_idx,
                         end_idx=end_idx,
+                        dist_backend="auto",
                     )
                 )
 
@@ -134,7 +136,7 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_config.bmm_transforms
+    detected_transformations = optimizer.shared_config.sharding_transform_container.bmm_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)

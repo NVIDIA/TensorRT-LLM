@@ -64,7 +64,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
                  LlmRequestState>(),
             nb::arg("ctx_chunk_config") = std::nullopt, nb::arg("max_context_length") = std::nullopt,
             nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
-            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE)
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_TO_COMPLETE)
         .def("__call__", &MicroBatchScheduler::operator(), nb::arg("active_requests"), nb::arg("inflight_req_ids"),
             nb::arg("max_batch_size_runtime"), nb::arg("max_num_tokens_runtime"))
         .def("name", [](MicroBatchScheduler const&) { return MicroBatchScheduler::name; });
@@ -84,9 +84,10 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
 
     nb::class_<AllocateKvCache>(m, AllocateKvCache::name)
-        .def(nb::init<>())
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
         .def("__call__", &AllocateKvCache::operator(), nb::arg("kv_cache_manager"), nb::arg("context_requests"),
-            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt)
+            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 
     nb::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)

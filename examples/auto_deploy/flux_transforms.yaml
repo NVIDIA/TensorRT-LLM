@@ -1,0 +1,30 @@
+# Configuration for Flux model transforms (export, optimizer, compile)
+# Usage: python build_and_run_flux.py --config flux_transforms.yaml
+
+# Export configuration
+export:
+  clone: false
+  strict: false
+
+# TODO: Integrate these transforms into the optimizer
+# Optimizer configuration - FP8/FP4 quantization and fusion
+# optimizer:
+#   quantize_fp8_from_graph:
+#     stage: "pattern_matcher"
+#   quantize_nvfp4_from_graph:
+#     stage: "pattern_matcher"
+#   fuse_fp8_gemms:
+#     stage: "post_load_fusion"
+#   fuse_fp4_gemms:
+#     stage: "post_load_fusion"
+#   fuse_fp8_linear:
+#     stage: "post_load_fusion"
+#     backend: "torch"
+#   fuse_nvfp4_linear:
+#     stage: "post_load_fusion"
+#     backend: "trtllm"
+
+# Compilation configuration
+compile:
+  backend: "torch-opt"
+  cuda_graph_batch_sizes: null

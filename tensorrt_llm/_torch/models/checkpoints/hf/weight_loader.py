@@ -1,6 +1,7 @@
 import glob
 import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
 
 import psutil
@@ -91,6 +92,7 @@ class HfWeightLoader(BaseWeightLoader):
 
     @staticmethod
     def _load_safetensors_file(file):
+        logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
     @staticmethod
@@ -128,7 +130,7 @@ class HfWeightLoader(BaseWeightLoader):
         if len(local_file_names) == 0:
             return
 
-        max_processes = min(multiprocessing.cpu_count() * 2, 16,
-                            len(local_file_names))
-        with multiprocessing.Pool(processes=max_processes) as pool:
-            pool.map(self._prefetch_one_file, local_file_names)
+        max_workers = min(multiprocessing.cpu_count() * 2, 16,
+                          len(local_file_names))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(self._prefetch_one_file, local_file_names))

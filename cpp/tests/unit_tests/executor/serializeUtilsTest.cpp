@@ -1,17 +1,24 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -726,7 +733,7 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, nvinfer1::DataType::kFLOAT});
+        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, nvinfer1::DataType::kFLOAT});
         auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
@@ -787,7 +794,7 @@ TEST(SerializeUtilsTest, ExecutorConfig)
         texec::GuidedDecodingConfig(
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
         std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
-        texec::CacheTransceiverConfig(std::nullopt, 1024), true, true, true);
+        texec::CacheTransceiverConfig(std::nullopt, 1024, 100, 1000), true, true, true);
     auto executorConfig2 = serializeDeserialize(executorConfig);
 
     EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());
@@ -1026,8 +1033,266 @@ TEST(SerializeUtilsTest, MethodReturnType)
 TEST(SerializeUtilsTest, CacheTransceiverConfig)
 {
     texec::CacheTransceiverConfig cacheTransceiverConfig(
-        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024);
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 1000);
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
     EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
     EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
+    EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
+    EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
+        cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
+}
+
+TEST(SerializeUtilsTest, BlockKeyBasic)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+
+    VecUniqueTokens uniqueTokens{UniqueToken{1, 0}, UniqueToken{2, 0}, UniqueToken{3, 0}};
+    BlockKey key(false, std::nullopt, uniqueTokens, {});
+
+    testSerializeDeserialize(key);
+}
+
+TEST(SerializeUtilsTest, BlockKeyWithExtras)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+
+    // Prepare multimodal extra keys
+    std::array<uint8_t, 32> h1{};
+    std::array<uint8_t, 32> h2{};
+    for (size_t i = 0; i < h1.size(); ++i)
+    {
+        h1[i] = static_cast<uint8_t>(i);
+        h2[i] = static_cast<uint8_t>(255 - i);
+    }
+    std::vector<MmKey> extraKeys{{h1, SizeType32{0}}, {h2, SizeType32{5}}};
+
+    VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
+    std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
+
+    // Note: cacheSaltID is intentionally not set since it is not serialized
+    BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
+
+    testSerializeDeserialize(key);
+}
+
+// Connection notification tests
+namespace kv_cache = tensorrt_llm::executor::kv_cache;
+
+template <typename T>
+T serializeDeserializeNotification(T const& val)
+{
+    auto size = T::serializedSize(val);
+    std::ostringstream oss;
+    T::serialize(val, oss);
+    EXPECT_EQ(oss.str().size(), size);
+
+    std::istringstream iss(oss.str());
+    return T::deserialize(iss);
+}
+
+TEST(SerializeUtilsTest, RequestAndBufferInfo)
+{
+    // Test with all fields populated
+    {
+        kv_cache::RequestAndBufferInfo original{"testAgent", "127.0.0.1:8080",
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}},
+            std::make_optional<std::string>("metadata"), 1};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mAddress, deserialized.mAddress);
+        EXPECT_EQ(original.mRequestInfo.getRequestId(), deserialized.mRequestInfo.getRequestId());
+        ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
+        EXPECT_EQ(original.mBufferDescs[0].getAddr(), deserialized.mBufferDescs[0].getAddr());
+        EXPECT_EQ(original.mBufferDescs[0].getLen(), deserialized.mBufferDescs[0].getLen());
+        EXPECT_EQ(original.mBufferDescs[0].getDeviceId(), deserialized.mBufferDescs[0].getDeviceId());
+        EXPECT_EQ(original.mMetadata, deserialized.mMetadata);
+        EXPECT_EQ(original.mValidConnectionIdx, deserialized.mValidConnectionIdx);
+    }
+
+    // Test with nullopt metadata
+    {
+        kv_cache::RequestAndBufferInfo original{"testAgent2", "192.168.1.1:9090",
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 512, 0}}, std::nullopt, 2};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mAddress, deserialized.mAddress);
+        EXPECT_EQ(original.mRequestInfo.getRequestId(), deserialized.mRequestInfo.getRequestId());
+        ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
+        EXPECT_EQ(original.mBufferDescs[0].getAddr(), deserialized.mBufferDescs[0].getAddr());
+        EXPECT_EQ(original.mBufferDescs[0].getLen(), deserialized.mBufferDescs[0].getLen());
+        EXPECT_EQ(original.mBufferDescs[0].getDeviceId(), deserialized.mBufferDescs[0].getDeviceId());
+        EXPECT_EQ(original.mMetadata, deserialized.mMetadata);
+        EXPECT_EQ(original.mValidConnectionIdx, deserialized.mValidConnectionIdx);
+    }
+}
+
+TEST(SerializeUtilsTest, ReadySignalInfo)
+{
+    // Test with isReady = true
+    {
+        kv_cache::ReadySignalInfo original{"agent1", kv_cache::DataContext{12345}, true};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mContext.getTag(), deserialized.mContext.getTag());
+        EXPECT_EQ(original.mIsReady, deserialized.mIsReady);
+    }
+
+    // Test with isReady = false
+    {
+        kv_cache::ReadySignalInfo original{"agent2", kv_cache::DataContext{67890}, false};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mContext.getTag(), deserialized.mContext.getTag());
+        EXPECT_EQ(original.mIsReady, deserialized.mIsReady);
+    }
+
+    // Test with different context tags
+    {
+        kv_cache::ReadySignalInfo original{"agent3", kv_cache::DataContext{0}, true};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mContext.getTag(), deserialized.mContext.getTag());
+        EXPECT_EQ(original.mIsReady, deserialized.mIsReady);
+    }
+}
+
+TEST(SerializeUtilsTest, NotificationSyncInfo)
+{
+    // Test basic functionality
+    {
+        kv_cache::NotificationSyncInfo original{"syncAgent", kv_cache::DataContext{54321}};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mContext.getTag(), deserialized.mContext.getTag());
+    }
+
+    // Test with different agent names and context tags
+    {
+        kv_cache::NotificationSyncInfo original{"anotherAgent", kv_cache::DataContext{98765}};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mContext.getTag(), deserialized.mContext.getTag());
+    }
+
+    // Test with empty agent name
+    {
+        kv_cache::NotificationSyncInfo original{"", kv_cache::DataContext{11111}};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_EQ(original.mAgentName, deserialized.mAgentName);
+        EXPECT_EQ(original.mContext.getTag(), deserialized.mContext.getTag());
+    }
+}
+
+TEST(SerializeUtilsTest, NotificationInfo)
+{
+    // Test with RequestAndBufferInfo variant
+    {
+        kv_cache::RequestAndBufferInfo requestInfo{"testAgent", "127.0.0.1:8080",
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}},
+            std::make_optional<std::string>("test_metadata"), 1};
+
+        kv_cache::NotificationInfo original{requestInfo};
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_TRUE(std::holds_alternative<kv_cache::RequestAndBufferInfo>(deserialized.mInfo));
+        auto deserializedRequestInfo = std::get<kv_cache::RequestAndBufferInfo>(deserialized.mInfo);
+        EXPECT_EQ(requestInfo.mAgentName, deserializedRequestInfo.mAgentName);
+        EXPECT_EQ(requestInfo.mAddress, deserializedRequestInfo.mAddress);
+        EXPECT_EQ(requestInfo.mRequestInfo.getRequestId(), deserializedRequestInfo.mRequestInfo.getRequestId());
+        EXPECT_EQ(requestInfo.mMetadata, deserializedRequestInfo.mMetadata);
+        EXPECT_EQ(requestInfo.mValidConnectionIdx, deserializedRequestInfo.mValidConnectionIdx);
+    }
+
+    // Test with NotificationSyncInfo variant
+    {
+        kv_cache::NotificationSyncInfo syncInfo{"syncAgent", kv_cache::DataContext{12345}};
+
+        kv_cache::NotificationInfo original{syncInfo};
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_TRUE(std::holds_alternative<kv_cache::NotificationSyncInfo>(deserialized.mInfo));
+        auto deserializedSyncInfo = std::get<kv_cache::NotificationSyncInfo>(deserialized.mInfo);
+        EXPECT_EQ(syncInfo.mAgentName, deserializedSyncInfo.mAgentName);
+        EXPECT_EQ(syncInfo.mContext.getTag(), deserializedSyncInfo.mContext.getTag());
+    }
+
+    // Test with ReadySignalInfo variant
+    {
+        kv_cache::ReadySignalInfo readyInfo{"readyAgent", kv_cache::DataContext{67890}, true};
+
+        kv_cache::NotificationInfo original{readyInfo};
+        auto deserialized = serializeDeserializeNotification(original);
+
+        EXPECT_TRUE(std::holds_alternative<kv_cache::ReadySignalInfo>(deserialized.mInfo));
+        auto deserializedReadyInfo = std::get<kv_cache::ReadySignalInfo>(deserialized.mInfo);
+        EXPECT_EQ(readyInfo.mAgentName, deserializedReadyInfo.mAgentName);
+        EXPECT_EQ(readyInfo.mContext.getTag(), deserializedReadyInfo.mContext.getTag());
+        EXPECT_EQ(readyInfo.mIsReady, deserializedReadyInfo.mIsReady);
+    }
+}
+
+TEST(SerializeUtilsTest, CacheStateIndexerKCache)
+{
+    using texec::kv_cache::CacheState;
+    // Minimal realistic model/parallel config
+    std::vector<texec::SizeType32> nbKvHeadsPerLayer{8, 8};
+    texec::SizeType32 sizePerHead = 128;
+    texec::SizeType32 tokensPerBlock = 16;
+    texec::SizeType32 tp = 1;
+    texec::SizeType32 pp = 1;
+    texec::SizeType32 cp = 1;
+    std::vector<texec::SizeType32> attentionLayerNumPerPP{static_cast<texec::SizeType32>(nbKvHeadsPerLayer.size())};
+    auto dataType = nvinfer1::DataType::kFLOAT;
+    auto attentionType = CacheState::AttentionType::kDEFAULT;
+    int kvFactor = 2;
+    bool enableAttentionDP = false;
+    int dpRank = 0;
+    int dpSize = 1;
+    bool enableBlockReuse = true;
+    bool hasIndexerKCache = true;
+    texec::SizeType32 indexerDimPerHead = 96;
+    texec::SizeType32 indexerKCacheQuantBlockSize = 128;
+
+    CacheState state{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tp, pp, cp, attentionLayerNumPerPP, dataType,
+        attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, hasIndexerKCache,
+        indexerDimPerHead, indexerKCacheQuantBlockSize};
+
+    std::ostringstream oss;
+    texec::Serialization::serialize(state, oss);
+    std::istringstream iss(oss.str());
+    auto state2 = texec::Serialization::deserializeCacheState(iss);
+
+    EXPECT_EQ(state.getModelConfig().mNbKvHeadsPerLayer, state2.getModelConfig().mNbKvHeadsPerLayer);
+    EXPECT_EQ(state.getModelConfig().mSizePerHead, state2.getModelConfig().mSizePerHead);
+    EXPECT_EQ(state.getModelConfig().mTokensPerBlock, state2.getModelConfig().mTokensPerBlock);
+    EXPECT_EQ(state.getParallelConfig().mTensorParallelism, state2.getParallelConfig().mTensorParallelism);
+    EXPECT_EQ(state.getParallelConfig().mPipelineParallelism, state2.getParallelConfig().mPipelineParallelism);
+    EXPECT_EQ(state.getParallelConfig().mContextParallelism, state2.getParallelConfig().mContextParallelism);
+    EXPECT_EQ(state.getParallelConfig().mAttentionLayerNumPerPP, state2.getParallelConfig().mAttentionLayerNumPerPP);
+    EXPECT_EQ(state.getDataType(), state2.getDataType());
+    EXPECT_EQ(state.getAttentionConfig().mAttentionType, state2.getAttentionConfig().mAttentionType);
+    EXPECT_EQ(state.getAttentionConfig().mKvFactor, state2.getAttentionConfig().mKvFactor);
+    EXPECT_EQ(state.getEnableBlockReuse(), state2.getEnableBlockReuse());
+    EXPECT_EQ(state.getHasIndexerKCache(), state2.getHasIndexerKCache());
+    EXPECT_EQ(state.getIndexerDimPerHead(), state2.getIndexerDimPerHead());
+    EXPECT_EQ(state.getIndexerKCacheQuantBlockSize(), state2.getIndexerKCacheQuantBlockSize());
 }

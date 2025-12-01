@@ -27,16 +27,17 @@ if(NOT Python3_EXECUTABLE)
     REQUIRED)
 endif()
 
+set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 execute_process(
-  WORKING_DIRECTORY ${3RDPARTY_DIR}/cutlass/python/
+  WORKING_DIRECTORY ${cutlass_source_dir}/python/
   COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
 if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
   message(
     FATAL_ERROR
-      "Failed to set up the CUTLASS library due to ${_CUTLASS_LIBRARY_SUCCESS}."
-  )
+      "Failed to set up the CUTLASS library in ${cutlass_source_dir} due to"
+      " ${_CUTLASS_LIBRARY_SUCCESS}.")
 endif()
 
 set(GENERATE_KERNELS_SCRIPT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/python)
@@ -65,6 +66,8 @@ function(process_target target_name enable_hopper enable_blackwell)
   if(${enable_hopper} AND "90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
     # No kernels should be parsed, unless hopper is specified. This is a build
     # time improvement
+    target_compile_options(${target_name}
+                           PRIVATE "-DCUTLASS_ENABLE_GDC_FOR_SM90=1")
     target_compile_definitions(${target_name} PUBLIC COMPILE_HOPPER_TMA_GEMMS)
     target_compile_definitions(${target_name}
                                PUBLIC COMPILE_HOPPER_TMA_GROUPED_GEMMS)
@@ -72,16 +75,29 @@ function(process_target target_name enable_hopper enable_blackwell)
 
   if(${enable_blackwell}
      AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+         ))
 
-    if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    target_compile_options(${target_name}
+                           PRIVATE "-DCUTLASS_ENABLE_GDC_FOR_SM100=1")
+    # Both 100 and 103 support these kernels
+    if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
       # build time improvement
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_TMA_GEMMS)
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+    endif()
+    # SM103 only kernels
+    if("103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      target_compile_definitions(${target_name}
+                                 PUBLIC COMPILE_BLACKWELL_SM103_TMA_GEMMS)
+      target_compile_definitions(
+        ${target_name} PUBLIC COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS)
     endif()
     if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
        OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
@@ -113,6 +129,8 @@ function(add_instantiations library base_dir)
     list(LENGTH INSTANTIATIONS_GENERATED_${ARCH} n)
     if(${n} GREATER 0)
       set(TARGET_NAME "_${library}_instantiations_${ARCH}")
+      message(
+        STATUS "Adding target ${TARGET_NAME} with instantiations for ${ARCH}")
       add_library(${TARGET_NAME} OBJECT ${INSTANTIATIONS_GENERATED_${ARCH}})
       target_link_libraries(${library} PRIVATE ${TARGET_NAME})
       set_cuda_architectures(${TARGET_NAME} ${BUILD_ARCHS})
@@ -125,9 +143,11 @@ function(add_instantiations library base_dir)
     endif()
   endmacro()
 
-  glob_src_create_target(80 "80;86")
+  glob_src_create_target(80 "80;86;90;100f;120f") # we use sm80 kernels to
+                                                  # support fp16 of all archs
   glob_src_create_target(90 90)
   glob_src_create_target(100 100f)
+  glob_src_create_target(103 103)
   glob_src_create_target(120 120f)
 endfunction()
 
@@ -185,12 +205,12 @@ add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
-set_cuda_architectures(fb_gemm_src 89 90 120f)
+set_cuda_architectures(fb_gemm_src 89 90 100f 120f)
 # add_instantiations(fb_gemm_src
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f)
+set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f 120f)
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
@@ -203,7 +223,7 @@ if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
   set_cuda_architectures(low_latency_gemm_src 90)
   target_include_directories(low_latency_gemm_src
-                             PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
+                             PRIVATE ${cutlass_source_dir}/examples)
 endif()
 
 if(USING_OSS_CUTLASS_FP4_GEMM)
@@ -240,7 +260,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   process_target(_moe_gemm_hopper_fp4 true false)
 
   add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
-  set_cuda_architectures(_moe_gemm_fp4 100f 120f)
+  set_cuda_architectures(_moe_gemm_fp4 100f 103 120f)
   process_target(_moe_gemm_fp4 false true)
 
   add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})

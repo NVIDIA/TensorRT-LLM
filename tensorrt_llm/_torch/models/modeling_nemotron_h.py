@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Optional
 
 import torch
@@ -160,7 +161,7 @@ class NemotronHLayer(DecoderLayer):
         elif layer_type == "*":
             self.mixer = TransformerLayer(model_config, layer_idx)
         else:
-            ValueError(f"{layer_type} is not supported")
+            raise ValueError(f"{layer_type} is not supported")
 
     def forward(
         self,
@@ -255,7 +256,7 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
 
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                k.replace('model.layers.backbone', 'model')
+                re.sub(r'(model\.layers\.)?backbone', 'model', k)
                 for k in model_config.quant_config.exclude_modules
             ]
 

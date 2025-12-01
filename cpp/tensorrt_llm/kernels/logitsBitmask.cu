@@ -60,6 +60,7 @@ __device__ PackedT packedNegativeInfinity()
     }
     return *reinterpret_cast<PackedT*>(packed);
 }
+} // namespace
 
 template <typename T, typename PackedT, int32_t kBitsPerThread>
 __global__ void __launch_bounds__(kThreadsPerBlock) logitsBitmaskKernel(
@@ -118,7 +119,8 @@ void logitsBitmaskDispatchToBitsPerThread(
     T** logits, uint32_t const** bitmask, int32_t batchSize, int32_t vocabSizePadded, cudaStream_t stream)
 {
     int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
-    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * 128, batchSize);
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * smCount, batchSize);
     int32_t const numBitsPerThread = ceilDiv(vocabSizePadded, kThreadsPerBlock * numBlocksPerRow);
     int32_t bitmaskSize = ceilDiv(vocabSizePadded, kBitsPerMaskElement);
 
@@ -145,7 +147,6 @@ void logitsBitmaskDispatchToBitsPerThread(
         logitsBitmaskKernel<T, PackedT, 32><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
     }
 }
-} // namespace
 
 template <typename T>
 void invokeLogitsBitmask(
@@ -179,5 +180,154 @@ template void invokeLogitsBitmask<half>(
 template void invokeLogitsBitmask<__nv_bfloat16>(
     __nv_bfloat16** logits, uint32_t const** bitmask, int32_t batchSize, int32_t vocabSizePadded, cudaStream_t stream);
 #endif
+
+template <typename T, typename PackedT, int32_t kBitsPerThread>
+__global__ void __launch_bounds__(kThreadsPerBlock) contiguousLogitsBitmaskKernel(T* __restrict__ logits,
+    uint32_t const* __restrict__ bitmask, int32_t const* __restrict__ tokenMask, int32_t const* __restrict__ d2t,
+    int32_t vocabSizePadded, int32_t bitmaskSize)
+{
+    int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
+    uint32_t constexpr kPackedMask = (1 << kAlignment) - 1;
+
+    int const batchIdx = blockIdx.y;
+    if (tokenMask != nullptr && !tokenMask[batchIdx])
+    {
+        return;
+    }
+
+    int const blockOffset = blockIdx.x * kThreadsPerBlock * kBitsPerThread;
+    T* logitsGmemPtr = logits + batchIdx * vocabSizePadded + blockOffset;
+
+    uint32_t const* bitmaskGmemPtr = bitmask + batchIdx * bitmaskSize + blockOffset / kBitsPerMaskElement;
+    int const bitmaskInnerIdx = threadIdx.x % (kBitsPerMaskElement / kAlignment);
+    T logitsReg[kAlignment];
+
+#pragma unroll
+    for (int offset = threadIdx.x * kAlignment; offset < kThreadsPerBlock * kBitsPerThread;
+         offset += kThreadsPerBlock * kAlignment)
+    {
+        if (blockOffset + offset >= vocabSizePadded)
+        {
+            break;
+        }
+
+        uint32_t bitmaskVal = 0;
+        if (d2t == nullptr)
+        {
+            bitmaskVal
+                = (~bitmaskGmemPtr[offset / kBitsPerMaskElement] >> (bitmaskInnerIdx * kAlignment)) & kPackedMask;
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < kAlignment; i++)
+            {
+                int const d2tOffset = blockOffset + offset + i + d2t[blockOffset + offset + i];
+                bitmaskVal |= ((~bitmask[batchIdx * bitmaskSize + d2tOffset / kBitsPerMaskElement]
+                                   >> (d2tOffset % kBitsPerMaskElement))
+                                  & 1)
+                    << i;
+            }
+        }
+
+        if (bitmaskVal == 0)
+        {
+            continue;
+        }
+
+        if (bitmaskVal == kPackedMask)
+        {
+            *reinterpret_cast<PackedT*>(logitsGmemPtr + offset) = packedNegativeInfinity<T, PackedT>();
+            continue;
+        }
+
+        *reinterpret_cast<PackedT*>(logitsReg) = *reinterpret_cast<PackedT*>(logitsGmemPtr + offset);
+#pragma unroll
+        for (int i = 0; i < kAlignment; i++)
+        {
+            if (((bitmaskVal >> i) & 1))
+            {
+                logitsReg[i] = negativeInfinity<T>();
+            }
+        }
+        *reinterpret_cast<PackedT*>(logitsGmemPtr + offset) = *reinterpret_cast<PackedT*>(logitsReg);
+    }
+}
+
+template <typename T, typename PackedT>
+void contiguousLogitsBitmaskDispatchToBitsPerThread(T* logits, uint32_t const* bitmask, int32_t const* tokenMask,
+    int32_t const* d2t, int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream)
+{
+    int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * smCount, batchSize);
+    int32_t const numBitsPerThread = ceilDiv(vocabSizePadded, kThreadsPerBlock * numBlocksPerRow);
+
+    dim3 const block(kThreadsPerBlock);
+
+    if (numBitsPerThread <= 4 && kAlignment <= 4)
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 4), batchSize);
+        contiguousLogitsBitmaskKernel<T, PackedT, 4>
+            <<<grid, block, 0, stream>>>(logits, bitmask, tokenMask, d2t, vocabSizePadded, bitmaskSize);
+    }
+    else if (numBitsPerThread <= 8 && kAlignment <= 8)
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 8), batchSize);
+        contiguousLogitsBitmaskKernel<T, PackedT, 8>
+            <<<grid, block, 0, stream>>>(logits, bitmask, tokenMask, d2t, vocabSizePadded, bitmaskSize);
+    }
+    else if (numBitsPerThread <= 16 && kAlignment <= 16)
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 16), batchSize);
+        contiguousLogitsBitmaskKernel<T, PackedT, 16>
+            <<<grid, block, 0, stream>>>(logits, bitmask, tokenMask, d2t, vocabSizePadded, bitmaskSize);
+    }
+    else
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 32), batchSize);
+        contiguousLogitsBitmaskKernel<T, PackedT, 32>
+            <<<grid, block, 0, stream>>>(logits, bitmask, tokenMask, d2t, vocabSizePadded, bitmaskSize);
+    }
+}
+
+template <typename T>
+void invokeContiguousLogitsBitmask(T* logits, uint32_t const* bitmask, int32_t const* tokenMask, int32_t const* d2t,
+    int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream)
+{
+    // Dispatch to PackedT
+    if (vocabSizePadded % (sizeof(float4) / sizeof(T)) == 0)
+    {
+        contiguousLogitsBitmaskDispatchToBitsPerThread<T, float4>(
+            logits, bitmask, tokenMask, d2t, batchSize, vocabSizePadded, bitmaskSize, stream);
+    }
+    else if (vocabSizePadded % (sizeof(float2) / sizeof(T)) == 0)
+    {
+        contiguousLogitsBitmaskDispatchToBitsPerThread<T, float2>(
+            logits, bitmask, tokenMask, d2t, batchSize, vocabSizePadded, bitmaskSize, stream);
+    }
+    else if (vocabSizePadded % (sizeof(float) / sizeof(T)) == 0)
+    {
+        contiguousLogitsBitmaskDispatchToBitsPerThread<T, float>(
+            logits, bitmask, tokenMask, d2t, batchSize, vocabSizePadded, bitmaskSize, stream);
+    }
+    else
+    {
+        contiguousLogitsBitmaskDispatchToBitsPerThread<T, T>(
+            logits, bitmask, tokenMask, d2t, batchSize, vocabSizePadded, bitmaskSize, stream);
+    }
+}
+
+template void invokeContiguousLogitsBitmask<float>(float* logits, uint32_t const* bitmask, int32_t const* tokenMask,
+    int32_t const* d2t, int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream);
+template void invokeContiguousLogitsBitmask<half>(half* logits, uint32_t const* bitmask, int32_t const* tokenMask,
+    int32_t const* d2t, int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream);
+
+#ifdef ENABLE_BF16
+template void invokeContiguousLogitsBitmask<__nv_bfloat16>(__nv_bfloat16* logits, uint32_t const* bitmask,
+    int32_t const* tokenMask, int32_t const* d2t, int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize,
+    cudaStream_t stream);
+#endif
+
 } // namespace kernels
 } // namespace tensorrt_llm

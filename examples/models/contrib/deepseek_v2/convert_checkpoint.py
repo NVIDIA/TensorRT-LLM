@@ -79,7 +79,7 @@ def parse_arguments():
                         type=str,
                         default='trtllm_checkpoint',
                         required=True,
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
