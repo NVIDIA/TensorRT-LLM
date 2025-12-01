@@ -688,13 +688,13 @@ class AsyncWorkerMixin:
     """
     Mixin that adds the ability to fork off operations to run on a worker
     thread (particularly D2H copies). If the async worker isn't active,
-    operations will seamlessly run on the main thread
+    operations will seamlessly run on the main thread.
     """
 
     MAX_WORKERS = 1
 
     def _async_worker_active(self) -> bool:
-        return hasattr(self, "_async_worker") and self._async_worker is not None
+        return getattr(self, "_async_worker", None) is not None
 
     def _async_worker_init(self, enable_async_worker: bool):
         self._enable_async_worker = enable_async_worker
@@ -702,7 +702,7 @@ class AsyncWorkerMixin:
         self._async_worker_futures: list[futures.Future[any]] = []
 
     def async_worker_enabled(self):
-        return hasattr(self, "_enable_async_worker") and self._enable_async_worker
+        return getattr(self, "_enable_async_worker", False)
 
     def async_worker_start(self):
         assert self.async_worker_enabled()
@@ -769,7 +769,7 @@ class AsyncWorkerMixin:
         self._async_worker_submit(dest.copy_, src, non_blocking=True)
         return dest
 
-    def _sampler_event_get(self) -> SamplerEvent:
+    def _record_sampler_event(self) -> SamplerEvent:
         cuda_event = torch.cuda.Event()
         cuda_event.record()
 
@@ -1861,7 +1861,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 requests, finish_reasons=first_finish_reasons, beam_histories=beam_histories
             )
 
-        sampler_event = self._sampler_event_get()
+        sampler_event = self._record_sampler_event()
         return SampleStateTorch(
             scheduled_requests=scheduled_requests,
             device=SampleStateTensors(new_tokens=new_tokens),
@@ -2968,7 +2968,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
             gathered_ids=gathered_ids,
         )
 
-        sampler_event = self._sampler_event_get()
+        sampler_event = self._record_sampler_event()
 
         self.micro_batch_idx = (self.micro_batch_idx + 1) % self.num_micro_batches
 

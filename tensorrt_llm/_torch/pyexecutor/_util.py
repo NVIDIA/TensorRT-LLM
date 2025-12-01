@@ -890,7 +890,7 @@ def instantiate_sampler(
     disable_flashinfer_sampling: bool,
 ):
     enable_async_worker = (confidential_compute_enabled()
-                           or llm_args.enable_sampler_async_worker)
+                           or llm_args.sampler_force_async_worker)
 
     sampler_args = create_torch_sampler_args(
         mapping,

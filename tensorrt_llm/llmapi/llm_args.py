@@ -2576,9 +2576,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
         status="beta")
 
-    enable_sampler_async_worker: bool = Field(
+    sampler_force_async_worker: bool = Field(
         default=False,
-        description="Enable the async worker in the sampler for D2H copies.",
+        description="Force usage of the async worker in the sampler for D2H "
+        "copies, even if confidential compute is not active\n"
+        "Normally, the async worker should only be used when confidential "
+        "compute is active. This argument is provided to enable it for testing "
+        "purposes, irrespective of confidential compute state.",
         status="prototype")
 
     enable_iter_perf_stats: bool = Field(

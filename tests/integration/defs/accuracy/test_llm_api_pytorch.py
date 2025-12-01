@@ -242,7 +242,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             max_batch_size=
             1,  # add max_batch_size to avoid error in overlap scheduler
-            enable_sampler_async_worker=sampler_async_worker,
+            sampler_force_async_worker=sampler_async_worker,
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=1,
                                               enable_padding=True),
@@ -442,7 +442,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 max_batch_size=max_beam_width,
                 max_seq_len=2048,
                 max_beam_width=max_beam_width,
-                enable_sampler_async_worker=sampler_async_worker,
+                sampler_force_async_worker=sampler_async_worker,
                 disable_overlap_scheduler=disable_overlap_scheduler,
                 cuda_graph_config=cuda_graph_config,
         ) as llm:
@@ -488,7 +488,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_seq_len=2048,
             max_beam_width=max_beam_width,
             disable_overlap_scheduler=disable_overlap_scheduler,
-            enable_sampler_async_worker=sampler_async_worker,
+            sampler_force_async_worker=sampler_async_worker,
             cuda_graph_config=cuda_graph_config,
         )
 
@@ -529,7 +529,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
         llm = LLM(model=self.MODEL_PATH,
                   pipeline_parallel_size=pp_size,
                   disable_overlap_scheduler=disable_overlap_scheduler,
-                  enable_sampler_async_worker=sampler_async_worker)
+                  sampler_force_async_worker=sampler_async_worker)
 
         sampling_params = SamplingParams(max_tokens=8,
                                          return_context_logits=True,
@@ -1573,7 +1573,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(
                 backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
-            enable_sampler_async_worker=sampler_async_worker,
+            sampler_force_async_worker=sampler_async_worker,
         )
 
         if fp8kv:
