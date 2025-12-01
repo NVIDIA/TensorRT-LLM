@@ -19,7 +19,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
 import operator
 import re
 from collections import defaultdict
-from typing import DefaultDict, Dict, List, Set, Tuple, Type
+from typing import Any, DefaultDict, Dict, List, Set, Tuple, Type
 
 import torch
 from pydantic import Field, field_validator
@@ -40,12 +40,13 @@ from ...utils.node_utils import (
 )
 from ...utils.sharding_utils import (
     BMMShardingInfo,
+    DistBackend,
     EPShardingInfo,
     LayerType,
     ParameterUpdateInfo,
-    ShardingConfig,
     ShardingDim,
     ShardingSource,
+    ShardingTransformContainer,
     ShardingTransformInfo,
     SplitDimension,
     WeightShardingInfo,
@@ -61,6 +62,40 @@ from ..interface import (
 )
 
 
+class ShardingTransformConfig(TransformConfig):
+    """Configuration for sharding the model."""
+
+    factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
+    factory_config: Dict[str, Any] = Field(default_factory=dict)
+    manual_config: Dict[str, Any] = Field(default_factory=dict)
+    simple_shard_only: bool = Field(default=False)
+    support_partial_config: bool = Field(default=True)
+    sharding_source: List[ShardingSource] = Field(
+        default_factory=lambda: [
+            ShardingSource.MANUAL,
+            ShardingSource.FACTORY,
+            ShardingSource.HEURISTIC,
+        ]
+    )
+    sharding_dims: List[ShardingDim] = Field(
+        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+    )
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.AUTO,
+        description="AllReduce strategy for distributed operations. "
+        "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
+        "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
+    )
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        return validate_allreduce_strategy(v)
+
+    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
+
+
 @TransformRegistry.register("sharding_transform_executor")
 class ShardingTransformExecutor(BaseTransform):
     """Apply transformations to the graph module.
@@ -69,6 +104,10 @@ class ShardingTransformExecutor(BaseTransform):
         gm: Graph module to apply transformations to
         sharding_config: Transformation configuration containing list of transformations to apply
     """
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return ShardingTransformConfig
 
     def _apply(
         self,
@@ -91,18 +130,19 @@ class ShardingTransformExecutor(BaseTransform):
             return transform.check_and_apply(gm, node_dict[transform.target_node])
 
         num_matches = 0
-        for tp_transform in shared_config.sharding_config.weight_sharding_transforms:
+        transforms = shared_config.sharding_transform_container
+        for tp_transform in transforms.weight_sharding_transforms:
             if check_and_apply(tp_transform):
                 num_matches += 1
-        for bmm_transform in shared_config.sharding_config.bmm_transforms:
+        for bmm_transform in transforms.bmm_transforms:
             if check_and_apply(bmm_transform):
                 num_matches += 1
-        for ep_transform in shared_config.sharding_config.ep_transforms:
+        for ep_transform in transforms.ep_transforms:
             if check_and_apply(ep_transform):
                 num_matches += 1
 
         # post-sharding cleanup transformations
-        for update_transform in shared_config.sharding_config.parameter_update_transforms:
+        for update_transform in transforms.parameter_update_transforms:
             if not check_and_apply(update_transform):
                 ad_logger.warning(f"Invalid parameter update transformation {update_transform}.")
 
@@ -120,7 +160,7 @@ def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     rank: int,
     world_size: int,
-    sharding_config: ShardingConfig,
+    sharding_config: ShardingTransformContainer,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
@@ -140,32 +180,6 @@ def _process_simple_shard(
                 )
             )
     return num_simple_shards
-
-
-class ShardingTransformConfig(TransformConfig):
-    """Configuration for sharding transformations."""
-
-    simple_shard_only: bool = Field(default=False)
-    sharding_source: List[ShardingSource] = Field(
-        default_factory=lambda: [ShardingSource.HEURISTIC]
-    )
-    support_partial_config: bool = Field(default=False)
-    # Which sharding dimensions to run: any subset of {"tp", "ep", "bmm"}
-    sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
-    )
-    allreduce_strategy: AllReduceStrategy = Field(
-        default=AllReduceStrategy.AUTO,
-        description="AllReduce strategy for distributed operations. "
-        "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
-        "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
-    )
-
-    @field_validator("allreduce_strategy", mode="before")
-    @classmethod
-    def _validate_allreduce_strategy(cls, v):
-        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
-        return validate_allreduce_strategy(v)
 
 
 @TransformRegistry.register("detect_sharding")
@@ -201,62 +215,51 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        # world_size = 2
-
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
-        sharding_config = shared_config.sharding_config
-        sharding_config.rank = local_rank
-        sharding_config.world_size = world_size
-        sharding_config.allreduce_strategy = self.config.allreduce_strategy
-        ad_logger.info(f"Using allreduce strategy: {sharding_config.allreduce_strategy.name}")
-        sharding_config.predefined_config = factory.get_sharding_config() if factory else {}
-        sharding_config.factory_source = (
-            sharding_config.predefined_config.get("source", ShardingConfigSource.UNKNOWN)
-            if factory
-            else ShardingConfigSource.UNKNOWN
-        )
-        sharding_config.simple_shard_only = self.config.simple_shard_only
-        sharding_config.support_partial_config = self.config.support_partial_config
-        sharding_config.sharding_dims = self.config.sharding_dims
-        sharding_config.sharding_source = self.config.sharding_source
-
-        sharding_config.validate_config()
+        self.config.factory_config = factory.get_sharding_config() if factory else {}
+        transform_container = shared_config.sharding_transform_container
+        transform_container.init_params(self.config, local_rank, world_size)
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        for source in sharding_config.sharding_source:
+        for source in transform_container.sharding_source:
             if source == ShardingSource.FACTORY:
-                if len(sharding_config.get_predefined_config()) == 0:
-                    ad_logger.warning(
+                if len(transform_container.get_factory_config()) == 0:
+                    ad_logger.debug(
                         "No factory config found. Skipping sharding from factory config"
                     )
                     continue
                 ad_logger.info("Applying sharding from factory config")
-                info += detect_sharding_from_factory_config(gm, sharding_config)
+                info += detect_sharding_from_config(gm, transform_container, ShardingSource.FACTORY)
+            elif source == ShardingSource.MANUAL:
+                if len(transform_container.get_manual_config()) == 0:
+                    ad_logger.debug("No manual config found. Skipping sharding from manual config")
+                    continue
+                ad_logger.info("Applying sharding from manual config")
+                info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
 
             elif source == ShardingSource.HEURISTIC:
                 ad_logger.info(
-                    f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}"
+                    f"Running autodeploy sharding heuristics: {transform_container.sharding_dims}"
                 )
-                if ShardingDim.SSM in sharding_config.sharding_dims:
-                    info += detect_ssm_shard(gm, sharding_config)
+                if ShardingDim.SSM in transform_container.sharding_dims:
+                    info += detect_ssm_shard(gm, transform_container)
 
                 # run TP sharding across ranks
-                if ShardingDim.TP in sharding_config.sharding_dims:
-                    info += detect_column_row_shard(gm, sharding_config)
+                if ShardingDim.TP in transform_container.sharding_dims:
+                    info += detect_column_row_shard(gm, transform_container)
 
                 # run EP sharding across ranks
-                if ShardingDim.EP in sharding_config.sharding_dims:
-                    info += detect_ep_shard(gm, sharding_config)
+                if ShardingDim.EP in transform_container.sharding_dims:
+                    info += detect_ep_shard(gm, transform_container)
 
                 # run BMM sharding across ranks
-                if ShardingDim.BMM in sharding_config.sharding_dims:
-                    info += detect_dp_bmm_shard(gm, sharding_config)
+                if ShardingDim.BMM in transform_container.sharding_dims:
+                    info += detect_dp_bmm_shard(gm, transform_container)
 
         return gm, info
 
@@ -264,7 +267,7 @@ class Sharding(BaseTransform):
 def _process_ssm_sharding(
     gm: GraphModule,
     entry_node: Node,
-    sharding_config: ShardingConfig,
+    sharding_config: ShardingTransformContainer,
     rank: int,
     world_size: int,
     min_local_shape: int = 1,
@@ -446,7 +449,7 @@ def _process_ssm_sharding(
 def _process_column_sharding(
     gm: GraphModule,
     linear_nodes: List[Node],
-    sharding_config: ShardingConfig,
+    sharding_config: ShardingTransformContainer,
     rank: int,
     world_size: int,
     min_local_shape: int = 1,
@@ -516,9 +519,10 @@ def _process_column_sharding(
             )
 
 
-def detect_sharding_from_factory_config(
+def detect_sharding_from_config(
     gm: GraphModule,
-    sharding_config: ShardingConfig,
+    transform_container: ShardingTransformContainer,
+    source: ShardingSource,
 ) -> TransformInfo:
     """
     Create sharding transformations from the predefined config.
@@ -542,12 +546,17 @@ def detect_sharding_from_factory_config(
     #   - "gather"
     # The following constraints are based on
     # https://github.com/huggingface/transformers/blob/d8e05951b8efd4880acca9a3f291e8b65841a86d/src/transformers/models/llama4/configuration_llama4.py#L249
+    if source == ShardingSource.FACTORY:
+        config = transform_container.get_factory_config()
+    elif source == ShardingSource.MANUAL:
+        config = transform_container.get_manual_config()
+    else:
+        raise ValueError(f"Unsupported sharding source: {source}")
 
-    factory_config = sharding_config.get_predefined_config()
-    head_dim = factory_config["head_dim"]
-    tp_plan = factory_config["tp_plan"]
+    head_dim = config["head_dim"]
+    tp_plan = config["tp_plan"]
 
-    rank, world_size = sharding_config.rank, sharding_config.world_size
+    rank, world_size = transform_container.rank, transform_container.world_size
 
     # If the node is inside the attention module, we need to set min_local_shape to the
     # head_dim - otherwise, we would risk splitting the heads into smaller shards.
@@ -589,7 +598,7 @@ def detect_sharding_from_factory_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
                 if config == "colwise":
-                    if sharding_config.add(
+                    if transform_container.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -601,7 +610,7 @@ def detect_sharding_from_factory_config(
                     ):
                         num_row_col_shards += 1
                 elif config == "rowwise":
-                    if sharding_config.add(
+                    if transform_container.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.ROW,
@@ -613,7 +622,7 @@ def detect_sharding_from_factory_config(
                     ):
                         num_row_col_shards += 1
                 elif config == "mamba":
-                    sharding_config.add(
+                    transform_container.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -634,9 +643,9 @@ def detect_sharding_from_factory_config(
                     if "shared" in module_name:
                         col_row_action = config.replace("local_", "")
                         if col_row_action == "colwise":
-                            sharding_config.add(
-                                WeightShardingInfo(
-                                    target_node=lin_node.name,
+                            transform_container.add(
+                                WeightShardingInfo.from_node(
+                                    lin_node,
                                     split_dim=SplitDimension.COLUMN,
                                     rank=rank,
                                     world_size=world_size,
@@ -645,9 +654,9 @@ def detect_sharding_from_factory_config(
                                 )
                             )
                         elif col_row_action == "rowwise":
-                            if sharding_config.add(
-                                WeightShardingInfo(
-                                    target_node=lin_node.name,
+                            if transform_container.add(
+                                WeightShardingInfo.from_node(
+                                    lin_node,
                                     split_dim=SplitDimension.ROW,
                                     rank=rank,
                                     world_size=world_size,
@@ -664,7 +673,7 @@ def detect_sharding_from_factory_config(
 
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
-                    if sharding_config.add(
+                    if transform_container.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -679,7 +688,7 @@ def detect_sharding_from_factory_config(
                     ad_logger.warning(
                         f"Unsupported sharding action {config}. Fallback to simple shard"
                     )
-                    sharding_config.add(
+                    transform_container.add(
                         WeightShardingInfo.from_node(
                             lin_node,
                             split_dim=SplitDimension.COLUMN,
@@ -697,30 +706,7 @@ def detect_sharding_from_factory_config(
         f"row-col pattern: {num_row_col_shards})"
     )
 
-    num_matches = len(sharding_config.weight_sharding_transforms)
-
-    if sharding_config.support_partial_config:
-        ad_logger.info(
-            f"Partial factory config applied only for TP. "
-            f"Applying heuristics for {sharding_config.sharding_dims}."
-        )
-
-        # run EP sharding across ranks
-        if "ep" in sharding_config.sharding_dims:
-            ep_info = detect_ep_shard(gm, sharding_config)
-        else:
-            ep_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
-        # run BMM sharding across ranks
-        if "bmm" in sharding_config.sharding_dims:
-            dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
-        else:
-            dp_bmm_info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-        num_matches += ep_info.num_matches + dp_bmm_info.num_matches
+    num_matches = len(transform_container.weight_sharding_transforms)
 
     return TransformInfo(
         skipped=False,
@@ -732,7 +718,7 @@ def detect_sharding_from_factory_config(
 
 def detect_ssm_shard(
     gm: GraphModule,
-    sharding_config: ShardingConfig,
+    sharding_config: ShardingTransformContainer,
 ) -> TransformInfo:
     """A transformation to apply sharding to the model following SSM parallelism.
     TODO: This is a TEMPORARY place for this logic due to the incompatibility between the
@@ -767,7 +753,7 @@ def detect_ssm_shard(
 
 def detect_column_row_shard(
     gm: GraphModule,
-    sharding_config: ShardingConfig,
+    sharding_config: ShardingTransformContainer,
 ) -> TransformInfo:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -979,7 +965,9 @@ def detect_column_row_shard(
     )
 
 
-def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> TransformInfo:
+def detect_dp_bmm_shard(
+    gm: GraphModule, sharding_config: ShardingTransformContainer
+) -> TransformInfo:
     """A transformation to apply sharding to batched matrix multiplications in the graph.
 
     We'll shard the BMM nodes by slicing the batch dimension of input tensors into world_size number of slices.
@@ -1019,7 +1007,8 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
         base_size = bmm_batch_size // world_size
         remainder = bmm_batch_size % world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather/trtllm_dist_all_gather
+        #  doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
@@ -1058,7 +1047,7 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
     )
 
 
-def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> TransformInfo:
+def detect_ep_shard(gm: GraphModule, sharding_config: ShardingTransformContainer) -> TransformInfo:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     rank, world_size = sharding_config.rank, sharding_config.world_size

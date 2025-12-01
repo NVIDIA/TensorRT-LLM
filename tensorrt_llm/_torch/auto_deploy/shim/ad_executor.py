@@ -702,6 +702,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=ad_config.max_beam_width,
+        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
     )
     sampler = TorchSampler(sampler_args)
 

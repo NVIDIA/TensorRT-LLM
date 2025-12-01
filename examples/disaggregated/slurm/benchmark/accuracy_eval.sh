@@ -7,6 +7,7 @@ accuracy_model=${2}
 accuracy_tasks=${3}
 model_path=${4}
 model_args_extra=${5}
+output_dir=${6}
 
 echo "Starting accuracy evaluation..."
 echo "Log directory: ${full_logdir}"
@@ -31,9 +32,12 @@ echo "Installing lm_eval[api] and running evaluation..."
 pip install lm_eval[api]==0.4.8
 
 echo "Running lm_eval with tasks: ${accuracy_tasks}..."
+
+mkdir -p ${output_dir}
 lm_eval --model ${accuracy_model} \
     --tasks ${accuracy_tasks} \
     --model_args model=${model_path},base_url=${base_url},${model_args_extra} \
+    --output_path ${output_dir} --log_samples \
     --trust_remote_code
 
 echo "Accuracy evaluation completed successfully"

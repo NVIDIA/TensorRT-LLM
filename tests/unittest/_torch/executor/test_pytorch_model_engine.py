@@ -1,6 +1,6 @@
 import unittest
 from dataclasses import dataclass
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import torch
 
@@ -393,19 +393,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                           rank=cp_rank)
         model_engine.mapping = mapping
 
-        # Mock model_engine's dist and its cp_allgather to return different values per CP rank.
-        mock_dist = MagicMock()
-
-        def mock_cp_allgather(obj):
-            # Simulate allgather across CP ranks: [past_seen_token_num_rank0, past_seen_token_num_rank1]
-            if cp_rank == 0:
-                return [obj, obj + 10]  # Rank 0 sees tokens [obj, obj+10]
-            else:
-                return [obj - 10, obj]  # Rank 1 sees tokens [obj-10, obj]
-
-        mock_dist.cp_allgather.side_effect = mock_cp_allgather
-        model_engine.dist = mock_dist
-
         # Create scheduled requests with two generation requests.
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests = []
@@ -419,6 +406,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             req.py_seq_slot = idx
             req.sampling_config.beam_width = 1
             req.py_multimodal_data = {}
+            req.total_input_len_cp = prompt_lens[idx] * 2
+            req.py_decoding_iter = 1
             gen_requests.append(req)
         scheduled_requests.generation_requests = gen_requests
 
@@ -464,15 +453,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertIn('position_ids', result)
         self.assertIn('attn_metadata', result)
 
-        # Check that cp_allgather was called for position calculation.
         # Also, verify that position_ids are properly calculated.
-        self.assertTrue(mock_dist.cp_allgather.called)
         position_ids = result['position_ids']
         self.assertIsInstance(position_ids, torch.Tensor)
-        # For cp_rank=0, the expected position_ids should be:
-        # req1: past_seen_token_num=19 (prompt_len0-1), allgather=[19, 29], sum=48.
-        # req2: past_seen_token_num=14 (prompt_len1-1), allgather=[14, 24], sum=38.
-        expected_positions = [48, 38]
+        expected_positions = [40, 30]
         actual_positions = position_ids.squeeze(0).cpu().tolist()[:2]
         self.assertEqual(
             actual_positions, expected_positions,

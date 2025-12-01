@@ -135,6 +135,9 @@ class BaseLLM:
         logger.set_level("info")  # force display the backend
 
         try:
+            env_overrides = kwargs.get("env_overrides", None)
+            self._process_env_overrides(env_overrides)
+
             backend = kwargs.get('backend', None)
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
@@ -586,6 +589,25 @@ class BaseLLM:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
         '''
         return self._executor.aget_kv_events(timeout=timeout)
+
+    def _process_env_overrides(self,
+                               env_overrides: Optional[dict[str, str]]) -> None:
+        if env_overrides is None:
+            return
+        logger.info("Processing LLM API environment variable overrides")
+        # TODO: If an env var is cached at import-time in code, overriding os.environ will
+        # unfortunately not update wherever the var is used.
+        # This is a known issue and only way to fix it is at every such usage to access it
+        # from os.environ on-demand.
+        for key, value in env_overrides.items():
+            str_value = str(value)
+            if key in os.environ:
+                old_value = os.environ[key]
+                os.environ[key] = str_value
+                logger.info(f"Overriding {key}: '{old_value}' -> '{str_value}'")
+            else:
+                os.environ[key] = str_value
+                logger.info(f"Setting {key}='{str_value}'")
 
     def _prepare_sampling_params(
             self,
