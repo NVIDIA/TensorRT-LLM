@@ -1,1 +1,1 @@
-aiperf
+aiperf==0.2.0
