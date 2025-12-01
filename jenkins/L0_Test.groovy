@@ -546,12 +546,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
-                // Specific for OCI machines
-                def mounts = [
-                    "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                    "/home/svc_tensorrt:/home/svc_tensorrt",
-                    "/home/svc_tensorrt/.cache:/root/.cache"
-                ].join(",")
+                def mounts = getMountListForSlurmTest(cluster).join(",")
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
@@ -797,6 +792,27 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
+def getMountListForSlurmTest(SlurmCluster cluster) 
+{
+    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+        return [
+            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
+            "/home/svc_tensorrt:/home/svc_tensorrt",
+        ]
+    }
+
+    if (!cluster.scratchPath) {
+        throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
+    }
+
+    return [
+        "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
+        "/home/svc_tensorrt:/home/svc_tensorrt",
+        "/home/svc_tensorrt/bloom/scripts",
+        "/home/svc_tensorrt/.cache:/root/.cache"
+    ]
+}
+
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
@@ -918,7 +934,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
-                def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
+                def mounts = getMountListForSlurmTest(cluster).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -930,13 +946,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
-                    mounts = [
-                        "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                        "/home/svc_tensorrt/bloom/scripts",
-                        "/home/svc_tensorrt/.cache:/root/.cache",
-                    ].join(",")
-
-                    def enrootImagePath = "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
+                    def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
                     containerImageArg = enrootImagePath
 
                     srunPrologue = """
@@ -2772,11 +2782,11 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
-        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
-        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
-        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
-        "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4-lbd", "l0_dgx_b200", 2, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8-lbd", "l0_dgx_b200", 1, 1, 8, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         // Perf sanity post merge test
         // Disable perf stages due to https://nvbugs/5643646
