@@ -89,12 +89,10 @@ def setup_bmm_moe_test(dtype, num_experts):
     ).cuda()
 
     for expert_id in range(NUM_EXPERTS):
-        w1 = torch.rand(INTERMEDIATE_SIZE, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
+        w31 = torch.rand(INTERMEDIATE_SIZE * 2, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
         w2 = torch.rand(HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype=dtype).cuda() * 0.1
-        w3 = torch.rand(INTERMEDIATE_SIZE, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
-
         # TRT-LLM format: concat w3 and w1 along intermediate dim
-        w3_w1_stacked_weight.data[expert_id].copy_(torch.cat([w3, w1], dim=0))  # (2*I, H)
+        w3_w1_stacked_weight.data[expert_id].copy_(w31, dim=0))  # (2*I, H)
         w2_stacked_weight.data[expert_id].copy_(w2)  # (H, I)
 
     return (
