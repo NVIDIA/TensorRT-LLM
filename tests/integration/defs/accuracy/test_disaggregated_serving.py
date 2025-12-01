@@ -14,6 +14,7 @@ import pytest
 import requests
 import yaml
 
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
@@ -67,37 +68,19 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
         return False
 
 
-def check_port_available(port: int) -> int:
-    import socket
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('localhost', port))
-            return port
-    except socket.error:
-        # find a free port
-        sock = socket.socket()
-        sock.bind(('', 0))
-        return sock.getsockname()[1]
-
-
 def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: Dict[str, Any]) -> Dict[str, Any]:
-    disaggregated_server_config['port'] = check_port_available(
-        disaggregated_server_config['port'])
-    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
-    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
+    num_ctx_ports = len(disaggregated_server_config["context_servers"]["urls"])
+    num_gen_ports = len(
+        disaggregated_server_config["generation_servers"]["urls"])
 
-    new_ctx_urls = []
-    new_gen_urls = []
-    for url in ctx_urls:
-        port = check_port_available(int(url.split(":")[1]))
-        new_ctx_urls.append(f"localhost:{port}")
-    for url in gen_urls:
-        port = check_port_available(int(url.split(":")[1]))
-        new_gen_urls.append(f"localhost:{port}")
-
-    disaggregated_server_config["context_servers"]["urls"] = new_ctx_urls
-    disaggregated_server_config["generation_servers"]["urls"] = new_gen_urls
+    disaggregated_server_config['port'] = get_free_port()
+    disaggregated_server_config["context_servers"]["urls"] = [
+        f"localhost:{get_free_port()}" for _ in range(num_ctx_ports)
+    ]
+    disaggregated_server_config["generation_servers"]["urls"] = [
+        f"localhost:{get_free_port()}" for _ in range(num_gen_ports)
+    ]
 
     return disaggregated_server_config
 
