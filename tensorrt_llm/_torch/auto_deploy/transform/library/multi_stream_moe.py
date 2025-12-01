@@ -5,7 +5,10 @@ from typing import Callable, Dict, Tuple
 import torch
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.multi_stream import record_event_wrapper
+from tensorrt_llm._torch.auto_deploy.custom_ops.multi_stream import (
+    cuda_stream_manager,
+    record_event_wrapper,
+)
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -67,7 +70,8 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.triton_moe_fused: torch.ops.auto_deploy.triton_moe_fused_aux,
             torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused: torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused_aux,
         }
-
+        # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
+        cuda_stream_manager.add_device(torch.cuda.current_device())
         gm, num_matches = _execute_op_in_aux_stream(gm, op_dict)
 
         info = TransformInfo(
