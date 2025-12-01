@@ -95,7 +95,8 @@ def launch_disaggregated_llm(
         ctx_model: str = None,
         gen_model: str = None,
         server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
-        max_workers: int = 16):
+        max_workers: int = 16,
+        enable_perf=False):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -104,9 +105,7 @@ def launch_disaggregated_llm(
         print(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
-
-    enable_perf = True
-    perf_max_requests = 10000
+    perf_max_requests = 50
 
     def _apply_perf_flags(cfg: Optional[Dict[str, Any]]):
         if not isinstance(cfg, dict):
@@ -120,6 +119,7 @@ def launch_disaggregated_llm(
     _apply_perf_flags(disaggregated_server_config)
     _apply_perf_flags(ctx_server_config)
     _apply_perf_flags(gen_server_config)
+
     disaggregated_server_config = revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config)
 
@@ -366,7 +366,7 @@ def launch_disaggregated_llm(
             except requests.exceptions.RequestException as e:
                 print(f"Error fetching {perf_url}: {e}")
 
-        def _show_kvcache_time(kv_cache_perf_dir, max_lines=1000):
+        def _show_kvcache_time(kv_cache_perf_dir, max_lines=100):
             print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
             for file in os.listdir(kv_cache_perf_dir):
                 print(f"file: {file}")
@@ -475,9 +475,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": disable_overlap_scheduler,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
-            },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT"
             }
         }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
@@ -495,8 +492,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      enable_perf=True) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1128,8 +1127,10 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      enable_perf=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1165,8 +1166,10 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      enable_perf=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
