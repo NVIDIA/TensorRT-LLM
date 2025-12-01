@@ -98,7 +98,7 @@ def get_llm_args(
         reasoning_parser: Optional[str] = None,
         fail_fast_on_attention_window_too_large: bool = False,
         otlp_traces_endpoint: Optional[str] = None,
-        enable_chunked_prefill: bool = True,
+        disable_chunked_prefill: bool = False,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -142,7 +142,7 @@ def get_llm_args(
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
         "otlp_traces_endpoint": otlp_traces_endpoint,
-        "enable_chunked_prefill": enable_chunked_prefill,
+        "enable_chunked_prefill": not disable_chunked_prefill,
     }
 
     return llm_args, llm_args_extra_dict
@@ -361,10 +361,20 @@ class ChoiceWithAlias(click.Choice):
               type=str,
               default=None,
               help="URI of the disaggregated cluster.")
-@click.option("--enable_chunked_prefill",
-              is_flag=True,
-              default=True,
-              help="Enable chunked prefill")
+@click.option(
+    "--enable_chunked_prefill",
+    is_flag=True,
+    default=True,
+    help=
+    "Enable chunked prefill. This is now enabled by default on applicable models, so this flag "
+    "is a no-op. It is deprecated and will be removed in a future release.")
+@click.option(
+    "--disable_chunked_prefill",
+    is_flag=True,
+    default=False,
+    help=
+    "Disable chunked prefill (required for video modality models like Gemma3VL)."
+)
 @click.option("--media_io_kwargs",
               type=str,
               default=None,
@@ -386,13 +396,19 @@ def serve(
         server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
+        disable_chunked_prefill: bool, disagg_cluster_uri: Optional[str],
+        media_io_kwargs: Optional[str], custom_module_dirs: list[Path],
+        chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if enable_chunked_prefill:
+        logger.warning(
+            "--enable_chunked_prefill is deprecated: chunked prefill is now enabled by default on applicable models. "
+            "This flag will be removed in a future release.")
 
     for custom_module_dir in custom_module_dirs:
         try:
@@ -422,7 +438,7 @@ def serve(
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
         otlp_traces_endpoint=otlp_traces_endpoint,
-        enable_chunked_prefill=enable_chunked_prefill)
+        disable_chunked_prefill=disable_chunked_prefill)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
