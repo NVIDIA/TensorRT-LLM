@@ -30,7 +30,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from ..flashinfer_utils import ENABLE_PDL
+from ..flashinfer_utils import get_env_enable_pdl
 from .sampling_utils import (
     GREEDY,
     GroupedStrategySampler,
@@ -113,7 +113,7 @@ class _StrategyImpls:
             probs = flashinfer.sampling.softmax(
                 logits,
                 temperature,
-                enable_pdl=ENABLE_PDL,
+                enable_pdl=get_env_enable_pdl(),
             )
             return probs
 
