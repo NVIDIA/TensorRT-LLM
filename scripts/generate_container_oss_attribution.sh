@@ -47,7 +47,7 @@ mkdir -p "${OUTPUT_DIR}"
 
 # Generate the attribution file
 cat > "${OUTPUT_FILE}" << EOF
-This distribution includes open source which is archived at the following URL: ${OSS_URL}
+This container image includes open-source software whose source code is archived in the /third-party-source directory or at ${OSS_URL}.
 
 For further inquiries or assistance, contact us at oss-requests@nvidia.com
 EOF
