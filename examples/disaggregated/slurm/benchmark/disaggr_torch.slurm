@@ -40,18 +40,20 @@ trtllm_wheel_path=${28}
 
 # Profiling
 nsys_on=${29}
+ctx_profile_range=${30}
+gen_profile_range=${31}
 
 # Accuracy evaluation
-enable_accuracy_test=${30}
-accuracy_model=${31}
-accuracy_tasks=${32}
-model_args_extra=${33}
+enable_accuracy_test=${32}
+accuracy_model=${33}
+accuracy_tasks=${34}
+model_args_extra=${35}
 
 # Worker environment variables
-worker_env_var=${34}
+worker_env_var=${36}
 
 # Server environment variables
-server_env_var=${35}
+server_env_var=${37}
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -90,6 +92,8 @@ echo "  build_wheel: ${build_wheel}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
 echo "  work_dir: ${work_dir}"
 echo "  nsys_on: ${nsys_on}"
+echo "  ctx_profile_range: ${ctx_profile_range}"
+echo "  gen_profile_range: ${gen_profile_range}"
 echo
 echo "Accuracy Configuration:"
 echo "  enable_accuracy_test: ${enable_accuracy_test}"
@@ -169,17 +173,6 @@ elif [ -d "${trtllm_repo}" ]; then
     echo "TensorRT-LLM installation completed successfully"
 fi
 
-# Get enable_pdl from gen config
-enable_pdl=$(python3 -c "import yaml; import sys;
-try:
-    with open('${gen_config_path}') as f:
-        c = yaml.safe_load(f)
-        print(str(not c.get('enable_attention_dp', True)).lower())
-except Exception as e:
-    print(f'Error reading config: {e}', file=sys.stderr)
-    sys.exit(1)
-")
-
 # Get node lists
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
@@ -211,7 +204,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_config_path}" "${worker_env_var}" \
+        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_profile_range}" "${gen_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
@@ -226,7 +219,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" "${worker_env_var}" \
+        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_profile_range}" "${ctx_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 
@@ -283,7 +276,7 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         --mpi=pmix --overlap -N 1 -n 1 \
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
-        "${model_args_extra}" \
+        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
         &> ${full_logdir}/accuracy_eval.log; then
         cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
     fi

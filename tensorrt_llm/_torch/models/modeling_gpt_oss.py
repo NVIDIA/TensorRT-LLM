@@ -657,6 +657,18 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             module_weights = {}
             for k, v in self.hf_params_map.items():
                 name = name.replace(k, v)
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            names = name.split('.')
+            if names[-1] == "backend" and isinstance(module, MoE):
+                # Backend is under experts module (ConfigurableMoE wrapper)
+                name = '.'.join(names[:-1])
+
             module_weights = filter_weights(name, weights)
 
             if isinstance(module, MoE):

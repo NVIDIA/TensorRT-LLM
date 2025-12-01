@@ -122,6 +122,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="pipeline parallelism size",
 )
 @optgroup.option(
+    "--cp",
+    type=int,
+    default=1,
+    help="context parallelism size",
+)
+@optgroup.option(
     "--ep",
     type=int,
     default=None,
@@ -225,7 +231,7 @@ def latency_command(
     if options.backend and options.backend.lower(
     ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
         if bench_env.checkpoint_path is None:
-            snapshot_download(options.model)
+            snapshot_download(options.model, revision=bench_env.revision)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
@@ -250,6 +256,7 @@ def latency_command(
             param_hint="backend")
 
     exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Update configuration with runtime options

@@ -34,8 +34,11 @@ class CacheConfig(BaseModel):
 
     dtype: Optional[torch.dtype] = Field(default=None, description="KV cache dtype.")
     mamba_dtype: Optional[torch.dtype] = Field(default=None, description="Mamba cache dtype.")
+    delta_dtype: Optional[torch.dtype] = Field(
+        default=torch.float32, description="Delta cache dtype. Defaults to float32."
+    )
 
-    @field_validator("dtype", "mamba_dtype", mode="before")
+    @field_validator("dtype", "mamba_dtype", "delta_dtype", mode="before")
     @classmethod
     def _coerce_dtype(cls, value):
         if value is None or isinstance(value, torch.dtype):

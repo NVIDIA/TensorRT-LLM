@@ -389,6 +389,7 @@ class CUDAGraphRunner:
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
 
+        self.padding_dummy_request.py_draft_tokens = [0] * runtime_draft_len
         batch.generation_requests.extend([self.padding_dummy_request] *
                                          padding_size)
         return padding_size
