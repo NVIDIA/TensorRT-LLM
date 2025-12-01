@@ -751,6 +751,13 @@ def _register_fake():
     def _(gathered_o, gathered_stats, scale):
         return gathered_o.new_empty(*gathered_o.shape[1:])
 
+    @torch.library.register_fake("trtllm::helix_post_process_native")
+    def _(gathered_o, gathered_stats, scale, cp_dim):
+        # Remove the dimension at cp_dim (context parallelism dimension)
+        out_shape = list(gathered_o.shape)
+        del out_shape[cp_dim]
+        return gathered_o.new_empty(*out_shape)
+
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
         # input [M, K], weight [N, K], bias [N]
