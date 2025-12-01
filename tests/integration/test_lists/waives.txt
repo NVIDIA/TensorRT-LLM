@@ -417,3 +417,8 @@ unittest/llmapi/test_llm_pytorch.py::test_embedding_bias_with_torch_sampler_stra
 accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp4[tp4-cuda_graph=True] SKIP (https://nvbugs/5702793)
 accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp4_chunked_prefill[tp4ep4-cuda_graph=True] SKIP (https://nvbugs/5702793)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[no_cuda_graph_overlap-cutlass] SKIP (https://nvbugs/5702795)
+accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass] SKIP (https://nvbugs/5702795)
+accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp4ep1-cutlass] SKIP (https://nvbugs/5702795)
+accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp4ep4-cutlass] SKIP (https://nvbugs/5702795)
+accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp4ep4-trtllm] SKIP (https://nvbugs/5702795)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_trtllmgen] SKIP (https://nvbugs/5698897)
