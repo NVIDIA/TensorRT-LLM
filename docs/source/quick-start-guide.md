@@ -29,6 +29,8 @@ Ensure your GPU supports FP8 quantization before running the following:
 trtllm-serve "nvidia/Qwen3-8B-FP8"
 ```
 
+For more options, browse the full [collection of generative models](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer) that have been quantized and optimized for inference with the TensorRT Model Optimizer.
+
 ```{note}
 If you are running trtllm-server inside a Docker container, you have two options for sending API requests:
 1. Expose a port (e.g., 8000) to allow external access to the server from outside the container.
