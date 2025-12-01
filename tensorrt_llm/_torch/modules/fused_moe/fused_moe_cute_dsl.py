@@ -180,6 +180,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        init_load_balancer: bool = True,
     ):
 
         super().__init__(
@@ -194,6 +195,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
         )
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
