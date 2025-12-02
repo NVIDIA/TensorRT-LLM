@@ -280,8 +280,7 @@ def test_allreduce_strategy_propagation(strategy):
     sharding_container.add(
         WeightShardingInfo(
             target_node=linear1_node.name,
-            rank=rank,
-            world_size=world_size,
+            config=config,
             split_dim=SplitDimension.COLUMN,
             dist_op=None,
         )
@@ -289,8 +288,7 @@ def test_allreduce_strategy_propagation(strategy):
     sharding_container.add(
         WeightShardingInfo(
             target_node=linear2_node.name,
-            rank=rank,
-            world_size=world_size,
+            config=config,
             split_dim=SplitDimension.ROW,
             dist_op="all_reduce",
         )
