@@ -318,7 +318,7 @@ def test_multiple_dynamic_shapes_cache():
     # We also test the cache serialization and deserialization here.
     AutoTuner.get().profiling_cache.clear()
     AutoTuner.get().profiling_cache.load_cache(
-        os.path.join(temp_dir.name, "test_multiple_dynamic_shapes.rank0.json"))
+        os.path.join(temp_dir.name, "test_multiple_dynamic_shapes.json"))
     cache_entries = tuner.profiling_cache.get_specific_custom_op(
         "test_multiple_dynamic_shapes")
 
