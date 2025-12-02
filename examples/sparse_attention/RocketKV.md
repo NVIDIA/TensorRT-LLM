@@ -2,7 +2,7 @@
 
 This document details enabling RocketKV sparse attention within TensorRT LLM.
 
-RocketKV is a training-free, two-stage KV cache compression method designed to accelerate long-context LLM inference. It combines permanent KV token eviction (coarse-grain) with dynamic KV token selection (fine-grain) to significantly reduce memory bandwidth usage and increase throughput while maintaining high accuracy.
+RocketKV is a training-free, two-stage KV cache compression method designed to accelerate long-context LLM inference. It combines permanent KV token eviction (in context phase) with dynamic KV token selection (in generation phase) to significantly reduce memory bandwidth usage and increase throughput while maintaining high accuracy.
 
 For more technical details, please refer to the paper: [RocketKV: Accelerating Long-Context LLM Inference via Two-Stage KV Cache Compression](https://arxiv.org/pdf/2502.14051).
 
@@ -11,7 +11,7 @@ For more technical details, please refer to the paper: [RocketKV: Accelerating L
 In Transformer-based LLM inference, the KV cache grows linearly with sequence length, becoming a major bottleneck. RocketKV mitigates this issue through a two-stage process:
 
 1.  **Context Phase (Stage 1):** It performs **permanent KV cache eviction**. Instead of storing the full history, it selects and keeps a `prompt_budget` of the most important tokens based on attention scores.
-2.  **Generation Phase (Stage 2):** It utilizes a **fine-grain Top-K sparse attention**. It maintains a lightweight, compressed auxiliary cache (KT Cache) to dynamically predict which blocks of the KV cache are relevant for the current token, and loading only those blocks to do the attention computation.
+2.  **Generation Phase (Stage 2):** It utilizes a **blocked Top-K sparse attention**. It maintains a lightweight, compressed auxiliary cache (KT Cache) to dynamically predict which blocks of the KV cache are relevant for the current token, and loading only those blocks to do the attention computation.
 
 RocketKV is integrated into TensorRT LLM as a specialized attention backend, accessible via the LLM API. Specifically, the core sparse KV prediction kernels are implemented using **Triton** kernels, achieving highly optimized performance on modern NVIDIA GPUs.
 
@@ -23,7 +23,10 @@ RocketKV is integrated into TensorRT LLM as a specialized attention backend, acc
   * Tensor Parallel
   * Cuda Graph
 
-**Note:** RocketKV currently requires `enable_block_reuse=False` in the KV cache configuration, as the sparse eviction logic is incompatible with standard block reuse mechanisms. Also, RocketKV doesn't support `enable_chunked_prefill=True` for now.
+**Note:** 
+1. RocketKV currently requires `enable_block_reuse=False` in the KV cache configuration, as the sparse eviction logic is incompatible with standard block reuse mechanisms. 
+2. RocketKV doesn't support `enable_chunked_prefill=True` for now.
+3. RocketKV doesn't support *disagg-serving* as well, since it needs the KV cache transmission from prefill engine to the decode engine. But currently RocketKV uses a python kt cache manager and it cannot support this transmission.
 
 ## Usage
 
@@ -88,7 +91,26 @@ python3 ../llm-api/llm_sparse_attention.py \
     --max_new_tokens 128
 ```
 
-### Configuration Arguments
+
+### Usage with `trtllm-bench` and `trtllm-serve`
+
+Sparse attention options must be specified via `--extra_llm_api_options config.yaml` for both `trtllm-bench` and `trtllm-serve`. All sparse attetnion options can be specified in this YAML file and the argument names/valid values are the same as in their corresponding configuration described in the Configuration Arguments section. For example, a YAML configuration could look like this:
+
+```
+backend: pytorch
+attn_backend: TRTLLM
+sparse_attention_config:
+  algorithm: rocket
+  kt_cache_dtype: float8_e5m2
+  window_size: 32
+  prompt_budget: 2048
+kv_cache_config:
+  enable_block_reuse: false
+enable_chunked_prefill: false
+```
+
+
+## Configuration Arguments
 
 The `RocketSparseAttentionConfig` allows fine-grained control over compression ratios and performance trade-offs:
 
