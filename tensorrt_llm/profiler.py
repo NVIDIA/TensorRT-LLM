@@ -154,6 +154,14 @@ def host_memory_info(pid: Optional[int] = None) -> Tuple[int, int, int]:
 def device_memory_info(
         device: Optional[Union[torch.device,
                                int]] = None) -> Tuple[int, int, int]:
+    if on_jetson_l4t:
+        if not getattr(device_memory_info, "_has_logged_jetson_warning", False):
+            logger.warning(
+                "Device memory monitoring is not fully supported on Jetson/Tegra. Reporting 0 usage."
+            )
+            device_memory_info._has_logged_jetson_warning = True
+        return 0, 0, 0
+
     if pynvml is not None:
         if device is None:
             device = torch.cuda.current_device()
