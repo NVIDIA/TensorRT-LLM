@@ -297,8 +297,9 @@ def test_allreduce_strategy_propagation(strategy):
     # Verify transforms have the strategy injected
     assert len(sharding_container.weight_sharding_transforms) == 2
     for transform in sharding_container.weight_sharding_transforms:
-        assert transform.allreduce_strategy == AllReduceStrategy[strategy], (
-            f"Transform {transform.target_node} should have strategy {strategy}, got {transform.allreduce_strategy}"
+        assert transform.config.allreduce_strategy == AllReduceStrategy[strategy], (
+            f"Transform {transform.target_node} should have strategy {strategy}, "
+            f"got {transform.config.allreduce_strategy}"
         )
 
     # Apply transforms
