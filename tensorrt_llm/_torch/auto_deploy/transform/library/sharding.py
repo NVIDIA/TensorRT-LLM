@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from .....functional import AllReduceStrategy
+from ...custom_ops.trtllm_dist import is_trtllm_op_available
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -137,6 +138,7 @@ class ShardingTransformConfig(TransformConfig):
         "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
         "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
     )
+    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
 
     @field_validator("allreduce_strategy", mode="before")
     @classmethod
@@ -262,6 +264,47 @@ def _load_hook_remove(
     key = prefix + param_key
     ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     state_dict.pop(key, None)
+
+
+def _get_dist_ops(backend: str):
+    """Get the appropriate distributed ops based on backend availability.
+
+    Args:
+        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
+                 'auto' will automatically select based on availability.
+
+    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    """
+    # Handle DistBackend enum or string
+    if hasattr(backend, "value"):
+        backend = backend.value
+
+    if backend == "trtllm":
+        # Force TRT-LLM ops
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    elif backend == "torch":
+        # Force PyTorch distributed ops
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+        )
+    else:  # auto
+        # Automatically select based on availability
+        if is_trtllm_op_available():
+            # Use TRT-LLM optimized ops in MPI mode
+            return (
+                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+            )
+        else:
+            # Use PyTorch distributed ops in demollm mode
+            return (
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                torch.ops.auto_deploy.torch_dist_all_reduce.default,
+            )
 
 
 def _validate_sharded_shapes(
@@ -426,7 +469,7 @@ def _insert_sharded_mamba(
     entry_node: Node,
     dim: int,
     config: ShardingTransformConfig,
-    min_local_shape: int = 1,
+    min_local_shape: int,
     weights_to_shard: Optional[list[str]] = None,
     weight_shard_dims: Optional[Dict[str, int]] = None,
     fused_weight_dims: Optional[Dict[str, list]] = None,
@@ -531,6 +574,7 @@ def _insert_sharded_mamba(
         node=entry_node,
         dim=SplitDimension.COLUMN,
         config=config,
+        add_dist=False,
         min_local_shape=min_local_shape,
         fused_weight_dims=entry_fused_dims,
         quantization_cb=quantization_cb,
@@ -672,25 +716,19 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_any_lin_op(node):
-            _validate_sharded_shapes(
-                node, fused_weight_dims=fused_weight_dims, world_size=world_size
-            )
         return
 
-    # figure out the right dist op
-    if dim == 0:
-        # Column split -> all_gather
-        fn_dist = torch.ops.auto_deploy.torch_dist_all_gather.default
-        dist_args = (node, -1)
-    else:
-        # Row split -> all_reduce with strategy
-        fn_dist = torch.ops.auto_deploy.torch_dist_all_reduce.default
-        dist_args = (node, allreduce_strategy)
+    # figure out the right dist op (backend-aware)
+    all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
+    dist_lookup = {
+        0: (all_gather_op, -1),
+        1: (all_reduce_op, allreduce_strategy),
+    }
+    fn_dist, *dist_args = dist_lookup[dim]
 
     # add reduction node
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(fn_dist, args=dist_args)
+        dist_node = gm.graph.call_function(fn_dist, args=(node,) + tuple(dist_args))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -1444,8 +1482,6 @@ class ShardingTransformContainer(BaseModel):
         transform_list.append(transform)
         return True
 
-    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
-
 
 @TransformRegistry.register("sharding_transform_executor")
 class ShardingTransformExecutor(BaseTransform):
@@ -1578,7 +1614,9 @@ class Sharding(BaseTransform):
         # initialize the transform container
         transform_container = ShardingTransformContainer(config=config)
         shared_config.sharding_transform_container = transform_container
-        ad_logger.info(f"Using allreduce strategy: {config.allreduce_strategy.name}")
+        ad_logger.info(
+            f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
+        )
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
