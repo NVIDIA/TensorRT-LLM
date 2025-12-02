@@ -231,6 +231,53 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_moe_output_memset(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+    dtype = getattr(torch, dtype)
+    hidden_size = 4096
+    num_experts = 256
+    num_local_experts = num_experts // 32
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    x = torch.ones(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    x = torch.ops.trtllm.moe_output_memset(
+        x,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        tile_size,
+        top_k,
+    )
+    x_ref = torch.ones_like(x)
+    x_ref[(expanded_idx_to_permuted_idx >= 0).any(dim=-1)] = 0
+    torch.testing.assert_close(x, x_ref)
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
     interm_size = 4096

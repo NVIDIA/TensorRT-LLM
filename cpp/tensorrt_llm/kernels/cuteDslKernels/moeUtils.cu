@@ -67,7 +67,7 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
     int64_t const kCopyPerToken = hidden_size / kElemPerCopy;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
@@ -110,7 +110,7 @@ __global__ void moePermuteKernel(InputType const* input, InputType* permuted_out
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -195,7 +195,7 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
     int32_t const token_idx = blockIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     auto* dst_ptr = reinterpret_cast<ElemCopyType*>(output) + token_idx * kCopyPerToken;
@@ -232,7 +232,7 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -277,6 +277,105 @@ INSTANTIATE_MOE_UNPERMUTE(__nv_bfloat16, __nv_bfloat16);
 #endif
 #undef INSTANTIATE_MOE_UNPERMUTE
 
+template <typename InputType, int32_t kThreadsPerBlock>
+__global__ void moeOutputMemsetKernel(InputType* input, int32_t const* tile_idx_to_mn_limit,
+    int32_t const* expanded_idx_to_permuted_idx, int32_t const* permuted_idx_to_expanded_idx,
+    int32_t const* num_non_exiting_tiles, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size)
+{
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    int64_t const kCopyPerToken = hidden_size / kElemPerCopy;
+
+    InputType rmem[kElemPerCopy];
+#pragma unroll
+    for (int32_t j = 0; j < kElemPerCopy; j++)
+    {
+        rmem[j] = 0;
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    int32_t const num_tokens = num_non_exiting_tiles[0] * tile_size;
+    for (int32_t permuted_idx = blockIdx.x; permuted_idx < num_tokens; permuted_idx += gridDim.x)
+    {
+        int32_t const tile_idx = permuted_idx / tile_size;
+        if (permuted_idx >= tile_idx_to_mn_limit[tile_idx])
+        {
+            continue;
+        }
+        int32_t const expanded_idx = permuted_idx_to_expanded_idx[permuted_idx];
+        int32_t const token_idx = expanded_idx / top_k;
+        int32_t const topk_idx = expanded_idx % top_k;
+
+        bool is_first_in_topk = true;
+        for (int32_t k = 0; k < topk_idx; k++)
+        {
+            if (expanded_idx_to_permuted_idx[token_idx * top_k + k] >= 0)
+            {
+                is_first_in_topk = false;
+                break;
+            }
+        }
+        if (!is_first_in_topk)
+        {
+            continue;
+        }
+
+        auto* dst_ptr = reinterpret_cast<ElemCopyType*>(input) + token_idx * kCopyPerToken;
+        for (int32_t i = threadIdx.x; i < kCopyPerToken; i += kThreadsPerBlock)
+        {
+            dst_ptr[i] = *reinterpret_cast<ElemCopyType*>(rmem);
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename InputType>
+void moeOutputMemset(InputType* input, int32_t const* tile_idx_to_mn_limit, int32_t const* expanded_idx_to_permuted_idx,
+    int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
+    int32_t const max_num_permuted_tokens, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size,
+    cudaStream_t stream)
+{
+    int32_t constexpr kThreadsPerBlock = 256;
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.", kElemPerCopy);
+
+    auto kernel = &moeOutputMemsetKernel<InputType, kThreadsPerBlock>;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, max_num_permuted_tokens);
+    int32_t const threads = kThreadsPerBlock;
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel, input, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx, num_non_exiting_tiles, hidden_size, top_k, tile_size);
+}
+
+#define INSTANTIATE_MOE_OUTPUT_MEMSET(InputType)                                                                       \
+    template void moeOutputMemset<InputType>(InputType * input, int32_t const* tile_idx_to_mn_limit,                   \
+        int32_t const* expanded_idx_to_permuted_idx, int32_t const* permuted_idx_to_expanded_idx,                      \
+        int32_t const* num_non_exiting_tiles, int32_t const max_num_permuted_tokens, int32_t const hidden_size,        \
+        int32_t const top_k, int32_t const tile_size, cudaStream_t stream)
+
+INSTANTIATE_MOE_OUTPUT_MEMSET(half);
+#ifdef ENABLE_BF16
+INSTANTIATE_MOE_OUTPUT_MEMSET(__nv_bfloat16);
+#endif
+#undef INSTANTIATE_MOE_OUTPUT_MEMSET
+
 template <typename InputType, typename OutputType, typename SFType, int32_t kSFVecSize, typename ActFn,
     int32_t kThreadsPerBlock>
 __global__ void moeActivationKernel(InputType const* input, OutputType* output, float const* global_sf,
@@ -297,7 +396,7 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
     ActFn act{};
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     float global_sf_val = global_sf == nullptr ? 1.0f : global_sf[0];
@@ -353,7 +452,7 @@ __global__ void moeActivationKernel(InputType const* input, OutputType* output, 
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
