@@ -976,7 +976,7 @@ class WideEPMoE(MoE):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             **kwargs)
-        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
             shape = moe_output.shape
             top_k = self.routing_method.experts_per_token
             new_shape = [shape[0], top_k, shape[1]]
