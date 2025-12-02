@@ -81,8 +81,7 @@ def get_model_yaml_config(model_label: str,
         },
         {
             'patterns': [
-                # TODO: Verify the case name here use the to_string() method
-                'deepseek_r1_nvfp4-bench-pytorch'
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-ep:1-gpus:4'
             ],
             'config': {
                 'enable_iter_perf_stats': True,
