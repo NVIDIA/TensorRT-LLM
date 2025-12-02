@@ -3088,7 +3088,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         c_sf = cute.make_tensor(
             c_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, interm_size // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
+                order=(2, 1, 4, 0, 3, 5),
             ),
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
