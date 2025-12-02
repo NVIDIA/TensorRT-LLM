@@ -563,7 +563,6 @@ NVFP4_TEST_DTYPES = [
 ]
 
 
-@pytest.mark.parametrize("precompute_fc_alphas", [True, False])
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -578,7 +577,6 @@ NVFP4_TEST_DTYPES = [
     reason="Requires fp4 and trtllm support",
 )
 def test_trtllm_fused_moe_nvfp4(
-    precompute_fc_alphas,
     batch_size,
     hidden_size,
     num_experts,
@@ -693,34 +691,47 @@ def test_trtllm_fused_moe_nvfp4(
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
-    if precompute_fc_alphas:
-        fc1_weight_gs = torch.max(w3_gs, w1_gs)
-        fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
-        fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
-    else:
-        fc1_alpha = None
-        fc2_alpha = None
+    fc1_weight_gs = torch.max(w3_gs, w1_gs)
+    fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
+    fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
 
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
+    if mlp_style == "gated_mlp":
+        # For gated MLP, concatenate w1 and w3 as [w3, w1]
+        w3_w1_stacked = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
+        fc1_expert_weights_fp4 = w3_w1_stacked
+        fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
+        fc1_weight_gs = torch.max(w3_gs, w1_gs)
+        if activation_func != "silu":
+            raise ValueError(
+                f"Unsupported activation '{activation_func}' for gated_mlp. Use 'silu'."
+            )
+    elif mlp_style == "mlp":
+        # For non-gated MLP with ReLU^2
+        fc1_expert_weights_fp4 = w1_q_fp4
+        fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
+        fc1_weight_gs = w1_gs
+        if activation_func != "relu2":
+            raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
+    else:
+        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+
+    fc2_expert_weights_fp4 = w2_q_fp4.view(torch.long)
+    fc2_weight_blockscale_fp8 = w2_blockscale.view(torch.long)
+    fc1_expert_weights_fp4 = fc1_expert_weights_fp4.view(torch.long)
+
     trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
         x,
         selected_experts.to(torch.int),
         routing_weights,
-        w1_q_fp4,
-        w2_q_fp4,
-        w3_q_fp4,
-        w1_gs,
-        w2_gs,
-        w3_gs,
-        w1_blockscale,
-        w2_blockscale,
-        w3_blockscale,
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
         fc1_activation_gs,
         fc2_activation_gs,
-        fc1_alpha=fc1_alpha,
-        fc2_alpha=fc2_alpha,
-        input_blockscale=None,
-        output_dtype=otype,
+        fc1_alpha,
+        fc2_alpha,
         mlp_style=mlp_style,
         act_fn=activation_func,
     )
