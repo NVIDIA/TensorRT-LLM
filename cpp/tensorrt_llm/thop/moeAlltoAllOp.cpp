@@ -545,7 +545,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int "
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
-    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens) -> int");
+    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens) -> int",
+        &torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
@@ -555,5 +556,4 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_initialize", &torch_ext::moe_comm::moeA2AInitializeOp);
     module.impl("moe_a2a_sanitize_expert_ids", &torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
     module.impl("moe_a2a_get_combine_payload_tensor", &torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
-    module.impl("moe_a2a_get_aux_data_size", &torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
