@@ -20,23 +20,9 @@ import math
 import operator
 import re
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from enum import Enum, IntEnum
 from functools import partial
-from typing import (
-    Any,
-    Callable,
-    DefaultDict,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
-    Union,
-)
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -857,27 +843,16 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
-            _insert_sharded_mamba(
-                gm=gm,
-                entry_node=node,
-                dim=self.split_dim.value,
-                config=self.config,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-                quantization_cb=self.quantization_cb,
-            )
-        else:
-            _shard_parameter_node(
-                gm=gm,
-                node=node,
-                dim=self.split_dim.value,
-                config=self.config,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-                quantization_cb=self.quantization_cb,
-            )
+        _shard_parameter_node(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            config=self.config,
+            add_dist=self.dist_op is not None,
+            min_local_shape=self.min_local_shape,
+            fused_weight_dims=self.fused_weight_dims,
+            quantization_cb=self.quantization_cb,
+        )
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
@@ -1547,11 +1522,12 @@ class ShardingTransformExecutor(BaseTransform):
 def _process_simple_shard(
     nodes_linear: Dict[Node, List[Node]],
     transform_container: ShardingTransformContainer,
+    layer_type: LayerType = LayerType.MLP,
 ) -> int:
     # for every linear node:
     # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
     # if nodes_linear is a dict, flatten it to a 1D list of nodes
-
+    config = transform_container.config
     if isinstance(nodes_linear, dict):
         nodes_linear = [n for group in nodes_linear.values() for n in group]
 
@@ -1562,8 +1538,7 @@ def _process_simple_shard(
                 WeightShardingInfo.from_node(
                     n,
                     split_dim=SplitDimension.COLUMN,
-                    rank=rank,
-                    world_size=world_size,
+                    config=config,
                     dist_op="all_gather",
                     min_local_shape=1,
                     layer_type=layer_type,
@@ -1644,9 +1619,7 @@ class Sharding(BaseTransform):
                 info += detect_sharding_from_config(gm, transform_container, ShardingSource.MANUAL)
 
             elif source == ShardingSource.HEURISTIC:
-                ad_logger.info(
-                    f"Running autodeploy sharding heuristics: {transform_container.sharding_dims}"
-                )
+                ad_logger.info(f"Running autodeploy sharding heuristics: {config.sharding_dims}")
                 # run TP sharding across ranks
                 if ShardingDim.TP in config.sharding_dims:
                     info += detect_column_row_shard(gm, transform_container)
@@ -1717,8 +1690,7 @@ def _process_ssm_sharding(
         WeightShardingInfo.from_node(
             entry_node,
             split_dim=SplitDimension.COLUMN,
-            rank=rank,
-            world_size=world_size,
+            config=config,
             dist_op=None,
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims["in_proj"],
@@ -2185,7 +2157,7 @@ def detect_ssm_shard(
 
 def detect_column_row_shard(
     gm: GraphModule,
-    transfrom_container: ShardingTransformContainer,
+    transform_container: ShardingTransformContainer,
 ) -> TransformInfo:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -2204,7 +2176,8 @@ def detect_column_row_shard(
     splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-    rank, world_size = transfrom_container.rank, transfrom_container.world_size
+    config = transform_container.config
+    world_size = config.world_size
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     ad_logger.info("Running TP sharding detection")
@@ -2235,12 +2208,12 @@ def detect_column_row_shard(
             else LayerType.MLP
         )
 
-        if transfrom_container.simple_shard_only:
+        if config.simple_shard_only:
             ad_logger.debug(
                 f"Forcing Simple Shard on nodes: {nodes_linear} with layer type: {layer_type}"
             )
             num_simple_shards += _process_simple_shard(
-                nodes_linear, rank, world_size, transfrom_container, layer_type=layer_type
+                nodes_linear, transform_container, layer_type=layer_type
             )
             continue
 
@@ -2250,7 +2223,9 @@ def detect_column_row_shard(
             assert len(opening) == 1, "Expected exactly one opening node in Mamba layer"
             ad_logger.debug(f"Found SSM nodes in layer subgraph: {ssm_nodes}")
             num_ssm_shards += _process_ssm_sharding(
-                gm, opening[0], transfrom_container, rank, world_size
+                gm,
+                opening[0],
+                transform_container,
             )
             continue
 
@@ -2261,7 +2236,7 @@ def detect_column_row_shard(
                 # only one attention operation. Fall back to simple shard.
                 ad_logger.debug(f"More than one attention node: {attention_nodes}")
                 num_simple_shards += _process_simple_shard(
-                    nodes_linear, rank, world_size, transfrom_container, layer_type=layer_type
+                    nodes_linear, transform_container, layer_type=layer_type
                 )
                 continue
             # Extract head dimension. We cannot shard below the head_dim size.
@@ -2284,9 +2259,7 @@ def detect_column_row_shard(
                         )
                         num_simple_shards += _process_simple_shard(
                             nodes_linear,
-                            rank,
-                            world_size,
-                            transfrom_container,
+                            transform_container,
                             layer_type=layer_type,
                         )
                         # TODO: handle the case where num_kv_heads is not divisible by world_size
@@ -2296,19 +2269,16 @@ def detect_column_row_shard(
         _process_column_sharding(
             linear_nodes=opening,
             subgraph_nodes=layer_subgraph,
-            transform_container=transfrom_container,
-            rank=rank,
-            world_size=world_size,
+            transform_container=transform_container,
             min_local_shape=min_local_shape,
         )
 
         # shard single row node
-        if transfrom_container.add(
+        if transform_container.add(
             WeightShardingInfo.from_node(
                 closing,
                 split_dim=SplitDimension.ROW,
-                rank=rank,
-                world_size=world_size,
+                config=config,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
                 layer_type=layer_type,
@@ -2319,9 +2289,7 @@ def detect_column_row_shard(
                 num_attention_shards += 1
 
     # simple shard remaining linear nodes
-    num_simple_shards += _process_simple_shard(
-        unprocessed_linear_nodes, rank, world_size, transfrom_container
-    )
+    num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
     num_column_row_shards += num_ssm_shards
     ad_logger.info(
         f"Heuristics found {num_shards} TP shards. Simple: {num_simple_shards}, "
@@ -2344,7 +2312,8 @@ def detect_dp_bmm_shard(
     We'll also assume that the inputs to BMM are broadcasted across the devices already.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
-    rank, world_size = transform_container.rank, transform_container.world_size
+    config = transform_container.config
+    rank, world_size = config.rank, config.world_size
     if world_size < 2:
         ad_logger.info("Skipping DP BMM sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
@@ -2396,7 +2365,7 @@ def detect_dp_bmm_shard(
                 start_idx=start_idx,
                 end_idx=end_idx,
                 target_node=node.name,
-                config=transform_container.config,
+                config=config,
             )
         )
         ad_logger.debug(
@@ -2458,7 +2427,8 @@ def detect_ep_shard(
 ) -> TransformInfo:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
-    rank, world_size = transform_container.rank, transform_container.world_size
+    config = transform_container.config
+    world_size = config.world_size
     if world_size < 2:
         ad_logger.info("Skipping EP sharding for single device")
         return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
@@ -2471,7 +2441,7 @@ def detect_ep_shard(
         if transform_container.add(
             EPShardingInfo.from_node(
                 node,
-                config=transform_container.config,
+                config=config,
             )
         ):
             num_moe_patterns += 1
