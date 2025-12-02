@@ -117,10 +117,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          revision: Optional[str], extra_llm_api_options: Optional[str],
          disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
@@ -135,11 +131,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
         "revision": revision,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
     }
 
@@ -149,10 +140,17 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     profiler.start("trtllm init")
     if backend == 'pytorch':
-        llm_args.pop("build_config", None)
-        llm = PyTorchLLM(**llm_args)
+        llm = PyTorchLLM(**llm_args,
+                         max_batch_size=max_batch_size,
+                         max_num_tokens=max_num_tokens,
+                         max_beam_width=max_beam_width,
+                         max_seq_len=max_seq_len)
     elif backend == 'tensorrt':
-        llm = LLM(**llm_args)
+        build_config = BuildConfig(max_batch_size=max_batch_size,
+                                   max_num_tokens=max_num_tokens,
+                                   max_beam_width=max_beam_width,
+                                   max_seq_len=max_seq_len)
+        llm = LLM(**llm_args, build_config=build_config)
     else:
         raise click.BadParameter(
             f"{backend} is not a known backend, check help for available options.",
