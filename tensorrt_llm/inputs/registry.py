@@ -1,5 +1,6 @@
 import enum
 import random
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
@@ -707,6 +708,7 @@ def create_input_processor_with_hash(
                         return input_processor(inputs, sampling_params)
                     except Exception as e2:
                         logger.warning(f"Basic input processor failed: {e}.")
+                        logger.debug(traceback.format_exc())
                         raise e2
                 else:
                     raise e
@@ -715,6 +717,7 @@ def create_input_processor_with_hash(
                 return input_processor(inputs, sampling_params)
             except Exception as e:
                 logger.warning(f"Basic input processor failed: {e}.")
+                logger.debug(traceback.format_exc())
                 raise e
 
     return input_processor_wrapper
