@@ -12,8 +12,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
 )
-from .checkpoints.base_weight_mapper import BaseWeightMapper
-from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -25,29 +24,21 @@ from ...inputs import (
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     TextPrompt,
-    register_input_processor
+    register_input_processor,
 )
 from ...inputs.multimodal import MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-<<<<<<< HEAD
 from ..attention_backend.utils import get_attention_backend
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from ..modules.rotary_embedding import MRotaryEmbedding
+from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
-=======
-from ..modules.embedding import Embedding
-from ..modules.rotary_embedding import MRotaryEmbedding
-from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (
-    _get_uncached_multimodal_params,
-    filter_mm_token_from_input_ids,
->>>>>>> 61099da95 (fix: impl interleave MRoPE)
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -87,11 +78,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         self._processor = AutoProcessor.from_pretrained(
             model_path, use_fast=True, trust_remote_code=trust_remote_code
         )
-<<<<<<< HEAD
         self.tllm_multimodal_token_id = self.get_vocab_size() + 1
-=======
-        self.tllm_multimodal_token_id = self.model_config.text_config.vocab_size + 1
->>>>>>> 61099da95 (fix: impl interleave MRoPE)
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(self.config.vision_config, "temporal_patch_size", 1)
 
@@ -117,11 +104,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
-<<<<<<< HEAD
         return self.config.text_config.vocab_size
-=======
-        return self.model_config.text_config.vocab_size
->>>>>>> 61099da95 (fix: impl interleave MRoPE)
 
     @classmethod
     def get_rope_index(
@@ -794,15 +777,10 @@ class Qwen3VisionModelBase(nn.Module):
             image_embeds, deepstack_image_embeds = self.visual(
                 pixel_values, grid_thw=image_grid_thw
             )
-<<<<<<< HEAD
             # NOTE: We concatenate deepstack_embeds to mm_embeds
             # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
             mixed_image_embeds = torch.cat([image_embeds] + deepstack_image_embeds, dim=1)
             embeds.append(mixed_image_embeds)
-=======
-            embeds.append(image_embeds)
-            deepstack_embeds.append(torch.stack(deepstack_image_embeds))
->>>>>>> 61099da95 (fix: impl interleave MRoPE)
 
         if pixel_values_videos is not None:
             pixel_values_videos = pixel_values_videos.to(self.model_dtype)
