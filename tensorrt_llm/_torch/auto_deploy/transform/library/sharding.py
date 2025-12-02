@@ -16,6 +16,8 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+# Adding this message just to test CI
+
 import operator
 import re
 from collections import defaultdict
@@ -827,6 +829,7 @@ def detect_column_row_shard(
     num_shards = 0
     num_simple_shards = 0
     num_row_col_shards = 0
+    sharding_config.simple_shard_only = True
     for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # we iterate through all nodes between the two boundary nodes and store linear nodes
         # sorted by their input activation node. We also store remaining nodes.
