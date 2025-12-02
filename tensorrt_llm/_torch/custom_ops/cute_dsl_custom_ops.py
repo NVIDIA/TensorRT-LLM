@@ -7,8 +7,9 @@ from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version
 from ...math_utils import pad_up
-from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
@@ -364,6 +365,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 last_positive_power_of_2), ),
             constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
             use_cold_l2_cache=True,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
         )
 
         def __init__(self,

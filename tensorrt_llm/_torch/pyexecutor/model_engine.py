@@ -625,7 +625,7 @@ class PyTorchModelEngine(ModelEngine):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
-
+        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -635,8 +635,7 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size * (self.max_seq_len - 1))
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        with self.no_cuda_graph(), autotune(cache_path=cache_path,
-                                            rank=self.mapping.rank):
+        with self.no_cuda_graph(), autotune(cache_path=cache_path):
             warmup_request = self._create_warmup_request(
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,

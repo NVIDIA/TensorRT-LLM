@@ -11,8 +11,9 @@ from tensorrt_llm._torch.utils import (Fp4QuantizedTensor, fp4_utils,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 
 
 def prepare_dummy_topk_and_hook(
@@ -345,8 +346,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
 
         return tuning_config
 
@@ -667,8 +670,10 @@ class FP8BlockScaleMoERunner(TunableRunner):
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
 
         return tuning_config
 
@@ -966,8 +971,10 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
 
         return tuning_config
 
@@ -1237,8 +1244,10 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
 
         return tuning_config
 
@@ -1506,8 +1515,10 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
 
         return tuning_config
 
@@ -1764,8 +1775,10 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
         constraint_specs = cls.get_constraint_specs()
 
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
 
         return tuning_config
 

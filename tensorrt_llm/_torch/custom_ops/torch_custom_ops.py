@@ -10,8 +10,9 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..modules.multi_stream_utils import do_multi_stream
@@ -35,6 +36,7 @@ class MoERunner(TunableRunner):
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
         tune_max_num_tokens=8192,
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(
@@ -103,9 +105,7 @@ class MoERunner(TunableRunner):
             self.output_dtype,
             self.top_k,
             self.tp_size,
-            self.tp_rank,
             self.ep_size,
-            self.ep_rank,
             self.cluster_size,
             self.cluster_rank,
             self.enable_alltoall,
