@@ -37,14 +37,13 @@ from open_search_db import OpenSearchDB
 
 
 def queryJobEvents(commitID="", stageName="", onlySuccess=True):
-    """
-    Query OpenSearch database for job events with pagination.
-    
+    """Query OpenSearch database for job events with pagination.
+
     Args:
         commitID: Git commit SHA to filter by (optional)
         stageName: Stage name to filter by (optional)
         onlySuccess: If True, only return PASSED tests (default: True)
-        
+
     Returns:
         List of all matching test result records
     """
