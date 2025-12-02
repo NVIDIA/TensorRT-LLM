@@ -381,7 +381,6 @@ accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype SKIP (https:/
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5688388)
 accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True] SKIP (https://nvbugs/5688721)
 unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-FLASHINFER-False-False-False-False-True-False-False] SKIP (https://nvbugs/5691246)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/5698897)
 test_e2e.py::test_openai_completions_example[trt] SKIP (https://nvbugs/5701450)
 examples/test_ray.py::test_llm_inference_distributed_ray[tep2] SKIP (https://nvbugs/5701457)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/5701457)
