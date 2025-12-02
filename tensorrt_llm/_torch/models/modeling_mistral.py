@@ -446,10 +446,15 @@ class Mistral3VLM(PreTrainedModel):
                               **kwargs)
 
         vit_weights = _filter_weights(weights, "vision_tower.")
-        self._vision_tower.load_weights(vit_weights,
-                                        params_map=vit_params_map,
-                                        *args,
-                                        **kwargs)
+        try:
+            self._vision_tower.load_weights(vit_weights,
+                                            params_map=vit_params_map,
+                                            *args,
+                                            **kwargs)
+        except Exception as e:
+            # FIXME
+            logger.error(f"Error loading vision_tower weights: {e}")
+            # raise e
 
         mm_projector_weights = _filter_weights(weights,
                                                "multi_modal_projector.")
