@@ -160,11 +160,14 @@ class ShardingTransformConfig(TransformConfig):
                 source == ShardingSource.FACTORY
                 and self.factory_source != ShardingConfigSource.HUGGINGFACE
             ):
-                ad_logger.debug(
-                    "Sharding config is currently only supported for HuggingFace. Skipping."
-                )
-                config.clear()
-                continue
+                if "source" in config:
+                    self.factory_source = config["source"]
+                if self.factory_source != ShardingConfigSource.HUGGINGFACE:
+                    ad_logger.debug(
+                        "Sharding config is currently only supported for HuggingFace. Skipping."
+                    )
+                    config.clear()
+                    continue
 
             if "head_dim" not in config:
                 ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
@@ -880,7 +883,6 @@ class WeightShardingInfo(ShardingTransformInfo):
 class ParameterUpdateInfo(ShardingTransformInfo):
     """Configuration for node args sharding transformations."""
 
-    target_node: str
     args: tuple
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
@@ -1675,8 +1677,8 @@ def _process_ssm_sharding(
     except RuntimeError:
         ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
         return 0
-
-    world_size = transform_container.config.world_size
+    config = transform_container.config
+    world_size = config.world_size
     # Get subgraph between entry_node and next linear node
     subgraph_nodes = subgraph([entry_node], [out_proj_node])
 
@@ -1735,14 +1737,14 @@ def _process_ssm_sharding(
     split_args_1[1] = [s // world_size for s in split_args_1[1]]
     transform_container.add(
         ParameterUpdateInfo(
-            config=transform_container.config,
+            config=config,
             target_node=split_nodes[0].name,
             args=tuple(split_args_0),
         )
     )
     transform_container.add(
         ParameterUpdateInfo(
-            config=transform_container.config,
+            config=config,
             target_node=split_nodes[1].name,
             args=tuple(split_args_1),
         )
@@ -1796,7 +1798,7 @@ def _process_ssm_sharding(
             WeightShardingInfo.from_node(
                 list(weight_node.users)[0],
                 split_dim=SplitDimension.COLUMN,
-                config=transform_container.config,
+                config=config,
                 dist_op=None,
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_dims,
@@ -1897,7 +1899,7 @@ def _process_column_sharding(
             WeightShardingInfo.from_node(
                 linear_node,
                 split_dim=SplitDimension.COLUMN,
-                config=transform_container.config,
+                config=config,
                 dist_op=None,  # for column sharding, no dist op is performed
                 min_local_shape=min_local_shape,
                 fused_weight_dims=fused_weight_dims,
@@ -1922,9 +1924,7 @@ def _process_column_sharding(
             view_shape[2] = -1
             args[1] = tuple(view_shape)
             transform_container.add(
-                ParameterUpdateInfo(
-                    config=transform_container.config, target_node=view_node.name, args=tuple(args)
-                )
+                ParameterUpdateInfo(target_node=view_node.name, config=config, args=tuple(args))
             )
             ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
 
@@ -1947,7 +1947,7 @@ def _process_column_sharding(
             args[1] = new_sizes
             transform_container.add(
                 ParameterUpdateInfo(
-                    config=transform_container.config, target_node=user.name, args=tuple(args)
+                    rank=rank, world_size=world_size, target_node=user.name, args=tuple(args)
                 )
             )
         elif len(slice_nodes) > 0:
@@ -1996,9 +1996,9 @@ def detect_sharding_from_config(
     # The following constraints are based on
     # https://github.com/huggingface/transformers/blob/d8e05951b8efd4880acca9a3f291e8b65841a86d/src/transformers/models/llama4/configuration_llama4.py#L249
     if source == ShardingSource.FACTORY:
-        config = transform_container.get_factory_config()
+        config = transform_container.config.factory_config
     elif source == ShardingSource.MANUAL:
-        config = transform_container.get_manual_config()
+        config = transform_container.config.manual_config
     else:
         raise ValueError(f"Unsupported sharding source: {source}")
 
@@ -2053,9 +2053,7 @@ def detect_sharding_from_config(
                         linear_nodes=[lin_node],
                         subgraph_nodes=None,
                         transform_container=transform_container,
-                        config=config,
                         min_local_shape=min_local_shape,
-                        layer_type=layer_type,
                     )
                 elif config == "rowwise":
                     if transform_container.add(
@@ -2072,7 +2070,7 @@ def detect_sharding_from_config(
                             num_attention_shards += 1
                         num_row_col_shards += 1
                 elif config == "mamba":
-                    if _process_ssm_sharding(gm, lin_node, transform_container, config=config) > 0:
+                    if _process_ssm_sharding(gm, lin_node, transform_container) > 0:
                         num_ssm_shards += 1
                         num_row_col_shards += 1
 
