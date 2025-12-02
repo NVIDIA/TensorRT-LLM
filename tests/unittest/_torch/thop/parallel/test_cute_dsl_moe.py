@@ -883,14 +883,41 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         scaling_vector_size=sf_vec_size,
     )
 
-    # Verify output
-    match_ratio = (
-        c[:num_valid_permuted_tokens].view(torch.uint8) == c_ref[:num_valid_permuted_tokens]
-    ).sum().item() / c[:num_valid_permuted_tokens].numel()
-    assert match_ratio > 0.95, f"Output match ratio {match_ratio} < 0.95"
+    # Verify output (only compare valid tokens, skip padding tokens where token_id_mapping == -1)
+    # Create mask for valid tokens
+    valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
+    for i in range(num_valid_permuted_tokens):
+        if token_id_mapping[i].item() >= 0:
+            valid_token_mask[i] = True
 
-    num_sf_elements = num_valid_permuted_tokens * interm_size // sf_vec_size
-    match_ratio = (
-        c_sf[:num_sf_elements] == c_sf_ref[:num_sf_elements]
-    ).sum().item() / num_sf_elements
-    assert match_ratio > 0.95, f"Scale factor match ratio {match_ratio} < 0.95"
+    num_valid_tokens = valid_token_mask.sum().item()
+    if num_valid_tokens > 0:
+        # Compare output values only for valid tokens
+        c_valid = c[:num_valid_permuted_tokens][valid_token_mask]
+        c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_token_mask]
+        match_ratio = (
+            c_valid.view(torch.uint8) == c_ref_valid.view(torch.uint8)
+        ).sum().item() / c_valid.numel()
+        assert match_ratio > 0.95, (
+            f"Output match ratio {match_ratio} < 0.95 (compared {num_valid_tokens} valid tokens)"
+        )
+
+        # Compare scale factors only for valid tokens
+        # For each valid token, we have interm_size // sf_vec_size scale factor elements
+        sf_elements_per_token = interm_size // sf_vec_size
+        c_sf_valid = []
+        c_sf_ref_valid = []
+        for i in range(num_valid_permuted_tokens):
+            if token_id_mapping[i].item() >= 0:
+                start_idx = i * sf_elements_per_token
+                end_idx = (i + 1) * sf_elements_per_token
+                c_sf_valid.append(c_sf[start_idx:end_idx])
+                c_sf_ref_valid.append(c_sf_ref[start_idx:end_idx])
+
+        c_sf_valid = torch.cat(c_sf_valid)
+        c_sf_ref_valid = torch.cat(c_sf_ref_valid)
+        match_ratio = (c_sf_valid == c_sf_ref_valid).sum().item() / c_sf_valid.numel()
+        assert match_ratio > 0.95, (
+            f"Scale factor match ratio {match_ratio} < 0.95 "
+            f"(compared {num_valid_tokens} valid tokens)"
+        )
