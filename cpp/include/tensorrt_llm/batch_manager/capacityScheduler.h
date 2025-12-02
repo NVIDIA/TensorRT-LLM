@@ -124,6 +124,10 @@ protected:
 
 private:
     SizeType32 mMaxNumRequests;
+    mutable size_t mLastPendingRequests = 0;
+    mutable size_t mPendingIterations = 0;
+    size_t mMaxPendingRequests = 128;
+    size_t mMaxPendingIterations = 8;
 };
 
 /// @brief Schedule requests using the STATIC_BATCH policy
