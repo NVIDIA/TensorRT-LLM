@@ -13,8 +13,12 @@ from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
-# NOTE(suyogg): Moving the multi-stream custom ops to the transform level to ensure each device
-# has its own cuda streams and events.
+# Previously, CudaStreamManager and the custom ops that use the cuda streams and events were
+# placed in custom_ops folder. However doing so resulted in CudaStreamManager
+# being created only in the parent process, but we need each rank to have its own CudaStreamManager that
+# manages the cuda streams and events for that rank. Placing the logic to instantiate
+# CudaStreamManager and the custom ops that use the cuda streams and events at the transform level ensures that
+# each rank has its own CudaStreamManager since each rank applies the transform independently.
 class _Singleton(type):
     _instances: Dict[type, Any] = {}
     _lock = RLock()
