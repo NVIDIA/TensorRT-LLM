@@ -14,17 +14,8 @@ With the chunked context feature, there are two benefits:
 Chunked context is now **enabled by default** in TensorRT LLM for better usability and performance. With this default setting:
 - Long sequences that exceed `max_num_tokens` will be automatically chunked instead of throwing an error
 - Short sequences are generally processed as a single chunk. However, when multiple short sequences in a batch collectively fill up `max_num_tokens`, the last sequence may be chunked.
-- For models that don't support chunked context (e.g., RNN-based models like Mamba), it will be automatically disabled with a warning
 
-To explicitly control chunked context:
-```bash
-    llm = LLM(
-        ...
-        enable_chunked_prefill=True,   # Now the default
-        # Or to disable: enable_chunked_prefill=False,
-        ...
-    )
-```
+To explicitly disable chunked context, users can set `enable_chunked_prefill=False` in the LLM API.
 
 Note that when chunked context is enabled, please set the `max_num_tokens` to be an integer multiple of the kv-cache block size `tokens_per_block`, which defaults to 64.
 
