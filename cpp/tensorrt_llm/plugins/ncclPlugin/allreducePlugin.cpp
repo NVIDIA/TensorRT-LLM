@@ -137,13 +137,12 @@ bool AllreducePlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     int base_inputs = 0;
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB)
+    switch (mStrategy)
     {
-        base_inputs = 1;
-    }
-    else
-    {
-        base_inputs = 2;
+    case AllReduceStrategyType::NCCL:
+    case AllReduceStrategyType::UB:
+    case AllReduceStrategyType::NCCL_SYMMETRIC: base_inputs = 1; break;
+    default: base_inputs = 2; break;
     }
     int fusion_op_extra_inputs = 0;
     int scale_idx = 0;
@@ -169,9 +168,15 @@ bool AllreducePlugin::supportsFormatCombination(
 
     TLLM_CHECK(nbInputs == (base_inputs + fusion_op_extra_inputs));
 
-    if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB && pos == 1)
+    if (pos == 1)
     {
-        return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        switch (mStrategy)
+        {
+        case AllReduceStrategyType::NCCL:
+        case AllReduceStrategyType::UB:
+        case AllReduceStrategyType::NCCL_SYMMETRIC: break;
+        default: return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
     }
     if (mStrategy == AllReduceStrategyType::UB)
     {
@@ -338,6 +343,10 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     if (forceNcclAllReduceStrategy || mStrategy == AllReduceStrategyType::NCCL)
     {
         runtimeStrategy = AllReduceStrategyType::NCCL;
+    }
+    else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL_SYMMETRIC;
     }
     else if (mStrategy == AllReduceStrategyType::UB)
     {
