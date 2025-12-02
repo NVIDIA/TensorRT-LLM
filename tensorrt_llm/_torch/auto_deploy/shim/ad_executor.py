@@ -302,6 +302,39 @@ class ADEngine(ModelEngine):
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)
 
+    @nvtx_range("ad_compute_logits_raw")
+    def _compute_logits_raw(self) -> torch.Tensor:
+        """Run model and return raw logits tensor."""
+        return self.model(**self.cache_seq_interface.named_args)[0]
+
+    def _update_gather_buffer(self) -> None:
+        """Update the seq_len buffer for the gather_last_logits transform."""
+        if not self._gather_in_graph:
+            return
+        # Get the buffer from the model (check wrapped model if needed)
+        buffer = getattr(self.model, "_gather_seq_len_buffer", None)
+        if buffer is None and hasattr(self.model, "model"):
+            buffer = getattr(self.model.model, "_gather_seq_len_buffer", None)
+        if buffer is None:
+            return
+        # Copy seq_len values to the buffer
+        seq_len_tensor = self.cache_seq_interface.info._args_device["seq_len"]
+        num_seqs = len(self.cache_seq_interface.info.seq_len)
+        buffer[:num_seqs].copy_(seq_len_tensor[:num_seqs], non_blocking=True)
+
+    @property
+    def _gather_in_graph(self) -> bool:
+        """Check if gather_last_logits transform was applied to the model."""
+        # Check on the model itself (for unwrapped GraphModule)
+        if hasattr(self.model, "_gather_last_logits_applied"):
+            return self.model._gather_last_logits_applied
+        # Check on wrapped model (for CapturedGraph or other wrappers)
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "_gather_last_logits_applied"
+        ):
+            return self.model.model._gather_last_logits_applied
+        return False
+
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
         return self.cache_seq_interface.info.max_batch_size
@@ -321,7 +354,18 @@ class ADEngine(ModelEngine):
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
         self.iter_counter += 1
 
-        # compute all logits
+        # Check if gather was already done in the model graph
+        if self._gather_in_graph:
+            # Update the seq_len buffer for the in-graph gather
+            self._update_gather_buffer()
+            # Model outputs [max_batch, vocab] - slice to actual num_seqs
+            logits = self._compute_logits_raw()
+            num_seqs = len(self.cache_seq_interface.info.seq_len)
+            # Slice to actual batch size [num_seqs, vocab]
+            logits_flat = logits[:num_seqs].view(num_seqs, -1)
+            return {"logits": logits_flat}
+
+        # Original path: compute all logits and gather+cat
         logits = self._compute_logits()
 
         # gather+cat logits

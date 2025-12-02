@@ -129,7 +129,9 @@ transforms:
     rmsnorm_backend: triton
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
-
+  gather_last_logits:
+    stage: post_load_fusion
+    enabled: true
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
