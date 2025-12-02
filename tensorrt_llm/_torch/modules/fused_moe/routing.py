@@ -1,10 +1,10 @@
 import math
+import warnings
 from enum import IntEnum
 from typing import Dict, Optional, Type
 
 import torch
 import torch.nn.functional as F
-from tensorrt import warnings
 from torch import nn
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug

@@ -106,11 +106,13 @@ def prepare_dummy_topk_and_hook(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Recreate dummy topk tensors if token count changed during profiling."""
         current_num_tokens = inputs[hidden_states_index].shape[0]
-        routing_logits_for_tuner = torch.randn(
-            current_num_tokens,
-            num_experts,
-            dtype=torch.bfloat16,
-            device=inputs[hidden_states_index].device)
+        # Recreate routing logits if token count changed
+        if inputs[0] is None or inputs[0].shape[0] != current_num_tokens:
+            routing_logits_for_tuner = torch.randn(
+                current_num_tokens,
+                num_experts,
+                dtype=torch.bfloat16,
+                device=inputs[hidden_states_index].device)
 
         # Only recreate if we originally created dummies
         if need_dummy_topk:
@@ -119,7 +121,7 @@ def prepare_dummy_topk_and_hook(
                     0] != current_num_tokens:
                 # Recreate with new shape
                 topk_ids_for_tuner, topk_weights_for_tuner = routing_method.apply(
-                    routing_logits_for_tuner, **routing_kwargs)
+                    routing_logits_for_tuner)
                 inputs[-1] = topk_ids_for_tuner
                 inputs[-2] = topk_weights_for_tuner
             # Note: routing_logits is None in attention DP, no need to adjust
