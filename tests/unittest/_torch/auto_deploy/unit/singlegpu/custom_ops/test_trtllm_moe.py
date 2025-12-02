@@ -569,9 +569,7 @@ NVFP4_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype, wtype", NVFP4_TEST_DTYPES)
-# relu2 support requires merge of https://github.com/NVIDIA/TensorRT-LLM/pull/9261
-# @pytest.mark.parametrize("activation_func", ["silu", "relu2"])
-@pytest.mark.parametrize("activation_func", ["silu"])
+@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
 @pytest.mark.skipif(
     not fp4_compatible() or not trtllm_ops_available(),
     reason="Requires fp4 and trtllm support",
@@ -698,8 +696,7 @@ def test_trtllm_fused_moe_nvfp4(
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
     if mlp_style == "gated_mlp":
         # For gated MLP, concatenate w1 and w3 as [w3, w1]
-        w3_w1_stacked = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
-        fc1_expert_weights_fp4 = w3_w1_stacked
+        fc1_expert_weights_fp4 = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
         fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
         fc1_weight_gs = torch.max(w3_gs, w1_gs)
         if activation_func != "silu":
@@ -709,7 +706,7 @@ def test_trtllm_fused_moe_nvfp4(
     elif mlp_style == "mlp":
         # For non-gated MLP with ReLU^2
         fc1_expert_weights_fp4 = w1_q_fp4
-        fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
+        fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
         fc1_weight_gs = w1_gs
         if activation_func != "relu2":
             raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
