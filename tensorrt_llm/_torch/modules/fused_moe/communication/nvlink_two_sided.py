@@ -14,13 +14,11 @@
 # limitations under the License.
 
 """
-MNNVL AllToAll Communication Strategy
+NVLINK Two-Sided AllToAll Communication Strategy
 
-This module implements the MNNVL AllToAll communication method for MoE.
-MNNVL is an optimized communication strategy for NVIDIA GPU clusters.
+This module implements the NVLINK two-sided comm AllToAll communication method for MoE.
 
-MNNVL supports post-quant dispatch for all quantization modes
-
+NVLINK Two-Sided supports post-quant dispatch for all quantization modes.
 """
 
 import os
@@ -34,9 +32,14 @@ from tensorrt_llm.mapping import Mapping
 from .base import Communication
 
 
-class MnnvlLatency(Communication):
+class NVLinkTwoSided(Communication):
     """
-    MNNVL AllToAll strategy for latency scenarios
+    NVLINK two-sided comm AllToAll strategy.
+    This implementation utilizes symmetric memory to enable peer-to-peer access between GPUs over NVLink.
+    The kernel takes the role as both sender and receiver: as the sender, it puts the data into a FIFO
+    quene in peer ranks' symmetric memory; as the receiver, it gets the data from the FIFO quene to the
+    local buffer. This communication model is akin to NCCL's collective operations.
+    The required symmetric memory size is proportional to the communication channels opened.
     """
 
     def __init__(
@@ -62,7 +65,7 @@ class MnnvlLatency(Communication):
             os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
         )
 
-        # Initialize MNNVL workspaces
+        # Initialize NVLINK workspaces
         MnnvlMemory.initialize()
         self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(mapping)
         self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(mapping)
@@ -73,24 +76,24 @@ class MnnvlLatency(Communication):
     @staticmethod
     def is_platform_supported() -> bool:
         """
-        Check if MNNVL is supported on current hardware
+        Check if NVLINK two-sided comm is supported on current hardware.
         """
         return MnnvlMemory.supports_mnnvl()
 
     def supports_post_quant_dispatch(self) -> bool:
         """
-        MNNVL supports post-quant for all modes
+        NVLINK two-sided comm supports post-quant for all modes.
         """
         return self.enable_postquant_alltoall
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
-        Check if MNNVL is feasible for the given workload at runtime.
+        Check if NVLINK two-sided comm is feasible for the given workload at runtime.
 
         This method performs runtime checks based on workload characteristics such as
         token counts, number of chunks, and other runtime parameters.
         """
-        return self.is_platform_supported()
+        return True
 
     def prepare_dispatch(
         self,
@@ -99,12 +102,12 @@ class MnnvlLatency(Communication):
         local_statistic_tensor: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """
-        MNNVL prepare dispatch: gather EPLB statistics and prepare alltoall_info
+        NVLINK two-sided comm prepare dispatch: gather EPLB statistics and prepare alltoall_info.
         """
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         top_k = token_selected_slots.shape[1]
 
-        # Call MNNVL prepare to get alltoall_info and gather EPLB statistics
+        # Call NVLINK prepare to get alltoall_info and gather EPLB statistics
         alltoall_info, gathered_local_statistic_tensor = (
             MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                 token_selected_slots,
@@ -135,12 +138,14 @@ class MnnvlLatency(Communication):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
         """
-        MNNVL dispatch (post-quant, uses alltoall_info from prepare_dispatch)
+        NVLINK two-sided comm dispatch (post-quant, uses alltoall_info from prepare_dispatch).
         """
         # Read alltoall_info from dispatch_state (set by prepare_dispatch)
         alltoall_info = self._dispatch_state.get("alltoall_info")
         if alltoall_info is None:
-            raise ValueError("MNNVL dispatch requires prepare_dispatch() to be called first")
+            raise ValueError(
+                "NVLinkTwoSided dispatch requires prepare_dispatch() to be called first"
+            )
 
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         original_token_count = hidden_states.shape[0]  # Store for combine
@@ -178,8 +183,7 @@ class MnnvlLatency(Communication):
         **kwargs,
     ) -> torch.Tensor:
         """
-        MNNVL combine - reads from self._dispatch_state
-
+        NVLINK two-sided comm combine - reads from self._dispatch_state.
         """
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]

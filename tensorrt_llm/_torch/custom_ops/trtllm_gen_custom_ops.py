@@ -191,24 +191,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
         FP4BlockScaleMoERunner.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
         )
 
-    # The hash is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2
-    # so the routing type does not matter
-    def __hash__(self):
-        return hash((
-            self.top_k,
-            self.intermediate_size,
-            self.local_num_experts,
-        ))
-
-    # __eq__ and __hash__ must agree
-    def __eq__(self, other):
-        if not isinstance(other, FP4BlockScaleMoERunner):
-            return False
-
-        return (self.top_k == other.top_k
-                and self.intermediate_size == other.intermediate_size
-                and self.local_num_experts == other.local_num_experts)
+    # The unique_id is used by the autotuner to get the cache key, so we hash on members
+    # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
+    def unique_id(self):
+        return (self.top_k, self.intermediate_size, self.local_num_experts)
 
     def get_runner(self):
         instance_key = ()
@@ -558,24 +544,11 @@ class FP8BlockScaleMoERunner(TunableRunner):
         FP8BlockScaleMoERunner.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
         )
 
-    # The hash is used by the autotuner to get the cache key, so we hash on members
+    # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
-    def __hash__(self):
-        return hash((
-            self.top_k,
-            self.intermediate_size,
-            self.local_num_experts,
-        ))
-
-    # __eq__ and __hash__ must agree
-    def __eq__(self, other):
-        if not isinstance(other, FP8BlockScaleMoERunner):
-            return False
-
-        return (self.top_k == other.top_k
-                and self.intermediate_size == other.intermediate_size
-                and self.local_num_experts == other.local_num_experts)
+    def unique_id(self):
+        return (self.top_k, self.intermediate_size, self.local_num_experts)
 
     def get_runner(self):
         instance_key = ()
@@ -845,30 +818,18 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         MxE4m3MxE2m1BlockScaleMoERunner.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
 
-    # The hash is used by the autotuner to get the cache key, so we hash on members
+    # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
-    def __hash__(self):
-        return hash((
+    def unique_id(self):
+        return (
             self.top_k,
             self.intermediate_size,
             self.valid_hidden_size,
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ))
-
-    # __eq__ and __hash__ must agree
-    def __eq__(self, other):
-        if not isinstance(other, MxE4m3MxE2m1BlockScaleMoERunner):
-            return False
-
-        return (self.top_k == other.top_k
-                and self.intermediate_size == other.intermediate_size
-                and self.valid_hidden_size == other.valid_hidden_size and
-                self.valid_intermediate_size == other.valid_intermediate_size
-                and self.local_num_experts == other.local_num_experts
-                and self.act_type == other.act_type)
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, True)
@@ -1145,30 +1106,18 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         E4m3MxE2m1BlockScaleMoERunner.tuning_config = E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
 
-    # The hash is used by the autotuner to get the cache key, so we hash on members
+    # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
-    def __hash__(self):
-        return hash((
+    def unique_id(self):
+        return (
             self.top_k,
             self.intermediate_size,
             self.valid_hidden_size,
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ))
-
-    # __eq__ and __hash__ must agree
-    def __eq__(self, other):
-        if not isinstance(other, E4m3MxE2m1BlockScaleMoERunner):
-            return False
-
-        return (self.top_k == other.top_k
-                and self.intermediate_size == other.intermediate_size
-                and self.valid_hidden_size == other.valid_hidden_size and
-                self.valid_intermediate_size == other.valid_intermediate_size
-                and self.local_num_experts == other.local_num_experts
-                and self.act_type == other.act_type)
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, False)
@@ -1425,10 +1374,10 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         Bf16MxE2m1BlockScaleMoERunner.tuning_config = Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
 
-    # The hash is used by the autotuner to get the cache key, so we hash on members
+    # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
-    def __hash__(self):
+    def unique_id(self):
         return hash((
             self.top_k,
             self.intermediate_size,
@@ -1437,18 +1386,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             self.act_type,
         ))
-
-    # __eq__ and __hash__ must agree
-    def __eq__(self, other):
-        if not isinstance(other, Bf16MxE2m1BlockScaleMoERunner):
-            return False
-
-        return (self.top_k == other.top_k
-                and self.intermediate_size == other.intermediate_size
-                and self.valid_hidden_size == other.valid_hidden_size and
-                self.valid_intermediate_size == other.valid_intermediate_size
-                and self.local_num_experts == other.local_num_experts
-                and self.act_type == other.act_type)
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -1695,26 +1632,13 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         FP8FP4BlockScaleMoERunner.tuning_config = FP8FP4BlockScaleMoERunner.get_tuning_config(
         )
 
-    # The hash is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2
-    # so the routing type does not matter
-    def __hash__(self):
-        return hash((
+    def unique_id(self):
+        return (
             self.top_k,
             self.intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ))
-
-    # __eq__ and __hash__ must agree
-    def __eq__(self, other):
-        if not isinstance(other, FP8FP4BlockScaleMoERunner):
-            return False
-
-        return (self.top_k == other.top_k
-                and self.intermediate_size == other.intermediate_size
-                and self.local_num_experts == other.local_num_experts
-                and self.act_type == other.act_type)
+        )
 
     def get_runner(self):
         instance_key = (self.act_type, )

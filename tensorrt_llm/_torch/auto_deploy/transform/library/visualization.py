@@ -77,9 +77,9 @@ def add_outputs_metadata(self, fx_node: torch.fx.node.Node, node: GraphNode):
 # TODO(yudong): make custom_ops configurable
 CUSTOM_OPS = (
     torch.ops.auto_deploy.torch_dist_all_reduce.default,
+    torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
     torch.ops.aten.slice.Tensor,
     torch.ops.auto_deploy.triton_attention_fused_mha_with_cache.default,
-    torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce.default,
     torch.ops.auto_deploy.torch_linear_simple.default,
     torch.ops.aten.split_with_sizes.default,
 )

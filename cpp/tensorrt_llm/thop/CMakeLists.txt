@@ -100,7 +100,7 @@ add_library(
   virtualMemoryAllocator.cpp
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
-  mtpOp.cpp
+  specDecOp.cpp
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp

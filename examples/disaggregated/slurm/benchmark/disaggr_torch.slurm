@@ -1,57 +1,60 @@
 #!/bin/bash
 set -euo pipefail
 
-# Parse arguments
-# Hardware configuration
-gpus_per_node=${1}
-numa_bind=${2}
-ctx_nodes=${3}  # Number of nodes needed for ctx workers
-gen_nodes=${4}  # Number of nodes needed for gen workers
-ctx_world_size=${5}  # World size for ctx workers
-gen_world_size=${6}  # World size for gen workers
-
-# Worker configuration
-num_ctx_servers=${7}
-ctx_config_path=${8}
-num_gen_servers=${9}
-gen_config_path=${10}
-concurrency_list=${11}
-
-# Sequence and benchmark parameters
-isl=${12}
-osl=${13}
-multi_round=${14}
-benchmark_ratio=${15}
-streaming=${16}
-use_nv_sa_benchmark=${17}
-benchmark_mode=${18}
-cache_max_tokens=${19}
-
-# Environment and paths
-dataset_file=${20}
-model_path=${21}
-trtllm_repo=${22}
-work_dir=${23}
-full_logdir=${24}
-container_mount=${25}
-container_image=${26}
-build_wheel=${27}
-trtllm_wheel_path=${28}
-
-# Profiling
-nsys_on=${29}
-
-# Accuracy evaluation
-enable_accuracy_test=${30}
-accuracy_model=${31}
-accuracy_tasks=${32}
-model_args_extra=${33}
-
-# Worker environment variables
-worker_env_var=${34}
-
-# Server environment variables
-server_env_var=${35}
+# Parse named arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        # Hardware configuration
+        --gpus-per-node) gpus_per_node="$2"; shift 2 ;;
+        --numa-bind) numa_bind="$2"; shift 2 ;;
+        --ctx-nodes) ctx_nodes="$2"; shift 2 ;;
+        --gen-nodes) gen_nodes="$2"; shift 2 ;;
+        --ctx-world-size) ctx_world_size="$2"; shift 2 ;;
+        --gen-world-size) gen_world_size="$2"; shift 2 ;;
+        # Worker configuration
+        --num-ctx-servers) num_ctx_servers="$2"; shift 2 ;;
+        --ctx-config-path) ctx_config_path="$2"; shift 2 ;;
+        --num-gen-servers) num_gen_servers="$2"; shift 2 ;;
+        --gen-config-path) gen_config_path="$2"; shift 2 ;;
+        --concurrency-list) concurrency_list="$2"; shift 2 ;;
+        # Sequence and benchmark parameters
+        --isl) isl="$2"; shift 2 ;;
+        --osl) osl="$2"; shift 2 ;;
+        --multi-round) multi_round="$2"; shift 2 ;;
+        --benchmark-ratio) benchmark_ratio="$2"; shift 2 ;;
+        --streaming) streaming="$2"; shift 2 ;;
+        --use-nv-sa-benchmark) use_nv_sa_benchmark="$2"; shift 2 ;;
+        --benchmark-mode) benchmark_mode="$2"; shift 2 ;;
+        --cache-max-tokens) cache_max_tokens="$2"; shift 2 ;;
+        # Environment and paths
+        --dataset-file) dataset_file="$2"; shift 2 ;;
+        --model-path) model_path="$2"; shift 2 ;;
+        --trtllm-repo) trtllm_repo="$2"; shift 2 ;;
+        --work-dir) work_dir="$2"; shift 2 ;;
+        --full-logdir) full_logdir="$2"; shift 2 ;;
+        --container-mount) container_mount="$2"; shift 2 ;;
+        --container-image) container_image="$2"; shift 2 ;;
+        --build-wheel) build_wheel="$2"; shift 2 ;;
+        --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        # Profiling
+        --nsys-on) nsys_on="$2"; shift 2 ;;
+        --ctx-profile-range) ctx_profile_range="$2"; shift 2 ;;
+        --gen-profile-range) gen_profile_range="$2"; shift 2 ;;
+        # Accuracy evaluation
+        --enable-accuracy-test) enable_accuracy_test="$2"; shift 2 ;;
+        --accuracy-model) accuracy_model="$2"; shift 2 ;;
+        --accuracy-tasks) accuracy_tasks="$2"; shift 2 ;;
+        --model-args-extra) model_args_extra="$2"; shift 2 ;;
+        # Worker environment variables
+        --worker-env-var) worker_env_var="$2"; shift 2 ;;
+        # Server environment variables
+        --server-env-var) server_env_var="$2"; shift 2 ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -90,6 +93,8 @@ echo "  build_wheel: ${build_wheel}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
 echo "  work_dir: ${work_dir}"
 echo "  nsys_on: ${nsys_on}"
+echo "  ctx_profile_range: ${ctx_profile_range}"
+echo "  gen_profile_range: ${gen_profile_range}"
 echo
 echo "Accuracy Configuration:"
 echo "  enable_accuracy_test: ${enable_accuracy_test}"
@@ -169,17 +174,6 @@ elif [ -d "${trtllm_repo}" ]; then
     echo "TensorRT-LLM installation completed successfully"
 fi
 
-# Get enable_pdl from gen config
-enable_pdl=$(python3 -c "import yaml; import sys;
-try:
-    with open('${gen_config_path}') as f:
-        c = yaml.safe_load(f)
-        print(str(not c.get('enable_attention_dp', True)).lower())
-except Exception as e:
-    print(f'Error reading config: {e}', file=sys.stderr)
-    sys.exit(1)
-")
-
 # Get node lists
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
@@ -211,7 +205,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_config_path}" "${worker_env_var}" \
+        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_profile_range}" "${gen_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
@@ -226,7 +220,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_config_path}" "${worker_env_var}" \
+        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_profile_range}" "${ctx_config_path}" "${worker_env_var}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 
@@ -283,7 +277,7 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         --mpi=pmix --overlap -N 1 -n 1 \
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
-        "${model_args_extra}" \
+        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
         &> ${full_logdir}/accuracy_eval.log; then
         cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
     fi

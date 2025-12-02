@@ -8,6 +8,8 @@ import torch
 
 if TYPE_CHECKING:
     from ..speculative.utils import SpecDecodingTensor
+    from ..speculative.interface import SpecMetadata
+    from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
@@ -187,7 +189,6 @@ class TrtllmAttentionWrapper:
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
-        helix_position_offsets: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
         is_spec_dec_tree: bool = False,
@@ -205,6 +206,8 @@ class TrtllmAttentionWrapper:
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
+        helix_position_offsets: Optional[torch.Tensor] = None,
+        helix_is_inactive_rank: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -241,7 +244,6 @@ class TrtllmAttentionWrapper:
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
-            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
             sparse_kv_indices (torch.Tensor): The sparse indices for the KV cache, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
@@ -250,6 +252,8 @@ class TrtllmAttentionWrapper:
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
             sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
             sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
+            helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -285,7 +289,6 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.block_ids_per_seq = block_ids_per_seq
         self.softmax_stats_tensor = softmax_stats_tensor
-        self.helix_position_offsets = helix_position_offsets
         self.attention_sinks = attention_sinks
         self.sparse_kv_indices = sparse_kv_indices
         self.sparse_kv_offsets = sparse_kv_offsets
@@ -293,6 +296,13 @@ class TrtllmAttentionWrapper:
         self.sparse_attn_offsets = sparse_attn_offsets
         self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
         self.sparse_mla_topk = sparse_mla_topk
+        self.helix_position_offsets = helix_position_offsets
+        self.helix_is_inactive_rank = helix_is_inactive_rank
+        if self.helix_is_inactive_rank is not None and not isinstance(
+                self.helix_is_inactive_rank, torch.Tensor):
+            self.helix_is_inactive_rank = torch.tensor(
+                self.helix_is_inactive_rank, dtype=torch.bool, pin_memory=True)
+
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -471,7 +481,9 @@ class TrtllmAttentionWrapper:
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
             spec_decoding_tensor_params.append(
                 self.spec_bl_tree_first_sparse_mask_offset_kv)
-        mla_tensor_params = [self.helix_position_offsets]
+        mla_tensor_params = [
+            self.helix_position_offsets, self.helix_is_inactive_rank
+        ]
 
         thop.attention(
             q,
@@ -596,6 +608,7 @@ class TrtllmAttentionWrapper:
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
+    cuda_graph_workspace: Optional[torch.Tensor] = None
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -629,6 +642,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+
+    # Whether the current rank is inactive for helix parallelism.
+    # In helix parallelism, only the active rank appends KV cache for the query token
+    # and attends to the previously cached tokens as well as the query token. Inactive
+    # ranks do not append KV cache for the query token and attend to the previously
+    # cached tokens only.
+    helix_is_inactive_rank: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -714,6 +734,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
                 dtype=torch.int8,
             )
+
+        if self.cuda_graph_workspace is None:
+            self.cuda_graph_workspace = torch.empty(
+                (0, ),
+                device='cuda',
+                dtype=torch.int8,
+            )
+
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,
@@ -838,7 +866,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
-        kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+        if self.helix_is_inactive_rank is not None and len(
+                self.helix_is_inactive_rank):
+            # If helix is inactive, attend to the previously cached tokens only.
+            assert cached_token_lens is not None, "cached_token_lens should be set for helix"
+            kv_lens = cached_token_lens.clone()
+            helix_is_inactive_rank_cpu = torch.tensor(
+                self.helix_is_inactive_rank,
+                dtype=torch.bool,
+                device='cpu',
+            )
+            active_rank = ~helix_is_inactive_rank_cpu
+            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+        else:
+            kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
@@ -1141,13 +1183,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def update_spec_dec_param(
         self,
+        batch_size,
         is_spec_decoding_enabled,
         is_spec_dec_tree,
         is_spec_dec_dynamic_tree,
-        max_draft_tokens,
+        max_draft_len,
+        max_total_draft_tokens,
+        model_is_wrapped: bool = False,
+        spec_metadata: Optional['SpecMetadata'] = None,
+        spec_tree_manager: Optional['SpecTreeManager'] = None,
         spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ) -> None:
-
+        '''
+        Update the spec-dec parameters for the TRTLLM attention layer.
+        Args:
+            batch_size: int, the number of requests in the batch.
+            is_spec_decoding_enabled: bool, whether the attention need to be spec_decoding mode, which is determined by attention_need_spec_dec_mode() function.
+            is_spec_dec_tree: bool, whether the spec-dec mode is a tree, i.e., static tree or dynamic tree. For linear-tree, it is always False.
+            is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
+            max_draft_len: int, the number of the draft layers.
+            max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
+            model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
+            spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
+            spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
+            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None, the spec_decoding_tensor for draft token tree.
+        '''
         if spec_decoding_tensor is not None:
             spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
             spec_decoding_packed_mask = spec_decoding_tensor.packed_mask
@@ -1157,10 +1217,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             spec_decoding_packed_mask = None
             spec_decoding_generation_lengths = None
 
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled
-        if get_sm_version(
-        ) >= 100 and not is_spec_dec_tree and not is_spec_dec_dynamic_tree:
-            self.is_spec_decoding_enabled = False
+        # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
+            get_sm_version() < 100 or get_sm_version() == 120)
+
+        self.is_spec_dec_tree = spec_tree_manager is not None
+        self.is_spec_dec_dynamic_tree = spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree
+
+        if get_sm_version() >= 100 and get_sm_version() != 120:
+            if self.is_spec_dec_tree or self.is_spec_dec_dynamic_tree:
+                assert not self.is_spec_dec_tree, "Spec-dec tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec tree."
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
@@ -1170,26 +1236,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
-            self.spec_decoding_position_offsets = torch.empty(
-                [self.max_num_requests, max_draft_tokens + 1],
-                dtype=torch.int,
-                device='cuda',
-            )
+            # These buffers are accessed more like removing input padding,
+            # rather than using max_total_draft_tokens + 1 as the offset between different requests.
+            if self.spec_decoding_position_offsets is None:
+                self.spec_decoding_position_offsets = torch.empty(
+                    [self.max_num_requests, max_total_draft_tokens + 1],
+                    dtype=torch.int,
+                    device='cuda',
+                )
+            if self.spec_decoding_packed_mask is None:
+                self.spec_decoding_packed_mask = torch.empty(
+                    [
+                        self.max_num_requests, max_total_draft_tokens + 1,
+                        math.ceil((max_total_draft_tokens + 1) / 32)
+                    ],
+                    dtype=torch.int,
+                    device='cuda',
+                )
+            if self.spec_decoding_generation_lengths is None:
+                self.spec_decoding_generation_lengths = torch.empty(
+                    [self.max_num_requests],
+                    dtype=torch.int,
+                    device='cuda',
+                )
 
-            self.spec_decoding_packed_mask = torch.empty(
-                [
-                    self.max_num_requests, max_draft_tokens + 1,
-                    math.ceil((max_draft_tokens + 1) / 32)
-                ],
-                dtype=torch.int,
-                device='cuda',
-            )
-
-            self.spec_decoding_generation_lengths = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int,
-                device='cuda',
-            )
             if get_sm_version() >= 100:
                 self.spec_decoding_param_prepare_for_blackwell()
             else:
@@ -1197,7 +1267,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
 
+            # Case 1: dynamic tree
             if self.is_spec_dec_dynamic_tree:
+                assert spec_decoding_position_offsets is not None, "spec_decoding_position_offsets is required for dynamic tree"
+                assert spec_decoding_packed_mask is not None, "spec_decoding_packed_mask is required for dynamic tree"
                 self.spec_decoding_position_offsets.copy_(
                     spec_decoding_position_offsets, non_blocking=True)
                 self.spec_decoding_packed_mask.copy_(spec_decoding_packed_mask,
@@ -1207,35 +1280,94 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         spec_decoding_generation_lengths, non_blocking=True)
                 else:
                     self.generate_spec_decoding_generation_length(
-                        max_draft_tokens=max_draft_tokens)
+                        max_draft_len=max_total_draft_tokens)
+
+            # Case 2/3: static tree
+            elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
+                assert spec_metadata.spec_dec_mode.is_eagle3(
+                ), "Tree decoding is only supported for Eagle3 now"
+
+                is_target_model = not getattr(spec_metadata, 'is_draft_model',
+                                              False)
+
+                # Case 2: static tree and target model
+                if is_target_model:
+                    # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
+                    self.spec_decoding_position_offsets[:batch_size, :].copy_(
+                        spec_tree_manager.spec_dec_position_offsets[0, :],
+                        non_blocking=True)
+                    self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
+                        spec_tree_manager.spec_dec_packed_mask[0, :, :],
+                        non_blocking=True)
+                    self.spec_decoding_generation_lengths[:batch_size].fill_(
+                        spec_tree_manager.max_total_draft_tokens + 1)
+
+                # Case 3: static tree and the first drafter layer
+                else:
+                    assert model_is_wrapped == True, "The drafter model should be wrapped"
+                    # The first drafter layer will take the padded tokens as input (padding to the max_draft_len + 1)
+                    # But the spec-dec parameters are still in the shape of max_total_draft_tokens + 1.
+                    # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
+                    # we need to write them consecutively when setting them.
+                    # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
+                    # position_offsets
+                    position_offset = torch.arange(
+                        max_draft_len + 1,
+                        dtype=torch.int,
+                        device='cpu',
+                        pin_memory=True).repeat(batch_size)
+                    self.spec_decoding_position_offsets.reshape(
+                        -1)[:(max_draft_len + 1) * batch_size].copy_(
+                            position_offset, non_blocking=True)
+                    # packed_mask
+                    dummy_idx = torch.arange(max_draft_len + 1)
+                    spec_decoding_packed_mask = torch.pow(
+                        2, dummy_idx + 1) - 1  # [max_draft_len + 1]
+                    spec_decoding_packed_mask = spec_decoding_packed_mask.repeat(
+                        batch_size)  # [batch_size * (max_draft_len + 1)]
+                    self.spec_decoding_packed_mask.reshape(
+                        -1)[:(max_draft_len + 1) * batch_size].copy_(
+                            spec_decoding_packed_mask, non_blocking=True)
+                    # generation_lengths
+                    self.generate_spec_decoding_generation_length(
+                        max_draft_len=max_draft_len)
+
+            # Case 4: linear tree
             else:
+                assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
+                # Prepare for the linear-tree.
                 # Populate the mask that won't change during inference phase.
                 self.generate_spec_decoding_position_offsets(
-                    max_draft_tokens=max_draft_tokens)
+                    max_draft_len=max_draft_len)
                 self.generate_spec_decoding_packed_mask(
-                    max_draft_tokens=max_draft_tokens)
+                    max_draft_len=max_draft_len)
                 self.generate_spec_decoding_generation_length(
-                    max_draft_tokens=max_draft_tokens)
+                    max_draft_len=max_draft_len)
 
-    def generate_spec_decoding_position_offsets(self, max_draft_tokens):
-        position_offset = torch.arange(max_draft_tokens + 1,
+    def generate_spec_decoding_position_offsets(self, max_draft_len):
+        position_offset = torch.arange(max_draft_len + 1,
                                        dtype=torch.int,
                                        device='cpu',
                                        pin_memory=True)
-
         # fill all the batches with same position offset
         self.spec_decoding_position_offsets.copy_(position_offset,
                                                   non_blocking=True)
 
-    def generate_spec_decoding_packed_mask(self, max_draft_tokens):
-        dummy_idx = torch.arange(max_draft_tokens + 1)
-        spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
-        self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
-                                                      non_blocking=True)
+    def generate_spec_decoding_packed_mask(self, max_draft_len):
+        num_blocks = math.ceil((max_draft_len + 1) / 32)
+        tmp_max_draft_len = max_draft_len + 1
+        for block_idx in range(num_blocks):
+            if tmp_max_draft_len < 0:
+                break
+            dummy_idx = torch.arange(min(32, tmp_max_draft_len))
+            spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
+            self.spec_decoding_packed_mask[:, :, block_idx].copy_(
+                spec_decoding_packed_mask, non_blocking=True)
+            tmp_max_draft_len -= 32
 
-    def generate_spec_decoding_generation_length(self, max_draft_tokens):
+    def generate_spec_decoding_generation_length(self, max_draft_len):
         spec_decoding_generation_length = torch.full((self.max_num_requests, ),
-                                                     max_draft_tokens + 1)
+                                                     max_draft_len + 1)
         self.spec_decoding_generation_lengths[:self.max_num_requests].copy_(
             spec_decoding_generation_length, non_blocking=True)
 
@@ -1419,8 +1551,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            workspace=metadata.
-            workspace,  # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
+            # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
+            workspace=metadata.workspace
+            if not metadata.is_cuda_graph else metadata.cuda_graph_workspace,
             cache_indirection=metadata.cache_indirection,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
@@ -1435,7 +1568,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q_pe=q_pe,
             mrope_config=mrope_config,
             softmax_stats_tensor=softmax_stats_tensor,
-            helix_position_offsets=helix_position_offsets,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
@@ -1458,6 +1590,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
         out_dtype = None
         if out_scale is not None:
@@ -1717,6 +1851,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm2_scale: torch.Tensor,
         quant_q_buffer: torch.Tensor,
         helix_position_offsets: Optional[torch.Tensor] = None,
+        helix_is_inactive_rank: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -1736,7 +1871,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
-        mla_tensor_params = [helix_position_offsets]
+
+        # Ensure helix_is_inactive_rank is on the same device as other tensors.
+        if helix_is_inactive_rank is not None:
+            if isinstance(helix_is_inactive_rank, list):
+                helix_is_inactive_rank = torch.tensor(
+                    helix_is_inactive_rank,
+                    dtype=torch.bool,
+                    device=helix_position_offsets.device)
+            elif helix_is_inactive_rank.device.type != 'cuda':
+                helix_is_inactive_rank = helix_is_inactive_rank.to(
+                    helix_position_offsets.device)
+
+        mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
 
         torch.ops.trtllm.mla_rope_generation(
             fused_q,

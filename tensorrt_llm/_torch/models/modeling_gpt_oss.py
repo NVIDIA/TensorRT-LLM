@@ -47,6 +47,7 @@ class AttentionBlock(Attention):
         self,
         config: ModelConfig[GptOssConfig],
         layer_idx: int = 0,
+        reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
     ):
         pretrained_config = config.pretrained_config
@@ -80,6 +81,7 @@ class AttentionBlock(Attention):
             config=config,
             q_scaling=1.0,
             attention_chunk_size=None,
+            reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
@@ -339,7 +341,10 @@ class TransformerBlock(DecoderLayer):
             eps=pretrained_config.rms_norm_eps,
             dtype=pretrained_config.torch_dtype)
 
-        self.attn = AttentionBlock(config, layer_idx, use_custom_cublas_mm)
+        self.attn = AttentionBlock(config,
+                                   layer_idx,
+                                   reduce_output=False,
+                                   use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.post_attention_layernorm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
@@ -348,7 +353,7 @@ class TransformerBlock(DecoderLayer):
 
         self.mlp = MLPBlock(config,
                             layer_idx,
-                            reduce_results=not self.is_tp,
+                            reduce_results=False,
                             use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.mapping = config.mapping
@@ -359,9 +364,12 @@ class TransformerBlock(DecoderLayer):
             dtype=pretrained_config.torch_dtype)
 
         # setup for tp
-        self.allreduce = AllReduce(mapping=config.mapping,
-                                   strategy=config.allreduce_strategy,
-                                   dtype=config.pretrained_config.torch_dtype)
+        self.allreduce = None
+        if self.is_tp:
+            self.allreduce = AllReduce(
+                mapping=config.mapping,
+                strategy=config.allreduce_strategy,
+                dtype=config.pretrained_config.torch_dtype)
 
     def forward_normal(
         self,
@@ -657,6 +665,18 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             module_weights = {}
             for k, v in self.hf_params_map.items():
                 name = name.replace(k, v)
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            names = name.split('.')
+            if names[-1] == "backend" and isinstance(module, MoE):
+                # Backend is under experts module (ConfigurableMoE wrapper)
+                name = '.'.join(names[:-1])
+
             module_weights = filter_weights(name, weights)
 
             if isinstance(module, MoE):

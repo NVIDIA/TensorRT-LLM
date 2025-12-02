@@ -50,6 +50,31 @@ class Communication(ABC):
         self.ep_size = mapping.moe_ep_size
         self.ep_rank = mapping.moe_ep_rank
 
+        # Check platform support and raise error if not supported
+        if not self.is_platform_supported():
+            raise RuntimeError(
+                f"Communication strategy {self.__class__.__name__} "
+                f"is not supported on this platform."
+            )
+        self._is_platform_supported = True
+
+    @staticmethod
+    @abstractmethod
+    def is_platform_supported() -> bool:
+        """
+        Check if this communication strategy is supported on the current platform.
+
+        This method performs platform/hardware checks to determine if the strategy
+        can be used on the current system.
+
+        Returns:
+            True if platform is supported, False otherwise
+
+        Note: This is a static method that can be called before instantiation
+              to check compatibility without creating an instance.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def is_workload_feasible(
         self,
