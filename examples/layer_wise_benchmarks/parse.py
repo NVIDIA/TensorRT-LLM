@@ -268,6 +268,7 @@ parser_keywords = [
     ("memsetExpertIds", "memsetExpertIdsDevice"),
     ("blockSum", "blockExpertPrefixSumKernel"),
     ("globalSum", "globalExpertPrefixSumKernel"),
+    ("globalSumLarge", "globalExpertPrefixSumLargeKernel"),
     ("mergePrefix", "mergeExpertPrefixSumKernel"),
     ("fusedBuildExpertMaps", "fusedBuildExpertMapsSortFirstTokenKernel"),
     ("swiglu", "silu_and_mul_kernel"),
@@ -289,6 +290,7 @@ parser_keywords = [
     ("per_token_quant", "_per_token_quant_and_transform_kernel"),
     ("triton_fused_layer_norm", "triton_per_fused__to_copy_native_layer_norm_0"),
     ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<"),
+    ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheKernel<"),
     ("fp8_blockscale_gemm", "tensorrt_llm::kernels::fp8_blockscale_gemm"),
     ("triton_fused_mul_squeeze", "triton_poi_fused_mul_squeeze_0"),
     ("indexerKCacheScatter", "tensorrt_llm::kernels::indexerKCacheScatterUnifiedKernel"),
@@ -309,12 +311,17 @@ parser_keywords = [
     ("softmax_warp_forward", "softmax_warp_forward<"),
     ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
     ("torchMul", "at::native::binary_internal::MulFunctor<"),
+    ("computeSeqAndPaddingOffsets", "tensorrt_llm::kernels::computeSeqAndPaddingOffsets<"),
     ("applyBiasRopeUpdateKVCache", "tensorrt_llm::kernels::applyBiasRopeUpdateKVCacheV2<"),
     ("routingIndicesHistogramScores", "routingRenormalize::routingIndicesHistogramScoresKernel<"),
     ("routingIndicesHistogram", "routingIndicesHistogramKernel<"),
     ("routingIndicesOffsets", "routingIndicesOffsetsKernel<"),
     ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
     ("CuteDSLMoePermute", "cute_dsl::moePermuteKernel"),
+    (
+        "CuteDSLGemm",
+        ["cute_dsl_kernels", "blockscaled_gemm_persistent"],
+    ),
     (
         "CuteDSLGroupedGemmSwiglu",
         ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"],
@@ -343,7 +350,11 @@ def parse_kernel_name(demangledName):
         warned_names.add(name)
         if args.error_on_unknown_kernel:
             raise NotImplementedError(f"Unknown kernel name: {name}")
-    return name[:30]
+    if "<" in name:
+        name = name[: name.index("<")]
+    elif "(" in name:
+        name = name[: name.index("(")]
+    return name
 
 
 converted_seqs = []
@@ -405,7 +416,7 @@ stack = []
 csv_data = [["", *[problem["text"] for problem in problem_set]]]
 js_data = []
 js_stack = [js_data]
-max_title_len = max((len(title) - 1) * 3 + len(title[-1]) for title in merged_title)
+max_title_len = max((len(title) - 1) * 3 + len(title[-1][:40]) for title in merged_title)
 for title, time_data in zip(merged_title, merged_data):
     while stack != list(title[: len(stack)]):
         level_title = stack[-1]
@@ -426,7 +437,9 @@ for title, time_data in zip(merged_title, merged_data):
         js_stack.append([])
     level = len(stack) + 1
     print(
-        "|--" * (level - 1) + title[-1] + " " * (max_title_len - (level - 1) * 3 - len(title[-1])),
+        "|--" * (level - 1)
+        + title[-1][:40]
+        + " " * (max_title_len - (level - 1) * 3 - len(title[-1][:40])),
         *[f"{x / 1000:-6.1f}" for x in time_data],
     )
     csv_data.append(["|--" * (level - 1) + title[-1], *[f"{x / 1000:.1f}" for x in time_data]])

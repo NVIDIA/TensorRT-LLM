@@ -412,7 +412,7 @@
 
             // Name Col
             html += `<td onclick="toggleFold('${uniqueId}', event)" style="padding-left: ${10 + level * 20}px">
-                        <div class="cell-content">${toggleIcon} ${node.name}</div>
+                        <div class="cell-content" title="${node.name}">${toggleIcon} ${node.name}</div>
                      </td>`;
 
             // Data Cols
