@@ -839,7 +839,6 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
                                             llama_model_root):
-    pytest.fail("test: reuse test results")
     src_dst_dict = {
         llama_model_root:
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
