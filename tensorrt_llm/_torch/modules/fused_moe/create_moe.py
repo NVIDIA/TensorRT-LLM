@@ -7,7 +7,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType
+from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -80,6 +80,7 @@ def create_moe_backend(
     swiglu_limit: Optional[torch.Tensor] = None,
     init_load_balancer: bool = True,
     without_comm: bool = False,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """
     Create MoE backend instance with validation.
@@ -101,6 +102,7 @@ def create_moe_backend(
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
         swiglu_limit: SwiGLU limit parameter
+        activation_type: Activation type
 
     Returns:
         MoE: MoE backend instance
@@ -183,6 +185,7 @@ def create_moe_backend(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(
@@ -212,6 +215,8 @@ def create_moe_backend(
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            activation_type=activation_type,
         )
     elif moe_cls == CuteDslFusedMoE:
         return moe_cls(
@@ -280,6 +285,7 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -301,6 +307,7 @@ def create_moe(
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
         swiglu_limit: SwiGLU limit parameter
+        activation_type: Activation type
 
     Returns:
         MoE: MoE instance
@@ -384,4 +391,5 @@ def create_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        activation_type=activation_type,
     )
