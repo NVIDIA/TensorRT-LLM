@@ -1,3 +1,20 @@
+.. note::
+
+   **Traffic Patterns**: The ISL (Input Sequence Length) and OSL (Output Sequence Length)
+   values in each configuration represent the **maximum supported values** for that config.
+   Requests exceeding these limits may result in errors.
+
+   To handle requests with input sequences **longer than the configured ISL**, add the following
+   to your config file:
+
+   .. code-block:: yaml
+
+      enable_chunked_prefill: true
+
+   This enables chunked prefill, which processes long input sequences in chunks rather than
+   requiring them to fit within a single prefill operation. Note that enabling chunked prefill
+   does **not** guarantee optimal performance—these configs are tuned for the specified ISL/OSL.
+
 .. start-deepseek-ai/DeepSeek-R1-0528
 
 .. _deepseek-ai/DeepSeek-R1-0528:

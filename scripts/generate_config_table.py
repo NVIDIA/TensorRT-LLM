@@ -45,6 +45,37 @@ def generate_rst(yaml_path, output_file=None):
     # Prepare output lines
     lines = []
 
+    # Add introductory note about ISL/OSL constraints
+    lines.append(".. note::")
+    lines.append("")
+    lines.append(
+        "   **Traffic Patterns**: The ISL (Input Sequence Length) and OSL (Output Sequence Length)"
+    )
+    lines.append(
+        "   values in each configuration represent the **maximum supported values** for that config."
+    )
+    lines.append("   Requests exceeding these limits may result in errors.")
+    lines.append("")
+    lines.append(
+        "   To handle requests with input sequences **longer than the configured ISL**, add the following"
+    )
+    lines.append("   to your config file:")
+    lines.append("")
+    lines.append("   .. code-block:: yaml")
+    lines.append("")
+    lines.append("      enable_chunked_prefill: true")
+    lines.append("")
+    lines.append(
+        "   This enables chunked prefill, which processes long input sequences in chunks rather than"
+    )
+    lines.append(
+        "   requiring them to fit within a single prefill operation. Note that enabling chunked prefill"
+    )
+    lines.append(
+        "   does **not** guarantee optimal performance—these configs are tuned for the specified ISL/OSL."
+    )
+    lines.append("")
+
     # Sort models alphabetically
     sorted_models = sorted(model_groups.keys())
 
