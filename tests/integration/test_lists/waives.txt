@@ -353,7 +353,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp
 examples/test_multimodal.py::test_llm_multimodal_general[llava-onevision-qwen2-7b-ov-hf-video-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
 examples/test_multimodal.py::test_llm_multimodal_general[llava-onevision-qwen2-7b-ov-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
 examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4] SKIP (https://nvbugs/5655832)
-disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5661926)
 test_e2e.py::test_trtllm_multimodal_benchmark_serving SKIP (https://nvbugs/5647825)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[MNNVL] SKIP (https://nvbugs/5664904)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP] SKIP (https://nvbugs/5664904)
