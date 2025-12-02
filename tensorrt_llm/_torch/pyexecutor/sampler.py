@@ -729,44 +729,46 @@ class AsyncWorkerMixin:
             self._async_worker = None
 
     @torch.inference_mode()
-    def _async_worker_run(self, ready: torch.cuda.Event, func, /, *args, **kwargs):
+    def _async_copy_to_host(
+        self, copy_ready: torch.cuda.Event, dest: torch.Tensor, src: torch.Tensor
+    ):
         # Make sure the async work takes place after all prior operations on
         # the primary stream. synchronize() is intentionally chosen instead of
         # wait() here; otherwise, blocking copies will stall subsequent CUDA
-        # API calls on the main thread
-        ready.synchronize()
+        # API calls on the main stream/thread
+        copy_ready.synchronize()
 
-        # Do the work
-        result = func(*args, **kwargs)
-
-        # Work submitted to the async worker is expected to block at the end,
-        # consistent with the semantics of futures; make sure that we wait for
-        # everything to complete
-        torch.cuda.current_stream().synchronize()
-
-        return result
-
-    def _async_worker_submit(self, func, /, *args, **kwargs):
-        if self._async_worker_active():
-            # Record an event on the main thread/stream that we will
-            # synchronize with on the worker thread/stream
-            ready = torch.cuda.Event()
-            ready.record()
-
-            # Submit the async work
-            result = self._async_worker.submit(self._async_worker_run, ready, func, *args, **kwargs)
-
-            # Save the future, so that we can await it later
-            self._async_worker_futures.append(result)
-
-            return result
-        else:
-            # If the async worker is not in use, just execute the function
-            return func(*args, **kwargs)
+        # Note that the omission of non_blocking=True here is intentional; Work
+        # submitted to the async worker is expected to block at the end,
+        # consistent with the semantics of futures
+        dest.copy_(src)
 
     def _copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
         dest = torch.empty_like(src, device="cpu", pin_memory=True)
-        self._async_worker_submit(dest.copy_, src, non_blocking=True)
+        if self._async_worker_active():
+            # Create a snapshot of the source on the main stream, so as to
+            # guarantee that the tensor data hasn't been modified before the
+            # copy. This precaution is only needed because the copy will
+            # execute on a side stream and thus there is no guarantee that
+            # future operations on the main stream won't race to modify the
+            # tensor data before we copy it.
+            src_snapshot = src.clone()
+
+            # Record an event on the main thread/stream that we will
+            # synchronize with on the worker thread/stream
+            copy_ready = torch.cuda.Event()
+            copy_ready.record()
+
+            # Submit the copy to the async worker thread
+            result = self._async_worker.submit(
+                self._async_copy_to_host, copy_ready, dest, src_snapshot
+            )
+
+            # Save the future, so that we can await it later
+            self._async_worker_futures.append(result)
+        else:
+            # If the async worker is not in use, just copy as usual
+            dest.copy_(src, non_blocking=True)
         return dest
 
     def _record_sampler_event(self) -> SamplerEvent:
