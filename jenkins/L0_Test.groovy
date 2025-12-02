@@ -2134,19 +2134,19 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
 
         // Append reused tests to waives.txt
         if (reusedTests.size() > 0) {
-            sh(label: "Reused Tests", script: "echo \"Reused tests:\n${reusedTests.join('\n')}\"")
-
             // Build the content to append
             def reusedTestsContent = reusedTests.collect { test ->
                 "${test} SKIP (Reused from previous pipeline)"
             }.join('\n')
 
-            sh """
-                cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
-    ${reusedTestsContent}
-    REUSED_TESTS_EOF
-            """
-            sh(label: "Updated Waives File", script: "echo \"Appended ${reusedTests.size()} reused tests to ${waivesTxt}\"")
+            echo "Reused tests:\n${reusedTestsContent}"
+
+            sh(label: "Append Reused Tests", script: """
+cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
+${reusedTestsContent}
+REUSED_TESTS_EOF
+""")
+            echo "Appended ${reusedTests.size()} reused tests to ${waivesTxt}"
         }
     } catch (InterruptedException e) {
         throw e
