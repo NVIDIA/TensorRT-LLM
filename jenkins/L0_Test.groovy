@@ -134,7 +134,11 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
                 sh "ls ${stageName}"
                 def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
-                    writeFile file: "${stageName}/results-timeout.xml", text: timeoutTestXml
+                    sh """
+cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
+${timeoutTestXml}
+EOF_TIMEOUT_XML
+                    """
                     hasTimeoutTest = true
                 }
             }
@@ -1278,7 +1282,11 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed) {
                 def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
-                    writeFile file: "${stageName}/results-timeout.xml", text: timeoutTestXml
+                    sh """
+cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
+${timeoutTestXml}
+EOF_TIMEOUT_XML
+                    """
                 }
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
