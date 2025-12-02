@@ -30,7 +30,7 @@ class RecipeConstraints(BaseModel):
     def load_config(self) -> Dict[str, Any]:
         """Load configuration from the configuration path."""
         with open(self.config_path, "r") as f:
-            return Recipe(**yaml.load(f, Loader=yaml.FullLoader))
+            return Recipe(**yaml.safe_load(f, Loader=yaml.FullLoader))
 
 
 class Recipe(BaseModel):
@@ -53,7 +53,7 @@ class RecipeList(RootModel[List[RecipeConstraints]]):
             RecipeList: Recipe list object.
         """
         with open(yaml_path, "r") as f:
-            data = yaml.load(f, Loader=yaml.FullLoader)
+            data = yaml.safe_load(f, Loader=yaml.FullLoader)
         return cls(data)
 
     def to_pandas_dataframe(self) -> pd.DataFrame:
