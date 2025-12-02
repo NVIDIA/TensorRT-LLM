@@ -164,7 +164,7 @@ class DeepseekV3WeightLoader:
                      weight_mapper=None,
                      skip_modules: List[str] = []):
 
-        def rename_moe_weight(weights: Dict, rename_rules: Dict):
+        def rename_weight(weights: Dict, rename_rules: Dict):
             result = {}
             for key, value in weights.items():
                 new_key = key
@@ -301,6 +301,16 @@ class DeepseekV3WeightLoader:
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.model.named_modules())
 
+        fp4_weights_map = {
+            "weight_packed": "weight",
+            "input_global_scale": "input_scale",
+            "weight_global_scale": "weight_scale_2",
+        }
+        moe_weights_map = {
+            "down_proj": "w2",
+            "up_proj": "w3",
+            "gate_proj": "w1",
+        }
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -399,19 +409,21 @@ class DeepseekV3WeightLoader:
                     # to include indexer k weights, which is filled in post_load_weights.
                     module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                 elif names[-1] in params_map:
-                    module_weights = []
+                    module_weights_list = []
                     for new_name in params_map[names[-1]]:
-                        module_weights.append(
-                            filter_weights('.'.join(names[:-1] + [new_name]),
-                                           weights))
-                    module.load_weights(weights=module_weights)
+                        module_weights = filter_weights('.'.join(names[:-1] + [new_name]),
+                                           weights)
+                        module_weights = rename_weight(module_weights, fp4_weights_map)
+                        module_weights_list.append(module_weights)
+
+                    module.load_weights(weights=module_weights_list)
+                elif names[-1] == "down_proj":
+                    module_weights = filter_weights(name, weights)
+                    module_weights = rename_weight(module_weights, fp4_weights_map)
+                    module.load_weights(weights=[module_weights])
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
-                    module_weights = rename_moe_weight(module_weights, {
-                        "down_proj": "w2",
-                        "up_proj": "w3",
-                        "gate_proj": "w1",
-                    })
+                    module_weights = rename_weight(module_weights, (fp4_weights_map | moe_weights_map))
                     module.load_weights(weights=[module_weights])
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
