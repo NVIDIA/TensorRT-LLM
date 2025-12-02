@@ -63,7 +63,7 @@ class MistralWeightMapper(HfWeightMapper):
 
                 if combined_item in params_map:
                     new_key = new_key.replace(combined_item, params_map[combined_item])
-                elif item in params_map and params_map[item] not in new_key:
+                elif item in params_map:
                     new_key = new_key.replace(item, params_map[item])
 
             renamed_weights[new_key] = weights[key]

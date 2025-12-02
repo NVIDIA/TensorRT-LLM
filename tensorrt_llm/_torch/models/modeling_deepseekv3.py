@@ -1739,7 +1739,18 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         # TODO: remove when DeepSeek is integrated with _load_weights_impl_v2
         if weight_mapper is not None:
             if isinstance(weight_mapper, MistralLarge3WeightMapper):
+                if self.model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
+                    quantization_weights_map = {
+                        "weight_packed": "weight",
+                        "input_global_scale": "input_scale",
+                        "weight_global_scale": "weight_scale_2",
+                    }
+                elif self.model_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                    quantization_weights_map = {
+                        "weight_scale": "weight_scale_inv",
+                    }
                 params_map = weight_mapper.mistral_llm_mapping
+                params_map.update(quantization_weights_map)
                 weights = weight_mapper.rename_by_params_map(
                     weights=weights, params_map=params_map)
         weight_loader.load_weights(weights)
