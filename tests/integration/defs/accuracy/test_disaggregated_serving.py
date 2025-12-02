@@ -492,10 +492,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      enable_perf=True) as llm:
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -1127,10 +1125,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      enable_perf=True) as llm:
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1166,10 +1162,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      enable_perf=True) as llm:
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)

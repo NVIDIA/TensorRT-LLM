@@ -125,12 +125,12 @@ class BaseWorker(GenerationExecutor):
         Note:
             If the process already has constrained affinity, a warning is logged.
             Configuration is handled as follows:
-                TLLM_NUMA_WORKER_AFFINITY = <unset>
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
                     -> Affinity is automatically configured if it is unconstrained,
                        and deleted if it is constrained externally by the user.
-                TLLM_NUMA_WORKER_AFFINITY = 1
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
                     -> Affinity is unconditionally auto-configured.
-                TLLM_NUMA_WORKER_AFFINITY = 0 or any other value
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
                     -> Affinity is unconditionally _not_ auto-configured.
         '''
 
