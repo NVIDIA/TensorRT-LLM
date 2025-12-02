@@ -1931,6 +1931,12 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype",
     )
 
+    env_overrides: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand.",
+        status="prototype")
+
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
