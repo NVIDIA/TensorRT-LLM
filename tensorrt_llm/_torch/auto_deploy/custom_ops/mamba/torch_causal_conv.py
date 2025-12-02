@@ -21,15 +21,19 @@ def _torch_causal_conv1d(
 
     batch_size, seq_len, _ = input.shape
 
-    return F.conv1d(
-        input.transpose(1, 2),
-        weight,
-        bias,
-        stride,
-        padding,
-        dilation,
-        groups,
-    )[..., :seq_len].transpose(1, 2)
+    return (
+        F.conv1d(
+            input.transpose(1, 2),
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )[..., :seq_len]
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 @_torch_causal_conv1d.register_fake

@@ -168,6 +168,7 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             # Keep max_batch_size as in the PyTorch test to avoid OOM
             "max_batch_size": 128,
             # Model context length is 8K
+            "enable_chunked_prefill": True,
             "max_seq_len": 8192,
             # Set explicitly to match default build_config behavior
             "max_num_tokens": 8192,
@@ -179,6 +180,10 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                 "detect_sharding": {
                     "sharding_source": ['factory', 'heuristic'],
                     "sharding_dims": ['ep', 'bmm'],
+                },
+                "multi_stream_moe": {
+                    "stage": "compile",
+                    "enabled": True,
                 },
                 # NOTE: some accuracy benchmarks may require fp32 precision for mamba cache
                 # "insert_cached_ssm_attention": {
@@ -200,6 +205,9 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     def test_bf16(self):
         kwargs = self.get_default_kwargs()
+        # TODO: multi-stream MOE seems to increase the memory usage
+        kwargs["max_batch_size"] = 32
+        kwargs["free_mem_ratio"] = 0.5
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,

@@ -45,6 +45,9 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.page_size = self.sparse_attention_config.page_size
         self.topk = self.sparse_attention_config.topk
 
+        assert self.page_size == next_power_of_2(
+            self.page_size), "Page size must be a power of 2"
+
         capture_graph = torch.cuda.is_current_stream_capturing()
 
         # Cumulative valid sequence lengths for query and key
@@ -72,10 +75,24 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                              dtype=torch.int32)
 
         # Context length of RocketKV key for each valid sequence
-        self.k_context_lens = torch.empty(
-            self.max_num_sequences,
-            device='cpu',
+        self.k_context_lens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences, ),
             dtype=torch.int32,
+            cache_name="k_context_lens_cuda",
+            capture_graph=capture_graph,
+        )
+        self.k_context_lens = torch.zeros_like(self.k_context_lens_cuda,
+                                               device='cpu',
+                                               dtype=torch.int32)
+
+        # Start index of RocketKV key for each valid sequence
+        self.k_context_start_cuda = self.get_empty(
+            None,
+            (self.max_num_sequences, ),
+            dtype=torch.int32,
+            cache_name="k_context_start_cuda",
+            capture_graph=capture_graph,
         )
 
         # Cumulative context lengths for each sequence
@@ -228,13 +245,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Only consider sequences that are long enough for sparse kv indices prediction in context phase
         self.k_context_lens[:valid_batch_size] = self.prompt_lens_cpu[
             valid_seq_indices] - self.window_size
-        if valid_batch_size > 0:
-            # Maximum context length of RocketKV key for valid sequences for padding
-            self.max_rocket_k_ctx_len = self.k_context_lens[:
-                                                            valid_batch_size].max(
-                                                            ).item()
-        else:
-            self.max_rocket_k_ctx_len = 0
+        self.k_context_lens_cuda[:valid_batch_size].copy_(
+            self.k_context_lens[:valid_batch_size], non_blocking=True)
 
         sparse_counts_ctx = torch.zeros(self.num_contexts,
                                         dtype=torch.int32,
@@ -258,6 +270,17 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.k_context_lens[:valid_batch_size], dim=0)
         self.k_cu_seqlens_cuda[:valid_batch_size + 1].copy_(
             self.k_cu_seqlens[:valid_batch_size + 1], non_blocking=True)
+
+        if valid_batch_size > 0:
+            # Maximum context length of RocketKV key for valid sequences for padding
+            self.max_rocket_k_ctx_len = self.k_context_lens[:
+                                                            valid_batch_size].max(
+                                                            ).item()
+            self.total_rocket_k_ctx_tokens = self.k_cu_seqlens[
+                valid_batch_size].item()
+        else:
+            self.max_rocket_k_ctx_len = 0
+            self.total_rocket_k_ctx_tokens = 0
 
         self.valid_batch_size = valid_batch_size
         self.total_sparse_ctx_indices = self.sparse_offsets_ctx[
@@ -357,6 +380,7 @@ class RocketTrtllmAttention(TrtllmAttention):
                 metadata.context_cumsum_cuda,
                 metadata.valid_seq_indices_cuda,
                 metadata.k_cu_seqlens_cuda,
+                metadata.total_rocket_k_ctx_tokens,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -391,12 +415,32 @@ class RocketTrtllmAttention(TrtllmAttention):
                 padding=self.kernel_size // 2,
                 stride=1)
 
-            selected_prefix_indices = scores.topk(
-                self.prompt_budget - self.window_size,
-                dim=-1).indices.sort().values.to(torch.int32)
+            # Use indexer topk prefill to select topk prefix indices
+            total_tasks = metadata.valid_batch_size * self.num_kv_heads
+
+            selected_prefix_indices = torch.empty(
+                (total_tasks, self.prompt_budget - self.window_size),
+                device=qkv_input.device,
+                dtype=torch.int32)
+
+            scores = scores.view(total_tasks, -1)
+
+            row_starts = metadata.k_context_start_cuda[:metadata.
+                                                       valid_batch_size].repeat_interleave(
+                                                           self.num_kv_heads)
+            row_ends = metadata.k_context_lens_cuda[:metadata.
+                                                    valid_batch_size].repeat_interleave(
+                                                        self.num_kv_heads)
+            torch.ops.trtllm.indexer_topk_prefill(
+                scores, row_starts, row_ends, selected_prefix_indices,
+                self.prompt_budget - self.window_size)
+
+            # Sort selected prefix indices to keep topk indices in ascending order
+            selected_prefix_indices = torch.sort(selected_prefix_indices,
+                                                 dim=-1).values
         else:
             selected_prefix_indices = torch.empty(
-                (0, self.num_kv_heads, self.prompt_budget - self.window_size),
+                (0, self.prompt_budget - self.window_size),
                 device=qkv_input.device,
                 dtype=torch.int32)
 
@@ -408,7 +452,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             selected_prefix_indices, metadata.prompt_lens_cuda,
             metadata.valid_seq_indices_cuda, sparse_kv_offsets,
             metadata.num_contexts, metadata.total_sparse_ctx_indices,
-            self.window_size, self.prompt_budget)
+            self.window_size, self.prompt_budget, self.num_kv_heads)
 
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
@@ -425,6 +469,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             self.num_kv_heads,
             self.head_dim,
             self.page_size,
+            self.prompt_budget,
             metadata.kt_tokens_per_block,
             metadata.kv_cache_manager.max_kt_blocks_per_seq,
         )
@@ -453,20 +498,15 @@ class RocketTrtllmAttention(TrtllmAttention):
         q = q.view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads,
                    self.head_dim)
 
-        q_abs = torch.abs(q)
-        q_mask = torch.zeros_like(q)
+        return q, k
 
-        i1 = torch.topk(q_abs.mean(dim=2, keepdim=True), self.topr,
+    @torch.compile(dynamic=True)
+    def topr_filter(self, q: torch.Tensor) -> torch.Tensor:
+        i1 = torch.topk(q.abs().sum(dim=2, keepdim=True), self.topr,
                         dim=-1).indices
-
+        q_mask = torch.zeros_like(q)
         q_mask.scatter_(-1, i1.expand_as(q[..., :self.topr]), 1)
-
-        q_valid = q * q_mask
-
-        dim_pos = torch.where(q_valid.sum(dim=2) > 0, self.head_dim,
-                              0).to(torch.int32)
-
-        return q_valid, k, dim_pos
+        return q * q_mask
 
     def sparse_attn_predict(
         self,
@@ -478,7 +518,10 @@ class RocketTrtllmAttention(TrtllmAttention):
         if metadata.num_generations == 0:
             return None, None
 
-        q, k, dim_pos = self.preprocess_for_gen(q, k, metadata)
+        q, k = self.preprocess_for_gen(q, k, metadata)
+
+        if self.topr < self.head_dim:
+            q = self.topr_filter(q)
 
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
@@ -501,7 +544,6 @@ class RocketTrtllmAttention(TrtllmAttention):
             q,
             kt_cache_tensor,
             metadata.kt_cache_block_offsets[metadata.num_contexts:],
-            dim_pos,
             metadata.kv_lens_cuda_runtime[metadata.num_contexts:],
             metadata.cum_kt_lens_cuda,
             metadata.page_size,
@@ -611,6 +653,7 @@ class RocketVanillaAttention(VanillaAttention):
         self.window_size = sparse_attention_config.window_size
         self.kernel_size = sparse_attention_config.kernel_size
         self.page_size = sparse_attention_config.page_size
+        assert sparse_attention_config.kt_cache_dtype == 'bfloat16', "Only bfloat16 kt cache is supported for Vanilla RocketKV"
 
     def _single_request_sparse_kv_predict(
             self, q: Optional[Tensor], k: Optional[Tensor], v: Optional[Tensor],
@@ -877,6 +920,7 @@ class RocketKVCacheManager(KVCacheManager):
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
         self.kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
+        self.kt_cache_dtype = torch.bfloat16 if sparse_attn_config.kt_cache_dtype == 'bfloat16' else torch.float8_e5m2
 
         super().__init__(
             kv_cache_config,
@@ -910,7 +954,7 @@ class RocketKVCacheManager(KVCacheManager):
             torch.empty((self.num_blocks, self.kt_tokens_per_block,
                          num_kv_heads, head_dim * 2),
                         device="cuda",
-                        dtype=torch.bfloat16)
+                        dtype=self.kt_cache_dtype)
             for _ in range(self.num_local_layers)
         ]
         self.max_kt_blocks_per_seq = self.num_blocks
@@ -1026,13 +1070,19 @@ class RocketKVCacheManager(KVCacheManager):
         sparse_attn_config = model_config.sparse_attention_config
         kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
-        kv_factor = 2 + 2 * kt_tokens_per_block / tokens_per_block
+        kt_factor = 2
+        if sparse_attn_config.kt_cache_dtype == "float8_e5m2":
+            kt_factor = 1
+        kv_factor = 2 + kt_factor * kt_tokens_per_block / tokens_per_block
         mem_per_token *= kv_factor
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
-        kv_factor = self.kv_factor + 2 * self.kt_tokens_per_block / self.tokens_per_block
+        kt_factor = 2
+        if self.kt_cache_dtype == torch.float8_e5m2:
+            kt_factor = 1
+        kv_factor = self.kv_factor + kt_factor * self.kt_tokens_per_block / self.tokens_per_block
         cache_size_per_token = math.ceil(
             kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 

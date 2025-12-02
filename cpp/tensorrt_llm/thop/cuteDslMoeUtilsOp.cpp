@@ -120,8 +120,8 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
     TORCH_CHECK(token_final_scales.size(0) == num_tokens, "token_final_scales.size(0) must be num_tokens.");
     TORCH_CHECK(token_final_scales.size(1) == top_k, "token_final_scales.size(1) must be top_k.");
     return moe_topk_sort_impl(std::nullopt, std::nullopt, token_selected_experts, token_final_scales, num_experts,
-        top_k, std::nullopt, std::nullopt, local_expert_offset, local_num_experts, std::nullopt, tile_tokens_dim,
-        RoutingMethodType::Renormalize);
+        top_k, 1, 1, local_expert_offset, local_num_experts, std::nullopt, tile_tokens_dim,
+        RoutingMethodType::DeepSeekV3);
 }
 
 // Permute

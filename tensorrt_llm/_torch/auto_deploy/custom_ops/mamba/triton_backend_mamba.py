@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List, Tuple
 
 import torch
@@ -43,10 +58,6 @@ def _triton_ssm_prepare_metadata(
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
 
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
     # Truncate slot indices to match active sequences
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
@@ -88,7 +99,6 @@ def _triton_ssm_prepare_metadata(
 
     return (
         seq_len_sanitized,
-        seq_start,
         slot_idx_sanitized,
         use_initial_states,
         cu_seqlens,
@@ -109,7 +119,6 @@ def _triton_ssm_prepare_metadata_fake(
     device = slot_idx.device
     # Always-correct shapes
     seq_len_fake = torch.empty_like(seq_len_sanitized)
-    seq_start_fake = torch.empty_like(seq_len_sanitized)
     slot_idx_fake = torch.empty(num_seq, dtype=torch.long, device=device)
     use_initial_states_fake = torch.empty(num_seq, dtype=torch.bool, device=device)
     cu_seqlens_fake = torch.empty(num_seq + 1, dtype=torch.int32, device=device)
@@ -142,7 +151,6 @@ def _triton_ssm_prepare_metadata_fake(
 
     return (
         seq_len_fake,
-        seq_start_fake,
         slot_idx_fake,
         use_initial_states_fake,
         cu_seqlens_fake,
@@ -165,7 +173,6 @@ def _triton_cached_ssm(
     dt_bias: torch.Tensor,  # [num_heads]
     # METADATA
     seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
     use_initial_states: torch.Tensor,  # [num_seq]
     cu_seqlens: torch.Tensor,  # [num_seq + 1]
@@ -193,12 +200,12 @@ def _triton_cached_ssm(
     C_flat = C.reshape(bs, *C.shape[2:])  # [bs, G, N]
     dt_flat = dt.reshape(bs, dt.shape[2])  # [bs, H]
 
-    y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
-    y_flat = y.view(bs, *y.shape[2:])
-
     ssm_state_size = B.shape[3]
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_tensor.tolist()
+
+    y_prefill = None
+    y_decode = None
 
     # Prefill: concatenate tokens at the front and run combined scan
     if num_prefill > 0:
@@ -240,7 +247,6 @@ def _triton_cached_ssm(
             mamba_ssm_cache_dtype=ssm_state_cache.dtype,
         )
 
-        y_flat[:num_prefill_tokens] = y_prefill[0].to(y_flat.dtype)
         ssm_state_cache.index_copy_(
             0, slot_idx[:num_prefill], varlen_states.to(ssm_state_cache.dtype)
         )
@@ -259,7 +265,7 @@ def _triton_cached_ssm(
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        y_dec = selective_state_update(
+        y_decode = selective_state_update(
             ssm_state_cache,
             x_decode,
             dt_hp,
@@ -273,9 +279,19 @@ def _triton_cached_ssm(
             state_batch_indices=slot_idx_decode,
         )  # [nd, H, D]
 
-        y_flat[num_prefill_tokens : num_prefill_tokens + num_decode].copy_(y_dec.to(y_flat.dtype))
-
-    return y
+    # Dispatch return logic
+    if num_prefill > 0 and num_decode > 0:
+        y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+        y_flat = y.view(bs, *y.shape[2:])
+        y_flat[:num_prefill_tokens].copy_(y_prefill[0])
+        y_flat[num_prefill_tokens : num_prefill_tokens + num_decode].copy_(y_decode)
+        return y
+    elif num_prefill > 0:
+        return y_prefill[0].view(b, s, num_heads, head_dim).to(hidden_states.dtype)
+    elif num_decode > 0:
+        return y_decode.view(b, s, num_heads, head_dim).to(hidden_states.dtype)
+    else:
+        return torch.empty_like(hidden_states)
 
 
 @_triton_cached_ssm.register_fake
@@ -290,7 +306,6 @@ def _triton_cached_ssm_fake(
     dt_bias: torch.Tensor,  # [num_heads]
     # METADATA
     seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
     use_initial_states: torch.Tensor,  # [num_seq]
     cu_seqlens: torch.Tensor,  # [num_seq + 1]
@@ -340,9 +355,9 @@ class TritonBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns: seq_len, seq_start, slot_idx, use_initial_states,
+        # Returns: seq_len, slot_idx, use_initial_states,
         # cu_seqlens, chunk_indices, chunk_offsets, seq_idx_prefill, batch_info_tensor
-        return torch.ops.auto_deploy.triton_ssm_prepare_metadata, 9
+        return torch.ops.auto_deploy.triton_ssm_prepare_metadata, 8
 
     @classmethod
     def get_cache_initializers(

@@ -177,13 +177,13 @@ public:
     static constexpr int PipelineStages = IsMixedInput
         ? (IsArrayOfPointersGemm
                 ? detail::compute_stage_count_or_override_single_affine_transformed_input<Sm90ReducedSmemCapacityBytes,
-                    RealElementA, RealElementB, ElementScale, ElementZero, TileShape_MNK, StageCountType::bytes,
-                    SmemAlignment>(StageCountType{})
+                    RealElementA, RealElementB, ElementScale, ElementZero, TileShape_MNK, SmemAlignment,
+                    StageCountType::bytes>(StageCountType{})
                 : detail::compute_stage_count_or_override_single_affine_transformed_input<
                     detail::sm90_smem_capacity_bytes, RealElementA, RealElementB, ElementScale, ElementZero,
-                    TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{}))
+                    TileShape_MNK, SmemAlignment, StageCountType::bytes>(StageCountType{}))
         : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes, ElementAMma, ElementBMma,
-            TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{});
+            TileShape_MNK, SmemAlignment, StageCountType::bytes>(StageCountType{});
 
     using DispatchPolicy = cute::conditional_t<IsMixedInput,
         cute::conditional_t<IsArrayOfPointersGemm,

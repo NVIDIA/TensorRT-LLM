@@ -1,4 +1,5 @@
 import copy
+import gc
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -361,12 +362,23 @@ def create_py_executor(
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import \
-                        ChainDrafter
+                    from tensorrt_llm._torch.speculative.drafting_loops import (
+                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                    from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    return ChainDrafter(spec_config.max_draft_len,
-                                        spec_config.max_total_draft_tokens,
-                                        model)
+                    use_tree_drafter = isinstance(
+                        draft_spec_config, EagleDecodingConfig
+                    ) and not draft_spec_config.is_linear_tree
+
+                    if use_tree_drafter:
+                        return TreeDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, max_batch_size,
+                            model)
+                    else:
+                        return LinearDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens, model)
             else:
                 drafting_loop_wrapper = None
 
@@ -413,6 +425,11 @@ def create_py_executor(
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.max_total_draft_tokens
+
+    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
+        logger.warning(
+            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
+        )
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -516,7 +533,7 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flash_infer_sampling=llm_args._disable_flash_infer_sampling,
+            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -682,6 +699,9 @@ def create_py_executor(
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
+
+            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
@@ -711,6 +731,8 @@ def create_py_executor(
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
+
+    logger.info(f"{llm_args}")
 
     py_executor.start_worker()
     return py_executor

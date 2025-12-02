@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm.serve.chat_utils import parse_chat_message_content
+from tensorrt_llm.serve.chat_utils import load_chat_template, parse_chat_message_content
 
 
 @pytest.fixture
@@ -177,3 +177,48 @@ class TestParseToolMessages:
 
         expected = {**message, "media": []}
         assert result == expected
+
+
+# ruff: noqa: E501
+TEMPLATE_CHATML = """{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content']}}{% if (loop.last and add_generation_prompt) or not loop.last %}{{ '<|im_end|>' + '\\n'}}{% endif %}{% endfor %}
+{% if add_generation_prompt and messages[-1]['role'] != 'assistant' %}{{ '<|im_start|>assistant\\n' }}{% endif %}"""
+
+
+@pytest.fixture
+def chat_template_path(tmp_path):
+    """Return the path to the chat template."""
+    temp_file_path = tmp_path / "chat_template.jinja"
+    with open(temp_file_path, "w") as f:
+        f.write(TEMPLATE_CHATML)
+    return temp_file_path
+
+
+class TestLoadChatTemplate:
+    """Test suite for loading chat templates."""
+
+    def test_load_chat_template_from_path(self, chat_template_path):
+        """Test loading a chat template from a path."""
+        template = load_chat_template(chat_template_path)
+        assert template == TEMPLATE_CHATML
+
+    def test_load_chat_template_from_string(self):
+        """Test loading a chat template from a string."""
+        text = "Hello, how can I help you?"
+        template = load_chat_template(text, is_literal=True)
+        assert template == text
+
+    def test_load_chat_template_from_none(self):
+        """Test loading a chat template from None."""
+        template = load_chat_template(None)
+        assert template is None
+
+    def test_load_chat_template_from_path_with_invalid_path(self):
+        """Test loading a chat template from a path with an invalid path."""
+        with pytest.raises(ValueError, match="looks like a file path"):
+            load_chat_template("invalid/path/to/chat_template.jinja")
+
+    def test_jinjalike_literal(self):
+        """Test loading a chat template from a jinja-like string."""
+        template = "{{ messages }}"
+        template_content = load_chat_template(template)
+        assert template_content == template

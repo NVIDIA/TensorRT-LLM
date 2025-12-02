@@ -502,6 +502,12 @@ _SMALL_MODEL_CONFIGS = {
             "num_hidden_layers": 2,
         },
     },
+    "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024": {
+        "llm_models_subdir": "Nemotron-Nano-3-30B-A3.5B-dev-1024",
+        "model_kwargs": {
+            "num_hidden_layers": 8,
+        },
+    },
 }
 
 

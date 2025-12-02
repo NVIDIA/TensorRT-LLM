@@ -15,9 +15,15 @@ transforms:
   detect_sharding:
     sharding_source: ['factory', 'heuristic']
     sharding_dims: ['ep', 'bmm']
+  multi_stream_moe:
+    stage: compile
+    enabled: true
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (null) for speed
   insert_cached_ssm_attention:
       cache_config:
         # mamba_dtype: float32
         mamba_dtype: null
+  fuse_mamba_a_log:
+    stage: post_load_fusion
+    enabled: true

@@ -404,6 +404,10 @@ def test_trtllm_fused_moe_fp8(
     w3_weight, w1_weight = torch.chunk(w31_weight, 2, dim=1)
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
 
+    # compute quant_scales
+    gemm1_dequant = (w1_scales * hidden_states_scale).contiguous().squeeze().to(torch.float32)
+    gemm2_act_quant = (1.0 / w2_input_scale[0]).contiguous().to(torch.float32)
+    gemm2_dequant = (w2_scales * w2_input_scale[0]).contiguous().squeeze().to(torch.float32)
     ad_test_output = torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused(
         x,  # Note! unquantized input is expected
         selected_experts.to(torch.int),
@@ -417,6 +421,9 @@ def test_trtllm_fused_moe_fp8(
         w1_weight_scale=w1_scales,
         w2_weight_scale=w2_scales,
         w3_weight_scale=w3_scales,
+        gemm1_dequant=gemm1_dequant,
+        gemm2_act_quant=gemm2_act_quant,
+        gemm2_dequant=gemm2_dequant,
         mlp_style=mlp_style,
         act_fn=activation_func,
     )

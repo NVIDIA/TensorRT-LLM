@@ -18,7 +18,7 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
-    DSACacheManager, Indexer, compute_cu_seqlen_kv_bounds_nocache,
+    DSACacheManager, Indexer, compute_cu_seqlen_kv_bounds_with_cache,
     split_prefill_chunks)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -308,9 +308,9 @@ def test_deepgemm_fp8_mqa_logits_basic():
     """
     torch.manual_seed(0)
 
-    num_heads, head_dim = 32, 128
-    seq_len = 512
-    seq_len_kv = 1024
+    num_heads, head_dim = 64, 128
+    seq_len = 2048
+    seq_len_kv = 4096
     #[seq_len, num_heads, head_dim]
     q = torch.randn(
         seq_len,
@@ -335,8 +335,8 @@ def test_deepgemm_fp8_mqa_logits_basic():
     )
     # ks[i] -> ke[i] for each q[i]
     ks = torch.zeros(seq_len, dtype=torch.int, device="cuda")
-    ke = torch.arange(seq_len, dtype=torch.int, device="cuda") + (
-        seq_len_kv - seq_len) + 1  # +1 for exclusive end
+    ke = torch.arange(seq_len, dtype=torch.int,
+                      device="cuda") + (seq_len_kv - seq_len)
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
@@ -382,7 +382,8 @@ def _create_mock_metadata(request_ids,
                           num_ctx_tokens,
                           num_tokens,
                           indexer_max_chunk_size=8194,
-                          max_draft_tokens=0):
+                          max_draft_tokens=0,
+                          enable_context_mla_with_cached_kv=False):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -458,6 +459,12 @@ def _create_mock_metadata(request_ids,
                                                   device='cpu',
                                                   pin_memory=True,
                                                   dtype=torch.int64)
+            # Add host_ctx_cached_token_indptr for prepare_one_prefill_chunk
+            self.host_ctx_cached_token_indptr = torch.zeros(
+                (num_contexts + 1, ),
+                device='cpu',
+                pin_memory=True,
+                dtype=torch.int64)
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
             # Also set private attributes used by DSAtrtllmAttentionMetadata
@@ -474,10 +481,33 @@ def _create_mock_metadata(request_ids,
                          dim=0,
                          dtype=torch.int64,
                          out=self.host_gen_kv_indptr[1:num_generations + 1])
+            # Compute host_ctx_cached_token_indptr from num_cached_tokens
+            if num_contexts > 0:
+                cached_lens = torch.tensor(num_cached_tokens[:num_contexts],
+                                           dtype=torch.int64)
+                torch.cumsum(
+                    cached_lens,
+                    dim=0,
+                    dtype=torch.int64,
+                    out=self.host_ctx_cached_token_indptr[1:num_contexts + 1])
 
             # Add indexer-specific attributes
             self.indexer_max_chunk_size = indexer_max_chunk_size
             self.indexer_prefill_chunks = None
+
+            self.enable_context_mla_with_cached_kv = enable_context_mla_with_cached_kv
+
+            # Add runtime_features for chunked prefill detection
+            class RuntimeFeatures:
+
+                def __init__(self):
+                    self.chunked_prefill = enable_context_mla_with_cached_kv
+                    self.cache_reuse = False
+                    self.has_speculative_draft_tokens = False
+                    self.chunk_size = 512
+                    self.chunked_prefill_buffer_batch_size = 4
+
+            self.runtime_features = RuntimeFeatures()
 
     return MockMetadata()
 
@@ -958,8 +988,8 @@ def test_compute_cu_seqlen_bounds_nocache():
     num_contexts = 2
     num_ctx_tokens = 7
 
-    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
-        seq_lens, num_contexts, num_ctx_tokens)
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, None)
 
     # Expected results:
     # Seq 0: tokens [0,1,2], KV [0,1,2]
@@ -983,6 +1013,218 @@ def test_compute_cu_seqlen_bounds_nocache():
         f"cu_seqlen_ks mismatch:\nGot:      {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
     assert torch.equal(cu_seqlen_ke, expected_ke), \
         f"cu_seqlen_ke mismatch:\nGot:      {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+
+def test_compute_cu_seqlen_bounds_with_cache():
+    """
+    Test case with 2 sequences using chunked prefill (with cached tokens).
+
+    Scenario:
+    - Seq 0: 2 cached tokens, 3 new tokens being added
+    - Seq 1: 1 cached token, 4 new tokens being added
+    """
+    # New tokens being added in this chunk
+    seq_lens = torch.tensor([3, 4], dtype=torch.int32, device="cuda")
+
+    # Previously cached tokens
+    cached_token_lens = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
+
+    num_contexts = 2
+    num_ctx_tokens = 7  # 3 + 4 new tokens total
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
+
+    # Expected results:
+    #
+    # Seq 0: KV has [cached: 0,1] + [new: 2,3,4] = total 5 KV tokens, global range [0:5]
+    #   New Q token 0 (local pos 0): attends to cached(2) + self(1) = [0, 3)
+    #   New Q token 1 (local pos 1): attends to cached(2) + 0,1(2) = [0, 4)
+    #   New Q token 2 (local pos 2): attends to cached(2) + 0,1,2(3) = [0, 5)
+    #
+    # Seq 1: KV has [cached: 0] + [new: 1,2,3,4] = total 5 KV tokens, global range [5:10]
+    #   New Q token 0 (local pos 0, global Q pos 3): attends to cached(1) + self(1) = [5, 7)
+    #   New Q token 1 (local pos 1, global Q pos 4): attends to cached(1) + 0,1(2) = [5, 8)
+    #   New Q token 2 (local pos 2, global Q pos 5): attends to cached(1) + 0,1,2(3) = [5, 9)
+    #   New Q token 3 (local pos 3, global Q pos 6): attends to cached(1) + 0,1,2,3(4) = [5, 10)
+
+    expected_ks = torch.tensor([0, 0, 0, 5, 5, 5, 5],
+                               dtype=torch.int32,
+                               device="cuda")
+    expected_ke = torch.tensor([3, 4, 5, 7, 8, 9, 10],
+                               dtype=torch.int32,
+                               device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"cu_seqlen_ks mismatch:\nGot:      {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"cu_seqlen_ke mismatch:\nGot:      {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+
+def test_compute_cu_seqlen_bounds_with_cache_edge_cases():
+    """Additional edge case tests for chunked prefill with cache."""
+
+    # Case 1: No cached tokens (should behave similarly to nocache version but with global KV offsets)
+    seq_lens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    cached_token_lens = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+    num_contexts = 2
+    num_ctx_tokens = 5
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
+
+    # Seq 0: KV [0:2], Q tokens attend to [0,1), [0,2)
+    # Seq 1: KV [2:5], Q tokens attend to [2,3), [2,4), [2,5)
+    expected_ks = torch.tensor([0, 0, 2, 2, 2],
+                               dtype=torch.int32,
+                               device="cuda")
+    expected_ke = torch.tensor([1, 2, 3, 4, 5],
+                               dtype=torch.int32,
+                               device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"Case 1 - cu_seqlen_ks mismatch:\nGot: {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"Case 1 - cu_seqlen_ke mismatch:\nGot: {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+    # Case 2: Single new token per sequence
+    seq_lens = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+    cached_token_lens = torch.tensor([5, 3], dtype=torch.int32, device="cuda")
+    num_contexts = 2
+    num_ctx_tokens = 2
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
+
+    # Seq 0: 5 cached + 1 new = 6 total KV, global [0:6]
+    #   New Q token 0: attends to cached(5) + self(1) = [0, 6)
+    # Seq 1: 3 cached + 1 new = 4 total KV, global [6:10]
+    #   New Q token 0: attends to cached(3) + self(1) = [6, 10)
+    expected_ks = torch.tensor([0, 6], dtype=torch.int32, device="cuda")
+    expected_ke = torch.tensor([6, 10], dtype=torch.int32, device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"Case 2 - cu_seqlen_ks mismatch:\nGot: {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"Case 2 - cu_seqlen_ke mismatch:\nGot: {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+    # Case 3: Different cached amounts across sequences
+    seq_lens = torch.tensor([2, 1, 3], dtype=torch.int32, device="cuda")
+    cached_token_lens = torch.tensor([10, 0, 5],
+                                     dtype=torch.int32,
+                                     device="cuda")
+    num_contexts = 3
+    num_ctx_tokens = 6
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
+
+    # Seq 0: 10 cached + 2 new = 12 total KV, global [0:12]
+    #   Q token 0 (local 0): cached(10) + self(1) = [0, 11)
+    #   Q token 1 (local 1): cached(10) + 0,1(2) = [0, 12)
+    # Seq 1: 0 cached + 1 new = 1 total KV, global [12:13]
+    #   Q token 0 (local 0): cached(0) + self(1) = [12, 13)
+    # Seq 2: 5 cached + 3 new = 8 total KV, global [13:21]
+    #   Q token 0 (local 0): cached(5) + self(1) = [13, 19)
+    #   Q token 1 (local 1): cached(5) + 0,1(2) = [13, 20)
+    #   Q token 2 (local 2): cached(5) + 0,1,2(3) = [13, 21)
+    expected_ks = torch.tensor([0, 0, 12, 13, 13, 13],
+                               dtype=torch.int32,
+                               device="cuda")
+    expected_ke = torch.tensor([11, 12, 13, 19, 20, 21],
+                               dtype=torch.int32,
+                               device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"Case 3 - cu_seqlen_ks mismatch:\nGot: {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"Case 3 - cu_seqlen_ke mismatch:\nGot: {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+    # Case 4: All tokens cached, single new token
+    seq_lens = torch.tensor([1], dtype=torch.int32, device="cuda")
+    cached_token_lens = torch.tensor([100], dtype=torch.int32, device="cuda")
+    num_contexts = 1
+    num_ctx_tokens = 1
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
+
+    # Seq 0: 100 cached + 1 new = 101 total KV
+    #   Q token 0: attends to all = [0, 101)
+    expected_ks = torch.tensor([0], dtype=torch.int32, device="cuda")
+    expected_ke = torch.tensor([101], dtype=torch.int32, device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"Case 4 - cu_seqlen_ks mismatch:\nGot: {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"Case 4 - cu_seqlen_ke mismatch:\nGot: {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+
+def test_compute_cu_seqlen_bounds_with_cache_properties():
+    """Property-based tests to verify invariants of the with_cache function."""
+
+    for trial in range(10):
+        num_contexts = random.randint(1, 5)
+        seq_lens = torch.randint(1,
+                                 10, (num_contexts, ),
+                                 dtype=torch.int32,
+                                 device="cuda")
+        cached_token_lens = torch.randint(0,
+                                          20, (num_contexts, ),
+                                          dtype=torch.int32,
+                                          device="cuda")
+        num_ctx_tokens = seq_lens.sum().item()
+
+        cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+            seq_lens, num_contexts, num_ctx_tokens, cached_token_lens)
+
+        # Property 1: Output length matches num_ctx_tokens
+        assert cu_seqlen_ks.shape[0] == num_ctx_tokens, \
+            f"Trial {trial}: ks length mismatch: {cu_seqlen_ks.shape[0]} != {num_ctx_tokens}"
+        assert cu_seqlen_ke.shape[0] == num_ctx_tokens, \
+            f"Trial {trial}: ke length mismatch: {cu_seqlen_ke.shape[0]} != {num_ctx_tokens}"
+
+        # Property 2: End > Start for all tokens
+        assert torch.all(cu_seqlen_ke > cu_seqlen_ks), \
+            f"Trial {trial}: End indices must be greater than start indices"
+
+        # Property 3: End indices are strictly increasing within each sequence
+        offset = 0
+        for seq_idx in range(num_contexts):
+            seq_len = seq_lens[seq_idx].item()
+            seq_ke = cu_seqlen_ke[offset:offset + seq_len]
+
+            # Each token should attend to one more KV position than previous
+            if seq_len > 1:
+                diffs = seq_ke[1:] - seq_ke[:-1]
+                assert torch.all(diffs == 1), \
+                    f"Trial {trial}: Seq {seq_idx} - consecutive ke diffs should be 1, got {diffs.tolist()}"
+
+            offset += seq_len
+
+        # Property 4: First token in each sequence has correct attention window size
+        offset = 0
+        for seq_idx in range(num_contexts):
+            seq_len = seq_lens[seq_idx].item()
+            cached_len = cached_token_lens[seq_idx].item()
+
+            # First new Q token should attend to all cached + itself
+            expected_window_size = cached_len + 1
+            actual_window_size = (cu_seqlen_ke[offset] -
+                                  cu_seqlen_ks[offset]).item()
+
+            assert actual_window_size == expected_window_size, \
+                f"Trial {trial}: Seq {seq_idx} first token: expected window {expected_window_size}, got {actual_window_size}"
+
+            offset += seq_len
+
+        # Property 5: KV sequences are non-overlapping and contiguous in global space
+        kv_lens = cached_token_lens + seq_lens
+        expected_total_kv = kv_lens.sum().item()
+
+        # Last token of last sequence should end at total KV count
+        assert cu_seqlen_ke[-1].item() == expected_total_kv, \
+            f"Trial {trial}: Last ke should equal total KV count: {cu_seqlen_ke[-1].item()} != {expected_total_kv}"
 
 
 @pytest.mark.parametrize(
@@ -1802,3 +2044,180 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
 
     assert avg_similarity >= 0.95, \
         f"Single-pass prefill differ: avg similarity {avg_similarity:.4f} < 0.95"
+
+
+@skip_pre_hopper
+def test_indexer_topk_multi_request_with_different_cache():
+    """
+    Test that custom topk kernel handles multi-request batches with different cached amounts.
+    """
+    torch.manual_seed(42)
+
+    # Parameters matching your problematic case
+    batch_size = 2
+    heads, head_dim = 64, 128
+    block_size = 64
+    index_topk = 2048
+    max_model_len = 10240
+    layer_idx = 0
+
+    # Critical: different cached amounts
+    seq_lens = [256, 237]  # NEW tokens
+    cached_tokens = [0, 3584]  # Req0: no cache, Req1: large cache
+    total_kv_lens = [seq_lens[i] + cached_tokens[i] for i in range(batch_size)]
+    total_tokens = sum(seq_lens)
+
+    print(f"\n=== Test: Multi-request with different cache ===")
+    print(
+        f"  Req0: {cached_tokens[0]} cached + {seq_lens[0]} new = {total_kv_lens[0]} total"
+    )
+    print(
+        f"  Req1: {cached_tokens[1]} cached + {seq_lens[1]} new = {total_kv_lens[1]} total"
+    )
+
+    # Create cache manager
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1)
+    sparse_attn_config.index_topk = index_topk
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+
+    # Allocate blocks
+    request_ids = [0, 1]
+    cache_manager.add_dummy_requests(request_ids,
+                                     total_kv_lens,
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    # Generate test data
+    q = torch.randn((total_tokens, heads, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    k = torch.randn((total_tokens, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    weights = torch.randn((total_tokens, heads),
+                          device="cuda",
+                          dtype=torch.float32)
+    hidden_states = torch.randn((total_tokens, 4096),
+                                device="cuda",
+                                dtype=torch.bfloat16)
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
+
+    # Create metadata with chunked prefill enabled
+    metadata = _create_mock_metadata(request_ids,
+                                     batch_size,
+                                     batch_size,
+                                     0,
+                                     torch.tensor(seq_lens, dtype=torch.int32),
+                                     torch.tensor(total_kv_lens,
+                                                  dtype=torch.int32),
+                                     cached_tokens,
+                                     cache_manager,
+                                     total_tokens,
+                                     total_tokens,
+                                     indexer_max_chunk_size=32768,
+                                     enable_context_mla_with_cached_kv=True)
+
+    Indexer.prepare(metadata)
+    indexer._update_k_cache(k_fp8, k_scale, metadata)
+
+    # Test custom kernel
+    topk_custom = indexer.sparse_attn_indexer(metadata,
+                                              hidden_states,
+                                              q_fp8,
+                                              k_fp8,
+                                              k_scale,
+                                              weights,
+                                              use_custom_topk=True)
+
+    # Test fallback
+    topk_fallback = indexer.sparse_attn_indexer(metadata,
+                                                hidden_states,
+                                                q_fp8,
+                                                k_fp8,
+                                                k_scale,
+                                                weights,
+                                                use_custom_topk=False)
+
+    # Validate: custom and fallback should match
+    print(f"\n=== Validation ===")
+
+    print(f"Checking for invalid negative indices:")
+    for tok_id in [0, 255, 256, 492]:  # First/last of each request
+        num_valid_custom = (topk_custom[tok_id] >= 0).sum().item()
+        num_valid_fallback = (topk_fallback[tok_id] >= 0).sum().item()
+        min_val_custom = topk_custom[tok_id].min().item()
+        min_val_fallback = topk_fallback[tok_id].min().item()
+
+        has_invalid = min_val_custom < -1
+        if has_invalid or num_valid_custom != num_valid_fallback:
+            print(
+                f"  Token {tok_id}: custom={num_valid_custom}, fallback={num_valid_fallback}"
+            )
+            print(
+                f"    Custom min={min_val_custom}, Fallback min={min_val_fallback}"
+            )
+            if has_invalid:
+                print(
+                    f"    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
+                )
+
+    # Check tokens with large windows (>= 2048) should have exactly 2048 valid indices
+    print(f"\n=== Check: Large windows must have 2048 valid ===")
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
+        compute_cu_seqlen_kv_bounds_with_cache
+    host_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device='cpu')
+    host_cached = torch.tensor(cached_tokens, dtype=torch.int32, device='cpu')
+    cu_ks, cu_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        host_seq_lens, batch_size, total_tokens, host_cached)
+
+    for tok_id in range(total_tokens):
+        window_size = (cu_ke[tok_id] - cu_ks[tok_id]).item()
+        if window_size >= index_topk:
+            num_valid = (topk_custom[tok_id] >= 0).sum().item()
+            num_valid_fallback = (topk_fallback[tok_id] >= 0).sum().item()
+            assert num_valid_fallback == index_topk, \
+                f"[Fallback] Token {tok_id}: window={window_size}, but only {num_valid_fallback}/{index_topk} valid indices"
+            assert num_valid == index_topk, \
+                f"[Custom Topk] Token {tok_id}: window={window_size}, but only {num_valid}/{index_topk} valid indices"
+
+    print(f"  ✓ All large-window tokens have {index_topk} valid indices")
+
+    # Validation
+    num_exact_matches = 0
+    total_similarity = 0.0
+    min_similarity = 1.0
+
+    for token_idx in range(total_tokens):
+        custom_valid = topk_custom[token_idx][topk_custom[token_idx] >= 0]
+        fallback_valid = topk_fallback[token_idx][topk_fallback[token_idx] >= 0]
+
+        if torch.equal(custom_valid, fallback_valid):
+            num_exact_matches += 1
+            similarity = 1.0
+            total_similarity += similarity
+        else:
+            custom_set = set(custom_valid.cpu().tolist())
+            fallback_set = set(fallback_valid.cpu().tolist())
+            intersection = len(custom_set & fallback_set)
+            union = len(custom_set | fallback_set)
+            similarity = intersection / union if union > 0 else 0.0
+            total_similarity += similarity
+
+        # Track min similarity
+        min_similarity = min(min_similarity, similarity)
+
+    avg_similarity = total_similarity / total_tokens
+
+    print(f"  Exact matches: {num_exact_matches}/{total_tokens}")
+    print(
+        f"  Similarity - Min: {min_similarity:.4f}, Avg: {avg_similarity:.4f}")
+
+    assert avg_similarity >= 0.95, \
+        f"Custom vs fallback differ: avg similarity {avg_similarity:.4f} < 0.95"

@@ -25,7 +25,7 @@ l0_sanity_check:
       - llmapi/test_llm_examples.py::test_llmapi_example_multilora
       - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
       - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
-      - llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp
+      - llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp TIMEOUT (90)
       - llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3
       - llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_ngram
       - llmapi/test_llm_examples.py::test_llmapi_sampling

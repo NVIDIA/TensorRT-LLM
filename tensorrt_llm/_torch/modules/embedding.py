@@ -32,6 +32,7 @@ class LMHead(Linear):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
     ):
         local_in_features = embedding_dim
@@ -63,6 +64,7 @@ class LMHead(Linear):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
@@ -120,14 +122,17 @@ class LMHead(Linear):
         output = input.new_empty(output_shape)
         return output
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         original_weight = None
         if self.tp_mode == TensorParallelMode.COLUMN:
             if self.tp_rank == self.tp_size - 1 and self.padding_size > 0:
                 original_weight = self.weight.data.zero_()
                 self.weight.data = self.weight[:-self.padding_size, :]
 
-        super().load_weights(weights)
+        super().load_weights(weights,
+                             allow_partial_loading=allow_partial_loading)
 
         if original_weight is not None:
             self.weight.data = original_weight
@@ -198,6 +203,7 @@ class Embedding(LMHead):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        reduce_output: bool = True,
         enable_torch_compile_for_embedding: Optional[bool] = False,
         use_custom_cublas_mm: bool = False,
     ):
@@ -208,6 +214,7 @@ class Embedding(LMHead):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 

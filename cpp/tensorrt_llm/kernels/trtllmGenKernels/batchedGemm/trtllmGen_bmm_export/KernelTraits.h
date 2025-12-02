@@ -16,13 +16,13 @@
  */
 #pragma once
 
-#include <cassert>
-#include <stdexcept>
-#include <cstdio>
-#include "trtllm/gen/DtypeDecl.h"
-#include "trtllm/gen/CommonUtils.h"
-#include "trtllm/gen/MmaDecl.h"
 #include "Enums.h"
+#include "trtllm/gen/CommonUtils.h"
+#include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/MmaDecl.h"
+#include <cassert>
+#include <cstdio>
+#include <stdexcept>
 
 namespace batchedGemm
 {

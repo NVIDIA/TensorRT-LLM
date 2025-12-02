@@ -81,9 +81,9 @@ class VanillaMoE(nn.ModuleList):
             self.num_experts)
         self.expert_size_per_partition = self.expert_end - self.expert_start
 
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -416,9 +416,12 @@ class VanillaMoE(nn.ModuleList):
         packed_weight = packed_weight.view(len(weights), *weights_data[0].shape)
         getattr(self, f"{module_name}_{weight_name}").data = packed_weight
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         from ...models.modeling_utils import filter_weights
 
+        assert not allow_partial_loading, "Partial loading is not supported for vanilla MoE now"
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]

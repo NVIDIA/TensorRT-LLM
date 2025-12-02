@@ -16,16 +16,16 @@
  */
 #pragma once
 
-#include "GemmOptions.h"
-#include "GemmGatedActOptions.h"
 #include "BatchedGemmEnums.h"
+#include "GemmGatedActOptions.h"
+#include "GemmOptions.h"
 
 #include <cstdint>
 #include <vector>
 
 #ifndef TLLM_GEN_EXPORT_INTERFACE
-#include "trtllm/gen/GenCtx.h"
 #include "trtllm/gen/CudaRunner.h"
+#include "trtllm/gen/GenCtx.h"
 #else
 #include <iostream>
 
