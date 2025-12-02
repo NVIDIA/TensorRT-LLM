@@ -395,6 +395,7 @@ l0_h100:
   - examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16]
   - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
   - unittest/trt/attention/test_gpt_attention_no_cache.py
+  - examples/test_gpt.py::test_gpt_oss_20b_lora_torch
 - condition:
     ranges:
       system_gpu_count:
