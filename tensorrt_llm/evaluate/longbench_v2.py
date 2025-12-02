@@ -51,24 +51,26 @@ class LongBenchV2(Evaluator):
     DIFFICULTIES = ['easy', 'hard']
     LENGTHS = ['short', 'medium', 'long']
 
-    def __init__(self,
-                 dataset_path: str = 'THUDM/LongBench-v2',
-                 prompts_dir: Optional[str] = None,
-                 num_samples: Optional[int] = None,
-                 start_idx: int = 0,
-                 difficulty: Optional[str] = None,
-                 length: str = 'medium',
-                 domain: Optional[str] = None,
-                 cot: bool = False,
-                 no_context: bool = False,
-                 rag: int = 0,
-                 max_len: int = 128000,
-                 output_dir: Optional[str] = None,
-                 random_seed: int = 0,
-                 apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None,
-                 max_output_length: int = 32000,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None,):
+    def __init__(
+        self,
+        dataset_path: str = 'THUDM/LongBench-v2',
+        prompts_dir: Optional[str] = None,
+        num_samples: Optional[int] = None,
+        start_idx: int = 0,
+        difficulty: Optional[str] = None,
+        length: str = 'medium',
+        domain: Optional[str] = None,
+        cot: bool = False,
+        no_context: bool = False,
+        rag: int = 0,
+        max_len: int = 128000,
+        output_dir: Optional[str] = None,
+        random_seed: int = 0,
+        apply_chat_template: bool = False,
+        system_prompt: Optional[str] = None,
+        max_output_length: int = 32000,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ):
         """Initialize LongBench v2 evaluator.
 
         Args:
@@ -849,23 +851,25 @@ class LongBenchV2(Evaluator):
             temperature=0.6,
             top_p=0.95)
 
-        evaluator = LongBenchV2(dataset_path=dataset_path,
-                                prompts_dir=prompts_dir,
-                                num_samples=num_samples,
-                                start_idx=start_idx,
-                                difficulty=difficulty,
-                                length=length,
-                                domain=domain,
-                                cot=cot,
-                                no_context=no_context,
-                                rag=rag,
-                                max_len=max_len,
-                                output_dir=output_dir,
-                                random_seed=random_seed,
-                                apply_chat_template=apply_chat_template,
-                                system_prompt=system_prompt,
-                                max_output_length=max_output_length,
-                                chat_template_kwargs=chat_template_kwargs,)
+        evaluator = LongBenchV2(
+            dataset_path=dataset_path,
+            prompts_dir=prompts_dir,
+            num_samples=num_samples,
+            start_idx=start_idx,
+            difficulty=difficulty,
+            length=length,
+            domain=domain,
+            cot=cot,
+            no_context=no_context,
+            rag=rag,
+            max_len=max_len,
+            output_dir=output_dir,
+            random_seed=random_seed,
+            apply_chat_template=apply_chat_template,
+            system_prompt=system_prompt,
+            max_output_length=max_output_length,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
