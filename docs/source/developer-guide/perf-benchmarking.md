@@ -9,6 +9,13 @@ easier for users to reproduce our officially published [performance overview](./
 - An entirely Python workflow for benchmarking.
 - Ability to benchmark various flows and features within TensorRT LLM.
 
+TensorRT LLM also provides the OpenAI-compatiable API via `trtllm-serve` command, which starts an OpenAI compatible server that supports the following endpoints:
+- `/v1/models`
+- `/v1/completions`
+- `/v1/chat/completions`
+
+The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI. To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
+
 ## Table of Contents
 - [TensorRT LLM Benchmarking](#tensorrt-llm-benchmarking)
   - [Table of Contents](#table-of-contents)
