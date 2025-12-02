@@ -1,6 +1,7 @@
 import argparse
 import itertools
 import json
+import os
 
 import numpy as np
 import nvtx
@@ -196,7 +197,8 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
             if autotune_flag:
-                with autotune():
+                cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+                with autotune(cache_path=cache_path, rank=rank):
                     run_pack()
                 if args.run_type == "GEN":
                     logger.info("Layer-wise benchmarks: Prefill KV cache")
