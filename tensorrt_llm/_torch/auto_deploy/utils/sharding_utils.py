@@ -764,6 +764,7 @@ class WeightShardingInfo(ShardingTransformInfo):
             rank=self.rank,
             world_size=self.world_size,
             add_dist=self.dist_op is not None,
+            dist_backend=self.dist_backend,
             min_local_shape=self.min_local_shape,
             fused_weight_dims=self.fused_weight_dims,
             quantization_cb=self.quantization_cb,
