@@ -29,8 +29,6 @@ class MistralCheckpointLoader(HfCheckpointLoader):
         hf_weights = {}
 
         for key, value in weights.items():
-            modules = key.split(".")
-
             hf_weights["language_model." + key] = value
 
         return hf_weights
@@ -48,11 +46,17 @@ class MistralCheckpointLoader(HfCheckpointLoader):
             )
             weights[scale] = broadcast[:]
 
+    def reverse_nvfp4_global_scales(self, weights):
+        for key in weights.keys():
+            if "global_scale" in key:
+                weights[key] = 1.0 / weights[key]
+
     def load_weights(self, checkpoint_dir: str, **kwargs):
         weights = super().weight_loader.load_weights(checkpoint_dir, **kwargs)
         weights = self.preprocess_weights(weights)
         # FIXME @okozlova mimic DS fp8 till per tensor supported
         self.broadcast_per_tensor_scales(weights)
+        self.reverse_nvfp4_global_scales(weights)
         return weights
 
     def get_default_config_loader(self) -> MistralConfigLoader:

@@ -355,6 +355,31 @@ class ModelConfig(Generic[TConfig]):
                 'embedding', 'unembedding'
             ]
 
+        # Mistral checkpoints.
+        elif hf_quant_config.get("quant_method") == "compressed-tensors":
+            if 'NVFP4' in hf_quant_config.get("config_groups"):
+                quant_config.quant_algo = QuantAlgo.NVFP4
+                quant_config.group_size = 16
+                quant_config.exclude_modules = [
+                    "layers.*.attention.wq*", "layers.*.attention.wk*",
+                    "patch_merger*", "vision_encoder*",
+                    "vision_language_adapter*",
+                    "language_model.model.layers.*.self_attn.q*",
+                    "language_model.model.layers.*.self_attn.k*",
+                    "language_model.model.layers.*.self_attn.fused_qkv*",
+                    "language_model.model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                    "model.layers.*.self_attn.q*",
+                    "model.layers.*.self_attn.k*",
+                    "model.layers.*.self_attn.fused_qkv*",
+                    "model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                    "model.layers.*.self_attn.o_proj"
+                ]
+            elif 'FP8_BLOCK' in hf_quant_config.get("config_groups"):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.group_size = 128
+                quant_config.exclude_modules = [
+                    "*q_a_proj*", "*kv_a_proj_with_mqa*"
+                ]
         return quant_config, layer_quant_config
 
     @staticmethod
