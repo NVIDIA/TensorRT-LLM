@@ -17,7 +17,6 @@ from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue, logger_debug,
                             print_traceback_on_error)
 from ..sampling_params import BatchedLogitsProcessor
@@ -231,7 +230,6 @@ def worker_main(
     executor_config: Optional[tllm.ExecutorConfig] = None,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
-    tracer_init_kwargs: Optional[dict] = None,
     _torch_model_class_mapping: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
@@ -263,11 +261,6 @@ def worker_main(
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
     is_leader: bool = mpi_rank() == 0
-    if tracer_init_kwargs is not None and is_leader:
-        tracer = VizTracer(**tracer_init_kwargs)
-        tracer.register_exit()
-        tracer.start()
-        set_global_tracer(tracer)
 
     if _torch_model_class_mapping is not None:
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
