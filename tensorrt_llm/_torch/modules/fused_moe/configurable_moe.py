@@ -47,8 +47,11 @@ from .communication import (
     NVLinkOneSided,
     NVLinkTwoSided,
 )
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
+from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from .fused_moe_wide_ep import WideEPMoE
 
 
 class ConfigurableMoE(MoE):
@@ -902,27 +905,30 @@ class ConfigurableMoE(MoE):
         Returns:
             Dict: Backend-specific keyword arguments
         """
-        backend_name = self.backend.__class__.__name__
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if backend_name in ["CutlassFusedMoE", "DeepGemmFusedMoE"]:
+        if isinstance(self.backend, (CutlassFusedMoE, DeepGemmFusedMoE)):
             pass
 
         # Cutlass-specific parameters
-        if backend_name == "CutlassFusedMoE":
+        if isinstance(self.backend, CutlassFusedMoE):
             pass
 
+        # CuteDSL-specific parameters
+        elif isinstance(self.backend, CuteDslFusedMoE):
+            kwargs["enable_alltoall"] = self.enable_alltoall
+
         # WideEP-specific parameters
-        elif backend_name == "WideEPMoE":
+        elif isinstance(self.backend, WideEPMoE):
             pass
 
         # DeepGemm-specific parameters
-        elif backend_name == "DeepGemmFusedMoE":
+        elif isinstance(self.backend, DeepGemmFusedMoE):
             pass
 
         # TRTLLMGen-specific parameters
-        elif backend_name == "TRTLLMGenFusedMoE":
+        elif isinstance(self.backend, TRTLLMGenFusedMoE):
             # Determine router_logits based on whether routing has been done
             # If backend doesn't support load balancer, routing is done before communication
             # In that case, router_logits should be None (routing already done)

@@ -535,6 +535,7 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
         a_sf,
         b_sf,
         alpha,
+        None,  # output
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,

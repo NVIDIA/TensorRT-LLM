@@ -149,7 +149,7 @@ class GroupedGemmInputsHelper:
 
     def inputs_pre_hook_finalize_fusion(
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+        a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
         tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
@@ -184,7 +184,7 @@ class GroupedGemmInputsHelper:
             [num_non_exiting_tiles_val],
             dtype=num_non_exiting_tiles.dtype,
             device=num_non_exiting_tiles.device)
-        return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
+        return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
 
 class FusedMoEInputsHelper:
@@ -1015,11 +1015,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         helper.map_to_tuning_buckets), ),
                     constraint_specs=(
                         ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                        ConstraintSpec(5, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                         ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(7, 0, helper.infer_shape_max_num_tiles),
                         ConstraintSpec(
-                            7, 0, helper.infer_shape_max_num_permuted_tokens),
-                        ConstraintSpec(9, 0, helper.infer_shape_num_tokens)),
+                            8, 0, helper.infer_shape_max_num_permuted_tokens),
+                        ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cuda_graph=True,
                 )
@@ -1027,7 +1028,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
             assert b.dtype == torch.float4_e2m1fn_x2
@@ -1051,6 +1052,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b_sf.size(2) == scale_k
             assert alpha.size(0) == l
 
+            assert c.dtype == self.output_dtype
+            assert c.dim() == 2
+            num_tokens = c.size(0)
+            assert c.size(1) == n
+
             num_tiles = m // self.tile_size
             assert tile_idx_to_group_idx.dtype == torch.int32
             assert tile_idx_to_group_idx.size() == (num_tiles, )
@@ -1062,14 +1068,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert num_non_exiting_tiles.numel() == 1
             assert token_final_scales.dtype == torch.float32
             assert token_final_scales.dim() == 2
-            num_tokens = token_final_scales.size(0)
-            assert token_final_scales.size(1) == self.top_k
-
-            # TODO: Overlap the memset
-            c = torch.zeros(num_tokens,
-                            n,
-                            dtype=self.output_dtype,
-                            device=a.device)
+            assert token_final_scales.size() == (num_tokens, self.top_k)
 
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
@@ -1184,7 +1183,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
-        mutates_args=(),
+        mutates_args=("output", ),
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         input: torch.Tensor,
@@ -1192,6 +1191,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
+        output: Optional[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -1210,8 +1210,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
             tile_size, output_dtype, scaling_vector_size)
+
+        if output is None:
+            num_tokens = token_final_scales.size(0)
+            n = weight.size(1)
+            output = torch.zeros(num_tokens,
+                                 n,
+                                 dtype=output_dtype,
+                                 device=input.device)
+
         inputs = [
-            input, weight, input_scale, weight_scale, alpha,
+            input, weight, input_scale, weight_scale, alpha, output,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx, num_non_exiting_tiles,
             token_final_scales
@@ -1234,6 +1243,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
+        output: Optional[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,

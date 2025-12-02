@@ -256,8 +256,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_nvfp4
+        output_shape = x.size()
         output_dtype = torch.bfloat16
         tile_size = 128
 
@@ -295,6 +297,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
         )
         if self.use_fused_finalize:
+            output = None
+            if enable_alltoall:
+                output = torch.empty(output_shape,
+                                     dtype=output_dtype,
+                                     device=x.device)
+                torch.ops.trtllm.moe_output_memset(
+                    output=output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_size=tile_size,
+                    top_k=self.routing_method.experts_per_token,
+                )
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
@@ -302,6 +318,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight_scale=self.quant_scales.fc2_weight_block.view(
                     torch.uint8),
                 alpha=self.quant_scales.fc2_global,
+                output=output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -344,6 +361,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
@@ -400,7 +418,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             permuted_row_to_unpermuted_row_tensor,
             token_selected_experts,
             expert_first_token_offset_tensor,
-            False,  # enable_alltoall
+            enable_alltoall,
             x.shape[0],  # num_rows
             x.shape[1],  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
@@ -419,6 +437,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
     ) -> torch.Tensor:
         """
         Run MoE computation with CuteDSL backend.
@@ -433,6 +452,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                     this represents expert slots [num_tokens, top_k] instead.
             token_final_scales: Final scaling factors for each token
             x_sf: Input scale factors (optional, for certain quantization schemes)
+            enable_alltoall: Whether alltoall communication is enabled.
 
         Returns:
             final_hidden_states tensor.
@@ -485,5 +505,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x = self.run_moe(x=x,
                          token_selected_experts=token_selected_experts,
                          token_final_scales=token_final_scales,
-                         x_sf=x_sf)
+                         x_sf=x_sf,
+                         enable_alltoall=False)
         return x
