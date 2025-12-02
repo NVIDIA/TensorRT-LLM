@@ -61,12 +61,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Paths to custom module directories to import.",
 )
 @optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
                                  readable=True,
@@ -203,12 +205,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="pipeline parallelism size",
 )
 @optgroup.option(
-    "--cp",
-    type=int,
-    default=1,
-    help="context parallelism size",
-)
-@optgroup.option(
     "--ep",
     type=int,
     default=None,
@@ -299,6 +295,7 @@ def throughput_command(
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
     logger.info("Preparing to run throughput benchmark...")
+
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")

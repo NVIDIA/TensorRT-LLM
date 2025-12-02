@@ -62,8 +62,19 @@ class MappingBase:
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
-        cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
-            "cp_type", CpType.ULYSSES)
+        # Set default cp_type to ULYSSES.
+        cp_type = CpType.ULYSSES
+
+        # Convert cp_type to CpType enum if it is a string.
+        if cp_config is not None:
+            if "cp_type" in cp_config and isinstance(cp_config["cp_type"], str):
+                try:
+                    cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+                except KeyError:
+                    raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                                    f"Must be one of: {', '.join([t.name for t in CpType])}")
+            cp_type = cp_config.get("cp_type", CpType.ULYSSES)
+
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
         if moe_tp_size == -1 and moe_ep_size == -1:

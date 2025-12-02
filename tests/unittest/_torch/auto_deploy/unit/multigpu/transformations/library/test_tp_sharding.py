@@ -281,6 +281,7 @@ def _run_pattern_detection_job(
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
                             allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == MLP:
@@ -303,6 +304,7 @@ def _run_pattern_detection_job(
                             dist_op=dist_op,
                             min_local_shape=1,
                             allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == nn.Linear:
@@ -318,6 +320,7 @@ def _run_pattern_detection_job(
                             dist_op="all_gather",
                             min_local_shape=1,
                             allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == FP8MLP:
@@ -340,6 +343,7 @@ def _run_pattern_detection_job(
                             dist_op=dist_op,
                             min_local_shape=1,
                             allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
 

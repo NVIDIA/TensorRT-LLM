@@ -342,12 +342,14 @@ class ChoiceWithAlias(click.Choice):
               help="The revision to use for the HuggingFace model "
               "(branch name, tag name, or commit id).")
 @click.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @click.option(
     "--reasoning_parser",
     type=click.Choice(ReasoningParserFactory.parsers.keys()),

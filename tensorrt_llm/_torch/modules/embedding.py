@@ -32,6 +32,7 @@ class LMHead(Linear):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
     ):
         local_in_features = embedding_dim
@@ -63,6 +64,7 @@ class LMHead(Linear):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
@@ -201,6 +203,7 @@ class Embedding(LMHead):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        reduce_output: bool = True,
         enable_torch_compile_for_embedding: Optional[bool] = False,
         use_custom_cublas_mm: bool = False,
     ):
@@ -211,6 +214,7 @@ class Embedding(LMHead):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 

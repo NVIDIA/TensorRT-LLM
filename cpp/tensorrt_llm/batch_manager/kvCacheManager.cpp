@@ -876,14 +876,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
         }
 
         nvinfer1::Dims cacheShape;
-        if (pool.containsIndexerKCache)
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, blockSize});
-        }
-        else
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        }
+        cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
 
         TLLM_LOG_DEBUG("[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads", mLogPrefix.c_str(),
             mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads);

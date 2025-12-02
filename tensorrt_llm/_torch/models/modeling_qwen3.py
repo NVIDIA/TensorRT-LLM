@@ -31,6 +31,7 @@ class Qwen3Attention(QKNormRoPEAttention):
         attn_output_gate: bool = False,
         use_gemma_rms_norm: bool = False,
         disable_deep_gemm: bool = False,
+        reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -69,6 +70,7 @@ class Qwen3Attention(QKNormRoPEAttention):
             attn_output_gate=self.attn_output_gate,
             use_gemma_rms_norm=use_gemma_rms_norm,
             disable_deep_gemm=disable_deep_gemm,
+            reduce_output=reduce_output,
         )
 
 

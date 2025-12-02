@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -Eeo pipefail
 shopt -s nullglob
 trap 'echo "[install.sh] Error on line $LINENO" >&2' ERR
@@ -125,7 +125,7 @@ fi
 
 if [ $opencv -eq 1 ]; then
     echo "Installing OpenCV..."
-    pip3 uninstall -y opencv
+    bash -c "pip3 uninstall -y opencv"
     rm -rf /usr/local/lib/python3*/dist-packages/cv2/
-    pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
+    bash -c "pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir"
 fi

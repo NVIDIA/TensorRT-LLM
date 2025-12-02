@@ -40,6 +40,7 @@ from ...utils.node_utils import (
 )
 from ...utils.sharding_utils import (
     BMMShardingInfo,
+    DistBackend,
     EPShardingInfo,
     LayerType,
     ParameterUpdateInfo,
@@ -91,6 +92,8 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+
+    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
 
 
 @TransformRegistry.register("sharding_transform_executor")
@@ -1004,7 +1007,8 @@ def detect_dp_bmm_shard(
         base_size = bmm_batch_size // world_size
         remainder = bmm_batch_size % world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather/trtllm_dist_all_gather
+        #  doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
