@@ -28,8 +28,6 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor, unswizzle_sf
 
 
@@ -916,32 +914,15 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        if IS_CUTLASS_DSL_AVAILABLE and module.use_cute_dsl_nvfp4_blockscaling_mm:
-            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                act_fp4, module.weight, act_sf, module.weight_scale,
-                module.scalar_alpha, module.dtype)
-        elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
-            output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
-                act_fp4, module.weight, act_sf, module.weight_scale,
-                module.alpha, module.dtype)
-        else:
-            if module.enable_cuda_core and act_fp4.shape[0] <= 8:
-                act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                    act_sf.view((act_fp4.shape[0] + 128 - 1) // 128 * 128, -1))
-                output = torch.ops.trtllm.cuda_core_nvfp4_gemm(
-                    act_fp4,
-                    module.weight,
-                    scale_a=act_sf_unswizzled,
-                    scale_b=module.weight_scale,
-                    alpha=module.alpha,
-                    bias=None,
-                    out_dtype=module.dtype or input.dtype,
-                )
-            else:
-                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight,
-                                                     act_sf,
-                                                     module.weight_scale,
-                                                     module.alpha, module.dtype)
+        # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
+        output = torch.ops.trtllm.nvfp4_gemm(act_fp4,
+                                             module.weight,
+                                             act_sf,
+                                             module.weight_scale,
+                                             module.alpha,
+                                             module.dtype,
+                                             to_userbuffers=False,
+                                             backend=module.nvfp4_backend)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -2012,11 +1993,17 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
-        use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
-        use_cublaslt_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
+        nvfp4_backend: str = "auto",
     ):
+        """
+        Args:
+            nvfp4_backend: Backend selection for NVFP4 GEMM operations.
+                Supported values: "auto", "cutlass", "cublaslt", "cutedsl".
+                Default is "auto" which automatically selects the best backend.
+                Can be overridden via TRTLLM_NVFP4_GEMM_BACKEND environment variable.
+        """
         from ..distributed import AllReduce
 
         super().__init__()
@@ -2033,10 +2020,23 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
-        self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
-        self.use_cublaslt_nvfp4_blockscaling_mm = use_cublaslt_nvfp4_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
+
+        # Support environment variable override for nvfp4_backend
+        nvfp4_backend_value = os.environ.get('TRTLLM_NVFP4_GEMM_BACKEND',
+                                             nvfp4_backend)
+
+        # Validate backend selection
+        valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
+        if nvfp4_backend_value not in valid_backends:
+            raise ValueError(
+                f"Invalid nvfp4_backend: '{nvfp4_backend_value}'. "
+                f"Supported values are: {', '.join(sorted(valid_backends))}. "
+                f"Set via constructor argument or TRTLLM_NVFP4_GEMM_BACKEND environment variable."
+            )
+
+        self.nvfp4_backend = nvfp4_backend_value
 
         local_in_features = in_features
         local_out_features = out_features
