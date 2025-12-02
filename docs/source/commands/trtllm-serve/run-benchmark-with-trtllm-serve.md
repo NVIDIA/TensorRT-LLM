@@ -1,6 +1,6 @@
 # Run benchmarking with `trtllm-serve`
 
-TensorRT LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
+TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
@@ -10,6 +10,24 @@ This step-by-step tutorial covers the following topics for running online servin
  * Using `extra_llm_api_options`
  * Multimodal Serving and Benchmarking
 
+## Table of Contents
+- [Run benchmarking with `trtllm-serve`](#run-benchmarking-with-trtllm-serve)
+  - [Table of Contents](#table-of-contents)
+  - [Methodology Introduction](#methodology-introduction)
+  - [Preparation](#preparation)
+    - [Launch the NGC container](#launch-the-ngc-container)
+    - [Start the trtllm-serve service](#start-the-trtllm-serve-service)
+  - [Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`](#benchmark-using-tensorrt_llmservescriptsbenchmark_serving)
+    - [Key Metrics](#key-metrics)
+  - [About `extra_llm_api_options`](#about-extra_llm_api_options)
+      - [`kv_cache_config`](#kv_cache_config)
+      - [`cuda_graph_config`](#cuda_graph_config)
+      - [`moe_config`](#moe_config)
+      - [`attention_backend`](#attention_backend)
+  - [Multimodal Serving and Benchmarking](#multimodal-serving-and-benchmarking)
+    - [Setting up Multimodal Serving](#setting-up-multimodal-serving)
+    - [Multimodal Benchmarking](#multimodal-benchmarking)
+
 
 ## Methodology Introduction
 
@@ -17,8 +35,9 @@ The overall performance benchmarking involves:
    1. Launch the OpenAI-compatible service with `trtllm-serve`
    2. Run the benchmark with [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
+## Preparation
 
-## Launch the NGC container
+### Launch the NGC container
 
 TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags).
 
@@ -29,7 +48,7 @@ docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --uli
 ```
 
 
-## Start the trtllm-serve service
+### Start the trtllm-serve service
 > [!WARNING]
 > The commands and configurations presented in this document are for illustrative purposes only.
 > They serve as examples and may not deliver the optimal performance for your specific use case.
@@ -79,9 +98,9 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 ```
 
-## Run the benchmark
+## Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`
 
-Similar to starting trtllm-serve, create a script to execute the benchmark using the following code and name it bench.sh.
+Similar to starting `trtllm-serve`, create a script to execute the benchmark using the following code and name it bench.sh.
 
 ```bash
 concurrency_list="1 2 4 8 16 32 64 128 256"
@@ -267,28 +286,28 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.
 ```
 ============ Serving Benchmark Result ============
-Successful requests:                     1         
-Benchmark duration (s):                  0.83      
-Total input tokens:                      128       
-Total generated tokens:                  128       
-Request throughput (req/s):              1.20      
-Output token throughput (tok/s):         153.92    
-Total Token throughput (tok/s):          307.85    
-User throughput (tok/s):                 154.15    
-Mean Request AR:                         0.9845    
-Median Request AR:                       0.9845    
+Successful requests:                     1
+Benchmark duration (s):                  0.83
+Total input tokens:                      128
+Total generated tokens:                  128
+Request throughput (req/s):              1.20
+Output token throughput (tok/s):         153.92
+Total Token throughput (tok/s):          307.85
+User throughput (tok/s):                 154.15
+Mean Request AR:                         0.9845
+Median Request AR:                       0.9845
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          84.03     
-Median TTFT (ms):                        84.03     
-P99 TTFT (ms):                           84.03     
+Mean TTFT (ms):                          84.03
+Median TTFT (ms):                        84.03
+P99 TTFT (ms):                           84.03
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          5.88      
-Median TPOT (ms):                        5.88      
-P99 TPOT (ms):                           5.88      
+Mean TPOT (ms):                          5.88
+Median TPOT (ms):                        5.88
+P99 TPOT (ms):                           5.88
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           5.83      
-Median ITL (ms):                         5.88      
-P99 ITL (ms):                            6.14      
+Mean ITL (ms):                           5.83
+Median ITL (ms):                         5.88
+P99 ITL (ms):                            6.14
 ==================================================
 ```
 
