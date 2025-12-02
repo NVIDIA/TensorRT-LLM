@@ -225,14 +225,19 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     algorithm: ClassVar[str] = "rocket"
     window_size: Optional[int] = Field(
-        default=None, description="The window size for snap KV.")
+        default=32, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
-        default=None, description="The kernel size for snap KV.")
-    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
-    topk: Optional[int] = Field(default=128, description="Top-k")
-    prompt_budget: Optional[int] = Field(default=1266,
+        default=63, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=128, description="Top-r")
+    topk: Optional[int] = Field(default=64, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=2048,
                                          description="Prompt budget")
-    page_size: Optional[int] = Field(default=3, description="Page size")
+    page_size: Optional[int] = Field(default=4, description="Page size")
+    kt_cache_dtype: Optional[str] = Field(
+        default='float8_e5m2',
+        choices=['bfloat16', 'float8_e5m2'],
+        description="KT cache dtype",
+    )
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1926,6 +1931,12 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype",
     )
 
+    env_overrides: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand.",
+        status="prototype")
+
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
@@ -3021,6 +3032,15 @@ def update_llm_args_with_extra_dict(
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
 
+    # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
+    if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
+        # Convert KvCacheConfig object to dict if necessary
+        base_kv_config = llm_args['kv_cache_config']
+        if isinstance(base_kv_config, KvCacheConfig):
+            base_kv_config = base_kv_config.model_dump(exclude_unset=True)
+        llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
+            'kv_cache_config']
+
     field_mapping = {
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
@@ -3032,6 +3052,7 @@ def update_llm_args_with_extra_dict(
         "moe_config": MoeConfig,
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
+        "kv_cache_config": KvCacheConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

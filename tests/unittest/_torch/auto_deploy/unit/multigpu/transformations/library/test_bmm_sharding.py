@@ -119,6 +119,7 @@ def _run_pattern_detection_job(
                         world_size=world_size,
                         start_idx=start_idx,
                         end_idx=end_idx,
+                        dist_backend="auto",
                     )
                 )
 

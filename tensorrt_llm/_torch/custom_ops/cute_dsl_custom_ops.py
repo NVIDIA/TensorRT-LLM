@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ..._utils import get_sm_version
 from ...math_utils import pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -32,7 +34,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
-    class CuteDSLNVFP4BlackwellRunner(TunableRunner):
+    class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
@@ -43,20 +45,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_cold_l2_cache=True,
         )
 
-        def __init__(self, alpha: float, output_dtype: torch.dtype):
+        def __init__(self,
+                     output_dtype: torch.dtype,
+                     to_userbuffers: bool = False):
             super().__init__()
-            self.alpha = alpha
-            self.output_dtype = output_dtype
-            assert output_dtype == torch.bfloat16
 
-            if get_sm_version() != 100:
+            if output_dtype != torch.bfloat16:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
                 )
+            self.output_dtype = output_dtype
+            self.to_userbuffers = to_userbuffers
 
-        # rewrite the hash function because the value of self.alpha doesn't affect the tactic.
         def unique_id(self):
-            return (self.output_dtype, )
+            return (self.output_dtype, self.to_userbuffers)
+
+        def __hash__(self):
+            return hash((self.output_dtype, self.to_userbuffers))
+
+        def __eq__(self, other):
+            if not isinstance(other, self.__class__):
+                return False
+            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers
 
         def get_valid_tactics(
             self,
@@ -64,6 +74,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
+            # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
+            sm_version = get_sm_version()
+            if sm_version not in [100, 103]:
+                logger.debug(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL NVFP4 only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
+                )
+                return []
+
             assert inputs[0].dim() == 2
             assert inputs[1].dim() == 2
 
@@ -74,19 +93,54 @@ if IS_CUTLASS_DSL_AVAILABLE:
             real_k = k * 2
             batch_size = 1
             sf_vec_size = 16
-            # m,k
+
+            # Fixed layout for FP4: A and B are always K-major
             a_major = "k"
-            # n, k
             b_major = "k"
+
+            # Early exit: Check K dimension alignment
+            # For K-major layout (A and B tensors), K is the major mode (contiguous dimension).
+            # 16-byte alignment requirement: K must be divisible by 32 for FP4 (128 bits / 4 bits = 32)
+            if real_k % 32 != 0:
+                logger.debug(
+                    f"CuteDSL: K={real_k} does not meet 16-byte alignment requirement "
+                    f"(K%32={real_k%32}, expected 0). Skipping all tactics.")
+                return []
+
+            # Optimize swap_ab candidates based on M and N alignment
+            # swap_ab=False → C is N-major → requires N%8==0 (BF16: 128 bits / 16 bits = 8)
+            # swap_ab=True  → C is M-major → requires M%8==0
+            m_aligned = (m % 8 == 0)
+            n_aligned = (n % 8 == 0)
+
+            if not m_aligned and not n_aligned:
+                logger.debug(
+                    f"CuteDSL: Neither M={m} nor N={n} meets 16-byte alignment "
+                    f"(M%8={m%8}, N%8={n%8}). No valid C layout. Skipping all tactics."
+                )
+                return []
+
+            # Only test swap_ab values that satisfy alignment
+            swap_ab_candidates = []
+            if n_aligned:
+                swap_ab_candidates.append(False)  # N-major layout
+            if m_aligned:
+                swap_ab_candidates.append(True)  # M-major layout
+
+            logger.debug(
+                f"CuteDSL: M={m}(aligned={m_aligned}), N={n}(aligned={n_aligned}), K={real_k}(aligned=True). "
+                f"Testing swap_ab={swap_ab_candidates}")
 
             # full shamoo
             mma_tiler_mn_candidates = [
-                (256, 128),
+                (128, 64),
+                (256, 64),
                 (128, 128),
+                (256, 128),
+                (128, 192),
+                (256, 192),
                 (128, 256),
                 (256, 256),
-                (256, 64),
-                (128, 64),
             ]
             cluster_shape_mn_candidates = [
                 (1, 1),
@@ -100,38 +154,42 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 4),
             ]
             swap_ab_candidates = [True, False]
+            use_prefetch_candidates = [True, False]
 
             valid_tactics = []
-            for swap_ab in swap_ab_candidates:
-                for mma_tiler_mn in mma_tiler_mn_candidates:
-                    for cluster_shape_mn in cluster_shape_mn_candidates:
-                        if swap_ab:
-                            c_major = "m"
-                            kernel_m = n
-                            kernel_n = m
-                        else:
-                            c_major = "n"
-                            kernel_m = m
-                            kernel_n = n
+            for mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    swap_ab_candidates, use_prefetch_candidates):
+                if swap_ab:
+                    c_major = "m"
+                    kernel_m = n
+                    kernel_n = m
+                else:
+                    c_major = "n"
+                    kernel_m = m
+                    kernel_n = n
 
-                        if self.__class__.kernel_class.can_implement(
-                                cutlass.Float4E2M1FN,  # ab_dtype,
-                                cutlass.Float8E4M3FN,  # sf_dtype
-                                sf_vec_size,  # sf_vec_size,
-                                cutlass.BFloat16,  # c_dtype,
-                                mma_tiler_mn,
-                                cluster_shape_mn,
-                                kernel_m,
-                                kernel_n,
-                                real_k,
-                                batch_size,
-                                a_major,
-                                b_major,
-                                c_major,
-                        ):
-                            valid_tactics.append(
-                                (mma_tiler_mn, cluster_shape_mn, swap_ab))
+                if self.__class__.kernel_class.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype,
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        sf_vec_size,  # sf_vec_size,
+                        cutlass.BFloat16,  # c_dtype,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                ):
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
 
+            logger.debug(
+                f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
+            )
             return valid_tactics
 
         def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
@@ -147,6 +205,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self,
             inputs: List[torch.Tensor],
             tactic,
+            **kwargs,
         ) -> torch.Tensor:
             """
             Performs fp8 blockwise gemm operation using CuTe DSL.
@@ -158,7 +217,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[2]: Input scale tensor of shape (k//16, m), dtype: fp8.
                     inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
                     inputs[4]: Alpha scaling factor. dtype: float32.
-                    inputs[5]: Output dtype, expected to be torch.bfloat16.
                 tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn).
 
             Returns:
@@ -167,20 +225,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_vec_size = 16
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, swap_ab = tactic
+                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = tactic
             else:
                 # fallback to default tactic
-                mma_tiler_mn, cluster_shape_mn, swap_ab = [
+                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = [
                     (128, 128),
                     (1, 1),
                     False,
+                    False,
                 ]
 
-            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
+            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
-            c_tensor = torch.empty(*(m, n),
-                                   dtype=self.output_dtype,
-                                   device="cuda")
+
+            # Allocate output tensor from UserBuffers or regular CUDA memory
+            if self.to_userbuffers:
+                c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
+                    [m, n], self.output_dtype)
+            else:
+                c_tensor = torch.empty(*(m, n),
+                                       dtype=self.output_dtype,
+                                       device="cuda")
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
@@ -190,9 +255,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_k = pad_up(real_k // sf_vec_size, 4)
             sf_n = pad_up(n, 128)
 
-            # the scaling tensor is 1D. we need to make sure it has been padded to the correct shape
-            assert a_sf_tensor.shape == (sf_m * sf_k, )
-            assert b_sf_tensor.shape == (sf_n * sf_k, )
+            # Reshape scale factors to CuteDSL's expected format
+            # Input format (from CUTLASS/cuBLASLt): (m*k//16,) and (n*k//16,)
+            # CuteDSL format: (sf_m*sf_k,) and (sf_n*sf_k,)
+            # Note: This is just a view change, no memory copy
+            expected_a_sf_size = sf_m * sf_k
+            expected_b_sf_size = sf_n * sf_k
+
+            if a_sf_tensor.numel() != expected_a_sf_size:
+                raise ValueError(
+                    f"CuteDSL: act scale factor size mismatch. "
+                    f"Expected {expected_a_sf_size} (sf_m={sf_m} * sf_k={sf_k}), "
+                    f"got {a_sf_tensor.numel()} for shape M={m}, K={real_k}")
+            if b_sf_tensor.numel() != expected_b_sf_size:
+                raise ValueError(
+                    f"CuteDSL: weight scale factor size mismatch. "
+                    f"Expected {expected_b_sf_size} (sf_n={sf_n} * sf_k={sf_k}), "
+                    f"got {b_sf_tensor.numel()} for shape N={n}, K={real_k}")
+
+            # Reshape to CuteDSL's expected format (just a view, no copy)
+            a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+            b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
             a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
                                                       cutlass.Float4E2M1FN, 32)
@@ -204,12 +287,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_tensor, cutlass.Float8E4M3FN, 16)
             c_ptr = self.make_cute_dsl_global_pointer(c_tensor,
                                                       cutlass.BFloat16, 16)
+            # Create pointer to alpha on device
+            alpha_ptr = self.make_cute_dsl_global_pointer(
+                alpha_tensor, cutlass.Float32, 4)
 
             # get stream
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab)
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch)
             if swap_ab:
                 kernel_a_ptr = b_ptr
                 kernel_a_sf_ptr = b_sf_ptr
@@ -234,6 +321,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size,
                     mma_tiler_mn,
                     cluster_shape_mn,
+                    use_prefetch,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -254,10 +342,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_a_sf_ptr,
                     kernel_b_sf_ptr,
                     c_ptr,
-                    self.alpha,
+                    alpha_ptr,  # Pass alpha as device pointer
                     max_active_clusters,
                     stream,
                     swap_ab,
+                    options=f"--opt-level 2",
                 )
 
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -277,7 +366,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_a_sf_ptr,
                 kernel_b_sf_ptr,
                 c_ptr,
-                self.alpha,
+                alpha_ptr,  # Pass alpha as device pointer
                 stream,
             )
 
@@ -294,20 +383,45 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        alpha: float,
+        alpha: torch.Tensor,
         output_dtype: torch.dtype,
+        to_userbuffers: bool = False,
     ) -> torch.Tensor:
+        """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
+
+        Args:
+            input: Activation tensor [m, k] in FP4 format (packed in uint8)
+            weight: Weight tensor [n, k] in FP4 format (packed in uint8)
+            input_scale: Activation scale factors
+            weight_scale: Weight scale factors
+            alpha: Scaling factor
+            output_dtype: Output data type (must be bfloat16)
+            to_userbuffers: Whether to allocate output from UserBuffers pool
+
+        Note:
+            This function is primarily used internally by nvfp4_gemm.
+            Direct usage is discouraged. Consider using nvfp4_gemm instead
+            for automatic backend selection with better performance.
+        """
+        # Validate SM version before attempting to use CuteDSL
+        sm_version = get_sm_version()
+        if sm_version not in [100, 103]:
+            raise ValueError(
+                f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
+                f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
+            )
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellRunner(alpha, output_dtype)
-        inputs = [input, weight, input_scale, weight_scale]
+        runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers)
+        inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
             [runner],
             runner.__class__.tuning_config,
             inputs,
         )
+
         output = runner(inputs, tactic=best_tactic)
         return output
 
@@ -317,8 +431,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         mat_b: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
-        alpha: float,
+        alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
+        to_userbuffers: bool = False,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -531,6 +646,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -571,7 +697,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -807,6 +933,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -847,7 +984,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -1124,6 +1261,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
                 )
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.tile_size,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1164,7 +1311,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return valid_tactics
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
                                                  self.num_local_experts,
@@ -1443,6 +1590,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
+        def unique_id(self):
+            return (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.output_dtype,
+                self.scaling_vector_size,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1452,7 +1609,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return [128]
 
         def get_tuning_config(self) -> TuningConfig:
-            key = hash(self)
+            key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
                 helper = FusedMoEInputsHelper(self.num_experts, self.top_k,
                                               self.num_local_experts,

@@ -165,6 +165,11 @@ class ModelConfig(Generic[TConfig]):
             self.allreduce_strategy = get_all_reduce_strategy(
                 self.allreduce_strategy)
 
+        # Set default moe_max_num_tokens if not specified
+        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        if self.moe_max_num_tokens is None:
+            self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
     @property
     def torch_dtype(self) -> torch.dtype:
         """Get the torch dtype of the model."""

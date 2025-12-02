@@ -93,14 +93,15 @@ def _nemotron_h_topk_router_forward(self, hidden_states):
     Forward pass for NemotronHTopkRouter using the optimized noaux_tc_op kernel.
 
     This replaces the original forward method which used pure PyTorch operations
-    with a fused CUDA kernel that performs:
-    1. Sigmoid activation of logits
-    2. Group-based expert selection
-    3. Top-k selection within selected groups
-    4. Normalized weight computation
+    with optimized CUDA kernels:
     """
     hidden_states = hidden_states.view(-1, self.config.hidden_size)
-    router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+    if self.weight.dtype == torch.float32:
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight)
+    else:
+        router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+        )
 
     # Use the fused noaux_tc_op kernel which applies sigmoid internally
     # and performs group-based top-k selection with normalization
