@@ -125,8 +125,8 @@ def trtllm_moe_fused_aux(
     w2_stacked_weight: torch.Tensor,
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
-    device: int = torch.cuda.current_device(),
 ) -> torch.Tensor:
+    device = torch.cuda.current_device()
     with torch.cuda.stream(
         cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
     ):
@@ -154,7 +154,6 @@ def trtllm_moe_fused_aux_fake(
     w2_stacked_weight: torch.Tensor,
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
-    device: int = torch.cuda.current_device(),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -167,8 +166,8 @@ def triton_moe_fused_aux(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    device: int = torch.cuda.current_device(),
 ) -> torch.Tensor:
+    device = torch.cuda.current_device()
     with torch.cuda.stream(
         cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
     ):
@@ -192,7 +191,6 @@ def triton_moe_fused_aux_fake(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    device: int = torch.cuda.current_device(),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -217,8 +215,8 @@ def trtllm_quant_fp8_moe_fused_aux(
     gemm2_dequant: torch.Tensor,  # [E]
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
-    device: int = torch.cuda.current_device(),
 ) -> torch.Tensor:
+    device = torch.cuda.current_device()
     with torch.cuda.stream(
         cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
     ):
@@ -266,7 +264,6 @@ def trtllm_quant_fp8_moe_fused_aux_fake(
     gemm2_dequant: torch.Tensor,
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
-    device: int = torch.cuda.current_device(),
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -299,9 +296,7 @@ def _execute_op_in_aux_stream(
         target_input_node.replace_all_uses_with(new_node)
         graph.erase_node(target_input_node)
         with graph.inserting_after(n):
-            kwargs = n.kwargs.copy()
-            kwargs["device"] = torch.cuda.current_device()
-            new_node = graph.call_function(op_dict[n.target], args=n.args, kwargs=kwargs)
+            new_node = graph.call_function(op_dict[n.target], args=n.args, kwargs=n.kwargs)
         n.replace_all_uses_with(new_node)
         graph.erase_node(n)
         num_replaced += 1
