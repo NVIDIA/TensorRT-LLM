@@ -1514,27 +1514,54 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
             apiVersion: v1
             kind: Pod
             spec:
+                qosClass: Guaranteed
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                            - matchExpressions:
+                              - key: "tensorrt/taints"
+                                operator: DoesNotExist
+                              - key: "tensorrt/affinity"
+                                operator: NotIn
+                                values:
+                                - "core"
                 nodeSelector:
+                    kubernetes.io/arch: arm64
                     kubernetes.io/os: linux
                     nvidia.com/gpu.machine: NVIDIA_DGX_Spark
                     nvidia.com/tenant: blossom_trt
                 containers:
                   - name: trt-llm
                     image: ${image}
-                    command: ['nvidia-smi', '-l']
+                    command: ['sleep', 21600]
+                    tty: true
                     resources:
                       requests:
+                        cpu: 12
+                        memory: 96Gi
                         nvidia.com/gpu: 1
+                        ephemeral-storage: 300Gi
                       limits:
+                        cpu: 12
+                        memory: 96Gi
                         nvidia.com/gpu: 1
+                        ephemeral-storage: 300Gi
+                    imagePullPolicy: Always
                     env:
                     - name: NVIDIA_VISIBLE_DEVICES
                       value: "all"
                     - name: NVIDIA_DRIVER_CAPABILITIES
                       value: "compute,utility"
                     securityContext:
-                      privileged: true
-                    tty: true
+                      capabilities:
+                        add:
+                        - SYS_ADMIN
+                    env:
+                      - name: HOST_NODE_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: spec.nodeName
                   - name: jnlp
                     image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
