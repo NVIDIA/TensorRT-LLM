@@ -259,7 +259,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_nvfp4
-        output_shape = x.size()
         output_dtype = torch.bfloat16
         tile_size = 128
 
@@ -297,21 +296,22 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
         )
         if self.use_fused_finalize:
-            output = None
+            output = torch.empty((token_final_scales.size(0), self.hidden_size),
+                                 dtype=output_dtype,
+                                 device=x.device)
             if enable_alltoall:
-                output = torch.empty(output_shape,
-                                     dtype=output_dtype,
-                                     device=x.device)
                 torch.ops.trtllm.moe_output_memset_inplace(
-                    output=output,
+                    input=output,
                     tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                     expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                     permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
                     num_non_exiting_tiles=num_non_exiting_tiles,
-                    tile_size=tile_size,
+                    tile_tokens_dim=tile_size,
                     top_k=self.routing_method.experts_per_token,
                 )
-            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
+            else:
+                output.fill_(0)
+            torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -331,6 +331,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
+            x = output
         else:
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
@@ -462,13 +463,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
-                x_sf=x_sf)
+                x_sf=x_sf,
+                enable_alltoall=enable_alltoall)
         elif self.has_deepseek_fp8_block_scales:
             return self.run_moe_fp8_block_scales(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
-                x_sf=x_sf)
+                x_sf=x_sf,
+                enable_alltoall=enable_alltoall)
         else:
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."

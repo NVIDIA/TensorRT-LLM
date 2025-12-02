@@ -908,27 +908,27 @@ class ConfigurableMoE(MoE):
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if isinstance(self.backend, (CutlassFusedMoE, DeepGemmFusedMoE)):
+        if self.backend.__class__ in (CutlassFusedMoE, DeepGemmFusedMoE, CuteDslFusedMoE):
             pass
 
         # Cutlass-specific parameters
-        if isinstance(self.backend, CutlassFusedMoE):
+        if self.backend.__class__ == CutlassFusedMoE:
             pass
 
         # CuteDSL-specific parameters
-        elif isinstance(self.backend, CuteDslFusedMoE):
+        elif self.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = self.enable_alltoall
 
         # WideEP-specific parameters
-        elif isinstance(self.backend, WideEPMoE):
+        elif self.backend.__class__ == WideEPMoE:
             pass
 
         # DeepGemm-specific parameters
-        elif isinstance(self.backend, DeepGemmFusedMoE):
+        elif self.backend.__class__ == DeepGemmFusedMoE:
             pass
 
         # TRTLLMGen-specific parameters
-        elif isinstance(self.backend, TRTLLMGenFusedMoE):
+        elif self.backend.__class__ == TRTLLMGenFusedMoE:
             # Determine router_logits based on whether routing has been done
             # If backend doesn't support load balancer, routing is done before communication
             # In that case, router_logits should be None (routing already done)

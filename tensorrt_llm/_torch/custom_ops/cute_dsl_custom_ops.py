@@ -1182,8 +1182,53 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
         mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, output_dtype, scaling_vector_size)
+
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha, output,
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+            token_final_scales
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
+        mutates_args=(),
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         input: torch.Tensor,
@@ -1191,7 +1236,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
-        output: Optional[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -1205,34 +1249,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
-        tuner = AutoTuner.get()
-
-        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
-
-        if output is None:
-            num_tokens = token_final_scales.size(0)
-            n = weight.size(1)
-            output = torch.zeros(num_tokens,
-                                 n,
-                                 dtype=output_dtype,
-                                 device=input.device)
-
-        inputs = [
-            input, weight, input_scale, weight_scale, alpha, output,
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
-            token_final_scales
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
+        num_tokens = token_final_scales.size(0)
+        n = weight.size(1)
+        output = torch.zeros(num_tokens,
+                             n,
+                             dtype=output_dtype,
+                             device=input.device)
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            input=input,
+            weight=weight,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            alpha=alpha,
+            output=output,
+            tile_idx_to_group_idx=tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_size,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
         )
-        output = runner(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake(
@@ -1243,7 +1285,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
-        output: Optional[torch.Tensor],
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,

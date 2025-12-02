@@ -80,7 +80,7 @@ def inplace_info():
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
         },
-        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell.default:
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
         {
             6: "output"
         },
