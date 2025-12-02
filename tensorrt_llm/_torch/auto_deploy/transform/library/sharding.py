@@ -1853,6 +1853,8 @@ def _process_column_sharding(
     """
     Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
     """
+    config = transform_container.config
+    world_size = config.world_size
     if subgraph_nodes is None:
         subgraph_nodes = subgraph(linear_nodes, boundary_condition=is_any_lin_op)
     fused_weight_dims = None
@@ -1946,9 +1948,7 @@ def _process_column_sharding(
             args = list(user.args)
             args[1] = new_sizes
             transform_container.add(
-                ParameterUpdateInfo(
-                    rank=rank, world_size=world_size, target_node=user.name, args=tuple(args)
-                )
+                ParameterUpdateInfo(config=config, target_node=user.name, args=tuple(args))
             )
         elif len(slice_nodes) > 0:
             for slice_node in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice):
@@ -1957,8 +1957,7 @@ def _process_column_sharding(
                 args[3] = args[3] // world_size
                 transform_container.add(
                     ParameterUpdateInfo(
-                        rank=rank,
-                        world_size=world_size,
+                        config=config,
                         target_node=slice_node.name,
                         args=tuple(args),
                     )
