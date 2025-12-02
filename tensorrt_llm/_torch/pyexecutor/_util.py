@@ -155,9 +155,17 @@ class KvCacheCreator:
             dummy_mm_prompt = input_processor.get_dummy_prompt(input_seq_len)
 
             if dummy_mm_prompt is not None:
-                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor(
+                prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
                     dummy_mm_prompt, sampling_params=None)
+
+                multimodal_input = extra_processed_inputs.get(
+                    'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
+                req_mm_input = trtllm.MultimodalInput(
+                    multimodal_hashes=multimodal_input.multimodal_hashes,
+                    multimodal_positions=multimodal_input.multimodal_positions,
+                    multimodal_lengths=multimodal_input.multimodal_lengths
+                ) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
@@ -165,7 +173,8 @@ class KvCacheCreator:
                                          sampling_config=trtllm.SamplingConfig(
                                              beam_width=max_beam_width, ),
                                          output_config=trtllm.OutputConfig(),
-                                         end_id=-1)
+                                         end_id=-1,
+                                         multimodal_input=req_mm_input)
                 request.py_multimodal_data = multimodal_data
             else:
                 # Fall back to text-only prompt when we could not find the small image size.
@@ -285,10 +294,12 @@ class KvCacheCreator:
         ) // self._tokens_per_block * self._tokens_per_block
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return min(
-            num_cache_blocks * self._tokens_per_block *
-            self._dummy_reqs[0].sampling_config.beam_width,
-            max_num_tokens_in_memory)
+        # return min(
+        #     num_cache_blocks * self._tokens_per_block *
+        #     self._dummy_reqs[0].sampling_config.beam_width,
+        #     max_num_tokens_in_memory)
+        return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
+            0].sampling_config.beam_width
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
