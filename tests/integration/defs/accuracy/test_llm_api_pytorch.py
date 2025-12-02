@@ -271,9 +271,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_ngram(self):
+        max_bs = 16
+
         pytorch_config = dict(
             disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[i for i in range(1, max_bs + 1)]),
         )
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
@@ -291,9 +294,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
-                 max_batch_size=16) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+                 max_batch_size=max_bs) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -600,7 +601,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
                  max_batch_size=16,
@@ -1312,6 +1313,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_bfloat16_2_model_mtp(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       mtp_eagle_one_model=False,
+                                       speculative_model_dir=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_num_tokens=8192,
+                 **pytorch_config,
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -2597,17 +2617,13 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            # TODO: Support block reuse for DeepSeek-V3.2
-            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.6,
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                             tokens_per_block=64)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            # TODO: Support block reuse for DeepSeek-V3.2
-            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.7,
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                             tokens_per_block=64)
 
         pytorch_config = dict(
@@ -2670,8 +2686,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 "MOE TRTLLM backend does not support SM version 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.7,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         tokens_per_block=64)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
@@ -2730,8 +2745,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 "MOE TRTLLM backend does not support SM version 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.7,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         tokens_per_block=64)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
@@ -3442,31 +3456,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                 max_batch_size=32) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_eagle3(self):
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
-        )
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-
-        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3"
-        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B"
-
-        draft_len = 1
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=True)
-
-        llm = LLM(model=target_model_dir,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  speculative_config=spec_config,
-                  max_seq_len=8192)
-
-        with llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

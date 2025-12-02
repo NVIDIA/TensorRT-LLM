@@ -14,6 +14,7 @@ import pytest
 import requests
 import yaml
 
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
@@ -67,37 +68,19 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
         return False
 
 
-def check_port_available(port: int) -> int:
-    import socket
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('localhost', port))
-            return port
-    except socket.error:
-        # find a free port
-        sock = socket.socket()
-        sock.bind(('', 0))
-        return sock.getsockname()[1]
-
-
 def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: Dict[str, Any]) -> Dict[str, Any]:
-    disaggregated_server_config['port'] = check_port_available(
-        disaggregated_server_config['port'])
-    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
-    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
+    num_ctx_ports = len(disaggregated_server_config["context_servers"]["urls"])
+    num_gen_ports = len(
+        disaggregated_server_config["generation_servers"]["urls"])
 
-    new_ctx_urls = []
-    new_gen_urls = []
-    for url in ctx_urls:
-        port = check_port_available(int(url.split(":")[1]))
-        new_ctx_urls.append(f"localhost:{port}")
-    for url in gen_urls:
-        port = check_port_available(int(url.split(":")[1]))
-        new_gen_urls.append(f"localhost:{port}")
-
-    disaggregated_server_config["context_servers"]["urls"] = new_ctx_urls
-    disaggregated_server_config["generation_servers"]["urls"] = new_gen_urls
+    disaggregated_server_config['port'] = get_free_port()
+    disaggregated_server_config["context_servers"]["urls"] = [
+        f"localhost:{get_free_port()}" for _ in range(num_ctx_ports)
+    ]
+    disaggregated_server_config["generation_servers"]["urls"] = [
+        f"localhost:{get_free_port()}" for _ in range(num_gen_ports)
+    ]
 
     return disaggregated_server_config
 
@@ -112,7 +95,8 @@ def launch_disaggregated_llm(
         ctx_model: str = None,
         gen_model: str = None,
         server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT,
-        max_workers: int = 16):
+        max_workers: int = 16,
+        enable_perf=False):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -121,9 +105,7 @@ def launch_disaggregated_llm(
         print(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
-
-    enable_perf = True
-    perf_max_requests = 10000
+    perf_max_requests = 50
 
     def _apply_perf_flags(cfg: Optional[Dict[str, Any]]):
         if not isinstance(cfg, dict):
@@ -137,6 +119,7 @@ def launch_disaggregated_llm(
     _apply_perf_flags(disaggregated_server_config)
     _apply_perf_flags(ctx_server_config)
     _apply_perf_flags(gen_server_config)
+
     disaggregated_server_config = revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config)
 
@@ -176,17 +159,17 @@ def launch_disaggregated_llm(
         "--backend",
         "pytorch",
     ]
-    gen_tp, gen_pp = gen_server_config.get(
-        "tensor_parallel_size",
-        tensor_parallel_size), gen_server_config.get("pipeline_parallel_size",
-                                                     1)
-    ctx_tp, ctx_pp = ctx_server_config.get(
-        "tensor_parallel_size",
-        tensor_parallel_size), ctx_server_config.get("pipeline_parallel_size",
-                                                     1)
+    gen_tp, gen_pp, gen_cp = gen_server_config.get(
+        "tensor_parallel_size", tensor_parallel_size), gen_server_config.get(
+            "pipeline_parallel_size",
+            1), gen_server_config.get("context_parallel_size", 1)
+    ctx_tp, ctx_pp, ctx_cp = ctx_server_config.get(
+        "tensor_parallel_size", tensor_parallel_size), ctx_server_config.get(
+            "pipeline_parallel_size",
+            1), ctx_server_config.get("context_parallel_size", 1)
 
-    ctx_total_gpus = ctx_tp * ctx_pp
-    gen_total_gpus = gen_tp * gen_pp
+    ctx_total_gpus = ctx_tp * ctx_pp * ctx_cp
+    gen_total_gpus = gen_tp * gen_pp * gen_cp
 
     ctx_urls = disaggregated_server_config["context_servers"]["urls"]
     gen_urls = disaggregated_server_config["generation_servers"]["urls"]
@@ -213,7 +196,7 @@ def launch_disaggregated_llm(
         ctx_server_args = ctx_args + [
             "--port",
             str(port), "--extra_llm_api_options", ctx_server_config_path,
-            f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}"
+            f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}", f"--cp_size={ctx_cp}"
         ]
         if "max_num_tokens" in ctx_server_config:
             ctx_server_args.append(
@@ -236,7 +219,7 @@ def launch_disaggregated_llm(
         gen_server_args = gen_args + [
             "--port",
             str(port), "--extra_llm_api_options", gen_server_config_path,
-            f"--tp_size={gen_tp}", f"--pp_size={gen_pp}"
+            f"--tp_size={gen_tp}", f"--pp_size={gen_pp}", f"--cp_size={gen_cp}"
         ]
         if "max_num_tokens" in gen_server_config:
             gen_server_args.append(
@@ -383,7 +366,7 @@ def launch_disaggregated_llm(
             except requests.exceptions.RequestException as e:
                 print(f"Error fetching {perf_url}: {e}")
 
-        def _show_kvcache_time(kv_cache_perf_dir, max_lines=1000):
+        def _show_kvcache_time(kv_cache_perf_dir, max_lines=100):
             print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
             for file in os.listdir(kv_cache_perf_dir):
                 print(f"file: {file}")
@@ -492,9 +475,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": disable_overlap_scheduler,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
-            },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT"
             }
         }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
@@ -870,6 +850,65 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_with_helix(self):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False,
+            "enable_partial_reuse": False,
+            "tokens_per_block": 32,
+        }
+        ctx_server_config = {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 2,
+            "context_parallel_size": 1,
+            "max_batch_size": 8,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "UCX"
+            },
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "context_parallel_size": 2,
+            "cp_config": {
+                "cp_type": "HELIX",
+                "tokens_per_block": 32
+            },
+            "max_batch_size": 8,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "UCX"
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="helix_with_bs8")
+
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -1055,7 +1094,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         ctx_server_config["kv_cache_config"] = {
-            "enable_block_reuse": False,
             "free_gpu_memory_fraction": 0.7,
             "tokens_per_block": 64,
             "dtype": "fp8"
@@ -1072,7 +1110,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
         ctx_server_config["enable_attention_dp"] = True
         ctx_server_config["enable_autotuner"] = False
         gen_server_config["kv_cache_config"] = {
-            "enable_block_reuse": False,
             "tokens_per_block": 64,
             "free_gpu_memory_fraction": 0.7,
             "dtype": "fp8"
