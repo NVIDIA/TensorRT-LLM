@@ -856,7 +856,7 @@ def create_torch_sampler_args(
     max_beam_width: int,
     disable_overlap_scheduler: bool,
     disable_flashinfer_sampling: bool,
-    enable_async_worker: bool
+    enable_async_worker: bool,
 ):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else

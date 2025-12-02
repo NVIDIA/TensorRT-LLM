@@ -1855,9 +1855,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         beam_histories = [None] * len(requests)
         if self._use_beam_search:
             seq_lens = seq_lens_host.to(device="cuda", non_blocking=True)
-            first_finish_reasons_host = self.store.first_finish_reasons.to(
-                device="cpu", non_blocking=True
-            )
+            first_finish_reasons_host = self._copy_to_host(self.store.first_finish_reasons)
             self._update_original_tokens(seq_slots, seq_lens, new_tokens)
             self._maybe_create_beam_histories(
                 requests, finish_reasons=first_finish_reasons, beam_histories=beam_histories
