@@ -706,7 +706,7 @@ def test_trtllm_fused_moe_nvfp4(
     elif mlp_style == "mlp":
         # For non-gated MLP with ReLU^2
         fc1_expert_weights_fp4 = w1_q_fp4
-        fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
+        fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
         fc1_weight_gs = w1_gs
         if activation_func != "relu2":
             raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
