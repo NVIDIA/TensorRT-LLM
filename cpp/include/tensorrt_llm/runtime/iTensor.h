@@ -71,7 +71,7 @@ public:
     [[nodiscard]] DimType64 getDimension() const
     {
         auto const shape = getShape();
-        static_assert(n < shape.MAX_DIMS && n >= -shape.MAX_DIMS,
+        static_assert(n < Shape::MAX_DIMS && n >= -Shape::MAX_DIMS,
             "Trying to access the dimension of a tensor, when its maximal shape cannot have that dimension.");
         if constexpr (n < 0)
         {
@@ -126,6 +126,11 @@ public:
     {
         auto const vol = volume(shape);
         TLLM_CHECK_WITH_INFO(0 <= vol, "Invalid tensor shape");
+        if constexpr (sizeof(std::size_t) == 4)
+        {
+            TLLM_CHECK_WITH_INFO(vol <= static_cast<std::int64_t>(std::numeric_limits<std::size_t>::max()),
+                "Tensor volume exceeds 32-bit size_t maximum capacity.");
+        }
         return static_cast<std::size_t>(vol);
     }
 
