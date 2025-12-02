@@ -131,6 +131,8 @@ def generate_rst(yaml_path, output_file=None):
 
             for entry in entries:
                 gpu = entry.get("gpu", "N/A")
+                num_gpus = entry.get("num_gpus", 1)
+                gpu_display = f"{num_gpus}x{gpu}" if num_gpus and num_gpus > 1 else gpu
                 isl = entry.get("isl", "N/A")
                 osl = entry.get("osl", "N/A")
                 conc = int(entry.get("concurrency", 0))
@@ -170,7 +172,7 @@ def generate_rst(yaml_path, output_file=None):
                 github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{full_config_path}"
                 config_link = f"`{config_filename} <{github_url}>`_"
 
-                lines.append(f"   * - {gpu}")
+                lines.append(f"   * - {gpu_display}")
                 lines.append(f"     - {profile}")
                 lines.append(f"     - {isl} / {osl}")
                 lines.append(f"     - {conc}")
