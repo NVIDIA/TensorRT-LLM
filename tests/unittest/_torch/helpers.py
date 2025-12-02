@@ -128,7 +128,7 @@ def reference_bmm_moe_torch(
         w3_w1_stacked_weight: torch.Tensor,
         w2_stacked_weight: torch.Tensor,
         apply_routing_on_input: bool = True) -> torch.Tensor:
-    """Reference for stacked MoE (torch_moe_bmm) in TRT-LLM format.
+    """Reference for stacked MoE in TRT-LLM format.
 
     Args:
         x: (seq_len, hidden_size)

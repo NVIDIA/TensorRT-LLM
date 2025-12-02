@@ -18,6 +18,85 @@ from ..interface import (
 )
 
 
+def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
+    """Replace torch MoE ops with fused backend-specific implementations.
+
+    Handles both:
+    - Standard MoE (per-expert weight lists): torch_moe with apply_routing_on_input=False
+    - Llama4 MoE (pre-stacked weight tensors): torch_moe with apply_routing_on_input=True
+
+    For Llama4 stacked tensors, applies routing weights to input before the fused kernel.
+    """
+    fused_key_counter = 0
+    graph = gm.graph
+    backend = backend.lower()
+
+    # Map backend to fused MoE op (handles both standard and Llama4 stacked tensor patterns)
+    replacement_op = {
+        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
+        "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
+        "triton": torch.ops.auto_deploy.triton_moe_fused,
+    }[backend]
+
+    for node in graph.nodes:
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
+            continue
+
+        # Detect if this is a stacked MoE (Llama4 pattern) or per-expert list (standard pattern)
+        (apply_routing_val, w1_weight_list) = extract_op_args(
+            node, "apply_routing_on_input", "w1_weight"
+        )
+
+        # Check if it's stacked format: single-element list with 3D tensor
+        is_stacked_moe = False
+        if apply_routing_val:
+            # In FX graphs, w1_weight_list might be a Node representing a list() call
+            list_content = None
+            if isinstance(w1_weight_list, Node) and w1_weight_list.target is list:
+                # Extract from list() call node
+                if w1_weight_list.args:
+                    list_content = w1_weight_list.args[0]
+            elif isinstance(w1_weight_list, (list, tuple)):
+                # Direct Python list
+                list_content = w1_weight_list
+
+            # Check if it's a single-element list with a 3D tensor
+            if list_content is not None and len(list_content) == 1:
+                w1_node = list_content[0]
+                if isinstance(w1_node, Node) and w1_node.op == "get_attr":
+                    try:
+                        w1_tensor = gm.get_parameter(w1_node.target)
+                        is_stacked_moe = w1_tensor.ndim == 3
+                    except (AttributeError, KeyError):
+                        pass
+
+        if is_stacked_moe:
+            # Stacked MoE (Llama4 pattern): only supports gated MLP
+            (act_fn_val,) = extract_op_args(node, "act_fn")
+            _process_llama4_stacked_moe_node(
+                gm, graph, node, replacement_op, act_fn_val, fused_key_counter
+            )
+        else:
+            # Standard MoE with per-expert weight lists
+            (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
+            assert backend != "triton" or mlp_style_val == "mlp", (
+                "Triton backend only supports mlp style."
+            )
+            _process_regular_moe_node(
+                gm, graph, node, replacement_op, mlp_style_val, act_fn_val, fused_key_counter
+            )
+
+        fused_key_counter += 1
+
+        # Delete the unstacked weights immediately to save GPU memory
+        # This will happen automatically after the graph is canonicalized, but for large models we'll run out of memory
+        # during the transformation itself.
+        gm.graph.eliminate_dead_code()
+        gm.delete_all_unused_submodules()
+
+    return fused_key_counter
+
+
 def _process_regular_moe_node(
     gm: GraphModule,
     graph: torch.fx.Graph,
@@ -100,7 +179,7 @@ def _process_llama4_stacked_moe_node(
     act_fn_val: str,
     fused_key_counter: int,
 ) -> None:
-    """Process a single Llama4 MoE node with pre-stacked weight tensors (torch_moe_bmm).
+    """Process a single Llama4 MoE node with pre-stacked weight tensors.
 
     Only supports gated MLP (SwiGLU-style) architecture.
     Converts Llama4 format weights to TRT-LLM format to standardize all downstream ops.
@@ -108,14 +187,30 @@ def _process_llama4_stacked_moe_node(
     This is the Llama4 pattern where weights are already stacked across experts.
     Result: silu(input * routing_weight) - routing affects activation.
     """
-    hidden_states, selected_experts, routing_weights, w3_w1_stacked, w2_stacked = extract_op_args(
+    # torch_moe with stacked format: weights are in single-element lists
+    hidden_states, selected_experts, routing_weights, w1_list, w2_list = extract_op_args(
         node,
         "x",
         "selected_experts",
         "routing_weights",
-        "w3_w1_stacked",
-        "w2_stacked",
+        "w1_weight",
+        "w2_weight",
     )
+
+    # Extract the single stacked tensor from each list
+    # Handle both FX graph Nodes (list() calls) and direct Python lists
+    def extract_from_list_arg(list_arg):
+        if isinstance(list_arg, Node) and list_arg.target is list:
+            # Extract from list() call node
+            return list_arg.args[0][0] if list_arg.args else None
+        elif isinstance(list_arg, (list, tuple)):
+            # Direct Python list
+            return list_arg[0]
+        else:
+            raise ValueError(f"Unexpected list format: {type(list_arg)}")
+
+    w3_w1_stacked = extract_from_list_arg(w1_list)
+    w2_stacked = extract_from_list_arg(w2_list)
 
     # Convert Llama4 format to TRT-LLM format if needed
     # This standardizes all downstream ops to only handle TRT-LLM format
@@ -212,62 +307,6 @@ def _process_llama4_stacked_moe_node(
 
     node.replace_all_uses_with(new_node)
     graph.erase_node(node)
-
-
-def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "triton"]) -> int:
-    """Replace torch MoE ops with fused backend-specific implementations.
-
-    Handles both:
-    - Standard MoE (per-expert weight lists): torch_moe
-    - Llama4 MoE (pre-stacked weight tensors): torch_moe_bmm
-
-    For Llama4 stacked tensors, applies routing weights to input before the fused kernel.
-    """
-    fused_key_counter = 0
-    graph = gm.graph
-    backend = backend.lower()
-
-    # Map backend to fused MoE op (handles both standard and Llama4 stacked tensor patterns)
-    replacement_op = {
-        "auto": torch.ops.auto_deploy.trtllm_moe_fused,
-        "trtllm": torch.ops.auto_deploy.trtllm_moe_fused,
-        "triton": torch.ops.auto_deploy.triton_moe_fused,
-    }[backend]
-
-    for node in graph.nodes:
-        if not (
-            is_op(node, torch.ops.auto_deploy.torch_moe)
-            or is_op(node, torch.ops.auto_deploy.torch_moe_bmm)
-        ):
-            continue
-
-        is_llama4_stacked_moe = is_op(node, torch.ops.auto_deploy.torch_moe_bmm)
-
-        if is_llama4_stacked_moe:
-            # torch_moe_bmm: only supports gated MLP, no mlp_style parameter
-            (act_fn_val,) = extract_op_args(node, "act_fn")
-            _process_llama4_stacked_moe_node(
-                gm, graph, node, replacement_op, act_fn_val, fused_key_counter
-            )
-        else:
-            # torch_moe: supports both gated_mlp and mlp styles
-            (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
-            assert backend != "triton" or mlp_style_val == "mlp", (
-                "Triton backend only supports mlp style."
-            )
-            _process_regular_moe_node(
-                gm, graph, node, replacement_op, mlp_style_val, act_fn_val, fused_key_counter
-            )
-
-        fused_key_counter += 1
-
-        # Delete the unstacked weights immediately to save GPU memory
-        # This will happen automatically after the graph is canonicalized, but for large models we'll run out of memory
-        # during the transformation itself.
-        gm.graph.eliminate_dead_code()
-        gm.delete_all_unused_submodules()
-
-    return fused_key_counter
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
@@ -1174,17 +1213,34 @@ class MatchBmmMoePattern(BaseTransform):
                 # If input_routing is False: kernel applies routing to output
                 apply_routing_on_input = input_routing
 
+                # Wrap stacked tensors in single-element lists for torch_moe unified interface
                 with graph.inserting_before(output_node):
+                    # Create list nodes for stacked weights
+                    w1_list_node = graph.call_function(
+                        list,
+                        args=([gate_up_weight],),
+                    )
+                    w2_list_node = graph.call_function(
+                        list,
+                        args=([down_weight],),
+                    )
+                    w3_list_node = graph.call_function(
+                        list,
+                        args=([],),  # Empty list for stacked gated MLP
+                    )
+
                     fused_moe_node = graph.call_function(
-                        torch.ops.auto_deploy.torch_moe_bmm,
+                        torch.ops.auto_deploy.torch_moe,
                         args=(
                             input_hidden_states,
                             selected_experts,
                             routing_weights_node,
-                            gate_up_weight,
-                            down_weight,
+                            w1_list_node,
+                            w2_list_node,
+                            w3_list_node,
                         ),
                         kwargs={
+                            "mlp_style": "gated_mlp",
                             "apply_routing_on_input": apply_routing_on_input,
                         },
                     )

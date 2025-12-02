@@ -254,7 +254,7 @@ def shard_weight_tensor(
     if update_param:
         modname, _, param_name = param_key.rpartition(".")
         submod = gm.get_submodule(modname)
-        param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=False)
+        param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
         setattr(submod, param_name, param_new)
 
     return sharded_weight, sharded_shape
@@ -1008,9 +1008,13 @@ def _insert_sharded_moe(
     allreduce_strategy: AllReduceStrategy,
     scale_names: Sequence[str] = (),
 ):
-    """Update the torch_moe node with sharded weight lists,
+    """Update the torch_moe node with sharded weight lists or stacked tensors,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
+
+    Handles both:
+    - Standard format: per-expert weight lists
+    - Stacked format: single-element lists containing stacked 3D tensors (Llama4 pattern)
 
     NOTE: allreduce_strategy is MANDATORY.
     """
@@ -1018,7 +1022,52 @@ def _insert_sharded_moe(
         raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
-    num_experts = len(node.args[3])
+    # Detect format: check if w1_weight is a single-element list with a 3D tensor (stacked format)
+    w1_weight_arg = node.args[3]
+    is_stacked = False
+
+    # In FX graphs, the list might be a Node representing a list() call
+    if isinstance(w1_weight_arg, Node):
+        # Check if this is a list() call node
+        if w1_weight_arg.target is list and len(w1_weight_arg.args) > 0:
+            # Get the actual list content from the args
+            list_content = w1_weight_arg.args[0]
+            if isinstance(list_content, (list, tuple)) and len(list_content) == 1:
+                first_elem = list_content[0]
+                if isinstance(first_elem, Node) and first_elem.op == "get_attr":
+                    try:
+                        tensor = gm.get_parameter(first_elem.target)
+                        is_stacked = tensor.ndim == 3
+                    except (AttributeError, KeyError):
+                        pass
+                elif isinstance(first_elem, torch.Tensor):
+                    is_stacked = first_elem.ndim == 3
+    # Handle case where it's a direct Python list (not in FX graph context)
+    elif isinstance(w1_weight_arg, (list, tuple)) and len(w1_weight_arg) == 1:
+        first_elem = w1_weight_arg[0]
+        if isinstance(first_elem, Node) and first_elem.op == "get_attr":
+            try:
+                tensor = gm.get_parameter(first_elem.target)
+                is_stacked = tensor.ndim == 3
+            except (AttributeError, KeyError):
+                pass
+        elif isinstance(first_elem, torch.Tensor):
+            is_stacked = first_elem.ndim == 3
+
+    if is_stacked:
+        # Use stacked tensor sharding logic (similar to _insert_sharded_moe_bmm)
+        _insert_sharded_moe_stacked(gm, node, rank, world_size, allreduce_strategy, scale_names)
+        return
+
+    # Standard per-expert list sharding
+    # For FX graphs, get the list from the Node; for direct calls, use the list directly
+    if isinstance(w1_weight_arg, Node) and w1_weight_arg.target is list:
+        # Extract the list content from the list() call node
+        num_experts = len(w1_weight_arg.args[0]) if w1_weight_arg.args else 0
+    elif isinstance(w1_weight_arg, (list, tuple)):
+        num_experts = len(w1_weight_arg)
+    else:
+        raise ValueError(f"Unexpected w1_weight format in node {node.name}: {type(w1_weight_arg)}")
     args = list(node.args)
 
     # -- Handle selected_experts and final_scales sharding --
@@ -1243,7 +1292,7 @@ def _get_dim0_from_arg(gm: GraphModule, arg: Union[Node, torch.Tensor]) -> int:
     raise ValueError(f"Cannot determine shape[0] for {arg}")
 
 
-def _insert_sharded_moe_bmm(
+def _insert_sharded_moe_stacked(
     gm: GraphModule,
     node: Node,
     rank: int,
@@ -1251,20 +1300,35 @@ def _insert_sharded_moe_bmm(
     allreduce_strategy: AllReduceStrategy,
     scale_names: Sequence[str] = (),
 ):
-    """Update the torch_moe_bmm node with sliced weight tensors,
+    """Update the torch_moe node with sliced stacked weight tensors,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
-    Similar to _insert_sharded_moe but for BMM-based (stacked) tensors instead of lists.
+
+    For torch_moe with stacked tensor format (single-element lists containing 3D tensors).
 
     NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
     """
     if allreduce_strategy is None:
-        raise ValueError(f"allreduce_strategy must be set for MoE BMM sharding on node {node.name}")
-    scale_names = list(scale_names)
+        raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
 
-    # Get num_experts from the first weight tensor (w3_w1_stacked)
-    w3_w1_tensor_arg = node.args[3]
-    num_experts = _get_dim0_from_arg(gm, w3_w1_tensor_arg)
+    # Extract the stacked tensors from single-element lists
+    # args[3] = w1_weight (Node representing list with one 3D tensor, or direct list)
+    # args[4] = w2_weight (Node representing list with one 3D tensor, or direct list)
+
+    # Helper to extract tensor node from list (handles both Node and direct list)
+    def extract_tensor_from_list_arg(list_arg):
+        if isinstance(list_arg, Node) and list_arg.target is list:
+            # It's a list() call node - extract from its args
+            return list_arg.args[0][0]  # args[0] is the list content, [0] is first element
+        elif isinstance(list_arg, (list, tuple)):
+            # Direct list
+            return list_arg[0]
+        else:
+            raise ValueError(f"Unexpected list format: {type(list_arg)}")
+
+    w3_w1_tensor_node = extract_tensor_from_list_arg(node.args[3])
+    w2_tensor_node = extract_tensor_from_list_arg(node.args[4])
+    num_experts = _get_dim0_from_arg(gm, w3_w1_tensor_node)
 
     args = list(node.args)
 
@@ -1299,14 +1363,16 @@ def _insert_sharded_moe_bmm(
     local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
 
     # Transform w3_w1_stacked: slice experts, swap [W1,W3]->[W3,W1], transpose (E,H,2I)->(E,2I,H)
-    if isinstance(args[3], Node):
-        _transform_bmm_moe_weight_param(gm, args[3], local_lo, local_hi, swap_gate_up=True)
+    if isinstance(w3_w1_tensor_node, Node):
+        _transform_bmm_moe_weight_param(
+            gm, w3_w1_tensor_node, local_lo, local_hi, swap_gate_up=True
+        )
 
     # Transform w2_stacked: slice experts, transpose (E,I,H)->(E,H,I)
-    if isinstance(args[4], Node):
-        _transform_bmm_moe_weight_param(gm, args[4], local_lo, local_hi, swap_gate_up=False)
+    if isinstance(w2_tensor_node, Node):
+        _transform_bmm_moe_weight_param(gm, w2_tensor_node, local_lo, local_hi, swap_gate_up=False)
 
-    # -- Update args (keep same nodes, just with transformed parameters) --
+    # -- Update args (keep same lists/nodes, just with transformed parameters) --
     args[1] = selected_experts_local
     args[2] = final_scales_local
     # args[3] and args[4] stay the same - we modified the parameters in-place
@@ -1475,24 +1541,10 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         )
 
 
-class BmmEPShardingInfo(EPShardingInfo):
-    """EP sharding behavior for torch_moe_bmm (BMM-based MoE with stacked weights)."""
-
-    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
-        if not is_op(node, torch.ops.auto_deploy.torch_moe_bmm):
-            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
-            return False
-        return True
-
-    def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe_bmm(gm, node, self.rank, self.world_size, self.allreduce_strategy)
-
-
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
-    (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe_bmm), BmmEPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
 
@@ -1550,7 +1602,6 @@ class ShardingTransformContainer(BaseModel):
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
-    stacked_ep_transforms: List[BmmEPShardingInfo] = Field(default_factory=list)
 
     @field_validator("allreduce_strategy", mode="before")
     @classmethod
@@ -1565,7 +1616,6 @@ class ShardingTransformContainer(BaseModel):
             BMMShardingInfo: self.bmm_transforms,
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
-            BmmEPShardingInfo: self.stacked_ep_transforms,
         }
 
     def init_params(

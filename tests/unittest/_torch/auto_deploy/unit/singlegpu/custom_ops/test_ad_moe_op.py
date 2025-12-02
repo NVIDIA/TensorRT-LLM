@@ -63,7 +63,7 @@ def setup_moe_test(dtype, num_experts):
 
 
 def setup_bmm_moe_test(dtype, num_experts):
-    """Setup for stacked MoE (torch_moe_bmm) with topk=1 in TRT-LLM format."""
+    """Setup for stacked MoE with topk=1 in TRT-LLM format."""
     SEQ_LEN = 8
     HIDDEN_SIZE = 64
     INTERMEDIATE_SIZE = 32
@@ -92,7 +92,7 @@ def setup_bmm_moe_test(dtype, num_experts):
         w31 = torch.rand(INTERMEDIATE_SIZE * 2, HIDDEN_SIZE, dtype=dtype).cuda() * 0.1
         w2 = torch.rand(HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype=dtype).cuda() * 0.1
         # TRT-LLM format: concat w3 and w1 along intermediate dim
-        w3_w1_stacked_weight.data[expert_id].copy_(w31, dim=0))  # (2*I, H)
+        w3_w1_stacked_weight.data[expert_id].copy_(w31)  # (2*I, H)
         w2_stacked_weight.data[expert_id].copy_(w2)  # (H, I)
 
     return (
@@ -165,12 +165,17 @@ def test_bmm_based_moe_op_run(dtype):
     with torch.inference_mode():
         x = final_scales * x
         selected_experts = torch.ones_like(selected_experts)
-        output_torch_moe = torch.ops.auto_deploy.torch_moe_bmm(
+        # Use torch_moe with stacked tensor format (single-element lists)
+        output_torch_moe = torch.ops.auto_deploy.torch_moe(
             x,
             selected_experts,
             final_scales,
-            fused_w3_w1_stacked_weight,
-            fused_w2_weight,
+            [fused_w3_w1_stacked_weight],  # Wrap in list for unified interface
+            [fused_w2_weight],  # Wrap in list for unified interface
+            [],  # Empty w3_weight list for stacked gated MLP
+            mlp_style="gated_mlp",
+            act_fn="silu",
+            apply_routing_on_input=True,
         )
         output_torch_fused_moe = torch.ops.auto_deploy.torch_moe_fused(
             x,

@@ -68,13 +68,13 @@ def _template_moe(
 
         if apply_routing_on_input:
             # INPUT-SIDE routing (BMM-based pattern): multiply routing weights with INPUT
-            # Result: silu(input * routing_weight) - routing affects activation
+            # Result: silu(input * routing_weight)
             scaled_input = tokens_for_this_expert * routing_weights[top_x, idx, None]
             expert_out = mlps[expert_idx](scaled_input)
             current_hidden_states = expert_out
         else:
             # OUTPUT-SIDE routing (standard pattern): multiply routing weights with OUTPUT
-            # Result: silu(input) * routing_weight - routing applied after activation
+            # Result: silu(input) * routing_weight
             expert_out = mlps[expert_idx](tokens_for_this_expert)
             current_hidden_states = expert_out * routing_weights[top_x, idx, None]
 
@@ -94,10 +94,16 @@ def torch_moe(
     w3_weight: List[torch.Tensor],
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
     (token routing + index_add_ accumulation) and a selectable per-expert MLP.
+
+    Supports both:
+    - Standard MoE with per-expert weight lists (apply_routing_on_input=False)
+    - Llama4 MoE with stacked weight tensors (apply_routing_on_input=True)
+
     Parameters:
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
             S is the sequence length, and H is the hidden size.
@@ -105,35 +111,71 @@ def torch_moe(
             of the selected experts for each token. Only experts within range [0,num_experts) is processed
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
+            - Standard MoE: softmax normalized weights
+            - Llama4 MoE: sigmoid activated weights
         w1_weight:
-            List of per-expert weight tensors:
-              • mlp_style=="gated_mlp": W1 with shape (I, H)  — "gate" projection.
-              • mlp_style=="mlp":       W_up with shape (I, H) — up projection.
+            For per-expert lists:
+              • mlp_style=="gated_mlp": List of W1 with shape (I, H)  — "gate" projection.
+              • mlp_style=="mlp":       List of W_up with shape (I, H) — up projection.
+            For stacked tensors (Llama4):
+              • Single-element list containing stacked w3_w1 tensor with shape (E, 2*I, H) in TRT-LLM format
         w2_weight:
-            List of per-expert weight tensors:
-              • gated_mlp: W2 with shape (H, I) — down projection.
-              • mlp:       W_down with shape (H, I) — down projection.
+            For per-expert lists:
+              • List of W2/W_down with shape (H, I) — down projection.
+            For stacked tensors (Llama4):
+              • Single-element list containing stacked w2 tensor with shape (E, H, I) in TRT-LLM format
         w3_weight:
-            List of per-expert weight tensors:
-              • gated_mlp: W3 with shape (I, H) — "up" (second) projection in gated MLP.
-              • mlp:       pass an empty list []; ignored.
+            For per-expert lists with gated_mlp:
+              • List of W3 with shape (I, H) — "up" (second) projection in gated MLP.
+            For mlp style or stacked tensors:
+              • pass an empty list []; ignored.
         mlp_style:
             Selects the per-expert MLP computation:
-              • "gated_mlp" (default, Mixtral/DeepSeek-style):
+              • "gated_mlp" (default, Mixtral/DeepSeek/Llama4-style):
                     y = W2( act(W1 x) * (W3 x) )
               • "mlp" (NemotronH-style 2-layer MLP):
                     y = W_down( act(W_up x) )
         act_fn:
             Elementwise activation applied inside the expert MLP.
             Supported: "silu" (default), "relu2" (ReLU then square).
+        apply_routing_on_input:
+            If True (Llama4 pattern): multiply routing weights with INPUT before MLP
+                Result: act(input * routing_weight) - routing affects activation
+            If False (standard pattern): multiply routing weights with OUTPUT after MLP
+                Result: act(input) * routing_weight - routing scales output
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
     act_fn = _resolve_activation(act_fn)
     style = mlp_style.lower()
 
-    if style == "gated_mlp":
+    # Detect if using stacked tensor format (Llama4) vs per-expert lists (standard)
+    is_stacked = len(w1_weight) == 1 and w1_weight[0].ndim == 3
 
+    if is_stacked:
+        # Llama4 stacked tensor format - only supports gated_mlp
+        if style != "gated_mlp":
+            raise ValueError("Stacked tensor format only supports 'gated_mlp' style")
+
+        w3_w1_stacked = w1_weight[0]  # (E, 2*I, H)
+        w2_stacked = w2_weight[0]  # (E, H, I)
+
+        def make_mlp(i: int):
+            gate_up = w3_w1_stacked[i]  # (2*I, H)
+            intermediate_size = gate_up.shape[0] // 2
+            W3 = gate_up[:intermediate_size, :]  # (I, H)
+            W1 = gate_up[intermediate_size:, :]  # (I, H)
+            W2 = w2_stacked[i]  # (H, I)
+            weight_dtype = W1.dtype
+            return lambda inp: F.linear(
+                act_fn(F.linear(inp.to(weight_dtype), W1)) * F.linear(inp.to(weight_dtype), W3),
+                W2,
+            )
+
+        mlps = [make_mlp(i) for i in range(w3_w1_stacked.shape[0])]
+
+    elif style == "gated_mlp":
+        # Standard per-expert list format with gated MLP
         def make_mlp(i: int):
             W1 = w1_weight[i]  # (I, H)
             W2 = w2_weight[i]  # (H, I)
@@ -143,7 +185,7 @@ def torch_moe(
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
 
     elif style == "mlp":
-
+        # Standard per-expert list format with simple MLP
         def make_mlp(i: int):
             W_up = w1_weight[i]  # (I, H)
             W_down = w2_weight[i]  # (H, I)
@@ -154,7 +196,7 @@ def torch_moe(
     else:
         raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
-    return _template_moe(x, selected_experts, routing_weights, mlps)
+    return _template_moe(x, selected_experts, routing_weights, mlps, apply_routing_on_input)
 
 
 @torch_moe.register_fake
@@ -167,75 +209,7 @@ def torch_moe_fake(
     w3_weight: List[torch.Tensor],
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-@torch.library.custom_op("auto_deploy::torch_moe_bmm", mutates_args=())
-def torch_moe_bmm(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w3_w1_stacked: torch.Tensor,
-    w2_stacked: torch.Tensor,
-    act_fn: str = "silu",
-    apply_routing_on_input: bool = True,
-) -> torch.Tensor:
-    """MoE operator using stacked weights for expert computation.
-
-    Only supports gated MLP (SwiGLU-style) architecture.
-    Uses stacked expert weights in TRT-LLM format (conversion from Llama4 happens during graph transformation).
-
-    Weights are expected in TRT-LLM format:
-    - w3_w1_stacked: (NUM_EXPERTS, 2*INTERMEDIATE_SIZE, HIDDEN_SIZE)
-    - w2_stacked: (NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
-
-    Args:
-        x: Input tensor
-        selected_experts: Expert indices for each token
-        routing_weights: Routing weights for each selected expert
-        w3_w1_stacked: Stacked gate/up weights (TRT-LLM format)
-        w2_stacked: Stacked down weights (TRT-LLM format)
-        act_fn: Activation function name (default: "silu")
-        apply_routing_on_input: If True, apply routing to INPUT (default for Llama4 pattern).
-                                If False, apply routing to OUTPUT (alternative pattern).
-    """
-
-    act_fn = _resolve_activation(act_fn)
-
-    # Standardized on TRT-LLM format (conversion happens during graph transformation)
-    # Only gated MLP supported: output = (act_fn(x @ W1) * (x @ W3)) @ W2
-    def make_mlp(i: int):
-        gate_up = w3_w1_stacked[i]  # (2*I, H)
-        intermediate_size = gate_up.shape[0] // 2
-        W3 = gate_up[:intermediate_size, :]  # (I, H)
-        W1 = gate_up[intermediate_size:, :]  # (I, H)
-        W2 = w2_stacked[i]  # (H, I)
-        weight_dtype = W1.dtype
-        return lambda inp: F.linear(
-            act_fn(F.linear(inp.to(weight_dtype), W1)) * F.linear(inp.to(weight_dtype), W3),
-            W2,
-        )
-
-    mlps = [make_mlp(i) for i in range(w3_w1_stacked.shape[0])]
-
-    # Apply routing based on the specified pattern
-    # INPUT-SIDE (default): silu(input * routing_weight) - routing affects activation
-    # OUTPUT-SIDE (alternative): silu(input) * routing_weight - routing scales output
-    return _template_moe(
-        x, selected_experts, routing_weights, mlps, apply_routing_on_input=apply_routing_on_input
-    )
-
-
-@torch_moe_bmm.register_fake
-def torch_moe_bmm_fake(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w3_w1_stacked: torch.Tensor,
-    w2_stacked: torch.Tensor,
-    act_fn: str = "silu",
-    apply_routing_on_input: bool = True,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

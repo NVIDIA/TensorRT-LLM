@@ -160,8 +160,8 @@ def test_sharding_pattern_detection(world_size: int, num_experts: int):
 
 
 def test_llama4_stacked_moe_pattern_detection():
-    """Minimal test: verify torch_moe_bmm is detected for EP sharding."""
-    # Create a simple graph with torch_moe_bmm node
+    """Minimal test: verify torch_moe with stacked format is detected for EP sharding."""
+    # Create a simple graph with torch_moe node using stacked tensor format
     gm = torch.fx.GraphModule({}, torch.fx.Graph())
     graph = gm.graph
 
@@ -172,9 +172,15 @@ def test_llama4_stacked_moe_pattern_detection():
         w3_w1 = graph.placeholder("w3_w1_stacked")
         w2 = graph.placeholder("w2_stacked")
 
+        # Create single-element lists for stacked tensor format
+        w1_list = graph.call_function(list, args=([w3_w1],))
+        w2_list = graph.call_function(list, args=([w2],))
+        w3_list = graph.call_function(list, args=([],))
+
         moe_node = graph.call_function(
-            torch.ops.auto_deploy.torch_moe_bmm,
-            args=(x, selected_experts, routing_weights, w3_w1, w2),
+            torch.ops.auto_deploy.torch_moe,
+            args=(x, selected_experts, routing_weights, w1_list, w2_list, w3_list),
+            kwargs={"mlp_style": "gated_mlp", "apply_routing_on_input": True},
         )
         graph.output(moe_node)
 
@@ -195,7 +201,7 @@ def test_llama4_stacked_moe_pattern_detection():
     optimizer.shared_config.world_size = 2
     _ = optimizer(None, gm)
 
-    # Verify torch_moe_bmm is detected for EP sharding
-    detected = optimizer.shared_config.sharding_config.stacked_ep_transforms
+    # Verify torch_moe with stacked format is detected for EP sharding
+    detected = optimizer.shared_config.sharding_transform_container.ep_transforms
     assert len(detected) == 1, f"Expected 1 EP transform, got {len(detected)}"
     assert detected[0].target_node == moe_node.name
