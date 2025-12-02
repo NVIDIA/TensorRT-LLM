@@ -170,7 +170,11 @@ class DeepseekV3WeightLoader:
                 new_key = key
                 for old, new in rename_rules.items():
                     new_key = new_key.replace(old, new)
-                result[new_key] = value
+                if key in fp4_weights_map and "global_scale" in key:
+                    # The definition of global_scale is 1. / scale, so we need to invert it.
+                    result[new_key] = 1. / value
+                else:
+                    result[new_key] = value
             return result
 
         ## Prepare weights for TP
@@ -306,6 +310,7 @@ class DeepseekV3WeightLoader:
             "input_global_scale": "input_scale",
             "weight_global_scale": "weight_scale_2",
         }
+
         moe_weights_map = {
             "down_proj": "w2",
             "up_proj": "w3",
