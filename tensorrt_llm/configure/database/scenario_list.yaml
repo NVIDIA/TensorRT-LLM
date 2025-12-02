@@ -4,8 +4,6 @@
   osl: 1024
   concurrency: 128
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc128.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -13,8 +11,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -22,8 +18,6 @@
   osl: 1024
   concurrency: 256
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc256.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -31,8 +25,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -40,8 +32,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -49,8 +39,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -58,8 +46,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -67,8 +53,6 @@
   osl: 1024
   concurrency: 128
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc128.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -76,8 +60,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -85,8 +67,6 @@
   osl: 1024
   concurrency: 256
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc256.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -94,8 +74,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -103,8 +81,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -112,8 +88,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -121,8 +95,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_1k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -130,8 +102,6 @@
   osl: 1024
   concurrency: 128
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc128.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -139,8 +109,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -148,8 +116,6 @@
   osl: 1024
   concurrency: 256
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc256.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -157,8 +123,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -166,8 +130,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -175,8 +137,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -184,8 +144,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -193,8 +151,6 @@
   osl: 1024
   concurrency: 128
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc128.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -202,8 +158,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -211,8 +165,6 @@
   osl: 1024
   concurrency: 256
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc256.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -220,8 +172,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -229,8 +179,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -238,8 +186,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   gpu: B200_NVL
@@ -247,8 +193,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/deepseek_r1_0528_fp4_v2_fp4_b200_trt_8k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -256,8 +200,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_1k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -265,8 +207,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_1k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -274,8 +214,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_1k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -283,8 +221,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_1k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -292,8 +228,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_1k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -301,8 +235,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_8k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -310,8 +242,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_8k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -319,8 +249,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_8k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -328,8 +256,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_8k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: B200_NVL
@@ -337,8 +263,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/deepseek-ai/DeepSeek-R1-0528/B200/deepseek_r1_0528_fp8_b200_trt_8k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -346,8 +270,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_1k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -355,8 +277,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_1k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -364,8 +284,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_1k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -373,8 +291,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_1k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -382,8 +298,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_1k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -391,8 +305,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_8k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -400,8 +312,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_8k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -409,8 +319,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_8k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -418,8 +326,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_8k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
   gpu: H200_SXM
@@ -427,8 +333,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/deepseek-ai/DeepSeek-R1-0528/H200/deepseek_r1_0528_fp8_h200_trt_8k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -436,8 +340,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp1_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -445,8 +347,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp1_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -454,8 +354,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp1_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -463,8 +361,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp1_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -472,8 +368,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp1_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -481,8 +375,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp2_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -490,8 +382,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp2_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -499,8 +389,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp2_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -508,8 +396,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp2_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -517,8 +403,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp2_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -526,8 +410,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -535,8 +417,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -544,8 +424,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -553,8 +431,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -562,8 +438,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -571,8 +445,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -580,8 +452,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -589,8 +459,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -598,8 +466,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -607,8 +473,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -616,8 +480,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp1_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -625,8 +487,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp1_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -634,8 +494,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp1_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -643,8 +501,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp1_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -652,8 +508,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp1_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -661,8 +515,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp2_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -670,8 +522,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp2_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -679,8 +529,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp2_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -688,8 +536,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp2_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -697,8 +543,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp2_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -706,8 +550,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -715,8 +557,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -724,8 +564,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -733,8 +571,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -742,8 +578,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -751,8 +585,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -760,8 +592,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -769,8 +599,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -778,8 +606,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -787,8 +613,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_1k8k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -796,8 +620,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp1_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -805,8 +627,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp1_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -814,8 +634,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp1_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -823,8 +641,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp1_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -832,8 +648,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp1_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -841,8 +655,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp2_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -850,8 +662,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp2_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -859,8 +669,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp2_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -868,8 +676,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp2_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -877,8 +683,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp2_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -886,8 +690,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -895,8 +697,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -904,8 +704,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -913,8 +711,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -922,8 +718,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -931,8 +725,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -940,8 +732,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -949,8 +739,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -958,8 +746,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: B200_NVL
@@ -967,8 +753,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/B200/gpt_oss_120b_fp4_b200_trt_8k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -976,8 +760,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp1_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -985,8 +767,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp1_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -994,8 +774,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp1_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1003,8 +781,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp1_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1012,8 +788,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp1_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1021,8 +795,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp2_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1030,8 +802,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp2_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1039,8 +809,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp2_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1048,8 +816,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp2_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1057,8 +823,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp2_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1066,8 +830,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1075,8 +837,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1084,8 +844,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1093,8 +851,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1102,8 +858,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1111,8 +865,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1120,8 +872,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1129,8 +879,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1138,8 +886,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1147,8 +893,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1156,8 +900,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp1_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1165,8 +907,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp1_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1174,8 +914,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp1_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1183,8 +921,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp1_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1192,8 +928,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp1_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1201,8 +935,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp2_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1210,8 +942,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp2_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1219,8 +949,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp2_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1228,8 +956,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp2_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1237,8 +963,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp2_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1246,8 +970,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1255,8 +977,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1264,8 +984,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1273,8 +991,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1282,8 +998,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1291,8 +1005,6 @@
   osl: 8192
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1300,8 +1012,6 @@
   osl: 8192
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1309,8 +1019,6 @@
   osl: 8192
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1318,8 +1026,6 @@
   osl: 8192
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1327,8 +1033,6 @@
   osl: 8192
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_1k8k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1336,8 +1040,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp1_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1345,8 +1047,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp1_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1354,8 +1054,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp1_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1363,8 +1061,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp1_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1372,8 +1068,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp1_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 1
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1381,8 +1075,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp2_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1390,8 +1082,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp2_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1399,8 +1089,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp2_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1408,8 +1096,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp2_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1417,8 +1103,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp2_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 2
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1426,8 +1110,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp4_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1435,8 +1117,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp4_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1444,8 +1124,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp4_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1453,8 +1131,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp4_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1462,8 +1138,6 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp4_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 4
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1471,8 +1145,6 @@
   osl: 1024
   concurrency: 16
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp8_conc16.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1480,8 +1152,6 @@
   osl: 1024
   concurrency: 32
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp8_conc32.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1489,8 +1159,6 @@
   osl: 1024
   concurrency: 4
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp8_conc4.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1498,8 +1166,6 @@
   osl: 1024
   concurrency: 64
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp8_conc64.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
 - model: openai/gpt-oss-120b
   gpu: H200_SXM
@@ -1507,6 +1173,4 @@
   osl: 1024
   concurrency: 8
   config_path: database/openai/gpt-oss-120b/H200/gpt_oss_120b_fp4_h200_trt_8k1k_tp8_conc8.yaml
-  tps_per_user: null
-  tps_per_gpu: null
   num_gpus: 8
