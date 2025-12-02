@@ -136,6 +136,10 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "trust_remote_code": trust_remote_code,
         "revision": revision,
         "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
     }
 
