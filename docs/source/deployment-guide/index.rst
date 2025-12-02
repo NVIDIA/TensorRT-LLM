@@ -103,6 +103,6 @@ The deployment guides below provide more detailed instructions for serving speci
 Comprehensive Configuration Database
 ------------------------------------
 
-The table below lists all available pre-configured model scenarios in the TensorRT-LLM configuration database. Each row represents a specific model, GPU, and performance profile combination with recommended request settings.
+The table below lists all available pre-configured model scenarios in the TensorRT LLM configuration database. Each row represents a specific model, GPU, and performance profile combination with recommended request settings.
 
 .. include:: comprehensive_table.rst

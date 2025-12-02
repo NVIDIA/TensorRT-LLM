@@ -8,7 +8,6 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
 
-# Try to import generate_rst, fail gracefully if dependencies (like yaml) are missing
 from generate_config_table import generate_rst  # noqa: E402
 
 
