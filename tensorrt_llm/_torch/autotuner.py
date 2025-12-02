@@ -865,14 +865,9 @@ class AutoTuner:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
                     logger.warning_once(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
+                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
                         key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    (logger.info_once
-                     if self._log_level_to_info else logger.debug_once)(
-                         f"[Autotuner] Exception captured: {e}",
-                         key=(custom_op, "debug_autotuning_exception"),
-                     )
 
                     # Record the failed profiling combinations
                     self.stats.failed_profiling_count[custom_op].add(
