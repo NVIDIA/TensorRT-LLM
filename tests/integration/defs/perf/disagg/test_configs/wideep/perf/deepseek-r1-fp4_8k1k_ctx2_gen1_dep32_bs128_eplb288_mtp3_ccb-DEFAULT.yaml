@@ -15,6 +15,7 @@ slurm:
   account: <account>
   job_time: 02:00:00
   job_name: disaggr-test
+  extra_args: "--gres=gpu:4"
   numa_bind: true
 hardware:
   gpus_per_node: 4
