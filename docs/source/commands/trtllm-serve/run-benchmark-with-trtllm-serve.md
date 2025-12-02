@@ -1,6 +1,6 @@
 # Run benchmarking with `trtllm-serve`
 
-TensorRT LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
+TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:

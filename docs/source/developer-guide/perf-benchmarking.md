@@ -9,7 +9,7 @@ easier for users to reproduce our officially published [performance overview](./
 - An entirely Python workflow for benchmarking.
 - Ability to benchmark various flows and features within TensorRT LLM.
 
-TensorRT LLM also provides the OpenAI-compatiable API via `trtllm-serve` command, which starts an OpenAI compatible server that supports the following endpoints:
+TensorRT LLM also provides the OpenAI-compatible API via `trtllm-serve` command, which starts an OpenAI compatible server that supports the following endpoints:
 - `/v1/models`
 - `/v1/completions`
 - `/v1/chat/completions`
@@ -485,6 +485,6 @@ The two valid values for `kv_cache_config.dtype` are `auto` and `fp8`.
 
 ## Online Serving Benchmarking
 
-TensorRT LLM provides the OpenAI-compatiable API via `trtllm-serve` command, and `tensorrt_llm.serve.scripts.benchmark_serving` package to benchmark the online server. Alternatively, [AIPerf](https://github.com/ai-dynamo/aiperf) is a comprehensive benchmarking tool that can also measures the performance of the OpenAI-compatiable server launched by `trtllm-serve`.
+TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command, and `tensorrt_llm.serve.scripts.benchmark_serving` package to benchmark the online server. Alternatively, [AIPerf](https://github.com/ai-dynamo/aiperf) is a comprehensive benchmarking tool that can also measure the performance of the OpenAI-compatible server launched by `trtllm-serve`.
 
 To benchmark the OpenAI-compatible `trtllm-serve`, please refer to the [run benchmarking with `trtllm-serve`](../commands/trtllm-serve/run-benchmark-with-trtllm-serve.md) section.
