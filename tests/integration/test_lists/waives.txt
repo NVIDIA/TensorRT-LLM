@@ -340,7 +340,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[nougat-base-pp:1-tp:1-b
 accuracy/test_llm_api_pytorch_multimodal.py::TestNVILA_8B::test_auto_dtype SKIP (https://nvbugs/5648441)
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype SKIP (https://nvbugs/5648441)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend SKIP (https://nvbugs/5651824)
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/5601682)
 examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
 examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
 examples/test_multimodal.py::test_llm_multimodal_general[llava-onevision-qwen2-7b-ov-hf-video-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5655832)
