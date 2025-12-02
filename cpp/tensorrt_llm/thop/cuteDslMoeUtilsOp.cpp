@@ -255,7 +255,7 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
     return output;
 }
 
-torch::Tensor moe_output_memset(torch::Tensor const& input, torch::Tensor const& tile_idx_to_mn_limit,
+void moe_output_memset_inplace(torch::Tensor const& input, torch::Tensor const& tile_idx_to_mn_limit,
     torch::Tensor const& expanded_idx_to_permuted_idx, torch::Tensor const& permuted_idx_to_expanded_idx,
     torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k)
 {
@@ -305,8 +305,6 @@ torch::Tensor moe_output_memset(torch::Tensor const& input, torch::Tensor const&
     }
 
 #undef DISPATCH_MOE_OUTPUT_MEMSET
-
-    return input;
 }
 
 // Activation
@@ -478,8 +476,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
     m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx, Tensor topk_scales) -> Tensor");
     m.def(
-        "moe_output_memset(Tensor! input, Tensor tile_idx_to_mn_limit, Tensor expanded_idx_to_permuted_idx, "
-        "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> Tensor");
+        "moe_output_memset_inplace(Tensor(a!) input, Tensor tile_idx_to_mn_limit, Tensor expanded_idx_to_permuted_idx, "
+        "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> ()");
     m.def(
         "moe_swiglu(Tensor input, Tensor tile_idx_to_mn_limit, Tensor num_non_exiting_tiles, "
         "int tile_tokens_dim) -> Tensor");
@@ -497,7 +495,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_sort", &torch_ext::moe_sort);
     m.impl("moe_permute", &torch_ext::moe_permute);
     m.impl("moe_unpermute", &torch_ext::moe_unpermute);
-    m.impl("moe_output_memset", &torch_ext::moe_output_memset);
+    m.impl("moe_output_memset_inplace", &torch_ext::moe_output_memset_inplace);
     m.impl("moe_swiglu", &torch_ext::moe_swiglu);
     m.impl("moe_swiglu_nvfp4_quantize", &torch_ext::moe_swiglu_nvfp4_quantize);
     m.impl("moe_gelu", &torch_ext::moe_gelu);

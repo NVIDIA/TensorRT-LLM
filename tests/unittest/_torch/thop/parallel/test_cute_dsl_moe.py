@@ -231,7 +231,7 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_moe_output_memset(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+def test_moe_output_memset_inplace(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     dtype = getattr(torch, dtype)
     hidden_size = 4096
     num_experts = 256
@@ -260,7 +260,7 @@ def test_moe_output_memset(dtype: str, num_tokens: int, top_k: int, tile_size: i
     )
 
     x = torch.ones(num_tokens, hidden_size, dtype=dtype, device="cuda")
-    x = torch.ops.trtllm.moe_output_memset(
+    torch.ops.trtllm.moe_output_memset_inplace(
         x,
         tile_idx_to_mn_limit,
         expanded_idx_to_permuted_idx,

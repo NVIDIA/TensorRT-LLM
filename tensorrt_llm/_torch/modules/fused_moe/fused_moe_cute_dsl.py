@@ -302,7 +302,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 output = torch.empty(output_shape,
                                      dtype=output_dtype,
                                      device=x.device)
-                torch.ops.trtllm.moe_output_memset(
+                torch.ops.trtllm.moe_output_memset_inplace(
                     output=output,
                     tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                     expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
