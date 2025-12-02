@@ -527,6 +527,8 @@ class LlavaNextModel(PreTrainedModel):
             return
         if not DISAGG:
             self.mm_encoder = LlavaNextVisionModel(model_config)
+        else:
+            self.mm_encoder = None
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
