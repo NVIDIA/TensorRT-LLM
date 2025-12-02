@@ -383,7 +383,9 @@ class Attention(nn.Module):
 
         if self.attn_backend == "TRTLLM":
             # Don't use FP8 output if o_proj has pre_quant_scale - keep BF16 for better precision
-            if self.has_quant_scale and self.o_proj.pre_quant_scale is None and (
+            has_pre_quant_scale = getattr(self.o_proj, 'pre_quant_scale',
+                                          None) is not None
+            if self.has_quant_scale and not has_pre_quant_scale and (
                     self.attn.has_fp8_kv_cache or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
