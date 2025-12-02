@@ -2,6 +2,7 @@ import os
 
 import pytest
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
@@ -390,41 +391,52 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int):
                 f"the wrong token position."
 
 
-# def test_logprobs_match_hf_tp2():
-#     """Compare TensorRT-LLM logprobs against HuggingFace reference."""
-#     model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
-#     llm = LLM(
-#             model=model_path,
-#             tensor_parallel_size=2,
-#         )
+@force_ampere
+@pytest.mark.gpu2
+def test_logprobs_match_hf_tp2():
+    model_path = os.path.join(llm_models_root(), "llama-models-v2",
+                              "TinyLlama-1.1B-Chat-v1.0")
+    llm = LLM(
+        model=model_path,
+        tensor_parallel_size=2,
+    )
 
-#     sampling_params = SamplingParams(
-#         max_tokens=10,
-#         temperature=0,
-#         logprobs=0,
-#     )
+    prompts = ["The future of the AI is"]
 
-#     hf_model = AutoModelForCausalLM.from_pretrained(modesl_path, torch_dtype=torch.bfloat16).to("cuda")
-#     hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
+    sampling_params = SamplingParams(
+        max_tokens=10,
+        temperature=1.0,
+        logprobs=0,
+    )
 
-#     output = list(llm.generate(prompts, sampling_params=sampling_params))[0]
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16).to("cuda")
+    hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-#     trtllm_token_ids = output.outputs[0].token_ids
-#     trtllm_logprobs = torch.tensor([list(lp.values())[0].logprob for lp in output.outputs[0].logprobs])
+    output = list(llm.generate(prompts, sampling_params=sampling_params))[0]
 
-#     base_ids = hf_tokenizer.encode(prompts[0], return_tensors="pt").to("cuda")
-#     hf_logprobs = []
+    trtllm_token_ids = output.outputs[0].token_ids
+    trtllm_logprobs = torch.tensor(
+        [list(lp.values())[0].logprob for lp in output.outputs[0].logprobs])
 
-#     for i, token_id in enumerate(trtllm_token_ids):
-#         input_ids = torch.cat([base_ids, torch.tensor(trtllm_token_ids[:i], device="cuda").unsqueeze(0)], dim=1) if i > 0 else base_ids
-#         with torch.no_grad():
-#             logits = hf_model(input_ids).logits[0, -1, :]
-#         hf_logprobs.append(torch.log_softmax(logits, dim=-1)[token_id].item())
+    base_ids = hf_tokenizer.encode(prompts[0], return_tensors="pt").to("cuda")
+    hf_logprobs = []
 
-#     hf_logprobs = torch.tensor(hf_logprobs)
+    for i, token_id in enumerate(trtllm_token_ids):
+        if i > 0:
+            prev_tokens = torch.tensor([trtllm_token_ids[:i]], device="cuda")
+            input_ids = torch.cat([base_ids, prev_tokens], dim=1)
+        else:
+            input_ids = base_ids
+        with torch.no_grad():
+            logits = hf_model(input_ids).logits[0, -1, :]
+        hf_logprobs.append(torch.log_softmax(logits, dim=-1)[token_id].item())
 
-#     print(f"\nTensorRT-LLM logprobs: {trtllm_logprobs}")
-#     print(f"HuggingFace logprobs:  {hf_logprobs}")
+    hf_logprobs = torch.tensor(hf_logprobs)
 
-#     max_diff = (trtllm_logprobs - hf_logprobs).abs().max().item()
-#     assert max_diff < 0.1, f"Max logprob diff {max_diff:.4f} exceeds threshold"
+    print(f"\nTensorRT-LLM logprobs: {trtllm_logprobs}")
+    print(f"HuggingFace logprobs:  {hf_logprobs}")
+    print(f"Diff: {(trtllm_logprobs - hf_logprobs).abs()}")
+
+    max_diff = (trtllm_logprobs - hf_logprobs).abs().max().item()
+    assert max_diff < 0.15, f"Max logprob diff {max_diff:.4f} exceeds threshold"
