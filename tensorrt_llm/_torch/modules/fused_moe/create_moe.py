@@ -20,6 +20,8 @@ from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
+ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "0") == "1"
+
 
 def get_moe_cls(
         model_config: ModelConfig,
@@ -341,11 +343,7 @@ def create_moe(
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
-    # Check if ENABLE_CONFIGURABLE_MOE environment variable is set
-    enable_configurable_moe = os.environ.get('ENABLE_CONFIGURABLE_MOE',
-                                             '0') == '1'
-
-    if enable_configurable_moe:
+    if ENABLE_CONFIGURABLE_MOE or moe_cls == CuteDslFusedMoE:
         # ConfigurableMoE is only supported for TRTLLMGenFusedMoE backend
         if moe_cls in (TRTLLMGenFusedMoE, CuteDslFusedMoE):
             return ConfigurableMoE(
