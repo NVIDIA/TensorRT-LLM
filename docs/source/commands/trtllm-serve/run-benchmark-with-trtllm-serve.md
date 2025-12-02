@@ -19,7 +19,6 @@ This step-by-step tutorial covers the following topics for running online servin
     - [Start the trtllm-serve service](#start-the-trtllm-serve-service)
   - [Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`](#benchmark-using-tensorrt_llmservescriptsbenchmark_serving)
     - [Key Metrics](#key-metrics)
-  - [Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`](#benchmark-using-tensorrt_llmservescriptsbenchmark_serving-1)
   - [About `extra_llm_api_options`](#about-extra_llm_api_options)
       - [`kv_cache_config`](#kv_cache_config)
       - [`cuda_graph_config`](#cuda_graph_config)
@@ -181,8 +180,6 @@ P99 E2EL (ms):                           1643.44
   * The typical total time from when a request is submitted until the final token of the response is received.
 * Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
-
-## Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`
 
 ## About `extra_llm_api_options`
    trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.
