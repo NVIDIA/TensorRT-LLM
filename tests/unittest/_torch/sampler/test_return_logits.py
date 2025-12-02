@@ -6,7 +6,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
 prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(
@@ -64,19 +64,14 @@ def llm(
     sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
 ):
-    gather_context_logits = gather_context_logits_fixture
     gather_generation_logits = gather_generation_logits_fixture
     sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
-
-    build_config = BuildConfig()
-    build_config.gather_context_logits = gather_context_logits
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        build_config=build_config,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits

@@ -58,10 +58,15 @@ class Qwen3Gate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
+        w = weights[0].get("weight")
+        if not allow_partial_loading:
+            assert w is not None, "Qwen3Gate expects weight when partial loading is disabled"
+        if w is not None:
+            self.weight.copy_(w[:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
@@ -94,8 +99,10 @@ class Qwen3MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=model_config.allreduce_strategy)
 
         self.gate = Qwen3Gate(
             hidden_size=self.hidden_dim,
@@ -162,13 +169,14 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
         self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
             disable_deep_gemm=True,
-        )
-        self.mapping = model_config.mapping
-        self.enable_attention_dp = self.mapping.enable_attention_dp
+            reduce_output=not self.enable_attention_dp
+            and self.mapping.tp_size > 1)
 
         self.mlp = Qwen3MoE(model_config, aux_stream_dict, layer_idx=layer_idx)
 
@@ -181,8 +189,10 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
 
         self.is_p2p_supported = can_access_peer(model_config.mapping)
@@ -200,7 +210,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
-        self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+        self.moe_allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
         self,
@@ -243,8 +255,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
         do_finalize = not (
-            hidden_states.shape[0] <= self.moe_allreduce.max_token
-            and self.fusion_config.POST_MOE_FUSION
+            self.fusion_config.POST_MOE_FUSION
+            and hidden_states.shape[0] <= self.moe_allreduce.max_token
             and self.model_config.moe_backend == 'TRTLLM'
             and self.mlp.experts.has_nvfp4 and self.is_p2p_supported)
 
@@ -322,7 +334,8 @@ class Qwen3MoEModel(DecoderModel):
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
-                dtype=config.pretrained_config.torch_dtype)
+                dtype=config.pretrained_config.torch_dtype,
+            )
         else:
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,

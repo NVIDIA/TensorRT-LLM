@@ -1,3 +1,4 @@
+import copy
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
@@ -341,9 +342,24 @@ class MPIDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
+        self.create_cp_comm()
+        # Repurpose CP ranks to TP for Helix so that the right comms are created.
+        mapping_with_cp = None
+        if self.mapping.has_cp_helix():
+            logger.info(
+                f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
+            mapping_with_cp = copy.deepcopy(self.mapping)
+            self.mapping = self.mapping.repurpose_helix_cp_to_tp()
+
         self.create_tp_comm()
         self.create_pp_comm()
-        self.create_cp_comm()
+
+        # Restore the original mapping.
+        if mapping_with_cp is not None:
+            logger.info(
+                f"[MPIDist::__init__] Restoring original mapping undoing Helix manipulation."
+            )
+            self.mapping = mapping_with_cp
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
@@ -405,8 +421,8 @@ class MPIDist(Distributed):
     def pp_allgather(self, obj):
         return self.pp_comm.allgather(obj)
 
-    def pp_gather(self, obj):
-        return self.pp_comm.gather(obj)
+    def pp_gather(self, obj, root=0):
+        return self.pp_comm.gather(obj, root=root)
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
@@ -766,8 +782,7 @@ class TorchDist(Distributed):
             return ret[0]
 
 
-# TODO: rename to PPCommNCCL
-class PPComm:
+class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
@@ -820,7 +835,7 @@ def init_pp_comm(mapping):
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
     else:
-        _pp_comm = PPComm(mapping)
+        _pp_comm = PPCommNCCL(mapping)
 
 
 @TorchDist.log_op

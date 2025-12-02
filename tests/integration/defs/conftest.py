@@ -667,9 +667,11 @@ def trt_gpu_clock_lock(request):
     gpu_list = get_gpu_device_list()
     gpu_ids = [gpu.split()[1][:-1] for gpu in gpu_list]  # Extract GPU IDs
     gpu_ids_str = ",".join(gpu_ids)
+    enable_clock_locking = request.config.getoption("--enable-gpu-clock-lock")
     gpu_clock_lock = GPUClockLock(
         gpu_id=gpu_ids_str,
         interval_ms=1000.0,
+        enable_clock_locking=enable_clock_locking,
     )
 
     yield gpu_clock_lock
@@ -2131,6 +2133,20 @@ def pytest_addoption(parser):
         "Number of completed tests before triggering a periodic save (default: 10). "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--periodic-junit-xmlpath",
+        action="store",
+        default=None,
+        help="Path to the output XML file for periodic JUnit XML reporter. "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--enable-gpu-clock-lock",
+        action="store_true",
+        default=False,
+        help="Enable GPU clock locking during tests. "
+        "By default, GPU clock locking is disabled.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2235,7 +2251,8 @@ def pytest_configure(config):
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
     output_dir = config.getoption("--output-dir", default=None)
-
+    periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
+                                              default=None)
     if periodic and output_dir:
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
@@ -2245,7 +2262,8 @@ def pytest_configure(config):
         os.makedirs(output_dir, exist_ok=True)
 
         # Create the reporter with logger
-        xmlpath = os.path.join(output_dir, "results.xml")
+        xmlpath = periodic_junit_xmlpath or os.path.join(
+            output_dir, "results.xml")
         reporter = PeriodicJUnitXML(
             xmlpath=xmlpath,
             interval=periodic_interval,
@@ -2681,6 +2699,7 @@ def torch_empty_cache() -> None:
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
     if torch.cuda.is_available():
+        gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
 

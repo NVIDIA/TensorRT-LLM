@@ -57,7 +57,6 @@ void indexer_topk_decode(
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
 
     TORCH_CHECK(next_n > 0, "next_n must be greater than 0");
-    TORCH_CHECK(index_topk == 2048, "index_topk must be 2048 for now");
 
     int32_t num_rows = static_cast<int32_t>(numRows64);
     int32_t num_columns = static_cast<int32_t>(numColumns64);
@@ -95,7 +94,6 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
 
     TORCH_CHECK(indices.dim() == 2, "indices must be a 2D Tensor");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D Tensor");
-    TORCH_CHECK(index_topk == 2048, "index_topk must be 2048 for now");
 
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];
