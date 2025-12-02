@@ -103,34 +103,37 @@ class DisaggLogger:
         self.logger.error(f"[FAILED] {msg}")
 
 
-# Global logger instance - created immediately when module is imported
-logger = DisaggLogger()
+# Global logger instance - lazy initialization via proxy class
+_logger_instance: Optional[DisaggLogger] = None
 
 
-def setup_logging(output_path: str) -> None:
-    """Setup logging with output directory.
+class LazyLogger:
+    """Lazy logger proxy that initializes on first access."""
+    
+    def _ensure_logger(self) -> DisaggLogger:
+        """Ensure logger is initialized and return it."""
+        global _logger_instance
+        if _logger_instance is None:
+            _logger_instance = DisaggLogger()
+            # Auto-setup file logging on first access
+            try:
+                from .common import EnvManager
+                output_path = EnvManager.get_output_path()
+                if output_path and not output_path.startswith("<"):
+                    _logger_instance.setup_file_logging(output_path)
+                else:
+                    _logger_instance.warning(
+                        f"OUTPUT_PATH not configured (current: '{output_path}'). Logging to console only."
+                    )
+                    _logger_instance.info("Set OUTPUT_PATH environment variable to enable file logging.")
+            except Exception as e:
+                _logger_instance.warning(f"Failed to setup file logging: {e}. Logging to console only.")
+        return _logger_instance
+    
+    def __getattr__(self, name):
+        """Delegate all attribute access to the real logger."""
+        return getattr(self._ensure_logger(), name)
 
-    Args:
-        output_path: Output directory path from EnvManager.get_output_path()
-    """
-    logger.setup_file_logging(output_path)
 
-
-# Automatically setup file logging when module is imported
-try:
-    from .common import EnvManager
-
-    output_path = EnvManager.get_output_path()
-
-    # Check if output_path is a valid path (not a placeholder)
-    if output_path and not output_path.startswith("<"):
-        setup_logging(output_path)
-    else:
-        logger.warning(
-            f"OUTPUT_PATH not configured (current: '{output_path}'). Logging to console only."
-        )
-        logger.info("Set OUTPUT_PATH environment variable to enable file logging.")
-except Exception as e:
-    # If setup fails (e.g., EnvManager not available, path issues),
-    # logger will still work with console output only
-    logger.warning(f"Failed to setup file logging: {e}. Logging to console only.")
+# Export lazy logger instance - only initializes when actually used
+logger = LazyLogger()
