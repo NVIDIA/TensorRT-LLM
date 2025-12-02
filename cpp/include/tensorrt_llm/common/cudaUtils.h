@@ -38,6 +38,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
 #endif         // not WIN32
@@ -430,6 +431,24 @@ inline int getMaxSharedMemoryPerBlockOptin()
     check_cuda_error(
         cudaDeviceGetAttribute(&nByteMaxSharedMemoryPerBlockOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, deviceID));
     return nByteMaxSharedMemoryPerBlockOptin;
+}
+
+template <typename T>
+inline int getMaxActiveBlocksPerSM(T kernel, int blockSize, size_t dynamicSMemSize)
+{
+    static std::unordered_map<T, int> cache;
+    auto it = cache.find(kernel);
+    if (it == cache.end())
+    {
+        int numBlocks;
+        check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, blockSize, dynamicSMemSize));
+        cache[kernel] = numBlocks;
+        return numBlocks;
+    }
+    else
+    {
+        return it->second;
+    }
 }
 
 template <typename T1, typename T2>

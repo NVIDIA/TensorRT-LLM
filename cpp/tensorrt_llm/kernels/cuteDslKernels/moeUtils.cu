@@ -141,11 +141,11 @@ void moePermute(InputType const* input, InputType* permuted_output, SFType const
     }
 #endif
 
-    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int32_t const blocks = std::min(smCount * 8, max_num_permuted_tokens);
-    int32_t const threads = kThreadsPerBlock;
-
     auto kernel = &moePermuteKernel<InputType, SFType, kSFVecSize, kThreadsPerBlock>;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, max_num_permuted_tokens);
+    int32_t const threads = kThreadsPerBlock;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
@@ -382,10 +382,6 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
     }
 #endif
 
-    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int32_t const blocks = std::min(smCount * 8, max_num_permuted_tokens);
-    int32_t const threads = kThreadsPerBlock;
-
     auto get_act_kernel = [](ActivationType activation_type) -> void (*)(InputType const* input, OutputType* output,
                                                                  float const* global_sf, SFType* output_sf,
                                                                  int32_t const* tile_idx_to_mn_limit,
@@ -423,6 +419,11 @@ void moeActivation(InputType const* input, OutputType* output, float const* glob
         return nullptr;
     };
     auto kernel = get_act_kernel(activation_params.activation_type);
+
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, max_num_permuted_tokens);
+    int32_t const threads = kThreadsPerBlock;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
