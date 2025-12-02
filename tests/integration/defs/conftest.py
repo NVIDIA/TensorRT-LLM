@@ -1996,11 +1996,13 @@ def get_device_memory_str():
     with tempfile.TemporaryDirectory() as temp_dirname:
         suffix = ".exe" if is_windows() else ""
         cmd = " ".join([
-                "nvidia-smi" + suffix, "--query-gpu=memory.total,memory.reserved,memory.used,memory.free",
-                "--format=csv,noheader"
-            ])
+            "nvidia-smi" + suffix,
+            "--query-gpu=memory.total,memory.reserved,memory.used,memory.free",
+            "--format=csv,noheader"
+        ])
         output = check_output(cmd, shell=True, cwd=temp_dirname)
         return output.strip()
+
 
 def get_device_memory():
     "get gpu memory"
@@ -2032,11 +2034,7 @@ def get_device_memory():
 def print_device_memory():
     memory_str = get_device_memory_str()
     print(f"Device Memory:\ntotal:   reserved:   used:   free:  \n{memory_str}")
-    torch.cuda.empty_cache()
-    import gc
-    gc.collect()
-    memory_str = get_device_memory_str()
-    print(f"Device Memory:\ntotal:   reserved:   used:   free:  \n{memory_str}")
+
 
 def pytest_addoption(parser):
     parser.addoption(
