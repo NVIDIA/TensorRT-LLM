@@ -81,7 +81,7 @@ def trimForStageList(stageNameList)
 }
 
 @Field
-def REUSE_TEST = "reuse_test"   // Only used to determine if the pipeline should reuse the test results from the previous pipeline.
+def REUSE_TEST = "reuse_test"   // Determine if the pipeline should reuse test results in a stage from the previous pipelines.
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
