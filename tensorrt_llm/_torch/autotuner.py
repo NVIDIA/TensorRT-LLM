@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import copy
+import enum
 import inspect
 import itertools
 import json
@@ -13,11 +14,24 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from cuda.bindings import driver
 
 import tensorrt_llm
+# Import distributed communication utilities
+from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_broadcast,
+                                 mpi_disabled)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
+
+
+class DistributedTuningStrategy(enum.Enum):
+    """Strategy for distributed tuning."""
+    BROADCAST = "broadcast"
+    INDEPENDENT = "independent"
+    MERGE = "merge"
+    PARALLEL = "parallel"
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -99,6 +113,11 @@ class TuningConfig:
             This flag is to create circular buffer of input tensors to avoid L2 cache hits to simulate cold L2 cache.
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
+        distributed_tuning_strategy (DistributedTuningStrategy): Strategy for distributed tuning.
+            - BROADCAST: One rank (rank 0) tunes and broadcasts results to others
+            - INDEPENDENT: Each rank tunes independently (default for non-comm ops)
+            - MERGE: All ranks participate in tuning and reach merge
+            - PARALLEL: All ranks participate in tuning with partial tactics
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -106,6 +125,7 @@ class TuningConfig:
     inputs_pre_hook: Callable = None
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = True
+    distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.BROADCAST
 
 
 @dataclass(unsafe_hash=True)
@@ -225,7 +245,17 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True, cache_path: str = None, rank: int = 0):
+def autotune(tune_mode: bool = True, cache_path: str = None):
+    """Context manager for autotuning with distributed support.
+
+    Args:
+        tune_mode: Whether to enable tuning mode
+        cache_path: Path to save/load cache files
+        rank: Explicit rank override (if None, will auto-detect from distributed state)
+    """
+    autotuner = AutoTuner.get()
+    rank = autotuner.mapping.rank
+
     # if cache_path is provided, use the rank-specific file
     tune_required = tune_mode
     if cache_path is not None:
@@ -238,25 +268,36 @@ def autotune(tune_mode: bool = True, cache_path: str = None, rank: int = 0):
         if file_exists:
             logger.info(
                 f"[Autotuner] Loading cache from {cache_path_no_ext_rank}")
-            AutoTuner.get().profiling_cache.load_cache(cache_path_no_ext_rank)
+            autotuner.profiling_cache.load_cache(cache_path_no_ext_rank)
 
     # record the old tuning mode
-    old_mode = AutoTuner.get().is_tuning_mode
-    AutoTuner.get().is_tuning_mode = tune_required
+    old_mode = autotuner.is_tuning_mode
+    autotuner.is_tuning_mode = tune_required
     autotune_enabled = tune_required and not old_mode
+
     if autotune_enabled:
-        logger.info("[Autotuner] Autotuning process starts ...")
+        if autotuner._is_distributed():
+            logger.info(
+                f"[Autotuner] Autotuning process starts on rank {rank}/{autotuner.mapping.world_size}"
+            )
+        else:
+            logger.info("[Autotuner] Autotuning process starts ...")
+
     try:
         yield
     finally:
-        AutoTuner.get().is_tuning_mode = old_mode
+        autotuner.is_tuning_mode = old_mode
         if autotune_enabled:
-            logger.info("[Autotuner] Autotuning process ends")
+            if autotuner._is_distributed():
+                logger.info(
+                    f"[Autotuner] Autotuning process ends on rank {rank}")
+            else:
+                logger.info("[Autotuner] Autotuning process ends")
 
         # save cache
         if cache_path is not None:
             logger.info(f"[Autotuner] Saving cache to {cache_path_no_ext_rank}")
-            AutoTuner.get().profiling_cache.save_cache(cache_path_no_ext_rank)
+            autotuner.profiling_cache.save_cache(cache_path_no_ext_rank)
 
 
 @dataclass
@@ -394,6 +435,9 @@ class AutoTunerProfilingCache:
                 tuning_config.tune_max_num_tokens,
             ),
         )
+
+    def merge_cache_data(self, cache_data: Dict[str, Any]):
+        self.cache.update(cache_data)
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
@@ -544,6 +588,11 @@ class AutoTuner:
     _instance = None
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
+        # Increase log level for AutoTuner associated logger`
+        self._log_level_to_info = os.getenv(
+            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", '0') == '1'
+        self._debug_logger = logger.info if self._log_level_to_info else logger.debug
+
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
@@ -558,16 +607,18 @@ class AutoTuner:
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
-        # Increase log level for AutoTuner associated logger
-        self._log_level_to_info = os.getenv(
-            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", '0') == '1'
-        self._debug_logger = logger.info if self._log_level_to_info else logger.debug
+        # Dsitributed tuning state
+        self._distributed_comm = None
+        self.mapping = None
 
     @classmethod
     def get(cls):
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    def set_mapping(self, mapping: Mapping = None):
+        self.mapping = mapping
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
@@ -753,37 +804,22 @@ class AutoTuner:
             self.stats.failed_profiling_count[custom_op] = set()
         new_tuning_failure_occured = False
 
-        for p in profiles:
-            tensors = self._prepare_input_tensors(p, inputs)
-            is_cache_hit, *_ = self.profiling_cache.search_cache(
-                custom_op, runners, p.get_opt_shapes(), tuning_config)
-            if not is_cache_hit:
-                # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                best_runner_id, best_tactic, min_time, has_tuning_failure_occured = self._profile_runners(
-                    custom_op, runners, tensors, p, tuning_config, **kwargs)
-                if best_runner_id is not None:
-                    # At least one valid (runner, tactic) pair is found
-                    cache_key = self.profiling_cache.get_cache_key(
-                        custom_op, runners[best_runner_id], p.get_opt_shapes(),
-                        tuning_config)
+        # Synchronize ranks before profiling
+        self._synchronize_ranks()
+        if self._should_current_rank_tune(
+                tuning_config.distributed_tuning_strategy):
+            for p in profiles:
+                tensors = self._prepare_input_tensors(p, inputs)
+                is_cache_hit, *_ = self.profiling_cache.search_cache(
+                    custom_op, runners, p.get_opt_shapes(), tuning_config)
+                if not is_cache_hit:
+                    # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                    best_runner_id, best_tactic, min_time, has_tuning_failure_occured = self._profile_runners(
+                        custom_op, runners, tensors, p, tuning_config, **kwargs)
+                    new_tuning_failure_occured = new_tuning_failure_occured or has_tuning_failure_occured
 
-                    self._debug_logger(
-                        f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
-                    )
-                    # inspect call stack
-                    self.profiling_cache[cache_key] = (best_runner_id,
-                                                       best_tactic, min_time)
-
-                    self.stats.tuned_op_profiled_configs[custom_op] += 1
-                else:
-                    logger.warning_once(
-                        f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={input_shapes}. "
-                        f"At least one valid (runner, tactic) pair is required. "
-                        f"If get_valid_tactics is intended to return empty list, please ensure that this profile is not valid for the custom_op "
-                        f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash.",
-                        key=(custom_op, "warning_autotuning_no_valid_tactic"),
-                    )
-                new_tuning_failure_occured = new_tuning_failure_occured or has_tuning_failure_occured
+        self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
+                                    custom_op)
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occured:
@@ -828,8 +864,11 @@ class AutoTuner:
                 p.name
                 for p in inspect.signature(runner.forward).parameters.values()
             }
-            valid_tactics = runner.get_valid_tactics(input_tensors, profile,
-                                                     **kwargs)
+            all_valid_tactics = runner.get_valid_tactics(
+                input_tensors, profile, **kwargs)
+
+            valid_tactics = self._maybe_parallelize_tactics(
+                all_valid_tactics, tuning_config.distributed_tuning_strategy)
             if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
                 runner(
                     input_tensors,
@@ -874,6 +913,30 @@ class AutoTuner:
                 if time_measured < min_time:
                     min_time = time_measured
                     best_runner_id, best_tactic = runner_id, tac
+
+        if best_runner_id is not None:
+            # At least one valid (runner, tactic) pair is found
+            cache_key = self.profiling_cache.get_cache_key(
+                custom_op, runners[best_runner_id], profile.get_opt_shapes(),
+                tuning_config)
+
+            self._debug_logger(
+                f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
+            )
+            # inspect call stack
+            # TODO: use named tuple to make it more readable
+            self.profiling_cache[cache_key] = (best_runner_id, best_tactic,
+                                               min_time)
+
+            self.stats.tuned_op_profiled_configs[custom_op] += 1
+        else:
+            logger.warning_once(
+                f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={profile.get_opt_shapes()}. "
+                f"At least one valid (runner, tactic) pair is required. "
+                f"If get_valid_tactics is intended to return empty list, please ensure that this profile is not valid for the custom_op "
+                f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash.",
+                key=(custom_op, "warning_autotuning_no_valid_tactic"),
+            )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occured
 
@@ -1346,3 +1409,148 @@ class AutoTuner:
             return nvrtc.nvrtcGetErrorString(error)[1]
         else:
             raise RuntimeError("Unknown error type: {}".format(error))
+
+    def setup_distributed_state(self, mapping: Mapping):
+        """Setup distributed communication state for autotuning."""
+        self.mapping = mapping
+        try:
+            if mpi_disabled():
+                # Use torch.distributed
+                if dist.is_initialized():
+                    self._distributed_comm = "torch"
+                    logger.info(
+                        f"[AutoTuner] Using torch.distributed: rank={self.mapping.rank}, world_size={self.mapping.world_size}"
+                    )
+            else:
+                # Use MPI
+                from tensorrt_llm._utils import mpi_comm
+                comm = mpi_comm()
+                if comm is not None:
+                    self._distributed_comm = "mpi"
+                    logger.info(
+                        f"[AutoTuner] Using MPI: rank={self.mapping.rank}, world_size={self.mapping.world_size}"
+                    )
+        except Exception as e:
+            logger.error(f"[AutoTuner] Failed to setup distributed state: {e}")
+            raise
+
+    def _is_distributed(self) -> bool:
+        """Check if we're in a distributed environment."""
+        return self.mapping is not None and self.mapping.world_size > 1 and self._distributed_comm is not None
+
+    def _maybe_parallelize_tactics(
+            self, all_valid_tactics: List[Any],
+            strategy: DistributedTuningStrategy) -> List[Any]:
+        """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
+        if strategy == DistributedTuningStrategy.PARALLEL:
+            # only distribute across TP ranks
+            # each TP rank will only tune the tactics that are assigned to it
+            tp_size = self.mapping.tp_size
+            tp_rank = self.mapping.tp_rank
+            valid_tactics = []
+            for idx, tactic in enumerate(all_valid_tactics):
+                if idx % tp_size == tp_rank:
+                    valid_tactics.append(tactic)
+            self._debug_logger(
+                f"[AutoTuner] [rank{tp_rank}] Parallelizing tactics across all TP ranks: {valid_tactics}"
+            )
+            return valid_tactics
+        else:
+            return all_valid_tactics
+
+    def _maybe_sync_cache_data(self, strategy: DistributedTuningStrategy,
+                               custom_op: str):
+        """Synchronize cache data across all ranks."""
+        if not self._is_distributed():
+            logger.warning(
+                f"[AutoTuner] Not in distributed environment, skipping synchronization"
+            )
+            return
+
+        if strategy == DistributedTuningStrategy.BROADCAST:
+            self._broadcast_cache_data(custom_op)
+        elif strategy == DistributedTuningStrategy.INDEPENDENT:
+            return
+        elif strategy == DistributedTuningStrategy.MERGE:
+            self._merge_cache_data(custom_op)
+        elif strategy == DistributedTuningStrategy.PARALLEL:
+            self._merge_cache_data(custom_op)
+        else:
+            logger.error(
+                f"[AutoTuner] Unknown distributed tuning strategy: {strategy}, falling back to independent"
+            )
+            return
+
+    def _merge_cache_data(self, custom_op: str):
+        cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
+        merged_cache_data = dict()
+        if self._distributed_comm == "torch":
+            all_cache_data = [None] * self.mapping.world_size
+            dist.all_gather_object(all_cache_data, cache_data)
+        elif self._distributed_comm == "mpi":
+            all_cache_data = mpi_allgather(cache_data)
+
+        for data in all_cache_data:
+            for key, value in data.items():
+                current_time = merged_cache_data.get(key, [
+                    float('inf'),
+                ])[-1]
+                if value[-1] < current_time:
+                    merged_cache_data[key] = value
+
+        self.profiling_cache.merge_cache_data(merged_cache_data)
+
+    def _broadcast_cache_data(
+        self,
+        custom_op: str,
+    ) -> None:
+        """Broadcast tactics from root rank to all other ranks."""
+        cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
+        root = 0
+        if self._distributed_comm == "torch":
+            if self.mapping.rank == root:
+                obj_list = [cache_data]
+            else:
+                obj_list = [None]
+            dist.broadcast_object_list(obj_list, src=root)
+            cache_data = obj_list[0]
+        elif self._distributed_comm == "mpi":
+            cache_data = mpi_broadcast(cache_data, root=root)
+
+        self.profiling_cache.merge_cache_data(cache_data)
+
+    def _synchronize_ranks(self):
+        """Synchronize all ranks before proceeding."""
+        if not self._is_distributed():
+            return
+
+        try:
+            if self._distributed_comm == "torch":
+                dist.barrier()
+            elif self._distributed_comm == "mpi":
+                mpi_barrier()
+        except Exception as e:
+            logger.error(f"[AutoTuner] Failed to synchronize ranks: {e}")
+            raise
+
+    def _should_current_rank_tune(self,
+                                  strategy: DistributedTuningStrategy) -> bool:
+        """Determine if this rank should perform tuning based on strategy."""
+        if not self._is_distributed():
+            return True
+
+        if strategy == DistributedTuningStrategy.BROADCAST:
+            # Only rank 0 tunes
+            return self.mapping.rank == 0
+        elif strategy in {
+                DistributedTuningStrategy.INDEPENDENT,
+                DistributedTuningStrategy.MERGE,
+                DistributedTuningStrategy.PARALLEL,
+        }:
+            # All ranks tune independently
+            return True
+        else:
+            logger.error(
+                f"[AutoTuner] Unknown distributed tuning strategy: {strategy}, falling back to independent"
+            )
+            return True
