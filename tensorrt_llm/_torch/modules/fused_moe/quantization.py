@@ -1,3 +1,4 @@
+import inspect
 import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, NamedTuple, Optional, Union
@@ -219,7 +220,8 @@ class FusedMoEMethodBase(ABC):
         if module.bias:
             if w3_w1_bias_shape is None:
                 w3_w1_bias_shape = (module.expert_size_per_partition,
-                                    module.intermediate_size_per_partition * 2)
+                                    module.intermediate_size_per_partition *
+                                    module.intermediate_size_expand_ratio)
             if w2_bias_shape is None:
                 w2_bias_shape = (module.expert_size_per_partition,
                                  module.hidden_size)
@@ -237,12 +239,24 @@ class FusedMoEMethodBase(ABC):
             module.w2_bias = None
 
     def load_expert_weights_to_dst(
-            self, module: torch.nn.Module, weights: List[Dict],
+            self,
+            module: torch.nn.Module,
+            weights: List[Dict],
             weight_loading_mode: MoEWeightLoadingMode,
-            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
+            load_expert_ids: List[int],
+            dst_w3_w1_weights_tensor: torch.Tensor,
             dst_w2_weights_tensor: torch.Tensor,
             dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor]):
+            dst_w2_bias_tensor: Optional[torch.Tensor],
+            allow_partial_loading: bool = False):
+        w3_w1_kargs = {}
+        w2_kargs = {}
+        w3_w1_args = inspect.getfullargspec(self.load_expert_w3_w1_weight).args
+        w2_args = inspect.getfullargspec(self.load_expert_w2_weight).args
+        if "allow_partial_loading" in w3_w1_args:
+            w3_w1_kargs["allow_partial_loading"] = allow_partial_loading
+        if "allow_partial_loading" in w2_args:
+            w2_kargs["allow_partial_loading"] = allow_partial_loading
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
@@ -253,107 +267,170 @@ class FusedMoEMethodBase(ABC):
                     MoEWeightLoadingMode.VANILLA,
                     MoEWeightLoadingMode.W4A8_CUSTOM
             ]:
-                w1_weight = weights[f"{expert_id}.w1.weight"]
-                w3_weight = weights[f"{expert_id}.w3.weight"]
-                w2_weight = weights[f"{expert_id}.w2.weight"]
+                w1_weight = weights[
+                    f"{expert_id}.w1.weight"] if f"{expert_id}.w1.weight" in weights else None
+                w3_weight = weights[
+                    f"{expert_id}.w3.weight"] if f"{expert_id}.w3.weight" in weights else None
+                w2_weight = weights[
+                    f"{expert_id}.w2.weight"] if f"{expert_id}.w2.weight" in weights else None
                 if module.bias:
-                    w1_bias = weights[f"{expert_id}.w1.bias"]
-                    w3_bias = weights[f"{expert_id}.w3.bias"]
-                    w2_bias = weights[f"{expert_id}.w2.bias"]
+                    w1_bias = weights[
+                        f"{expert_id}.w1.bias"] if f"{expert_id}.w1.bias" in weights else None
+                    w3_bias = weights[
+                        f"{expert_id}.w3.bias"] if f"{expert_id}.w3.bias" in weights else None
+                    w2_bias = weights[
+                        f"{expert_id}.w2.bias"] if f"{expert_id}.w2.bias" in weights else None
             elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
-                    0, 1)
-                w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
+                w1_weight, w3_weight = None, None
+                if "gate_up_proj" in weights:
+                    w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
+                        0, 1)
+                    w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
                 w2_weight = weights["down_proj"][expert_id].transpose(
-                    0, 1).contiguous()
+                    0, 1).contiguous() if "down_proj" in weights else None
                 if module.bias:
-                    w1_w3_bias = weights["gate_up_proj.bias"][expert_id]
-                    w1_bias, w3_bias = w1_w3_bias.chunk(2, dim=0)
-                    w2_bias = weights["down_proj.bias"][expert_id]
+                    w1_bias, w3_bias = None, None
+                    if "gate_up_proj.bias" in weights:
+                        w1_w3_bias = weights["gate_up_proj.bias"][expert_id]
+                        w1_bias, w3_bias = w1_w3_bias.chunk(2, dim=0)
+                    if "down_proj.bias" in weights:
+                        w2_bias = weights["down_proj.bias"][expert_id]
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
                 )
 
             self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
-                                          dst_w3_w1_weights_tensor[expert_idx])
+                                          dst_w3_w1_weights_tensor[expert_idx],
+                                          **w3_w1_kargs)
 
             self.load_expert_w2_weight(module, w2_weight,
-                                       dst_w2_weights_tensor[expert_idx])
-            module._add_raw_shared_weights_for_unmap(
-                [w1_weight, w3_weight, w2_weight])
+                                       dst_w2_weights_tensor[expert_idx],
+                                       **w2_kargs)
+            unmap_weights = [
+                weight for weight in [w1_weight, w3_weight, w2_weight]
+                if weight is not None
+            ]
+            module._add_raw_shared_weights_for_unmap(unmap_weights)
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
                     module, w1_bias, w3_bias,
-                    dst_w3_w1_bias_tensor.data[expert_idx])
+                    dst_w3_w1_bias_tensor.data[expert_idx], **w3_w1_kargs)
 
                 self.load_expert_w2_weight(module, w2_bias,
-                                           dst_w2_bias_tensor.data[expert_idx])
-                module._add_raw_shared_weights_for_unmap(
-                    [w1_bias, w3_bias, w2_bias])
+                                           dst_w2_bias_tensor.data[expert_idx],
+                                           **w2_kargs)
+                unmap_weights = [
+                    weight for weight in [w1_bias, w3_bias, w2_bias]
+                    if weight is not None
+                ]
+                module._add_raw_shared_weights_for_unmap(unmap_weights)
 
-    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
 
         self.load_expert_weights_to_dst(
-            module, weights, weight_loading_mode,
-            module.initial_local_expert_ids, module.w3_w1_weight.data,
+            module,
+            weights,
+            weight_loading_mode,
+            module.initial_local_expert_ids,
+            module.w3_w1_weight.data,
             module.w2_weight.data,
             module.w3_w1_bias.data if module.bias else None,
-            module.w2_bias.data if module.bias else None)
+            module.w2_bias.data if module.bias else None,
+            allow_partial_loading=allow_partial_loading)
 
         self.load_quant_scales(module, weights)
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
             )
-            local_shared_w3_w1_tensors = torch.empty(
-                (len(local_shared_load_expert_ids), ) +
-                module.w3_w1_weight.data.shape[1:],
-                dtype=module.w3_w1_weight.data.dtype,
-                device='cpu')
-            local_shared_w2_tensors = torch.empty(
-                (len(local_shared_load_expert_ids), ) +
-                module.w2_weight.data.shape[1:],
-                dtype=module.w2_weight.data.dtype,
-                device='cpu')
+            if getattr(module, 'local_shared_w3_w1_tensors', None) is not None:
+                local_shared_w3_w1_tensors = getattr(
+                    module, 'local_shared_w3_w1_tensors')
+            else:
+                local_shared_w3_w1_tensors = torch.empty(
+                    (len(local_shared_load_expert_ids), ) +
+                    module.w3_w1_weight.data.shape[1:],
+                    dtype=module.w3_w1_weight.data.dtype,
+                    device='cpu')
+                setattr(module, 'local_shared_w3_w1_tensors',
+                        local_shared_w3_w1_tensors)
+            if getattr(module, 'local_shared_w2_tensors', None) is not None:
+                local_shared_w2_tensors = getattr(module,
+                                                  'local_shared_w2_tensors')
+            else:
+                local_shared_w2_tensors = torch.empty(
+                    (len(local_shared_load_expert_ids), ) +
+                    module.w2_weight.data.shape[1:],
+                    dtype=module.w2_weight.data.dtype,
+                    device='cpu')
+                setattr(module, 'local_shared_w2_tensors',
+                        local_shared_w2_tensors)
             if module.bias:
-                local_shared_w3_w1_bias_tensors = torch.empty(
-                    (len(local_shared_load_expert_ids), ) +
-                    module.w3_w1_bias.data.shape[1:],
-                    dtype=module.w3_w1_bias.data.dtype,
-                    device='cpu')
-                local_shared_w2_bias_tensors = torch.empty(
-                    (len(local_shared_load_expert_ids), ) +
-                    module.w2_bias.data.shape[1:],
-                    dtype=module.w2_bias.data.dtype,
-                    device='cpu')
+                if getattr(module, 'local_shared_w3_w1_bias_tensors',
+                           None) is not None:
+                    local_shared_w3_w1_bias_tensors = getattr(
+                        module, 'local_shared_w3_w1_bias_tensors')
+                else:
+                    local_shared_w3_w1_bias_tensors = torch.empty(
+                        (len(local_shared_load_expert_ids), ) +
+                        module.w3_w1_bias.data.shape[1:],
+                        dtype=module.w3_w1_bias.data.dtype,
+                        device='cpu')
+                    setattr(module, 'local_shared_w3_w1_bias_tensors',
+                            local_shared_w3_w1_bias_tensors)
+                if getattr(module, 'local_shared_w2_bias_tensors',
+                           None) is not None:
+                    local_shared_w2_bias_tensors = getattr(
+                        module, 'local_shared_w2_bias_tensors')
+                else:
+                    local_shared_w2_bias_tensors = torch.empty(
+                        (len(local_shared_load_expert_ids), ) +
+                        module.w2_bias.data.shape[1:],
+                        dtype=module.w2_bias.data.dtype,
+                        device='cpu')
+                    setattr(module, 'local_shared_w2_bias_tensors',
+                            local_shared_w2_bias_tensors)
             self.load_expert_weights_to_dst(
-                module, weights, weight_loading_mode,
-                local_shared_load_expert_ids, local_shared_w3_w1_tensors,
+                module,
+                weights,
+                weight_loading_mode,
+                local_shared_load_expert_ids,
+                local_shared_w3_w1_tensors,
                 local_shared_w2_tensors,
                 local_shared_w3_w1_bias_tensors if module.bias else None,
-                local_shared_w2_bias_tensors if module.bias else None)
+                local_shared_w2_bias_tensors if module.bias else None,
+                allow_partial_loading=allow_partial_loading)
+
+    def post_load_weights(self, module: torch.nn.Module):
+        if self.need_load_shared_weights(module):
             weight_fns = {
-                'w3_w1_weight': local_shared_w3_w1_tensors,
-                'w2_weight': local_shared_w2_tensors
+                'w3_w1_weight': getattr(module, 'local_shared_w3_w1_tensors'),
+                'w2_weight': getattr(module, 'local_shared_w2_tensors')
             }
+            delattr(module, 'local_shared_w3_w1_tensors')
+            delattr(module, 'local_shared_w2_tensors')
             if module.bias:
                 weight_fns.update({
-                    'w3_w1_bias': local_shared_w3_w1_bias_tensors,
-                    'w2_bias': local_shared_w2_bias_tensors
+                    'w3_w1_bias':
+                    getattr(module, 'local_shared_w3_w1_bias_tensors'),
+                    'w2_bias':
+                    getattr(module, 'local_shared_w2_bias_tensors')
                 })
+                delattr(module, 'local_shared_w3_w1_bias_tensors')
+                delattr(module, 'local_shared_w2_bias_tensors')
             module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
             module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights(
             )
-
         if hasattr(module,
                    "layer_load_balancer") and module.layer_load_balancer:
             module.layer_load_balancer.set_initial_weight_assignments(
                 module.initial_global_assignments)
-
-    def post_load_weights(self, module: torch.nn.Module):
         # Re-setup quant scales after loading weights as the tensors may have been modified.
         self.setup_quant_scales(module)
 
@@ -374,48 +451,64 @@ class FusedMoEMethodBase(ABC):
         raise NotImplementedError
 
     # Helper function
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
         """
         Load w1 and w3 weights for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight.device
-        w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-        w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+        if not allow_partial_loading:
+            assert w1_weight is not None and w3_weight is not None
+        w1_weight_shard = load_weight_shard(
+            w1_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w1_weight is not None else None
+        w3_weight_shard = load_weight_shard(
+            w3_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.COLUMN,
+            device=device) if w3_weight is not None else None
 
-        w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
-        dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
-                               non_blocking=True)
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
+        if w1_weight is not None:
+            dst_w1_weight.copy_(w1_weight_shard.view(dst_w3_w1_weight.dtype),
+                                non_blocking=True)
+        if w3_weight is not None:
+            dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_w1_weight.dtype),
+                                non_blocking=True)
 
     # Helper function
-    def load_expert_w2_weight(self, module: torch.nn.Module,
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
                               w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
         """
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w2_weight.device
-        w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
-                                            device=device)
-        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
-                            non_blocking=True)
+        if not allow_partial_loading:
+            assert w2_weight is not None
+        w2_weight_shard = load_weight_shard(
+            w2_weight,
+            module.tp_size,
+            module.tp_rank,
+            TensorParallelMode.ROW,
+            device=device) if w2_weight is not None else None
+        if w2_weight is not None:
+            dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                                non_blocking=True)
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
@@ -423,7 +516,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition,
@@ -488,13 +582,11 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
     w3_weight_scale = w3_weight_scale[...].reshape([])
     max_w3_w1_weight_scale = max(w1_weight_scale, w3_weight_scale)
 
+    split_length = module.intermediate_size_per_partition * module.intermediate_size_expand_ratio // 2
     w3_weight = dst_w3_w1_weight.narrow(
-        dim=0, start=0,
-        length=module.intermediate_size_per_partition).to(dtype=module.dtype)
+        dim=0, start=0, length=split_length).to(dtype=module.dtype)
     w1_weight = dst_w3_w1_weight.narrow(
-        dim=0,
-        start=module.intermediate_size_per_partition,
-        length=module.intermediate_size_per_partition).to(dtype=module.dtype)
+        dim=0, start=split_length, length=split_length).to(dtype=module.dtype)
     dequant_w3_weight = w3_weight * w3_weight_scale
     dequant_w1_weight = w1_weight * w1_weight_scale
     requant_w3_weight = (dequant_w3_weight / max_w3_w1_weight_scale).to(
@@ -502,13 +594,10 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
     requant_w1_weight = (dequant_w1_weight / max_w3_w1_weight_scale).to(
         torch.float8_e4m3fn)
 
-    dst_w3_w1_weight.narrow(
-        dim=0, start=0,
-        length=module.intermediate_size_per_partition).copy_(requant_w3_weight)
-    dst_w3_w1_weight.narrow(
-        dim=0,
-        start=module.intermediate_size_per_partition,
-        length=module.intermediate_size_per_partition).copy_(requant_w1_weight)
+    dst_w3_w1_weight.narrow(dim=0, start=0,
+                            length=split_length).copy_(requant_w3_weight)
+    dst_w3_w1_weight.narrow(dim=0, start=split_length,
+                            length=split_length).copy_(requant_w1_weight)
 
 
 class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
@@ -517,7 +606,8 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.float8_e4m3fn
 
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition,
@@ -1577,7 +1667,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         module.scaling_vector_size = scaling_vector_size
         # Divide by 16 because we use int64 to pack 16 fp4 values
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size // weight_vec_size)
         w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
                            module.intermediate_size_per_partition //
@@ -1587,7 +1678,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # column parallel
         w3_w1_weight_scale = nn.Parameter(
             torch.ones(module.expert_size_per_partition,
-                       module.intermediate_size_per_partition * 2,
+                       module.intermediate_size_per_partition *
+                       module.intermediate_size_expand_ratio,
                        module.hidden_size // module.scaling_vector_size //
                        block_scales_vec_size,
                        dtype=block_scales_dtype),
@@ -1858,16 +1950,17 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                                             device=device)
         # Keep weights in device buffer
         # w3
-        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition)
+        split_length = module.intermediate_size_per_partition * module.intermediate_size_expand_ratio // 2
+        dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(dim=0,
+                                                            start=0,
+                                                            length=split_length)
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
         # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition)
+        dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(dim=0,
+                                                            start=split_length,
+                                                            length=split_length)
         dst_w1_weight_scale.copy_(
             w1_weight_scale.view(dst_w1_weight_scale.dtype))
 

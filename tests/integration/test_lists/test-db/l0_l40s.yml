@@ -18,6 +18,7 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_siglip"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_nemotron_nano_v2_vl"
+  - unittest/_torch/modeling -k "modeling_phi4mm"
   - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
