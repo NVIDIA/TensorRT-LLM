@@ -792,7 +792,7 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
-def getMountListForSlurmTest(SlurmCluster cluster) 
+def getMountListForSlurmTest(SlurmCluster cluster)
 {
     if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
         return [
