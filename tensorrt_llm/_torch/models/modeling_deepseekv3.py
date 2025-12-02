@@ -170,10 +170,6 @@ class DeepseekV3WeightLoader:
                 new_key = key
                 for old, new in rename_rules.items():
                     new_key = new_key.replace(old, new)
-                if key in fp4_weights_map and "global_scale" in key:
-                    # The definition of global_scale is 1. / scale, so we need to invert it.
-                    result[new_key] = 1. / value
-                else:
                     result[new_key] = value
             return result
 
@@ -316,6 +312,25 @@ class DeepseekV3WeightLoader:
             "up_proj": "w3",
             "gate_proj": "w1",
         }
+
+        def reverse_global_scale(weights: Dict):
+            for key in weights:
+                if "global_scale" in key:
+                    weights[key] = 1. / weights[key]
+                
+            return weights
+
+        def scale_input_global_scale(weights: Dict):
+            for key in weights:
+                if "input_global_scale" in key:
+                    weights[key] = 2 * weights[key]
+            return weights
+
+        # Work around to support mistral nvfp4 ckpt
+        weights = reverse_global_scale(weights)
+        weights = scale_input_global_scale(weights)
+
+
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
