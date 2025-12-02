@@ -37,6 +37,8 @@ environment:
   build_wheel: false
   trtllm_wheel_path: ''
   work_dir: <full_path_to_work_dir>
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
 accuracy:
