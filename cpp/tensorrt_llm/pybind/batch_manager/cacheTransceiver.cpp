@@ -56,11 +56,12 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, requestAndReceiveAsync, llmRequest);
     }
 
-    using RequestsStatus = tb::RequestsStatus;
+    using RequestStatuses = tb::RequestStatuses;
 
-    RequestsStatus checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
-        PYBIND11_OVERLOAD_PURE(RequestsStatus, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum);
+        PYBIND11_OVERLOAD_PURE(
+            RequestStatuses, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum);
     }
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override

@@ -707,7 +707,7 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None,
-        using_kv_connector: bool = False) -> LlmRequest:
+        is_using_kv_connector: bool = False) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
@@ -799,7 +799,7 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
-        using_kv_connector=using_kv_connector)
+        is_using_kv_connector=is_using_kv_connector)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

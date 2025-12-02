@@ -190,7 +190,7 @@ public:
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
 };
 
-struct RequestsStatus
+struct RequestStatuses
 {
     /// Requests that have completed their transfer successfully.
     std::vector<LlmRequest::RequestIdType> completedRequestIds;
@@ -211,7 +211,7 @@ public:
     virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
-    virtual RequestsStatus checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
+    virtual RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
@@ -252,7 +252,7 @@ public:
     void requestAndReceiveSync(LlmRequest* llmRequest) override;
     void requestAndReceiveAsync(LlmRequest* llmRequest) override;
 
-    RequestsStatus checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
+    RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 

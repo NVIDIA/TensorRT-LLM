@@ -416,7 +416,7 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     }
 }
 
-RequestsStatus CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
+RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
@@ -475,7 +475,7 @@ RequestsStatus CacheTransceiver::checkContextTransferStatus(std::optional<int> c
         toCompleteIdSet.insert(request->mRequestId);
     }
 
-    RequestsStatus requestsStatus{};
+    RequestStatuses requestsStatus{};
 
     // Complete all the requests in toCompleteIdSet
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
@@ -490,6 +490,7 @@ RequestsStatus CacheTransceiver::checkContextTransferStatus(std::optional<int> c
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
+                    request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
                     requestsStatus.completedRequestIds.push_back(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }

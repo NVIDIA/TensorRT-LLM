@@ -439,7 +439,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """
         Mark scheduled KV connector requests as ready.
         In the py executor, we mark ALL KV connector requests as async loading.
-        However, if we returned False from get_num_new_matched_tokens, we need to mark the request as ready for the upcoming context forward pass.
+        However, if we returned (_, False) from get_num_new_matched_tokens, we need to mark the request as ready for the upcoming context forward pass.
         After we mark the request(s) as ready, we run scheduling again to account for the newly ready requests.
         """
 

@@ -298,7 +298,7 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-            using_kv_connector=kv_connector_manager is not None)
+            is_using_kv_connector=kv_connector_manager is not None)
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
         self.control_request_barrier = threading.Event()

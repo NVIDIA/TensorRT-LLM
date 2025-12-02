@@ -25,7 +25,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
-#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
@@ -61,7 +60,7 @@ public:
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
 
-    tb::RequestsStatus checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    tb::RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
         NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum);
     }
