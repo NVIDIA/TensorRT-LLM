@@ -162,7 +162,7 @@ P99 E2EL (ms):                           1643.44
 For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
 
 $$
-\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{#Output Tokens} - 1}
+\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{\symbol{35}Output Tokens} - 1}
 $$
 
 Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
