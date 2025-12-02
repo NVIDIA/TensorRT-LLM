@@ -93,36 +93,28 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
             world_size=world_size,
             stage="sharding",
             allreduce_strategy=AllReduceStrategy.AUTO,
+            dist_backend="auto",
         )
         for node in gm.graph.nodes:
             if is_op(node, torch.ops.auto_deploy.torch_moe):
                 expected_transformations.append(
                     EPShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
-                        allreduce_strategy=AllReduceStrategy.AUTO,
-                        dist_backend="auto",
+                        config=config,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
                 expected_transformations.append(
                     FP8EPShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
-                        allreduce_strategy=AllReduceStrategy.AUTO,
-                        dist_backend="auto",
+                        config=config,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
                 expected_transformations.append(
                     NVFP4EPShardingInfo(
                         target_node=node.name,
-                        rank=rank,
-                        world_size=world_size,
-                        allreduce_strategy=AllReduceStrategy.AUTO,
-                        dist_backend="auto",
+                        config=config,
                     )
                 )
 
