@@ -780,7 +780,8 @@ def getPytestBaseCommandLine(
         testCmdLine += [
             "--perf",
             "--perf-log-formats csv",
-            "--perf-log-formats yaml"
+            "--perf-log-formats yaml",
+            "--enable-gpu-clock-lock"
         ]
     }
     if (stageName.contains("-Ray-")) {
@@ -1704,12 +1705,12 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
 
 def parseMultiNodeTaskConfigFromStageName(String stageName) {
     def taskConfig = null
-    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs-(\d+)_Nodes/)
+    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs(?:-(\d+)_Nodes)?/)
     if (matcher.find()) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
             system_gpu_count: "${matcher.group(2)}",
-            node_count: "${matcher.group(3)}" // "node_count" might not be used currently
+            node_count: matcher.group(3) ?: "1" // Default to 1 if _Nodes not present
         ]
     }
     return taskConfig
