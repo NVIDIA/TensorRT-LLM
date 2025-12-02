@@ -713,6 +713,9 @@ class KVCacheManager(BaseResourceManager):
                 mem_per_token / 16)
         else:
             # All other cases (fp16/bf16 kv cache), we need 2 bytes per token for K and V.
+            assert quant_config is None or (
+                not quant_config.quant_mode.has_kv_cache_quant()
+            ), "Quantized kv cache is not expected"
             mem_per_token *= 2
         return mem_per_token
 
