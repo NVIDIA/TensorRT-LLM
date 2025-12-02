@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List
 
 import pandas as pd
 import yaml
@@ -17,8 +17,6 @@ class RecipeConstraints(BaseModel):
     osl: int = Field(description="Output sequence length")
     concurrency: int = Field(description="Concurrency")
     config_path: str = Field(description="Configuration path")
-    tps_per_user: Optional[int] = Field(description="TPS per user", default=None)
-    tps_per_gpu: Optional[int] = Field(description="TPS per GPU", default=None)
     num_gpus: int = Field(description="Number of GPUs")
 
     def to_pandas_row(self) -> pd.Series:
