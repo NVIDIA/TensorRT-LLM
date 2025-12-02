@@ -1947,6 +1947,9 @@ class PyExecutor:
 
         return
 
+    def _disagg_should_use_transfer_manager(self):
+        return self.block_reuse_enabled and not self.kv_cache_manager.is_vswa
+
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
 
@@ -1962,11 +1965,14 @@ class PyExecutor:
                         req, cache_block_ids):
                     self.async_transfer_manager.start_transfer(req)
 
-        for req in scheduled_requests:
-            if self.kv_cache_transceiver and req.is_context_only_request and (
-                    req.is_context_finished or req.is_finished_due_to_length):
-                self.kv_cache_transceiver.respond_and_send_async(req)
-                self.async_transfer_manager.start_transfer(req)
+        if self.kv_cache_transceiver:
+            for req in scheduled_requests:
+                if req.is_context_only_request and (
+                        req.is_context_finished
+                        or req.is_finished_due_to_length):
+                    self.kv_cache_transceiver.respond_and_send_async(req)
+                    if self._disagg_should_use_transfer_manager():
+                        self.async_transfer_manager.start_transfer(req)
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -2019,7 +2025,8 @@ class PyExecutor:
             request = self.async_transfer_manager.requests_in_transfer().get(
                 request_id)
 
-            self.async_transfer_manager.end_transfer(request)
+            if self._disagg_should_use_transfer_manager():
+                self.async_transfer_manager.end_transfer(request)
 
         for request in list(
                 self.async_transfer_manager.requests_in_transfer().values()):
@@ -2030,7 +2037,9 @@ class PyExecutor:
                 if is_cancelled:
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-                    self.async_transfer_manager.end_transfer(request)
+
+                    if self._disagg_should_use_transfer_manager():
+                        self.async_transfer_manager.end_transfer(request)
 
         self._check_cache_transfer_errors("context requests")
 
