@@ -5,6 +5,7 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_qwen3_next import ALL_DECODER_LAYER_TYPES
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -77,12 +78,14 @@ class Qwen3NextRunner(RunnerMixin, RunnerBase):
                     if callable(getattr(module, "create_weights", None)):
                         module.create_weights()
                 layer.cuda()
+                initialize_dummy_weights(layer)
                 for module in layer.modules():
                     if hasattr(module, "post_load_weights") and not getattr(
                         module, "_weights_removed", False
                     ):
                         module.post_load_weights()
             next_layer_layernorm.cuda()
+            initialize_dummy_weights(next_layer_layernorm)
             for layer, next_layer in zip(layers[:-1], layers[1:]):
                 layer.next_layer_layernorm = next_layer.input_layernorm
             layers[-1].next_layer_layernorm = next_layer_layernorm
