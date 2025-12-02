@@ -46,6 +46,16 @@ parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
+group.add_argument(
+    "--use-low-precision-moe-combine", action="store_true", dest="use_low_precision_moe_combine"
+)
+group.add_argument(
+    "--no-use-use-low-precision-moe-combine",
+    action="store_false",
+    dest="use_low_precision_moe_combine",
+)
+parser.set_defaults(use_low_precision_moe_combine=None)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph")
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
 parser.set_defaults(use_cuda_graph=None)
@@ -89,6 +99,8 @@ if args.max_batch_size is None:
     args.max_batch_size = max(args.batch_size_list)
 if args.max_seq_len is None:
     args.max_seq_len = max(args.seq_len_q_list) + max(args.seq_len_kv_cache_list)
+if args.enable_attention_dp is None:
+    args.enable_attention_dp = False
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
     if args.run_type == "GEN":
@@ -102,6 +114,10 @@ else:
         assert args.max_num_tokens >= ctx_batch_size * max(args.seq_len_kv_cache_list), (
             "Max_num_tokens is too small to prefill KV cache"
         )
+if args.use_low_precision_moe_combine is None:
+    args.use_low_precision_moe_combine = False
+if args.use_cuda_graph is None:
+    args.use_cuda_graph = False
 print(args)
 
 # MPI args
@@ -141,6 +157,7 @@ runner = Runner(
     max_seq_len=args.max_seq_len,
     max_num_tokens=args.max_num_tokens,
     moe_max_num_tokens=args.moe_max_num_tokens,
+    use_low_precision_moe_combine=args.use_low_precision_moe_combine,
     use_cuda_graph=args.use_cuda_graph,
 )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
