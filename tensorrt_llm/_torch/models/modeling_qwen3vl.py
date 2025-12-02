@@ -673,7 +673,18 @@ class Qwen3VisionModelBase(nn.Module):
             kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
         )
 
+<<<<<<< HEAD
         self.visual = model_class(self.model_config).to(self.model_dtype)
+=======
+        if model_class == Qwen3VLVisionModel:
+            # NOTE: For hf impl, we use flash_attention_2 for attention implementation to avoid OOM issue.
+            config._attn_implementation = "flash_attention_2"
+            self.visual = model_class(config).to(self.model_dtype).eval()
+        elif model_class == Qwen3_VisionModel:
+            self.visual = model_class(self.model_config).to(self.model_dtype)
+        else:
+            raise NotImplementedError(f"Model class {model_class} not implemented")
+>>>>>>> 4c6f413cd (fix: remove log)
 
         self.post_config()
 
@@ -1038,9 +1049,19 @@ class Qwen3VLModel(Qwen3VLModelBase):
             "deepstack_feature",
         ]
 
+<<<<<<< HEAD
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)
+=======
+    def load_weights(self, weights, weight_mapper: BaseWeightMapper):
+        if not DISAGG:
+            if VISION_MODEL_CLS == Qwen3VLVisionModel:
+                vision_encoder_weights = process_weights(weights, "visual")
+                self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
+            else:
+                self.mm_encoder.load_weights(weights)
+>>>>>>> 4c6f413cd (fix: remove log)
 
         weight_mapper = Qwen3VLHfWeightMapper()
         weight_mapper.init_model_and_config(self.llm, self.model_config)
