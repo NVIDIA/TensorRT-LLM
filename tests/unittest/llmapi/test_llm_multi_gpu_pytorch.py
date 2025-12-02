@@ -47,6 +47,7 @@ def test_llama_7b_lora_tp2():
 
 
 @pytest.mark.gpu2
+@pytest.mark.skip(reason="https://nvbugs/5682551")
 def test_llama_7b_multi_lora_tp2():
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
