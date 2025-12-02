@@ -707,3 +707,190 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
         c_sf[:num_sf_elements] == c_sf_ref[:num_sf_elements]
     ).sum().item() / num_sf_elements
     assert match_ratio > 0.95
+
+
+@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
+def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+    num_tokens: int, top_k: int, ep_size: int, tile_size: int
+):
+    """Test gather-based grouped GEMM with SwiGLU fusion.
+
+    This test validates the gather kernel which:
+    1. Uses LDGSTS for A/SFA loading with token_id_mapping
+    2. Performs GEMM with interleaved weights
+    3. Applies SwiGLU activation fusion
+    4. Quantizes output to FP4 with scale factor generation
+    """
+    sf_vec_size = 16
+    hidden_size = 4096
+    interm_size = 8192
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    # Generate routing information
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    _, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    num_tokens_per_expert = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
+    num_tokens_per_expert = num_tokens_per_expert[:num_local_experts]
+    # Ensure at least one valid token
+    if num_tokens_per_expert.sum().item() == 0:
+        num_tokens_per_expert[0] = 1
+    num_tiles_per_expert = (num_tokens_per_expert + tile_size - 1) // tile_size
+    num_tokens_per_expert = num_tokens_per_expert.cpu()
+    num_tiles_per_expert = num_tiles_per_expert.cpu()
+    num_valid_tiles = num_tiles_per_expert.sum().item()
+    num_valid_permuted_tokens = num_valid_tiles * tile_size
+
+    # Create helper
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    max_num_tiles = helper.get_max_num_tiles(num_tokens)
+    max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+    assert 0 <= num_valid_tiles <= max_num_tiles
+    assert 0 <= num_valid_permuted_tokens <= max_num_permuted_tokens
+
+    # Generate tile metadata
+    num_non_exiting_tiles = torch.tensor([num_valid_tiles], dtype=torch.int32, device="cuda")
+    tile_idx_to_group_idx = torch.empty(max_num_tiles, dtype=torch.int32)
+    tile_idx_to_mn_limit = torch.empty(max_num_tiles, dtype=torch.int32)
+    tile_idx_to_group_idx.fill_(int(-2e9))
+    tile_idx_to_mn_limit.fill_(int(-2e9))
+
+    tile_idx_to_group_idx_list = helper.generate_tile_idx_to_group_idx(
+        num_tokens_per_expert.tolist()
+    )
+    tile_idx_to_mn_limit_list = helper.generate_tile_idx_to_mn_limit(num_tokens_per_expert.tolist())
+
+    for idx, (group_idx, mn_limit) in enumerate(
+        zip(tile_idx_to_group_idx_list, tile_idx_to_mn_limit_list)
+    ):
+        tile_idx_to_group_idx[idx] = group_idx
+        tile_idx_to_mn_limit[idx] = mn_limit
+
+    tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
+    tile_idx_to_mn_limit = tile_idx_to_mn_limit.cuda()
+
+    # Generate token_id_mapping for gather operation
+    token_id_mapping_list = helper.generate_token_id_mapping(
+        num_tokens, num_tokens_per_expert.tolist()
+    )
+    token_id_mapping = torch.tensor(token_id_mapping_list, dtype=torch.int32, device="cuda")
+    assert token_id_mapping.size(0) == max_num_permuted_tokens
+
+    # Create input tensors (original size, not permuted)
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    b = torch.randint(
+        -5,
+        5,
+        (num_local_experts, interm_size * 2, hidden_size),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.bfloat16)
+
+    # Quantize inputs to FP4
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    a_sf_unswizzled = unswizzle_sf(a_sf, num_tokens, hidden_size)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b = b.view(torch.float4_e2m1fn_x2)
+    b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    alpha = a_global_sf * b_global_sf
+
+    # Interleave weights for SwiGLU
+    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+        torch.float4_e2m1fn_x2
+    )
+    b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
+        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+    )
+    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+    b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
+        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+    )
+
+    # Compute reference: manually gather, compute GEMM, apply SwiGLU, then quantize
+    a_gathered = torch.zeros(
+        max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype, device=a.device
+    )
+    a_sf_gathered = torch.zeros(
+        max_num_permuted_tokens * hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
+    )
+    for i in range(num_valid_permuted_tokens):
+        token_id = token_id_mapping[i].item()
+        if token_id >= 0:
+            a_gathered[i] = a[token_id]
+            a_sf_gathered[i * hidden_size // sf_vec_size : (i + 1) * hidden_size // sf_vec_size] = (
+                a_sf_unswizzled[
+                    token_id * hidden_size // sf_vec_size : (token_id + 1)
+                    * hidden_size
+                    // sf_vec_size
+                ]
+            )
+
+    # Swizzle a_sf_gathered for reference GEMM
+    a_sf_gathered_swizzled = swizzle_sf(
+        a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
+        max_num_permuted_tokens,
+        hidden_size,
+    )
+
+    c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
+        a_gathered,
+        b,
+        a_sf_gathered_swizzled,
+        b_sf,
+        alpha,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+    c_ref = swiglu_ref(c_ref)
+    global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
+    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+
+    # Swizzle a_sf back for kernel input
+    a_sf_swizzled = swizzle_sf(
+        a_sf_unswizzled.view(num_tokens, hidden_size // sf_vec_size), num_tokens, hidden_size
+    )
+
+    # Call gather kernel
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        a,
+        b_interleaved,
+        a_sf_swizzled,
+        b_sf_interleaved,
+        alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
+        num_non_exiting_tiles,
+        torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+    )
+
+    # Verify output
+    match_ratio = (
+        c[:num_valid_permuted_tokens].view(torch.uint8) == c_ref[:num_valid_permuted_tokens]
+    ).sum().item() / c[:num_valid_permuted_tokens].numel()
+    assert match_ratio > 0.95, f"Output match ratio {match_ratio} < 0.95"
+
+    num_sf_elements = num_valid_permuted_tokens * interm_size // sf_vec_size
+    match_ratio = (
+        c_sf[:num_sf_elements] == c_sf_ref[:num_sf_elements]
+    ).sum().item() / num_sf_elements
+    assert match_ratio > 0.95, f"Scale factor match ratio {match_ratio} < 0.95"
