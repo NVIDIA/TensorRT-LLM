@@ -83,10 +83,16 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor)
 
+            # WAR: RL integration needs to use NCCL AllReduce for TP>1 due to a bug in TRTLLM's AllReduce
+            # which will cause convergence issue when using multiple rollout instances.
+            if not self.has_start_local_cluser:
+                self.worker_kwargs['llm_args'].allreduce_strategy = 'NCCL'
+                logger.info("Forcing allreduce_strategy to NCCL as a workaround for RL integration.")
+
             self.init_rpc_executor()
             # Inject the generated HMAC key into worker_kwargs for workers
-            worker_kwargs['hmac_key'] = self.hmac_key
-            worker_kwargs['rpc_addr'] = self.rpc_addr
+            self.worker_kwargs['hmac_key'] = self.hmac_key
+            self.worker_kwargs['rpc_addr'] = self.rpc_addr
             if not has_event_loop():
                 self.init_workers_sync()
             self.setup_engine_remote()
