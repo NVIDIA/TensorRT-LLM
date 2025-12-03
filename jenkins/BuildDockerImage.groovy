@@ -337,8 +337,6 @@ def buildImage(config, imageKeyToTag)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
-                } else if (MODE == "build_for_ci") {
-                    imageKeyToTag[config.stageName] = dependentImageWithTag
                 }
             }
         }
@@ -356,7 +354,6 @@ def buildImage(config, imageKeyToTag)
             sh "env | sort"
             def randomSleep = (Math.random() * 600 + 600).toInteger()
             trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            return // TODO: Remove this return statement
             try {
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
@@ -367,6 +364,9 @@ def buildImage(config, imageKeyToTag)
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                if (MODE == "build_for_ci") {
+                    imageKeyToTag[config.stageName] = imageWithTag
+                }
             } catch (InterruptedException ex) {
                 throw ex
             } catch (Exception ex) {
@@ -384,6 +384,9 @@ def buildImage(config, imageKeyToTag)
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                if (MODE == "build_for_ci") {
+                    imageKeyToTag[config.stageName] = imageWithTag
+                }
             }
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
@@ -553,6 +556,11 @@ def updateCIImageTag(globalVars) {
         "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python310)"],
         "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : imageKeyToTag["Build CI image (RockyLinux8 Python312)"],
     ]
+
+    def emptyKeys = newImageTags.findAll { k, v -> v == null || v.trim().isEmpty() }.keySet()
+    if (!emptyKeys.isEmpty()) {
+        error "Not found image tags for CI: ${emptyKeys.join(', ')}"
+    }
 
     def filePath = "jenkins/current_image_tags.properties"
 
