@@ -485,6 +485,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
+            logprobs_mode: str = "raw",
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -565,6 +566,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
+
+        self.py_logprobs_mode = logprobs_mode
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -825,7 +828,9 @@ def executor_request_to_llm_request(
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
-        kv_cache_retention_config=executor_request.kv_cache_retention_config)
+        kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        logprobs_mode=getattr(executor_request, "py_logprobs_mode", "raw"),
+    )
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
