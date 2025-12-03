@@ -681,12 +681,6 @@ class KVCacheManager(BaseResourceManager):
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfigPython,
                                  mapping: Mapping, **kwargs):
-        # get kv cache dtype bytes
-        mem_per_token = 2
-        quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
 
         # get num key value heads
         config = model_config.pretrained_config
@@ -712,10 +706,24 @@ class KVCacheManager(BaseResourceManager):
         # provide at least 1 layer to prevent division by zero cache size
         num_attention_layers = max(
             len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
-        mem_per_token *= num_attention_layers * head_dim
-
         # K and V
-        mem_per_token *= kv_factor
+        mem_per_token = kv_factor * num_attention_layers * head_dim
+        # The data type bytes.
+        quant_config = model_config.quant_config
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            mem_per_token *= 1
+        elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
+        ):
+            # 1 bytes for 2 elements, and SFs (fp8) per 16 elements.
+            mem_per_token = math.ceil(mem_per_token / 2) + math.ceil(
+                mem_per_token / 16)
+        else:
+            # All other cases (fp16/bf16 kv cache), we need 2 bytes per token for K and V.
+            assert quant_config is None or (
+                not quant_config.quant_mode.has_kv_cache_quant()
+            ), "Quantized kv cache is not expected"
+            mem_per_token *= 2
         return mem_per_token
 
     def get_cache_bytes_per_token(self):

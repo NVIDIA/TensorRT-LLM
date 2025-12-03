@@ -300,21 +300,28 @@ inline __device__ void apply_rotary_embedding_gptj(VecType& q, VecType& k, float
     }
 }
 
-template <typename T>
+template <typename T, int VECS_PER_HEAD>
 inline __device__ void quantizeAndWriteFP4KVCache(uint8_t* kBlockScales, uint8_t* vBlockScales, uint32_t* kDst,
     uint32_t* vDst, float kSecondLevelSF, float vSecondLevelSF, int inBlockIdx, PackedVec<T>& kPacked,
     PackedVec<T>& vPacked)
 {
     uint8_t* kSfOut = nullptr;
     uint8_t* vSfOut = nullptr;
+    // WARNING: 8 elements per thread is assumed.
     // Two threads are involved in the reduction for block scales inside
     // cvt_warp_fp16_to_fp4, but only one thread needs to write out the
     // final answer.
+    constexpr int NUM_SFS_PER_HEAD = VECS_PER_HEAD / 2;
     if (inBlockIdx % 2 == 0)
     {
         auto blockScaleIdxDst = inBlockIdx / 2;
         kSfOut = kBlockScales + blockScaleIdxDst;
-        vSfOut = vBlockScales + blockScaleIdxDst;
+        // A interleaved layout (num_tokens / 4, num_sfs_per_head, 4) is used for nvfp4 kv cache in order to achieve
+        // better performance. This is only used by trtllm-gen kernels.
+        auto tokenIdxV = blockScaleIdxDst / NUM_SFS_PER_HEAD;
+        auto headDimIdxV = blockScaleIdxDst % NUM_SFS_PER_HEAD;
+        auto blockScaleIdxDstV = (tokenIdxV / 4) * 4 * NUM_SFS_PER_HEAD + headDimIdxV * 4 + (tokenIdxV % 4);
+        vSfOut = vBlockScales + blockScaleIdxDstV;
     }
 
     // Despite the name of cvt_warp_fp16_to_fp4, it is used by
@@ -376,6 +383,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 #endif
     constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1 && !ENABLE_4BITS_CACHE;
     int const sizePerHeadDivX = params.size_per_head / VEC_SIZE;
+    // This is only used by nvfp4 kv cache where Dh_MAX is same as head size (others are not supported yet).
+    constexpr int VECS_PER_HEAD = Dh_MAX / VEC_SIZE;
     using TDst = TCache;
 
     // Variable sequence length.
@@ -615,9 +624,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                             float vSecondLevelSF = params.qkv_scale_orig_quant[2];
                             auto& kPacked = reinterpret_cast<PackedVec<T>&>(k_to_cache);
                             auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
-                            quantizeAndWriteFP4KVCache<T>(kBlockScales, vBlockScales, reinterpret_cast<uint32_t*>(kDst),
-                                reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF, vSecondLevelSF, inBlockIdx, kPacked,
-                                vPacked);
+                            quantizeAndWriteFP4KVCache<T, VECS_PER_HEAD>(kBlockScales, vBlockScales,
+                                reinterpret_cast<uint32_t*>(kDst), reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF,
+                                vSecondLevelSF, inBlockIdx, kPacked, vPacked);
                         }
                         else
                         {
@@ -1022,9 +1031,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                         float vSecondLevelSF = params.qkv_scale_orig_quant[2];
                         auto& kPacked = reinterpret_cast<PackedVec<T>&>(k);
                         auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
-                        quantizeAndWriteFP4KVCache<T>(kBlockScales, vBlockScales, reinterpret_cast<uint32_t*>(kDst),
-                            reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF, vSecondLevelSF, inBlockIdx, kPacked,
-                            vPacked);
+                        quantizeAndWriteFP4KVCache<T, VECS_PER_HEAD>(kBlockScales, vBlockScales,
+                            reinterpret_cast<uint32_t*>(kDst), reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF,
+                            vSecondLevelSF, inBlockIdx, kPacked, vPacked);
                     }
                     else
                     {
@@ -1528,6 +1537,15 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     // Use specialized kernels for different heads (better balance of work).
     TLLM_CHECK_WITH_INFO(params.size_per_head % 8 == 0, "Head size needs to be multiple of 8!");
     TLLM_CHECK_WITH_INFO(params.rotary_embedding_dim % 8 == 0, "Rotary embedding dimension needs to be multiple of 8!");
+
+// NVFP4 kv cache requires head size to be power of 2.
+#ifdef ENABLE_FP4
+    if (std::is_same_v<TCache, __nv_fp4_e2m1>)
+    {
+        TLLM_CHECK_WITH_INFO((params.size_per_head & (params.size_per_head - 1)) == 0,
+            "Head size needs to be power of 2 for nvfp4 kv cache.");
+    }
+#endif
 
     // TODO: this should be extended to support quantized FP4 outputs as well.
     // For now, we will assume that the attention kernel reads directly from the KV cache
