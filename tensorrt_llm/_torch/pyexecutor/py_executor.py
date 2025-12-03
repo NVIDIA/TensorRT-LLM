@@ -180,7 +180,6 @@ class PyExecutor:
         self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
         self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
         self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
-        self.max_pp_retry_count = self.llm_args.max_pp_retry_count
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -236,6 +235,8 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
         # schedule handle for PP to propagate the first PP rank's schedule result
         self.send_schedule_handler = None
+        self.max_pp_retry_count = getattr(self.llm_args, 'max_pp_retry_count',
+                                          10)
 
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
