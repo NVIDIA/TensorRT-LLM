@@ -3,7 +3,7 @@ import asyncio
 
 from openai import AsyncOpenAI
 
-from tensorrt_llm.scaffolding import ChatTokenCounter, MCPWorker, TaskTimer, TRTOpenaiWorker
+from tensorrt_llm.scaffolding import ChatTokenCounter, QueryCollector,MCPWorker, TaskTimer, TRTOpenaiWorker
 from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
 
 
@@ -13,6 +13,7 @@ def parse_arguments():
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1")
     parser.add_argument("--model", type=str, default="gpt-oss-20b")
     parser.add_argument("--enable_statistics", action="store_true")
+    parser.add_argument("--enable_query_collector", action="store_true")
     return parser.parse_args()
 
 
@@ -26,7 +27,7 @@ async def main():
     await mcp_worker.init_in_asyncio_event_loop()
 
     llm = create_open_deep_research_scaffolding_llm(
-        generation_worker, mcp_worker, args.enable_statistics
+        generation_worker, mcp_worker, args.enable_statistics, args.enable_query_collector
     )
 
     prompt = """
@@ -47,6 +48,10 @@ async def main():
         print("token counting info: " + str(token_counting_info))
         timer_info = TaskTimer.get_global_info()
         print("timer info: " + str(timer_info))
+
+    if args.enable_query_collector:
+        QueryCollector.get_global_info()
+        print("Query info dumped to query_result.json!")
 
     llm.shutdown()
     generation_worker.shutdown()
