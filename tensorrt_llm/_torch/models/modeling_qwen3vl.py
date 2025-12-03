@@ -5,11 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
-<<<<<<< HEAD
 from transformers.activations import ACT2FN as HF_ACT2FN
-=======
-from transformers.activations import ACT2FN
->>>>>>> 5e7dde7bc (fix: set dtype to None in Linear to improve accuracy)
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
@@ -372,27 +368,10 @@ class Qwen3VLVisionMLP(MLP):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             bias=True,
-<<<<<<< HEAD
             activation=HF_ACT2FN[config.hidden_act],
             # dtype=model_config.pretrained_config.text_config.dtype,
             config=model_config,
             layer_idx=layer_idx,
-=======
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
-            allreduce_strategy=model_config.allreduce_strategy,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-        self.linear_fc2 = Linear(
-            self.intermediate_size,
-            self.hidden_size,
-            bias=True,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
-            allreduce_strategy=model_config.allreduce_strategy,
->>>>>>> 5e7dde7bc (fix: set dtype to None in Linear to improve accuracy)
         )
 
 
@@ -411,14 +390,8 @@ class Qwen3VLVisionBlock(torch.nn.Module):
             eps=model_config.pretrained_config.text_config.rms_norm_eps,
             dtype=model_config.pretrained_config.text_config.dtype,
         )
-<<<<<<< HEAD
         self.attn = Qwen3VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen3VLVisionMLP(model_config, layer_idx)
-=======
-        self.attn = Qwen3_VLVisionAttention(model_config, layer_idx)
-        self.mlp = Qwen3_VLVisionMLP(model_config)
-        # self.mlp = Qwen3VLVisionMLP(config)
->>>>>>> 5e7dde7bc (fix: set dtype to None in Linear to improve accuracy)
 
     @torch.inference_mode()
     def forward(
@@ -573,66 +546,57 @@ class Qwen3VisionModel(torch.nn.Module):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+    def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
+        # copy from vllm
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
-
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
-
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
-
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
-
-            indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-            ]
-
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
-
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
-
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device
-        )
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
-
-        patch_pos_embeds_permute = []
-        merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
+        outputs = []
+        for t, h, w in grid_thw:
+            h_idxs = torch.linspace(
+                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
             )
-            patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
+            w_idxs = torch.linspace(
+                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
+            )
+
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
+
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
+
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
+
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=self.dtype)
+
+            embeds = self.pos_embed(indices)
+            embeds *= weights
+            combined = embeds.sum(dim=0)
+
+            combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
@@ -700,18 +664,7 @@ class Qwen3VisionModelBase(nn.Module):
             kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
         )
 
-<<<<<<< HEAD
         self.visual = model_class(self.model_config).to(self.model_dtype)
-=======
-        if model_class == Qwen3VLVisionModel:
-            # NOTE: For hf impl, we use flash_attention_2 for attention implementation to avoid OOM issue.
-            config._attn_implementation = "flash_attention_2"
-            self.visual = model_class(config).to(self.model_dtype).eval()
-        elif model_class == Qwen3_VisionModel:
-            self.visual = model_class(self.model_config).to(self.model_dtype)
-        else:
-            raise NotImplementedError(f"Model class {model_class} not implemented")
->>>>>>> 4c6f413cd (fix: remove log)
 
         self.post_config()
 
@@ -1076,19 +1029,9 @@ class Qwen3VLModel(Qwen3VLModelBase):
             "deepstack_feature",
         ]
 
-<<<<<<< HEAD
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)
-=======
-    def load_weights(self, weights, weight_mapper: BaseWeightMapper):
-        if not DISAGG:
-            if VISION_MODEL_CLS == Qwen3VLVisionModel:
-                vision_encoder_weights = process_weights(weights, "visual")
-                self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
-            else:
-                self.mm_encoder.load_weights(weights)
->>>>>>> 4c6f413cd (fix: remove log)
 
         weight_mapper = Qwen3VLHfWeightMapper()
         weight_mapper.init_model_and_config(self.llm, self.model_config)
