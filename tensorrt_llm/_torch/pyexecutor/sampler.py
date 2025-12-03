@@ -1672,8 +1672,8 @@ class TorchSampler(Sampler):
                 self.handle_logprobs(req, count=processed)
             req.py_decoding_iter += 1
 
-    def return_log_probs(self, scheduled_requests: ScheduledRequests) -> bool:
-        return any(req.py_return_log_probs for req in scheduled_requests.all_requests())
+    def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
+        return any(req.py_return_log_probs for req in requests)
 
     @override
     @torch.inference_mode()
@@ -1846,6 +1846,65 @@ class TorchSampler(Sampler):
         #     and thus introduces read-after-write dependencies (including possible false
         #     sharing).
         logits[logits_bias_mask_cuda] += biases_tensor_cuda
+
+    def _handle_log_probs(
+        self,
+        requests: list[LlmRequest],
+        logits_cuda: torch.Tensor,
+        *,
+        logits_cuda_indexer: _PackedStepIndexer,
+        req_num_generated_tokens: torch.Tensor,
+    ) -> None:
+        """Handle top-k logprobs.
+
+        This is done outside the sampling loop, because the returned logprobs are specified to not reflect
+        temperature scaling, top-k/top-p masking, etc.
+        """
+        if self._return_log_probs(requests):
+            assert logits_cuda.dim() == 2, "logits should be 2D"
+
+            logprobs_req_indices = [
+                req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
+            ]
+            logprobs_logit_indices = logits_cuda_indexer[logprobs_req_indices]
+            logprobs_logit_indices_cuda = logprobs_logit_indices.to(
+                device=logits_cuda.device, non_blocking=True
+            )
+            logprobs_cuda = F.log_softmax(
+                logits_cuda[logprobs_logit_indices_cuda].to(dtype=torch.float32, non_blocking=True),
+                dim=-1,
+            )
+            topk_vals_cuda, topk_indices_cuda = torch.topk(
+                logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
+            )
+            # Use a single D2H copy to reduce overheads
+            topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
+            topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
+            topk_vals.copy_(topk_vals_cuda, non_blocking=True)
+            topk_indices.copy_(topk_indices_cuda, non_blocking=True)
+            current_offset = 0
+            for req_id, steps in zip(
+                logprobs_req_indices, req_num_generated_tokens[logprobs_req_indices].tolist()
+            ):
+                req = requests[req_id]
+                next_offset = current_offset + steps
+                # NB: Assigning views on memory which is being filled asynchronously
+                req.py_topk_logprobs_vals = topk_vals[
+                    current_offset:next_offset, : req.py_num_logprobs
+                ]
+                req.py_topk_logprobs_indices = topk_indices[
+                    current_offset:next_offset, : req.py_num_logprobs
+                ]
+
+                # context requests do not have multiple input beams, but they need multiple output beams
+                if req.is_context_init_state:
+                    req.py_topk_logprobs_vals = req.py_topk_logprobs_vals.expand(
+                        req.sampling_config.beam_width, -1
+                    )
+                    req.py_topk_logprobs_indices = req.py_topk_logprobs_indices.expand(
+                        req.sampling_config.beam_width, -1
+                    )
+                current_offset = next_offset
 
     @nvtx_range("sample_batched_by_strategy")
     @torch.inference_mode()
@@ -2449,54 +2508,12 @@ class TorchSampler(Sampler):
             req_offsets=req_offsets,
         )
 
-        # Handle top-k logprobs. This is done outside the sampling loop,
-        # because the returned logprobs are specified to not reflect temperature scaling,
-        # top-k/top-p masking, etc.
-        if self.return_log_probs(scheduled_requests):
-            assert logits_cuda.dim() == 2, "logits should be 2D"
-
-            logprobs_req_indices = [
-                req_id for req_id, req in enumerate(requests) if req.py_num_logprobs
-            ]
-            logprobs_logit_indices = logits_cuda_indexer[logprobs_req_indices]
-            logprobs_logit_indices_cuda = logprobs_logit_indices.to(
-                device=logits_cuda.device, non_blocking=True
-            )
-            logprobs_cuda = F.log_softmax(
-                logits_cuda[logprobs_logit_indices_cuda].to(dtype=torch.float32, non_blocking=True),
-                dim=-1,
-            )
-            topk_vals_cuda, topk_indices_cuda = torch.topk(
-                logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
-            )
-            # Use a single D2H copy to reduce overheads
-            topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
-            topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
-            topk_vals.copy_(topk_vals_cuda, non_blocking=True)
-            topk_indices.copy_(topk_indices_cuda, non_blocking=True)
-            current_offset = 0
-            for req_id, steps in zip(
-                logprobs_req_indices, req_num_generated_tokens[logprobs_req_indices].tolist()
-            ):
-                req = requests[req_id]
-                next_offset = current_offset + steps
-                # NB: Assigning views on memory which is being filled asynchronously
-                req.py_topk_logprobs_vals = topk_vals[
-                    current_offset:next_offset, : req.py_num_logprobs
-                ]
-                req.py_topk_logprobs_indices = topk_indices[
-                    current_offset:next_offset, : req.py_num_logprobs
-                ]
-
-                # context requests do not have multiple input beams, but they need multiple output beams
-                if req.is_context_init_state:
-                    req.py_topk_logprobs_vals = req.py_topk_logprobs_vals.expand(
-                        req.sampling_config.beam_width, -1
-                    )
-                    req.py_topk_logprobs_indices = req.py_topk_logprobs_indices.expand(
-                        req.sampling_config.beam_width, -1
-                    )
-                current_offset = next_offset
+        self._handle_log_probs(
+            requests,
+            logits_cuda,
+            logits_cuda_indexer=logits_cuda_indexer,
+            req_num_generated_tokens=req_num_generated_tokens,
+        )
 
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
