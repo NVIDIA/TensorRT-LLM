@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 import openai
+from enum import Enum
 import requests
 from enum import Enum
 import requests
