@@ -183,6 +183,10 @@ private:
             auto windowSize = cacheManager.getBlockManager().getPoolWindowSize(poolIdx);
             mPoolsPerWindow[windowSize].push_back(cacheManager.getBlockManager().getPrimaryPool(poolIdx));
         }
+        if (cacheManager.isEnableIndexerKCache())
+        {
+            mIndexerKCachePool = cacheManager.getIndexerKCachePool();
+        }
     }
 
     BlockRange(BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId)
