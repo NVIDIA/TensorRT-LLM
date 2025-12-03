@@ -709,11 +709,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             if spec_config.spec_dec_mode.is_eagle3_one_model(
-            ) and model_config.spec_config.eagle3_mistral_large_3:
+            ) and spec_config.eagle3_mistral_large_3:
                 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                     MistralConfigLoader
                 self.draft_config = MistralConfigLoader().load(
-                    model_config.spec_config.speculative_model_dir,
+                    spec_config.speculative_model_dir,
                     mapping=model_config.mapping,
                     moe_backend=model_config.moe_backend,
                     moe_max_num_tokens=model_config.moe_max_num_tokens,
@@ -733,7 +733,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config._frozen = True
                 from tensorrt_llm._utils import get_sm_version
                 if self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and self.draft_config.moe_backend == "TRTLLM":
-                    # FIXME 
+                    # FIXME
                     if get_sm_version() == 100:
                         logger.warning(
                             "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"

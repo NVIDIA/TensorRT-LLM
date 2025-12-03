@@ -270,6 +270,9 @@ class MistralConfigLoader(BaseConfigLoader):
     def load(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
         config_dict, pretrained_config = self._parse_mistral_config(checkpoint_dir)
 
-        return ModelConfig.from_pretrained(
+        model_config = ModelConfig.from_pretrained(
             checkpoint_dir=checkpoint_dir, pretrained_hf_config=pretrained_config, **kwargs
         )
+        if model_config.spec_config is not None:
+            model_config.spec_config.eagle3_mistral_large_3 = True
+        return model_config
