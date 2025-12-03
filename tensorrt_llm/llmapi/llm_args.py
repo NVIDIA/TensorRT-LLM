@@ -2647,11 +2647,6 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays.",
         status="prototype")
-    max_pp_retry_count: int = Field(
-        default=10,
-        description=
-        "Maximum number of times a PP rank retries when it cannot run first PP's schedule result due to limited KV cache resources.",
-        status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
@@ -2762,6 +2757,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
         status="prototype",
     )
+
+    max_pp_retry_count: int = Field(
+        default=10,
+        description=
+        "Maximum number of times a PP rank retries when it cannot run first PP's schedule result due to limited KV cache resources.",
+        status="prototype")
 
     @property
     def quant_config(self) -> QuantConfig:
@@ -3047,19 +3048,19 @@ class TorchLlmArgs(BaseLlmArgs):
             )
         return self
 
-    @field_validator('max_pp_retry_count')
-    @classmethod
-    def validate_max_pp_retry_count(cls, v: int):
-        if v < 0:
-            raise ValueError(
-                f"max_pp_retry_count must be non-negative, got {v}")
-        return v
-
     @model_validator(mode='after')
     def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_max_pp_retry_count(self) -> 'TorchLlmArgs':
+        if self.max_pp_retry_count < 0:
+            raise ValueError(
+                f"max_pp_retry_count must be non-negative, got {self.max_pp_retry_count}"
             )
         return self
 
