@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import signal  # Added import
+import socket
 import subprocess  # nosec B404
 import sys
 from pathlib import Path
@@ -176,37 +177,40 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    if backend == 'pytorch':
-        llm_args.pop("build_config", None)
-        llm = PyTorchLLM(**llm_args)
-    elif backend == '_autodeploy':
-        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, port))
 
-        # AutoDeploy does not support build_config
-        llm_args.pop("build_config", None)
-        llm = AutoDeployLLM(**llm_args)
-    elif backend == 'tensorrt' or backend == 'trt':
-        llm_args.pop("backend")
-        llm = LLM(**llm_args)
-    else:
-        raise click.BadParameter(
-            f"{backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+        if backend == 'pytorch':
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == '_autodeploy':
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-    server = OpenAIServer(llm=llm,
-                          model=model,
-                          tool_parser=tool_parser,
-                          server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg,
-                          disagg_cluster_config=disagg_cluster_config,
-                          multimodal_server_config=multimodal_server_config,
-                          chat_template=chat_template)
+            # AutoDeploy does not support build_config
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == 'tensorrt' or backend == 'trt':
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
 
-    # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-        gc.disable()
+        server = OpenAIServer(llm=llm,
+                              model=model,
+                              tool_parser=tool_parser,
+                              server_role=server_role,
+                              metadata_server_cfg=metadata_server_cfg,
+                              disagg_cluster_config=disagg_cluster_config,
+                              multimodal_server_config=multimodal_server_config,
+                              chat_template=chat_template)
 
-    asyncio.run(server(host, port))
+        # Optionally disable GC (default: not disabled)
+        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+            gc.disable()
+
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 def launch_mm_encoder_server(
