@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, NamedTuple, Optional, Tuple, Union
+from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -173,6 +173,7 @@ class SamplingParams:
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
+        logprobs_mode (Literal["raw", "processed"]): The mode of log probabilities to return. Defaults to "raw".
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
@@ -219,6 +220,7 @@ class SamplingParams:
     n: int = 1
     best_of: Optional[int] = None
     use_beam_search: bool = False
+    logprobs_mode: Literal["raw", "processed"] = "raw"
 
     # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
     top_k: Optional[int] = None
@@ -319,6 +321,11 @@ class SamplingParams:
                 f"Please set to best_of=1 or set an environment variable "
                 f"TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 "
                 f"under the greedy decoding."
+            )
+
+        if self.logprobs_mode not in ["raw", "processed"]:
+            raise ValueError(
+                f"logprobs_mode must be one of ['raw', 'processed'], got {self.logprobs_mode}"
             )
 
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
