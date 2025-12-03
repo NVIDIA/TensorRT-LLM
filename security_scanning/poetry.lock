@@ -2793,7 +2793,7 @@ files = [
 [[package]]
 name = "nvidia-modelopt"
 version = "0.37.0"
-description = "Nvidia TensorRT Model Optimizer: a unified model optimization and deployment toolkit."
+description = "Nvidia Model Optimizer: a unified model optimization and deployment toolkit."
 optional = false
 python-versions = "<3.13,>=3.10"
 files = [
