@@ -977,7 +977,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend == "pytorch" or backend == "_autodeploy"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
