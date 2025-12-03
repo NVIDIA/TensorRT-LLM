@@ -732,14 +732,22 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.moe_backend = "TRTLLM"
                     self.draft_config._frozen = True
                 from tensorrt_llm._utils import get_sm_version
-                if self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and self.draft_config.moe_backend == "TRTLLM" and get_sm_version() == 100:
+                if self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and self.draft_config.moe_backend == "TRTLLM":
                     # FIXME 
-                    logger.warning(
-                        "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
-                    )
-                    self.draft_config._frozen = False
-                    self.draft_config.moe_backend = "DEEPGEMM"
-                    self.draft_config._frozen = True
+                    if get_sm_version() == 100:
+                        logger.warning(
+                            "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
+                        )
+                        self.draft_config._frozen = False
+                        self.draft_config.moe_backend = "DEEPGEMM"
+                        self.draft_config._frozen = True
+                    elif get_sm_version() != 90:
+                        logger.warning(
+                            "Switching moe_backend of draft model to CUTLASS for FP8_BLOCK_SCALES quantization on SM!=100"
+                        )
+                        self.draft_config._frozen = False
+                        self.draft_config.moe_backend = "CUTLASS"
+                        self.draft_config._frozen = True
 
             elif spec_config.spec_dec_mode.is_eagle3_one_model():
                 self.draft_config = ModelConfig.from_pretrained(
