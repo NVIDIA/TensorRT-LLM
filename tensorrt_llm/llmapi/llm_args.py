@@ -188,6 +188,11 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """
     Configuration for sparse attention.
     """
+    seq_len_threshold: Optional[int] = Field(
+        default=None,
+        description=
+        "The sequence length threshold for separating short and long sequences."
+    )
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -222,6 +227,15 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def get_indices_block_size(self) -> int:
         return 1
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        """
+        Whether to capture separate CUDA graphs for short and long sequences.
+        If True, the CUDA graphs will be captured for short and long sequences separately.
+        If False, the CUDA graphs will be captured for all sequences together.
+        Use seq_len_threshold to determine the threshold for separating short and long sequences.
+        """
+        return False
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
@@ -275,6 +289,14 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        """
+        Whether to capture separate CUDA graphs for short and long sequences.
+        Use seq_len_threshold to determine the threshold for separating short and long sequences.
+        """
+        self.seq_len_threshold = self.index_topk
+        return True
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):

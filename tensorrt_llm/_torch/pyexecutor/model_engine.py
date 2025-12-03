@@ -426,6 +426,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             kv_cache_manager_key=self.kv_cache_manager_key,
+            sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
@@ -704,31 +705,47 @@ class PyTorchModelEngine(ModelEngine):
                 draft_lengths.append(0)
             draft_lengths = [self.max_total_draft_tokens]
 
+        # Create CUDA graphs for short and long sequences separately for sparse attention.
+        sparse_config = self.sparse_attention_config
+        if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
+        ):
+            # For short sequences, use the sequence length threshold as the maximum sequence length.
+            # For long sequences, use the default maximum sequence length (self.max_seq_len).
+            if sparse_config.seq_len_threshold < self.max_seq_len:
+                max_seq_len_list = [
+                    self.max_seq_len, sparse_config.seq_len_threshold
+                ]
+            else:
+                max_seq_len_list = [self.max_seq_len]
+        else:
+            max_seq_len_list = [self.max_seq_len]
+
         for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
                 continue
 
             for draft_len in draft_lengths:
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        # No KV cache space, cannot continue capturing graphs
-                        return
+                for max_seq_len in max_seq_len_list:
+                    warmup_request = self._create_cuda_graph_warmup_request(
+                        resource_manager, bs, draft_len, max_seq_len)
+                    with self._release_batch_context(warmup_request,
+                                                     resource_manager) as batch:
+                        if batch is None:
+                            # No KV cache space, cannot continue capturing graphs
+                            return
 
-                    logger.info(
-                        f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
-                    )
+                        logger.info(
+                            f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
+                        )
 
-                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model
-                    self._update_draft_inference_state_for_warmup(
-                        batch, draft_len > 0, resource_manager)
+                        self.enable_spec_decode = draft_len > 0 or self.is_draft_model
+                        self._update_draft_inference_state_for_warmup(
+                            batch, draft_len > 0, resource_manager)
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -873,8 +890,11 @@ class PyTorchModelEngine(ModelEngine):
         return result
 
     def _create_cuda_graph_warmup_request(
-            self, resource_manager: ResourceManager, batch_size: int,
-            draft_len: int) -> Optional[ScheduledRequests]:
+            self,
+            resource_manager: ResourceManager,
+            batch_size: int,
+            draft_len: int,
+            max_seq_len: int = None) -> Optional[ScheduledRequests]:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -902,7 +922,8 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(draft_len)
 
         # Add one dummy request with the maximum possible sequence length.
-        token_num = max(1, min(available_tokens, self.max_seq_len - 1))
+        max_seq_len = self.max_seq_len if max_seq_len is None else max_seq_len
+        token_num = max(1, min(available_tokens, max_seq_len - 1))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
@@ -2685,6 +2706,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata=spec_metadata,
                 draft_tokens_cuda=self.draft_tokens_cuda
                 if self.is_spec_decode else None,
+                new_tensors_device=new_tensors_device,
                 spec_resource_manager=spec_resource_manager,
             )
             can_run_graph = key is not None
