@@ -652,13 +652,13 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "fastapi"
-version = "0.123.0"
+version = "0.123.5"
 description = "FastAPI framework, high performance, easy to learn, fast to code, ready for production"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "fastapi-0.123.0-py3-none-any.whl", hash = "sha256:cb56e69e874afa897bd3416c8a3dbfdae1730d0a308d4c63303f3f4b44136ae4"},
-    {file = "fastapi-0.123.0.tar.gz", hash = "sha256:1410678b3c44418245eec85088b15140d894074b86e66061017e2b492c09b138"},
+    {file = "fastapi-0.123.5-py3-none-any.whl", hash = "sha256:a9c708e47c0fa424139cddb8601d0f92d3111b77843c22e9c8d0164d65fe3c97"},
+    {file = "fastapi-0.123.5.tar.gz", hash = "sha256:54bbb660ca231d3985474498b51c621ddcf8888d9a4c1ecb10aa40ec217e4965"},
 ]
 
 [package.dependencies]
@@ -1620,13 +1620,13 @@ dev = ["meson-python (>=0.13.1,<0.17.0)", "pybind11 (>=2.13.2,!=2.13.3)", "setup
 
 [[package]]
 name = "mdtex2html"
-version = "1.3.1"
+version = "1.3.2"
 description = "library to convert Markdown with included LaTeX-Formulas to HTML with MathML"
 optional = false
 python-versions = "<4,>=3.7"
 files = [
-    {file = "mdtex2html-1.3.1-py3-none-any.whl", hash = "sha256:34d7a081adad8ce5d93742a5246c2ad1ff63be70b82384a2fe7ce6f13a683822"},
-    {file = "mdtex2html-1.3.1.tar.gz", hash = "sha256:fa4b56831135b100fb0c377b1e05ec11c2f7341a16fe4099245859a4a43b342c"},
+    {file = "mdtex2html-1.3.2-py3-none-any.whl", hash = "sha256:9bf8985ba3f1641c62df3cb9d6bb7151031bd6018ee30ad8184749ba696c2f3d"},
+    {file = "mdtex2html-1.3.2.tar.gz", hash = "sha256:3b2bc613e62ffdce39a9627d60a244cbbbb732b4bfcc30ddae97a9dff7d18d6d"},
 ]
 
 [package.dependencies]
@@ -3853,4 +3853,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "eb03555b3f95e886bca79153f0891d18caa53e5f2e8d4a7f1b4942ccec5428b7"
+content-hash = "462f31bce5ca01de65020033e9f0a8171e5ebee8c30e1761d16c2c48d5ff2c53"

@@ -163,21 +163,22 @@ def _validate_sharded_shapes(
         include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
         boundary_condition=is_any_lin_op,
     )
-    for view_node in nodes_to_validate:
-        if len(view_node.args) < 2:
+    for shape_node in nodes_to_validate:
+        # Parameter update must be idempotent
+        if "sharded" in shape_node.meta and shape_node.meta["sharded"]:
             continue
-        if "sharded" in view_node.meta and view_node.meta["sharded"]:
+        if len(shape_node.args) < 2:
             continue
-        view_shape = list(view_node.args[1])
+        view_shape = list(shape_node.args[1])
         if not isinstance(view_shape, list):
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
-            args = list(view_node.args)
+            args = list(shape_node.args)
             view_shape[2] = -1  # view_shape[2] // world_size
             args[1] = tuple(view_shape)
-            view_node.args = tuple(args)
-            view_node.meta["sharded"] = True
-            ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
+            shape_node.args = tuple(args)
+            shape_node.meta["sharded"] = True
+            ad_logger.debug(f"\nUpdated view node {shape_node} arguments to {shape_node.args}")
 
     # if fused_weight_dims is provided, we need to update all split sizes
     if fused_weight_dims is not None:
@@ -187,14 +188,18 @@ def _validate_sharded_shapes(
         split_nodes = subgraph(
             [node],
             [next_lin_node],
-            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+            include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
         )
         for split_node in split_nodes:
+            # Parameter update must be idempotent
+            if "sharded" in split_node.meta and split_node.meta["sharded"]:
+                continue
             orig_sizes = split_node.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
             args = list(split_node.args)
             args[1] = new_sizes
             split_node.args = tuple(args)
+            split_node.meta["sharded"] = True
             ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
 
 
@@ -256,10 +261,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -407,7 +408,9 @@ def _insert_sharded_mamba(
     conv_args[-1] = conv1d_node.args[-1] // world_size
     conv1d_node.args = tuple(conv_args)
 
-    # First, shard the entry_node (the first linear layer)
+    ##############################################################
+    ####### shard the entry_node (the first linear layer) ########
+    ##############################################################
     # Extract entry node's fused_weight_dims by matching weight name against patterns
     entry_fused_dims = None
     if fused_weight_dims:
@@ -431,6 +434,9 @@ def _insert_sharded_mamba(
         allreduce_strategy=allreduce_strategy,
     )
 
+    ##############################################################
+    ######## Shard remaining weights: conv1d and RMSNorm #########
+    ##############################################################
     # Get all weight nodes in the subgraph except for out_proj
     weight_nodes = [
         n
@@ -438,7 +444,6 @@ def _insert_sharded_mamba(
         if "out_proj" not in str(n)
     ]
 
-    # Shard remaining weights, such as conv1d or RMSNorm
     for weight_node in weight_nodes:
         weight_key = weight_node.target
 
@@ -480,6 +485,45 @@ def _insert_sharded_mamba(
             f"Sharded weight {weight_key} on dim {shard_dim}: "
             f"{weight_param.shape} -> {sharded_shape}"
         )
+
+    ##############################################################
+    ############## update split node parameters ##################
+    ##############################################################
+    next_lin_node, _ = bfs(entry_node, is_any_lin_op, include_root=False)
+
+    split_nodes = subgraph(
+        [entry_node],
+        [next_lin_node],
+        include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
+    )
+    for split_node in split_nodes:
+        orig_sizes = split_node.args[1]
+        new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
+        args = list(split_node.args)
+        args[1] = new_sizes
+        split_node.args = tuple(args)
+        ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
+
+    nodes_to_validate = subgraph(
+        [entry_node],
+        include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
+        boundary_condition=is_any_lin_op,
+    )
+    for reshape_node in nodes_to_validate:
+        if len(reshape_node.args) < 2:
+            continue
+        if "sharded" in reshape_node.meta and reshape_node.meta["sharded"]:
+            continue
+        view_shape = list(reshape_node.args[1])
+        if not isinstance(view_shape, list):
+            continue
+        if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
+            args = list(reshape_node.args)
+            view_shape[2] = -1  # view_shape[2] // world_size
+            args[1] = tuple(view_shape)
+            reshape_node.args = tuple(args)
+            reshape_node.meta["sharded"] = True
+            ad_logger.debug(f"\nUpdated view node {reshape_node} arguments to {reshape_node.args}")
 
 
 def _shard_parameter_node(
@@ -574,10 +618,6 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_any_lin_op(node):
-            _validate_sharded_shapes(
-                node, fused_weight_dims=fused_weight_dims, world_size=world_size
-            )
         return
 
     # figure out the right dist op (backend-aware)
@@ -717,36 +757,19 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
-            _insert_sharded_mamba(
-                gm=gm,
-                entry_node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                dist_backend=self.dist_backend,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims
-                if isinstance(self.fused_weight_dims, dict)
-                else None,
-                quantization_cb=self.quantization_cb,
-                allreduce_strategy=self.allreduce_strategy,
-            )
-        else:
-            _shard_parameter_node(
-                gm=gm,
-                node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                dist_backend=self.dist_backend,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-                quantization_cb=self.quantization_cb,
-                allreduce_strategy=self.allreduce_strategy,
-            )
+        _shard_parameter_node(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            dist_backend=self.dist_backend,
+            min_local_shape=self.min_local_shape,
+            fused_weight_dims=self.fused_weight_dims,
+            quantization_cb=self.quantization_cb,
+            allreduce_strategy=self.allreduce_strategy,
+        )
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
@@ -1337,7 +1360,6 @@ class ShardingSource(Enum):
 class ShardingDim(Enum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
     TP = "tp"
     EP = "ep"
     BMM = "bmm"
@@ -1365,7 +1387,7 @@ class ShardingTransformContainer(BaseModel):
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,

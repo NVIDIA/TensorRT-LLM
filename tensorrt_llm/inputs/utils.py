@@ -573,6 +573,7 @@ def apply_chat_template(
     documents: Optional[list[dict[str, str]]] = None,
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
+    enable_tokenize: bool = False,
 ) -> (str | List[str]):
     """Apply chat template to the conversation."""
 
@@ -594,7 +595,7 @@ def apply_chat_template(
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
-        tokenize=False,
+        tokenize=enable_tokenize,
         add_generation_prompt=add_generation_prompt,
         tools=tools,
         documents=documents,

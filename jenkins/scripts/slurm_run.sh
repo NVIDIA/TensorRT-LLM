@@ -38,18 +38,6 @@ fi
 if [ $SLURM_LOCALID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
-
-    # Download the new merged waives.txt
-    if ! wget -nv "$llmWaivesTxtfile"; then
-        echo "Failed to download merged waives.txt, use the default waives.txt."
-    elif [ ! -f "waives.txt" ]; then
-        echo "Downloaded but file does not exist, use the default waives.txt."
-    else
-        rm -f "$llmSrcNode/tests/integration/test_lists/waives.txt"
-        mv waives.txt "$llmSrcNode/tests/integration/test_lists/waives.txt"
-        echo "Download merged waives.txt successfully"
-    fi
-
     which python3
     python3 --version
     apt-get install -y libffi-dev
