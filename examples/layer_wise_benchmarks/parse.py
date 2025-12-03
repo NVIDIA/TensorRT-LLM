@@ -433,7 +433,7 @@ for title, time_data in zip(merged_title, merged_data):
         stack.append(level_title)
         level = len(stack)
         print("|--" * (level - 1) + level_title)
-        csv_data.append(["|--" * (level - 1) + level_title])
+        csv_data.append(["|--" * (level - 1) + level_title] + [""] * len(problem_set))
         js_stack.append([])
     level = len(stack) + 1
     print(
