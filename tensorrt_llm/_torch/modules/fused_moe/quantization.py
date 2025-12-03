@@ -332,17 +332,17 @@ class FusedMoEMethodBase(ABC):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        additional_kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.load_expert_weights_to_dst).args:
+            additional_kargs["allow_partial_loading"] = allow_partial_loading
 
         self.load_expert_weights_to_dst(
-            module,
-            weights,
-            weight_loading_mode,
-            module.initial_local_expert_ids,
-            module.w3_w1_weight.data,
+            module, weights, weight_loading_mode,
+            module.initial_local_expert_ids, module.w3_w1_weight.data,
             module.w2_weight.data,
             module.w3_w1_bias.data if module.bias else None,
-            module.w2_bias.data if module.bias else None,
-            allow_partial_loading=allow_partial_loading)
+            module.w2_bias.data if module.bias else None, **additional_kargs)
 
         self.load_quant_scales(module, weights)
 
@@ -397,15 +397,12 @@ class FusedMoEMethodBase(ABC):
                     setattr(module, 'local_shared_w2_bias_tensors',
                             local_shared_w2_bias_tensors)
             self.load_expert_weights_to_dst(
-                module,
-                weights,
-                weight_loading_mode,
-                local_shared_load_expert_ids,
-                local_shared_w3_w1_tensors,
+                module, weights, weight_loading_mode,
+                local_shared_load_expert_ids, local_shared_w3_w1_tensors,
                 local_shared_w2_tensors,
                 local_shared_w3_w1_bias_tensors if module.bias else None,
                 local_shared_w2_bias_tensors if module.bias else None,
-                allow_partial_loading=allow_partial_loading)
+                **additional_kargs)
 
     def post_load_weights(self, module: torch.nn.Module):
         if self.need_load_shared_weights(module):
