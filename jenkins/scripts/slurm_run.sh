@@ -38,27 +38,15 @@ fi
 if [ $SLURM_LOCALID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
-
-    # Download the new merged waives.txt
-    if ! wget -nv "$llmWaivesTxtfile"; then
-        echo "Failed to download merged waives.txt, use the default waives.txt."
-    elif [ ! -f "waives.txt" ]; then
-        echo "Downloaded but file does not exist, use the default waives.txt."
-    else
-        rm -f "$llmSrcNode/tests/integration/test_lists/waives.txt"
-        mv waives.txt "$llmSrcNode/tests/integration/test_lists/waives.txt"
-        echo "Download merged waives.txt successfully"
-    fi
-
     which python3
     python3 --version
     apt-get install -y libffi-dev
     nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
     if [[ $pytestCommand == *--run-ray* ]]; then
-        pip3 install ray[default]
+        pip3 install --retries 10 ray[default]
     fi
-    cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
-    cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+    cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
+    cd $resourcePathNode &&  pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     git config --global --add safe.directory "*"
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
     hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"

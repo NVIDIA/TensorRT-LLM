@@ -181,7 +181,11 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-        self.input_processor = create_input_processor(model_path, None)
+
+        self.input_processor = create_input_processor(
+            model_path,
+            tokenizer=None,
+            checkpoint_format=llm_args.checkpoint_format)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
@@ -563,12 +567,13 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
-            logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
-                        cp_type.name)
-            return
+            if cp_type in [CpType.ULYSSES, CpType.STAR]:
+                logger.info(
+                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                    cp_type.name)
+                return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -1219,6 +1224,11 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))
         return None
 
+    def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
+        if self.enable_attention_dp:
+            return list(self.dist.tp_allgather(num_ctx_requests))
+        return None
+
     def _get_padding_params(
         self, total_num_tokens: int, num_ctx_requests: int,
         attn_all_rank_num_tokens: Optional[List[int]]
@@ -1232,6 +1242,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         padded_num_tokens = total_num_tokens
 
+        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+            num_ctx_requests)
+
         def get_padded_piecewise_tokens(tokens):
             captured_num_tokens = self._torch_compile_backend.capture_num_tokens
             return captured_num_tokens[bisect.bisect_left(
@@ -1244,7 +1257,12 @@ class PyTorchModelEngine(ModelEngine):
                 -1]
             # Torch piecewise cuda graph is enabled.
             if attn_all_rank_num_tokens is not None:
-                can_run_piecewise_cuda_graph = (num_ctx_requests != 0 and
+                # Any rank has context requests, we enable piecewise cuda graph.
+                has_ctx_requests = num_ctx_requests != 0 or (
+                    all_rank_ctx_requests is not None
+                    and any(ctx_requests != 0
+                            for ctx_requests in all_rank_ctx_requests))
+                can_run_piecewise_cuda_graph = (has_ctx_requests and
                                                 max(attn_all_rank_num_tokens)
                                                 <= max_captured_num_tokens)
                 all_ranks_can_run_piecewise_cuda_graph = list(
@@ -1613,6 +1631,7 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
+        helix_is_inactive_rank = [] if self.mapping.has_cp_helix() else None
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1645,16 +1664,26 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
-                    past_seen_token_nums = self.dist.cp_allgather(
-                        past_seen_token_num)
-                    position_id = sum(past_seen_token_nums)
+                    # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
+                    if not self.is_warmup and not request.is_cuda_graph_dummy:
+                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
+                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
+                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                    else:
+                        # past_seen_token_num doesn't grow on inactive ranks.
+                        past_seen_token_num = request.orig_prompt_len
+
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
+                if self.mapping.has_cp_helix():
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)
@@ -1703,7 +1732,8 @@ class PyTorchModelEngine(ModelEngine):
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
         assert total_num_tokens <= self.max_num_tokens, (
-            "total_num_tokens should be less than or equal to max_num_tokens")
+            f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
+        )
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
@@ -1984,6 +2014,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.

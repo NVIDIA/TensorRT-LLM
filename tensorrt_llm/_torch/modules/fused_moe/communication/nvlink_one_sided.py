@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ruff: noqa: E501
+
+
 """
-MNNVL AllToAll Throughput Communication Strategy
+NVLINK One-Sided AllToAll Communication Strategy
 
-This module implements the MNNVL AllToAll throughput communication method for MoE.
-MNNVL Throughput uses Python-based AllToAll operations for high throughput scenarios.
+This module implements the NVLINK one-sided comm AllToAll throughput communication method for MoE.
 
-MNNVL Throughput supports post-quant dispatch
+NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
@@ -31,16 +33,21 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication
 
 
-class MNNVLThroughput(Communication):
+class NVLinkOneSided(Communication):
     """
-    MNNVL AllToAll strategy for throughput scenarios
+    NVLINK one-sided comm AllToAll strategy for throughput scenarios.
 
-    This class uses Python-based AllToAll operations for high throughput scenarios.
-    It manages workspace allocation and synchronization for cross-GPU communication.
+    This implementation utilizes symmetric memory to enable peer-to-peer access between GPUs over NVLink.
+    The kernels only take the role as one side of the communication: the dispatch kernel puts the data
+    into peer ranks' symmetric memory from local buffer, while the combine kernel gets the data from peer
+    ranks' symmetric memory and reduces the data into local buffer. It is the most efficient implementation
+    by now, but requires symmetric memory size proportional to `max_num_tokens * n_ranks`, which may not
+    scale well for very large-scale parallelization.
     """
 
     # Constants from C++ (must match moeAlltoAllKernels.h)
@@ -59,6 +66,47 @@ class MNNVLThroughput(Communication):
     DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = None
     COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
     PAYLOAD_DATA_OFFSET_INDEX = None
+
+    @staticmethod
+    def get_aux_data_size(ep_size: int, max_num_tokens: int) -> int:
+        return torch.ops.trtllm.moe_a2a_get_aux_data_size(ep_size, max_num_tokens)
+
+    @staticmethod
+    def calculate_required_workspace_size(
+        ep_size: int,
+        top_k: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        extra_payload_bytes_per_token: int = 0,
+    ) -> int:
+        element_size = dtype.itemsize
+        # Auxiliary data size
+        aux_size = NVLinkOneSided.get_aux_data_size(ep_size, max_num_tokens)
+
+        # Dispatch needs workspace for [ep_size, max_tokens] tokens,
+        # but due to the variety of quantization recipes, we cannot know the exact size,
+        # so we conservatively estimate assuming no quantization.
+        payload_size_dispatch = (
+            ep_size
+            * max_num_tokens
+            * (
+                hidden_size * element_size  # (Unquantized) token hidden states
+                + top_k * 4  # token_selected_experts
+                + top_k * 4  # token_final_scales
+                + extra_payload_bytes_per_token  # extra payload bytes per token
+            )
+        )
+
+        # Required workspace for combine [ep_size, max_tokens] tokens
+        payload_size_combine = ep_size * max_num_tokens * hidden_size * element_size
+
+        # Pad to 128 bytes to ensure alignment. This matches the implementation of C++ torch OP code.
+        return (
+            pad_up(aux_size, 128)
+            + pad_up(payload_size_dispatch, 128)
+            + pad_up(payload_size_combine, 128)
+        )
 
     @classmethod
     def _init_constants(cls):
@@ -83,12 +131,14 @@ class MNNVLThroughput(Communication):
         self,
         mapping: Mapping,
         num_experts: int,
-        top_k: int = 1,
-        max_num_tokens_per_rank: Optional[int] = None,
+        top_k: int,
+        max_num_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        hidden_size: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         """
-        Initialize MNNVLThroughput with workspace allocation.
+        Initialize NVLinkOneSided with workspace allocation.
 
         Args:
             mapping: TensorRT-LLM Mapping object containing rank information
@@ -96,30 +146,53 @@ class MNNVLThroughput(Communication):
             top_k: Number of experts per token
             max_num_tokens_per_rank: Maximum number of tokens per rank (for workspace allocation)
             payload_in_workspace: If True, final_hidden_states is already in workspace
+            hidden_size: Hidden dimension size (optional, for auto workspace calculation)
+            dtype: Data type (optional, for auto workspace calculation)
         """
         super().__init__(mapping)
+
+        if self.mapping.world_size != self.ep_size:
+            raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
 
         # Store needed parameters
         self.num_experts = num_experts
         self.top_k = top_k
-
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
 
         # Initialize constants from C++
         self._init_constants()
 
-        # Get workspace size from environment variable (default 512MB)
-        workspace_mb = int(os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
-        self.workspace_size_per_rank = workspace_mb * 1024 * 1024
+        # Get workspace size
+        auto_workspace_size = None
+        if hidden_size is not None and dtype is not None:
+            auto_workspace_size = self.calculate_required_workspace_size(
+                self.ep_size, self.top_k, max_num_tokens_per_rank, hidden_size, dtype
+            )
+        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        if workspace_mb_env:
+            self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
+            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env})."
+            if auto_workspace_size is not None:
+                msg += f"Automatically calculated workspace size is {auto_workspace_size} bytes."
+                msg += "Auto calculation is conservative, so only consider overriding it if you have a specific reason."
+            tllm_logger.warning(msg)
+        elif auto_workspace_size is not None:
+            self.workspace_size_per_rank = auto_workspace_size
+        else:
+            tllm_logger.warning(
+                "NVLinkOneSided: hidden_size and dtype are not provided (which are required for calculating workspace size)."
+                "Using default workspace size 2048MB."
+            )
+            self.workspace_size_per_rank = 2048 * 1024 * 1024
+
         # Initialize or reuse workspace
         MnnvlMemory.initialize()
 
         if self._WORKSPACE is None:
             tllm_logger.info(
-                f"MoE AlltoAll: Allocating workspace with size {self.workspace_size_per_rank} bytes. "
-                f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, "
-                f"max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
+                f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
+                f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
             mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
@@ -129,7 +202,7 @@ class MNNVLThroughput(Communication):
                 self.ep_size,
                 self.max_num_tokens_per_rank,
             )
-            MNNVLThroughput._WORKSPACE = {
+            NVLinkOneSided._WORKSPACE = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
                 "ep_rank": self.ep_rank,
@@ -163,30 +236,30 @@ class MNNVLThroughput(Communication):
         # Internal state
         self._state: str = "idle"  # idle | dispatched
 
-        # Invalid token expert ID (default to num_experts)
-        self.invalid_token_expert_id: int = self.num_experts
+        # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
+        self.invalid_token_expert_id: int = -1
 
     @staticmethod
     def is_platform_supported() -> bool:
         """
-        Check if MNNVL is supported on current hardware
+        Check if NVLINK one-sided comm is supported on current hardware.
         """
         return MnnvlMemory.supports_mnnvl()
 
     def supports_post_quant_dispatch(self) -> bool:
         """
-        MNNVL Throughput supports post-quant dispatch
+        NVLINK one-sided comm supports post-quant dispatch.
         """
         return True
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
-        Check if MNNVL Throughput is feasible for the given workload at runtime.
+        Check if NVLINK one-sided comm is feasible for the given workload at runtime.
 
         This method performs runtime checks based on workload characteristics such as
         token counts, number of chunks, and other runtime parameters.
         """
-        return self.is_platform_supported()
+        return True
 
     def dispatch(
         self,
@@ -217,28 +290,27 @@ class MNNVLThroughput(Communication):
         if self._state == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
 
-        # Build payloads list - token_selected_slots is always first
+        # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
+        runtime_max_tokens_per_rank = max(all_rank_num_tokens)
+
+        # Build payloads list - match TRTLLMGen baseline order for optimal performance
+        # Order: [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
+
         payloads = []
-        payloads.append(token_selected_slots)
         payloads.append(hidden_states)
         if hidden_states_sf is not None:
             payloads.append(hidden_states_sf)
+
+        payloads.append(token_selected_slots)
         if token_final_scales is not None:
             payloads.append(token_final_scales)
 
-        # Call AllToAll dispatch
-        (
-            recv_buffers,
-            send_counters,
-            recv_counters,
-            topk_target_ranks,
-            topk_send_indices,
-            combine_payload_offset,
-        ) = torch.ops.trtllm.moe_a2a_dispatch(
+        recv_buffers, combine_payload_offset = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_slots,
             payloads,
             self.workspace,
-            self.max_num_tokens_per_rank,
+            self.moe_a2a_metainfo,
+            runtime_max_tokens_per_rank,
             self.ep_rank,
             self.ep_size,
             self.top_k,
@@ -247,33 +319,43 @@ class MNNVLThroughput(Communication):
 
         self._state = "dispatched"
 
-        # Store all dispatch state for combine (no class variables)
-        self._dispatch_state["topk_target_ranks"] = topk_target_ranks
-        self._dispatch_state["topk_send_indices"] = topk_send_indices
-        self._dispatch_state["send_counters"] = send_counters
-        self._dispatch_state["recv_counters"] = recv_counters
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
-
-        # Sanitize expert IDs for invalid tokens if needed
-        # token_selected_slots is always at index 0 in recv_buffers
-        recv_token_selected_slots = recv_buffers[0]
-        torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
-            recv_token_selected_slots,
-            recv_counters,
-            int(self.invalid_token_expert_id),
-        )
+        self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
+        self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
 
         # Extract results from recv_buffers
-        # Payload order: [token_selected_slots, hidden_states, hidden_states_sf (optional),
-        #                  token_final_scales (optional)]
-        token_selected_slots_recv = recv_buffers[0]
-        hidden_states_recv = recv_buffers[1]
+        # Payload order matches input:
+        # [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
+        hidden_states_recv = recv_buffers[0]
         if hidden_states_sf is not None:
-            hidden_states_sf_recv = recv_buffers[2]
+            hidden_states_sf_recv = recv_buffers[1]
+            token_selected_slots_recv = recv_buffers[2]
             token_final_scales_recv = recv_buffers[3] if token_final_scales is not None else None
         else:
             hidden_states_sf_recv = None
+            token_selected_slots_recv = recv_buffers[1]
             token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
+
+        torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
+            token_selected_slots_recv,
+            self.workspace,
+            self.moe_a2a_metainfo,
+            self.ep_rank,
+            int(self.invalid_token_expert_id),
+        )
+
+        # Flatten 3D tensors to 2D for compatibility with MoE backends
+        # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...]
+        hidden_states_recv = hidden_states_recv.view(-1, hidden_states_recv.shape[-1])
+        if hidden_states_sf_recv is not None:
+            hidden_states_sf_recv = hidden_states_sf_recv.view(-1, hidden_states_sf_recv.shape[-1])
+        token_selected_slots_recv = token_selected_slots_recv.view(
+            -1, token_selected_slots_recv.shape[-1]
+        )
+        if token_final_scales_recv is not None:
+            token_final_scales_recv = token_final_scales_recv.view(
+                -1, token_final_scales_recv.shape[-1]
+            )
 
         return (
             hidden_states_recv,
@@ -302,13 +384,15 @@ class MNNVLThroughput(Communication):
         if self._state != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
 
-        # Read dispatch state
-        topk_target_ranks = self._dispatch_state.get("topk_target_ranks")
-        topk_send_indices = self._dispatch_state.get("topk_send_indices")
-        recv_counters = self._dispatch_state.get("recv_counters")
+        local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
+        runtime_max_tokens_per_rank = self._dispatch_state.get("runtime_max_tokens_per_rank")
 
-        if topk_target_ranks is None or topk_send_indices is None or recv_counters is None:
+        if (
+            local_num_tokens is None
+            or combine_payload_offset is None
+            or runtime_max_tokens_per_rank is None
+        ):
             raise RuntimeError("combine called but dispatch state is missing")
 
         # Reshape if needed (handle case where input is flattened)
@@ -317,7 +401,7 @@ class MNNVLThroughput(Communication):
             # Reshape to: [ep_size, max_tokens_per_rank, hidden_size]
             hidden_size = final_hidden_states.shape[-1]
             final_hidden_states = final_hidden_states.view(
-                self.ep_size, self.max_num_tokens_per_rank, hidden_size
+                self.ep_size, runtime_max_tokens_per_rank, hidden_size
             )
         elif final_hidden_states.dim() == 3:
             # Already shaped: [ep_size, max_tokens_per_rank, hidden_size]
@@ -326,15 +410,12 @@ class MNNVLThroughput(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
-
-        # Call AllToAll combine
         output = torch.ops.trtllm.moe_a2a_combine(
-            topk_target_ranks,
-            topk_send_indices,
-            recv_counters,
             final_hidden_states,
+            int(local_num_tokens),
             self.workspace,
-            self.max_num_tokens_per_rank,
+            self.moe_a2a_metainfo,
+            int(runtime_max_tokens_per_rank),
             self.ep_rank,
             self.ep_size,
             self.top_k,
@@ -349,7 +430,7 @@ class MNNVLThroughput(Communication):
         return output
 
     def get_combine_payload_tensor_in_workspace(
-        self, hidden_size: int, dtype: torch.dtype
+        self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype
     ) -> torch.Tensor:
         """
         Return the combine payload tensor in the workspace, which could be used
@@ -357,6 +438,7 @@ class MNNVLThroughput(Communication):
         See "payload_in_workspace" in combine method.
 
         Args:
+            runtime_max_tokens_per_rank: Runtime max tokens per rank
             hidden_size: Hidden dimension size
             dtype: Data type
 
@@ -372,12 +454,14 @@ class MNNVLThroughput(Communication):
         if combine_payload_offset is None:
             raise RuntimeError("combine_payload_offset not found in dispatch state")
 
-        return torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+        result = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
             self.workspace,
             int(self.ep_rank),
             int(self.ep_size),
-            int(self.max_num_tokens_per_rank),
+            int(runtime_max_tokens_per_rank),
             int(combine_payload_offset),
             dtype,
             int(hidden_size),
         )
+
+        return result

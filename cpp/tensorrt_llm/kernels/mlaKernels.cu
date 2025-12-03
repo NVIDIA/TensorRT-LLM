@@ -365,9 +365,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
-    float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets)
+    float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
+    bool const* helix_is_inactive_rank)
 {
-
     // Constants.
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -476,21 +476,25 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-
+                    // If helix parallelism is being used, only write to KV cache if current rank is active.
+                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
-                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                        auto inBlockIdx = kv_cache.getKVLocalIdx(
-                            token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                        if (cache_type == KvCacheDataType::FP8)
-                        {
+                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
-                            quantCopy<T, ELTS_PER_VEC>(
-                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                                reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                        {
+                            auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                            auto inBlockIdx = kv_cache.getKVLocalIdx(
+                                token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
+                            if (cache_type == KvCacheDataType::FP8)
+                            {
+
+                                quantCopy<T, ELTS_PER_VEC>(
+                                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                    reinterpret_cast<T const*>(&data), quant_scale_kv_val);
+                            }
+                            else
+                                reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                         }
-                        else
-                            reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                     }
                 }
                 else
@@ -535,21 +539,26 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
                 }
 
-                auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
-
+                // If helix parallelism is being used, only write to KV cache if current rank is active.
+                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                 {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
-                    if (cache_type == KvCacheDataType::FP8)
                     {
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                            fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                        auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
+
+                        if (cache_type == KvCacheDataType::FP8)
+                        {
+                            quantCopy<T, ELTS_PER_VEC>(
+                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                                fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
+                        }
+                        else
+                            reinterpret_cast<VecT*>(kDst)[inBlockIdx]
+                                = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                     }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                            = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                 }
             }
         }
@@ -1061,7 +1070,7 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
         params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale, params.helix_position_offsets);
+        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank);
 }
 
 template <typename T, typename TCache>

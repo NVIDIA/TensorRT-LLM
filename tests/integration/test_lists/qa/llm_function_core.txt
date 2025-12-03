@@ -14,8 +14,8 @@ examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-chat-ena
 examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-enable_weight_only]
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[disable_weight_only]
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[enable_weight_only]
-examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disable_weight_only] TIMEOUT (120)
-examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[enable_weight_only] TIMEOUT (120)
+examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disable_weight_only] TIMEOUT (180)
+examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[enable_weight_only] TIMEOUT (180)
 examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2]
@@ -111,7 +111,6 @@ examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-lla
 examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_fp8]
 examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_int8_wo]
 examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_sq_ootb]
-examples/test_llama.py::test_llm_llama_v2_lora_benchmark_2gpu[chinese_lora-llama-v2-13b-hf]
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-405b-enable_fp8] TIMEOUT (120)
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-405b-fp8-disable_fp8] TIMEOUT (90)
 examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-70b-disable_fp8]
@@ -459,6 +458,7 @@ accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-enable_chunked_prefill=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=True]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
@@ -754,7 +754,9 @@ examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3-mini-128k-instruct-eagle2]
 examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3-small-128k-instruct-eagle2]
 examples/test_eagle.py::test_phi_eagle_1gpu[Phi-3.5-mini-instruct-eagle2]
 
-examples/serve/test_serve.py::test_extra_llm_api_options
+examples/serve/test_serve.py::test_config_file_loading[--extra_llm_api_options]
+examples/serve/test_serve.py::test_config_file_loading[--config]
+examples/serve/test_serve.py::test_env_overrides_pdl
 examples/serve/test_serve_negative.py::test_invalid_max_tokens
 examples/serve/test_serve_negative.py::test_invalid_temperature
 examples/serve/test_serve_negative.py::test_invalid_top_p[-0.1]

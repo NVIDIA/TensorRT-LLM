@@ -1,6 +1,6 @@
 import os
 from functools import cached_property
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -11,7 +11,8 @@ from tensorrt_llm.logger import logger
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor, ceil_div)
 from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
 
@@ -74,6 +75,8 @@ class CutlassFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        init_load_balancer: bool = True,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
         super().__init__(
@@ -90,6 +93,8 @@ class CutlassFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
         # Store original hidden size before any potential padding
@@ -105,11 +110,12 @@ class CutlassFusedMoE(MoE):
         # slot_start, slot_end, initial_local_expert_ids are all initialized by
         # base class's _init_load_balancer() method
 
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < moe_max_num_tokens:
+        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        if self.moe_max_num_tokens < default_moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
@@ -150,14 +156,22 @@ class CutlassFusedMoE(MoE):
                 self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                     model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
-                workspace_mb = int(
-                    os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
+                # Calculate required workspace size
+                ep_size = self.mapping.moe_ep_size
+                max_num_tokens = model_config.max_num_tokens
+                hidden_size = self.hidden_size
+                dtype = self.dtype or torch.float16
+
+                workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+                    ep_size, self.routing_method.experts_per_token,
+                    max_num_tokens, hidden_size, dtype)
+
                 self.moe_a2a = MoeAlltoAll(
                     mapping=self.mapping,
                     max_num_tokens=model_config.max_num_tokens,
                     top_k=self.routing_method.experts_per_token,
                     num_experts=self.num_slots,
-                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                    workspace_size_per_rank=workspace_size,
                 )
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
@@ -242,6 +256,66 @@ class CutlassFusedMoE(MoE):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
         return self.alltoall_method_type != AlltoallMethodType.NotEnabled
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Quantize input tensor - CutlassFusedMoE implementation
+
+        Handles all quantization cases for Cutlass backend.
+        """
+        # Determine if this is post-quant communication scenario
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
+
+        x_sf = None
+        if self.has_any_quant:
+            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
+                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, self.fc31_input_dequant)
+            elif self.has_deepseek_fp8_block_scales:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_w4afp8:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_w4a16_mxfp4:
+                pad_size = self.hidden_size - x.shape[1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
+            elif self.has_int8_woq_per_channel:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_nvfp4:
+                if run_post_quant_allgather or self.enable_alltoall:
+                    if isinstance(x, Fp4QuantizedTensor):
+                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                    else:
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, False)
+                    # Reshape x_sf to 2D
+                    x_sf = x_sf.view((x.shape[0], -1))
+                else:
+                    if not isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, True)
+            elif self.has_w4a8_mxfp4_mxfp8:
+                if run_post_quant_allgather or self.enable_alltoall:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, False, alignment=self.quant_method.weight_alignment)
+                else:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, True, alignment=self.quant_method.weight_alignment)
+            else:
+                raise ValueError(
+                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+
+        return x, x_sf
 
     def _supports_load_balancer(self) -> bool:
         """CutlassFusedMoE supports load balancer."""

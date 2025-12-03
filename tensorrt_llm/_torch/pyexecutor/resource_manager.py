@@ -434,6 +434,10 @@ class KVCacheManager(BaseResourceManager):
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
+
+            # wait for all pending work to finish before launching offload/onboarding/partial copy
+            self.impl.sync_transfer_manager_with_buffer_manager()
+
             # allocate KV Cache
             for req in context_batch:
                 req_beam_width = req.sampling_config.beam_width
@@ -464,9 +468,19 @@ class KVCacheManager(BaseResourceManager):
                                 req, block_ids)
 
             for req in generation_batch:
+                # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
+                if self.mapping.has_cp_helix():
+                    if self.mapping.cp_rank != self.mapping.cp_size - 1:
+                        req.py_helix_is_inactive_rank = True
+                # Skip allocating KV cache at decode for inactive helix ranks.
+                if req.py_helix_is_inactive_rank:
+                    continue
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
+
+            # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
+            self.impl.refresh_blocks()
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
