@@ -1350,6 +1350,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def storageSize = "300Gi"
         def driverVersion = REQUIRED_OPEN_DRIVER_TYPES.any { type.contains(it) } ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
+        def tolerations = ""
 
         if (hasMultipleGPUs)
         {
@@ -1373,8 +1374,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/os: linux
                     nvidia.com/gpu.machine: NVIDIA_DGX_Spark
                     nvidia.com/tenant: blossom_trt"""
-            }
-            else {
+                memorySize = "64Gi"
+                tolerations = """
+                tolerations:
+                - key: "node_for_blossom_trt"
+                    operator: "Exists"
+                    effect: "NoSchedule"
+                """
+            } else {
                 selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -1486,6 +1493,10 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 containers:
                   ${containerConfig}
                     env:
+                    - name: NVIDIA_VISIBLE_DEVICES
+                      value: "all"
+                    - name: NVIDIA_DRIVER_CAPABILITIES
+                      value: "compute,utility"
                     - name: HOST_NODE_NAME
                       valueFrom:
                         fieldRef:
@@ -1513,69 +1524,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     ]
     if (type.contains("gb10x")) {
         print(podConfig)
-
-        podConfig = [
-            cloud:'nvks-sparks-cloud',
-            label: nodeLabel,
-            slaveConnectTimeout: 1000,
-            envVars:[envVar(key:"JENKINS_URL", value:"${env.JENKINS_URL}")],
-            yaml: """
-            apiVersion: v1
-            kind: Pod
-            spec:
-                nodeSelector:
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu.machine: NVIDIA_DGX_Spark
-                    nvidia.com/tenant: blossom_trt
-                containers:
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['sleep', 21600]
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: 4
-                        memory: 8Gi
-                        nvidia.com/gpu: 1
-                        ephemeral-storage: 30Gi
-                      limits:
-                        cpu: 4
-                        memory: 8Gi
-                        nvidia.com/gpu: 1
-                        ephemeral-storage: 30Gi
-                    imagePullPolicy: Always
-                    env:
-                    - name: NVIDIA_VISIBLE_DEVICES
-                      value: "all"
-                    - name: NVIDIA_DRIVER_CAPABILITIES
-                      value: "compute,utility"
-                    securityContext:
-                      capabilities:
-                        add:
-                        - SYS_ADMIN
-                    env:
-                      - name: HOST_NODE_NAME
-                        valueFrom:
-                          fieldRef:
-                            fieldPath: spec.nodeName
-                  - name: jnlp
-                    image: ${jnlpImage}
-                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 6Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 6Gi
-                        ephemeral-storage: 25Gi
-                tolerations:
-                  - key: "node_for_blossom_trt"
-                    operator: "Exists"
-                    effect: "NoSchedule"
-        """.stripIndent(),
-        ]
     }
 
     return podConfig
