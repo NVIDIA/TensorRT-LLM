@@ -199,9 +199,7 @@ def create_moe_backend(
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx,
-            init_load_balancer=init_load_balancer,
-        )
+            layer_idx=layer_idx)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
 
