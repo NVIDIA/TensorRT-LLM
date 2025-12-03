@@ -532,6 +532,8 @@ struct Launch_params
     int sage_block_size_v = 0;
     // if we use a kernel that supports returning softmax statistics
     bool supportReturnSoftmaxStats;
+    // enable skip softmax attention feature
+    bool enableSkipSoftmax = false;
 };
 
 } // namespace kernels

@@ -362,7 +362,10 @@ struct Compute
             int const actual_kv_seqlen = SEPARATE_Q_KV_BUFFER ? head_info.actual_kv_seqlen : actual_q_seqlen;
 
             // Update threshold of Skip-Softmax
-            softmax.skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+            {
+                softmax.skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+            }
 
             // Calculate the alibi head_scaling_factor.
             float alibi_head_scale

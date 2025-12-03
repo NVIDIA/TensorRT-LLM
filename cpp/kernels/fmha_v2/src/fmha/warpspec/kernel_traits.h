@@ -71,6 +71,8 @@ template <
     bool ENABLE_BMM1_SOFTCAPPING_SCALE_ = false,
     // Save softmax stats ?
     bool RETURN_SOFTMAX_STATS_ = false,
+    // Enable skip softmax attention feature
+    bool ENABLE_SKIP_SOFTMAX_ = false,
     // The output type (only used by fp8 kernels).
     typename OutputType = typename Instruction_traits<STEP_Q_, STEP_KV_, 0, false, false>::A_type,
     // The sage attention block size for Q, K and V
@@ -288,6 +290,12 @@ struct Kernel_traits
     enum
     {
         USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 3
+    };
+
+    // Are we enabling skip softmax attention feature?
+    enum
+    {
+        ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_
     };
 
     static_assert(!USE_CUSTOM_MASK || STEP_KV == 64 || STEP_KV == 128 || STEP_KV == 256, "Not implemented!");
@@ -586,6 +594,8 @@ template < // The step size in query sequence dimension (M of BMM1 and BMM2).
     bool ENABLE_BMM1_SOFTCAPPING_SCALE_ = false,
     // Save softmax stats ?
     bool RETURN_SOFTMAX_STATS_ = false,
+    // Enable skip softmax attention feature
+    bool ENABLE_SKIP_SOFTMAX_ = false,
     // The output type (only used by fp8 kernels).
     typename OutputType = e4m3_t,
     // The sage attention block size for Q, K and V
@@ -594,14 +604,15 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
     : public Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
           NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_,
           ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_,
-          RETURN_SOFTMAX_STATS_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>
+          RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_,
+          SAGE_BLOCK_SIZE_V_>
 {
 
     // Base class.
     using Base = Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
         NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_,
         SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_,
-        OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
+        ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
 
     enum
     {
