@@ -71,5 +71,5 @@ Some examples require specific model capabilities:
 | Example | Model Requirement |
 |---------|------------------|
 | 05 (JSON Mode) | xgrammar support |
-| 06 (Tool Calling) | Tool-capable model (Llama 3.1+, Mistral Instruct, etc.) |
+| 06 (Tool Calling) | Tool-capable model (Qwen3, GPT OSS) |
 | Others | Any model |
