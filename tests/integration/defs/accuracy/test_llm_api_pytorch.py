@@ -25,7 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+                                 RocketSparseAttentionConfig, SamplingParams,
+                                 TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -4606,3 +4607,50 @@ class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
                  max_seq_len=4096) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestLlama3_1_8B_Instruct_LongBenchV2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+
+    def test_auto_dtype(self):
+        model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        # Configure model settings
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=64)
+
+        sparse_attention_config = RocketSparseAttentionConfig(
+            kt_cache_dtype="float8_e5m2", )
+
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              sparse_attention_config=sparse_attention_config,
+                              enable_chunked_prefill=False)
+
+        MAX_LEN = 128000
+        MAX_NEW_TOKENS = 1024
+
+        with LLM(model_dir,
+                 max_seq_len=MAX_LEN,
+                 max_num_tokens=128000,
+                 max_batch_size=64,
+                 **pytorch_config) as llm:
+            task = LongBenchV2(self.MODEL_NAME)
+
+            sampling_params = SamplingParams(
+                max_tokens=MAX_NEW_TOKENS,
+                temperature=0.8,
+                top_p=0.95,
+            )
+
+            extra_evaluator_kwargs = dict(max_len=MAX_LEN,
+                                          max_output_length=MAX_NEW_TOKENS)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
