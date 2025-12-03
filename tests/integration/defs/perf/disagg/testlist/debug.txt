@@ -1,0 +1,1 @@
+test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_Qwen3-235B-A22B-FP8_1k1k_ctx1_gen1_tep8_bs32_eplb0_mtp0_ccb-NIXL]
