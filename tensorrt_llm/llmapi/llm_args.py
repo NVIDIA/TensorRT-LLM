@@ -757,7 +757,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
-    eagle3_mistral_large_3: Optional[bool] = True
+    eagle3_mistral_large_3: Optional[bool] = False
 
     def __init__(self, **kwargs):
         super().__init__()
