@@ -21,6 +21,14 @@ python3 submit.py \
   --run-sh /lustre/fsw/coreai_comparch_trtllm/chenfeiz/repos/trtllm-1/jenkins/scripts/perf/disaggregated/slurm_run.sh \
   --stage-name GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Disagg
 
+# For oci
+python3 submit.py \
+  --config-yaml /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/disaggregated/l0_gb200_multi_nodes_disagg.yaml \
+  --draft-launch-sh /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh \
+  --launch-sh /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/disaggregated/slurm_launch.sh \
+  --run-sh /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/disaggregated/slurm_run.sh \
+  --stage-name GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Disagg
+
 # For dlcluster
 python3 submit.py \
   --config-yaml /home/scratch.chenfeiz_gpu/another_repo/tekit-2/jenkins/scripts/perf/disaggregated/l0_gb200_multi_nodes_disagg.yaml \

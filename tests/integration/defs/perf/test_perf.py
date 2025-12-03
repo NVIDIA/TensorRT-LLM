@@ -1333,12 +1333,13 @@ class PerfTestConfig:
 
         def get_gpu_type(label: str) -> str:
             parts = label.split("_")
-            if len(parts) < 2:
+            if len(parts) < 2 or parts[0] != "l0":
                 return ""
-            if parts[0] != "l0":
-                return ""
-            if parts[1] == "dgx" and len(parts) >= 3:
-                gpu_type = f"{parts[1]}_{parts[2]}"
+            if parts[1] == "dgx":
+                if len(parts) >= 3:
+                    gpu_type = f"{parts[1]}_{parts[2]}"
+                else:
+                    gpu_type = ""
             else:
                 gpu_type = parts[1]
             return gpu_type.lower()
