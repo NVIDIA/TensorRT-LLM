@@ -1523,20 +1523,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
             apiVersion: v1
             kind: Pod
             spec:
-                qosClass: Guaranteed
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                            - matchExpressions:
-                              - key: "tensorrt/taints"
-                                operator: DoesNotExist
-                              - key: "tensorrt/affinity"
-                                operator: NotIn
-                                values:
-                                - "core"
                 nodeSelector:
-                    kubernetes.io/arch: arm64
                     kubernetes.io/os: linux
                     nvidia.com/gpu.machine: NVIDIA_DGX_Spark
                     nvidia.com/tenant: blossom_trt
@@ -1547,15 +1534,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     tty: true
                     resources:
                       requests:
-                        cpu: 12
-                        memory: 64Gi
+                        cpu: 4
+                        memory: 8Gi
                         nvidia.com/gpu: 1
-                        ephemeral-storage: 300Gi
+                        ephemeral-storage: 30Gi
                       limits:
-                        cpu: 12
-                        memory: 64Gi
+                        cpu: 4
+                        memory: 8Gi
                         nvidia.com/gpu: 1
-                        ephemeral-storage: 300Gi
+                        ephemeral-storage: 30Gi
                     imagePullPolicy: Always
                     env:
                     - name: NVIDIA_VISIBLE_DEVICES
@@ -1577,11 +1564,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 6Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 6Gi
                         ephemeral-storage: 25Gi
                 tolerations:
                   - key: "node_for_blossom_trt"
