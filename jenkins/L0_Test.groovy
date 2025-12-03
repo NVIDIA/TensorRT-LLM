@@ -1520,6 +1520,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     medium: Memory
                 ${llmModelVolume}
                 ${pvcVolume}
+                ${tolerations}
         """.stripIndent(),
     ]
     if (type.contains("gb10x")) {
