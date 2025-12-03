@@ -936,23 +936,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ]
                 ).join(" ")
 
-                def pytestCommandNoLLMAPILaunch = getPytestBaseCommandLine(
-                    llmSrcNode,
-                    stageName,
-                    waivesListPathNode,
-                    perfMode,
-                    jobWorkspace,
-                    "__PLACEHOLDER_TRTLLM_WHL_PATH__",
-                    "$jobWorkspace/.coveragerc",
-                    "",
-                    [
-                    "--test-list=$testListPathNode",
-                    "--splitting-algorithm least_duration",
-                    "--splits $splits",
-                    "--group $splitId"
-                    ]
-                ).join(" ")
-
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
@@ -1032,7 +1015,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
-                    export pytestCommandNoLLMAPILaunch="$pytestCommandNoLLMAPILaunch"
                     export coverageConfigFile="$coverageConfigFile"
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
