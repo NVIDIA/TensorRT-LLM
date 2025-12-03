@@ -101,6 +101,7 @@ The language component decides which quantization methods are supported by a giv
 | Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |     Y     |     Y     |     Y      |     Y      |
 | Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |     Y     |     Y     |     Y      |     Y      |
 | Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |     .     |     Y     |     .      |     Y      |
+
 ```{note}
 FP8 block wise scaling GEMM kernels for sm100/103 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).
 ```
