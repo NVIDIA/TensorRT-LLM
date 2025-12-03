@@ -731,10 +731,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config._frozen = False
                     self.draft_config.moe_backend = "TRTLLM"
                     self.draft_config._frozen = True
-                if self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and self.draft_config.moe_backend == "TRTLLM":
+                from tensorrt_llm._utils import get_sm_version
+                if self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and self.draft_config.moe_backend == "TRTLLM" and get_sm_version() == 100:
                     # FIXME 
                     logger.warning(
-                        "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization"
+                        "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
                     )
                     self.draft_config._frozen = False
                     self.draft_config.moe_backend = "DEEPGEMM"
