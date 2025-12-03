@@ -188,6 +188,7 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
 ]:
     assert batch_size <= args.max_batch_size
     assert seq_len_q + seq_len_kv_cache <= args.max_seq_len
+    assert batch_size * seq_len_q <= args.max_num_tokens
     run_pack = runner.create_run_pack(
         args.run_type,
         batch_size=batch_size,
@@ -209,13 +210,17 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
                         run_pack()
                 if args.run_type == "GEN":
                     logger.info("Layer-wise benchmarks: Prefill KV cache")
+                    ctx_seq_len_q = max(args.seq_len_kv_cache_list)
+                    assert ctx_batch_size <= args.max_batch_size
+                    assert ctx_seq_len_q + 0 <= args.max_seq_len
+                    assert ctx_batch_size * ctx_seq_len_q <= args.max_num_tokens
                     max_batch_size = max(args.batch_size_list)
                     for request_id_begin in range(0, max_batch_size, ctx_batch_size):
                         ctx_run_pack = runner.create_run_pack(
                             "CTX",
                             batch_size=min(ctx_batch_size, max_batch_size - request_id_begin),
                             request_id_begin=request_id_begin,
-                            seq_len_q=max(args.seq_len_kv_cache_list),
+                            seq_len_q=ctx_seq_len_q,
                             seq_len_kv_cache=0,
                             kv_cache_manager=kv_cache_manager,
                             attn_workspace=attn_workspace,
