@@ -1,4 +1,9 @@
-"""Custom ops corresponding to fla's chunked delta rule."""
+"""Custom ops corresponding to fla's chunked delta rule.
+
+Delta Rule is based on this paper: https://arxiv.org/abs/2406.06484
+
+Kernels are based on this repo: https://github.com/fla-org/flash-linear-attention
+"""
 
 from typing import Optional
 

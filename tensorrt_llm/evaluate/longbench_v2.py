@@ -51,23 +51,26 @@ class LongBenchV2(Evaluator):
     DIFFICULTIES = ['easy', 'hard']
     LENGTHS = ['short', 'medium', 'long']
 
-    def __init__(self,
-                 dataset_path: str = 'THUDM/LongBench-v2',
-                 prompts_dir: Optional[str] = None,
-                 num_samples: Optional[int] = None,
-                 start_idx: int = 0,
-                 difficulty: Optional[str] = None,
-                 length: str = 'medium',
-                 domain: Optional[str] = None,
-                 cot: bool = False,
-                 no_context: bool = False,
-                 rag: int = 0,
-                 max_len: int = 128000,
-                 output_dir: Optional[str] = None,
-                 random_seed: int = 0,
-                 apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+    def __init__(
+        self,
+        dataset_path: str = 'THUDM/LongBench-v2',
+        prompts_dir: Optional[str] = None,
+        num_samples: Optional[int] = None,
+        start_idx: int = 0,
+        difficulty: Optional[str] = None,
+        length: str = 'medium',
+        domain: Optional[str] = None,
+        cot: bool = False,
+        no_context: bool = False,
+        rag: int = 0,
+        max_len: int = 128000,
+        output_dir: Optional[str] = None,
+        random_seed: int = 0,
+        apply_chat_template: bool = False,
+        system_prompt: Optional[str] = None,
+        max_output_length: int = 32000,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ):
         """Initialize LongBench v2 evaluator.
 
         Args:
@@ -86,6 +89,7 @@ class LongBenchV2(Evaluator):
             random_seed: Random seed for reproducibility
             apply_chat_template: Whether to apply model's chat template
             system_prompt: System prompt to prepend
+            max_output_length: Maximum output length in tokens. Should keep this value as small as possible to avoid unnecessary truncation.
             chat_template_kwargs: Chat template kwargs as JSON string
         """
         super().__init__(random_seed=random_seed,
@@ -103,6 +107,7 @@ class LongBenchV2(Evaluator):
         self.no_context = no_context
         self.rag = rag
         self.max_len = max_len
+        self.max_output_length = max_output_length
         self.output_dir = output_dir
 
         # Will be set during evaluation
@@ -307,10 +312,11 @@ class LongBenchV2(Evaluator):
         return pred
 
     def _truncate_prompt(self, prompt: str, tokenizer: Any) -> str:
-        """Truncate prompt to max_len tokens using needle-in-haystack strategy.
+        """Truncate prompt using needle-in-haystack strategy.
 
-        If the prompt exceeds max_len, it takes the first half and last half
+        If the prompt exceeds (max_len - max_output_length), it takes the first half and last half
         to preserve both context beginning and end.
+        We need to minus max_output_length from max_len to reserve budget for output tokens.
 
         Args:
             prompt: The prompt string to truncate
@@ -325,8 +331,9 @@ class LongBenchV2(Evaluator):
         try:
             input_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-            if len(input_ids) > self.max_len:
-                half = self.max_len // 2
+            max_input_len = self.max_len - self.max_output_length
+            if len(input_ids) > max_input_len:
+                half = max_input_len // 2
                 truncated_ids = input_ids[:half] + input_ids[-half:]
                 prompt = tokenizer.decode(truncated_ids,
                                           skip_special_tokens=True)
@@ -791,7 +798,8 @@ class LongBenchV2(Evaluator):
         type=int,
         default=128000,
         help=
-        "Maximum prompt length in tokens for truncation when building prompts.")
+        "Maximum input and output length in tokens for truncation when building prompts."
+    )
     @click.option("--output_dir",
                   type=str,
                   default=None,
@@ -843,22 +851,25 @@ class LongBenchV2(Evaluator):
             temperature=0.6,
             top_p=0.95)
 
-        evaluator = LongBenchV2(dataset_path=dataset_path,
-                                prompts_dir=prompts_dir,
-                                num_samples=num_samples,
-                                start_idx=start_idx,
-                                difficulty=difficulty,
-                                length=length,
-                                domain=domain,
-                                cot=cot,
-                                no_context=no_context,
-                                rag=rag,
-                                max_len=max_len,
-                                output_dir=output_dir,
-                                random_seed=random_seed,
-                                apply_chat_template=apply_chat_template,
-                                system_prompt=system_prompt,
-                                chat_template_kwargs=chat_template_kwargs)
+        evaluator = LongBenchV2(
+            dataset_path=dataset_path,
+            prompts_dir=prompts_dir,
+            num_samples=num_samples,
+            start_idx=start_idx,
+            difficulty=difficulty,
+            length=length,
+            domain=domain,
+            cot=cot,
+            no_context=no_context,
+            rag=rag,
+            max_len=max_len,
+            output_dir=output_dir,
+            random_seed=random_seed,
+            apply_chat_template=apply_chat_template,
+            system_prompt=system_prompt,
+            max_output_length=max_output_length,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

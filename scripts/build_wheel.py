@@ -946,8 +946,9 @@ def main(*,
             # and validating python changes in the whl.
             clear_folder(dist_dir)
 
+        extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
 
     if install:

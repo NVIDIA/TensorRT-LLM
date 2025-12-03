@@ -1,4 +1,9 @@
-"""Cached attention op for chunked delta rule using the fla kernel library."""
+"""Cached attention op for delta rule using the fla kernel library.
+
+Delta Rule is based on this paper: https://arxiv.org/abs/2406.06484
+
+Kernels are based on this repo: https://github.com/fla-org/flash-linear-attention
+"""
 
 from typing import List, Tuple
 
