@@ -387,7 +387,7 @@ def parse_kernel_name(demangledName):
             raise NotImplementedError(f"Unknown kernel name: {name}")
     if "<" in name:
         name = name[: name.index("<")]
-    elif "(" in name:
+    if "(" in name:
         name = name[: name.index("(")]
     return name
 
