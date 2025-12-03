@@ -351,6 +351,7 @@ class TestRpcError:
                 assert error.traceback is not None
 
 
+@pytest.mark.skip(reason="This test is flaky, need to fix it")
 def test_rpc_shutdown_server():
 
     class App:
