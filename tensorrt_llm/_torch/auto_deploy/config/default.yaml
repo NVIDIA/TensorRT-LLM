@@ -129,9 +129,6 @@ transforms:
     rmsnorm_backend: triton
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
-  gather_last_logits:
-    stage: post_load_fusion
-    enabled: true
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -173,6 +170,9 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: false
+  gather_logits_before_lm_head:
+    stage: compile
+    enabled: true
   compile_model:
     stage: compile
     run_per_gm: false

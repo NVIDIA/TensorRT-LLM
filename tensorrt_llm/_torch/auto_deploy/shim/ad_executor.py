@@ -206,6 +206,7 @@ class ADEngine(ModelEngine):
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
+        logit_gather_ids: List[int] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
         flat_gather_idx: List[int] = []
@@ -232,6 +233,7 @@ class ADEngine(ModelEngine):
 
             request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
+            logit_gather_ids.append(num_ctx_tokens - 1)
 
             # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -267,6 +269,7 @@ class ADEngine(ModelEngine):
 
             # return all logits
             last_logit_only.append(False)
+            logit_gather_ids.append(num_ctx_tokens + num_generation_tokens - 1)
 
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -278,6 +281,7 @@ class ADEngine(ModelEngine):
             input_pos=input_pos,
             page_assignments=page_assignments,
             slot_idx=slot_idx,
+            logit_gather_ids=logit_gather_ids,
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
@@ -307,32 +311,17 @@ class ADEngine(ModelEngine):
         """Run model and return raw logits tensor."""
         return self.model(**self.cache_seq_interface.named_args)[0]
 
-    def _update_gather_buffer(self) -> None:
-        """Update the seq_len buffer for the gather_last_logits transform."""
-        if not self._gather_in_graph:
-            return
-        # Get the buffer from the model (check wrapped model if needed)
-        buffer = getattr(self.model, "_gather_seq_len_buffer", None)
-        if buffer is None and hasattr(self.model, "model"):
-            buffer = getattr(self.model.model, "_gather_seq_len_buffer", None)
-        if buffer is None:
-            return
-        # Copy seq_len values to the buffer
-        seq_len_tensor = self.cache_seq_interface.info._args_device["seq_len"]
-        num_seqs = len(self.cache_seq_interface.info.seq_len)
-        buffer[:num_seqs].copy_(seq_len_tensor[:num_seqs], non_blocking=True)
-
     @property
-    def _gather_in_graph(self) -> bool:
-        """Check if gather_last_logits transform was applied to the model."""
+    def _gather_before_lm_head_in_graph(self) -> bool:
+        """Check if gather_logits_before_lm_head transform was applied to the model."""
         # Check on the model itself (for unwrapped GraphModule)
-        if hasattr(self.model, "_gather_last_logits_applied"):
-            return self.model._gather_last_logits_applied
+        if hasattr(self.model, "_gather_logits_before_lm_head_applied"):
+            return self.model._gather_logits_before_lm_head_applied
         # Check on wrapped model (for CapturedGraph or other wrappers)
         if hasattr(self.model, "model") and hasattr(
-            self.model.model, "_gather_last_logits_applied"
+            self.model.model, "_gather_logits_before_lm_head_applied"
         ):
-            return self.model.model._gather_last_logits_applied
+            return self.model.model._gather_logits_before_lm_head_applied
         return False
 
     def get_max_num_sequences(self) -> int:
@@ -350,14 +339,12 @@ class ADEngine(ModelEngine):
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
+        assert not gather_context_logits, "gather_context_logits is not supported yet"
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
         self.iter_counter += 1
-
-        # Check if gather was already done in the model graph
-        if self._gather_in_graph:
-            # Update the seq_len buffer for the in-graph gather
-            self._update_gather_buffer()
+        # Check if gather before LM head was already done in the model graph
+        if self._gather_before_lm_head_in_graph:
             # Model outputs [max_batch, vocab] - slice to actual num_seqs
             logits = self._compute_logits_raw()
             num_seqs = len(self.cache_seq_interface.info.seq_len)
