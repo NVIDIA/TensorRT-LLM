@@ -57,6 +57,10 @@ group.add_argument(
 )
 parser.set_defaults(use_low_precision_moe_combine=None)
 group = parser.add_mutually_exclusive_group()
+group.add_argument("--enable-autotuner", action="store_true", dest="enable_autotuner")
+group.add_argument("--no-enable-autotuner", action="store_false", dest="enable_autotuner")
+parser.set_defaults(enable_autotuner=None)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph")
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
 parser.set_defaults(use_cuda_graph=None)
@@ -117,6 +121,8 @@ else:
         )
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
+if args.enable_autotuner is None:
+    args.enable_autotuner = True
 if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 print(args)
@@ -197,9 +203,10 @@ for autotune_flag, batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
             if autotune_flag:
-                cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
-                with autotune(cache_path=cache_path, rank=rank):
-                    run_pack()
+                if args.enable_autotuner:
+                    cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+                    with autotune(cache_path=cache_path, rank=rank):
+                        run_pack()
                 if args.run_type == "GEN":
                     logger.info("Layer-wise benchmarks: Prefill KV cache")
                     max_batch_size = max(args.batch_size_list)
