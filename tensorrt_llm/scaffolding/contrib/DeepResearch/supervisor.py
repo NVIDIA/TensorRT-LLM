@@ -22,6 +22,7 @@ from tensorrt_llm.scaffolding.task_collection import (
     ChatTokenCounter,
     DropKVCacheWorkerTag,
     TaskTimer,
+    QueryCollector,
     drop_kv_cache_scope,
     sub_request_node,
     with_task_collection,
@@ -195,6 +196,7 @@ def create_open_deep_research_scaffolding_llm(
     max_tokens: int = 16 * 1024,
     max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
+    enable_query_collector: bool = False,
 ) -> ScaffoldingLlm:
     gerneration_controller = NativeGenerationController(
         sampling_params={
@@ -227,6 +229,11 @@ def create_open_deep_research_scaffolding_llm(
             statistics_name="supervisor",
             task_types=[ChatTask, MCPCallTask],
         )(supervisor_type)
+
+    if enable_query_collector:
+        chat_with_mcp_type = with_task_collection(
+            "query_collect", QueryCollector,
+        )(chat_with_mcp_type)
 
     research_chat_with_tools_controller = chat_with_mcp_type(gerneration_controller)
     research_compress_controller = compressor_type(
