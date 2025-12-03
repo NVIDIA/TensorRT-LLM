@@ -284,17 +284,23 @@ class ModelLoader:
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
+                    # FIXME should have a better way to handle the multimodal models
+                    from tensorrt_llm._torch.models.modeling_mistral import Mistral3VLM
+                    if isinstance(model, Mistral3VLM):
+                        model_ = model.llm
+                    else:
+                        model_ = model
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model_dir)
 
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                    draft_model_arch = model_.draft_config.pretrained_config.architectures[
                         0]
                     draft_weight_mapper = AutoCheckpointMapper.get(
                         checkpoint_loader.checkpoint_format, draft_model_arch)
                     draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
+                        model_.draft_model, model_.draft_config)
 
-                    self._call_load_weights(model.load_draft_weights, weights,
+                    self._call_load_weights(model_.load_draft_weights, weights,
                                             draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
@@ -303,7 +309,13 @@ class ModelLoader:
                 initialize_dummy_weights(model)
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    model.draft_model.load_weights_from_target_model(model)
+                    # FIXME should have a better way to handle the multimodal models
+                    from tensorrt_llm._torch.models.modeling_mistral import Mistral3VLM
+                    if isinstance(model, Mistral3VLM):
+                        model_ = model.llm
+                    else:
+                        model_ = model
+                    model_.draft_model.load_weights_from_target_model(model_)
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.
