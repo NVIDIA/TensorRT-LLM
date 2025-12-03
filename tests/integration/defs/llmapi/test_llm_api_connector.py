@@ -63,6 +63,15 @@ def enforce_single_worker(monkeypatch):
     yield
 
 
+def generate_and_sleep(model, *args, **kwargs):
+    # When using the overlap scheduler, we generate an extra token. We want to be able to track calls to the connector made with this extra token.
+    # This is problematic since the final calls to the connector API occur after the final response has been returned.
+    # To get around this, we sleep for a short period of time to account for this additional time.
+    outputs = model.generate(*args, **kwargs)
+    time.sleep(1)
+    return outputs
+
+
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
 def test_connector_simple(enforce_single_worker, model_with_connector,
@@ -81,7 +90,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    model.generate(["Hello, world"], sampling_params)
+    generate_and_sleep(model, ["Hello, world"], sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -154,9 +163,10 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
     worker.get_finished.side_effect = lambda finished_gen, load_async: (
         finished_gen, load_async)
 
-    model.generate([
-        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-    ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
+    outputs = generate_and_sleep(
+        model, [
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+        ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
     # Once for the initial poll, then once for each token. One extra token when using the overlap scheduler.
     assert worker.get_finished.call_count == NUM_TOKENS + 1 + int(
@@ -187,7 +197,7 @@ def test_connector_async_save(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    model.generate(["Hello, world"], sampling_params)
+    generate_and_sleep(model, ["Hello, world"], sampling_params)
 
     assert scheduler.request_finished.call_count == 1
 
@@ -227,7 +237,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
 
-    model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
+    generate_and_sleep(model, [0] * NUM_INPUT_TOKENS, sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
     assert len(
@@ -277,7 +287,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (NUM_INPUT_TOKENS + NUM_TOKENS) / BLOCK_SIZE)
 
-    model.generate([1] * NUM_INPUT_TOKENS, sampling_params)
+    generate_and_sleep(model, [1] * NUM_INPUT_TOKENS, sampling_params)
 
     # The initial computed position should be 0, since we haven't yet onboarded any blocks.
     assert scheduler.build_connector_meta.call_args_list[0].args[
@@ -306,7 +316,7 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
 
     sampling_params = SamplingParams(max_tokens=BLOCK_SIZE, ignore_eos=True)
 
-    model.generate([0] * (CHUNK_SIZE * 2), sampling_params)
+    generate_and_sleep(model, [0] * (CHUNK_SIZE * 2), sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -379,16 +389,16 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    result = prefill_worker.generate([0] * 48,
-                                     sampling_params=sampling_params,
-                                     disaggregated_params=disaggregated_params)
+    result = generate_and_sleep(prefill_worker, [0] * 48,
+                                sampling_params=sampling_params,
+                                disaggregated_params=disaggregated_params)
 
     gen_disagg_params = result.disaggregated_params
     gen_disagg_params.request_type = "generation_only"
 
-    result = decode_worker.generate([0] * 48,
-                                    sampling_params=sampling_params,
-                                    disaggregated_params=gen_disagg_params)
+    result = generate_and_sleep(decode_worker, [0] * 48,
+                                sampling_params=sampling_params,
+                                disaggregated_params=gen_disagg_params)
 
     assert scheduler.build_connector_meta.call_count == 1
 
