@@ -172,7 +172,8 @@ def launch_server(
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-        multimodal_server_config: Optional[MultimodalServerConfig] = None):
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
+        expose_config_endpoint: bool = False):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -200,7 +201,8 @@ def launch_server(
                           metadata_server_cfg=metadata_server_cfg,
                           disagg_cluster_config=disagg_cluster_config,
                           multimodal_server_config=multimodal_server_config,
-                          chat_template=chat_template)
+                          chat_template=chat_template,
+                          expose_config_endpoint=expose_config_endpoint)
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -400,6 +402,15 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="[Experimental] Specify a custom chat template. "
               "Can be a file path or one-liner template string")
+@click.option(
+    "--expose_config_endpoint",
+    is_flag=True,
+    default=False,
+    help=
+    "Enable /config endpoint to expose full LLM API runtime configuration (LLM.args). "
+    "WARNING: May expose sensitive data (env vars, secrets, paths). "
+    "Use only for debugging. Can also be enabled via "
+    "TRTLLM_EXPOSE_CONFIG_ENDPOINT=1 environment variable.")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -413,7 +424,8 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
+        custom_module_dirs: list[Path], chat_template: Optional[str],
+        expose_config_endpoint: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -493,7 +505,7 @@ def serve(
         media_io_kwargs=parsed_media_io_kwargs)
     launch_server(host, port, llm_args, tool_parser, chat_template,
                   metadata_server_cfg, server_role, disagg_cluster_config,
-                  multimodal_server_config)
+                  multimodal_server_config, expose_config_endpoint)
 
 
 @click.command("mm_embedding_serve")
