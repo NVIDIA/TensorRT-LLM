@@ -71,6 +71,7 @@ class MetaInitMode(TorchDispatchMode):
     random_init_ops = {
         aten.normal_.default,
         aten.uniform_.default,
+        aten.log.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
 
