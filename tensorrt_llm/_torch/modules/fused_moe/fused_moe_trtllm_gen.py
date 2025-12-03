@@ -325,8 +325,12 @@ class TRTLLMGenFusedMoE(MoE):
                 x, False, alignment=self.quant_method.input_hidden_alignment)
             x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
-            x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-            x_row = x.shape[0]
+            # For SM100+, fp8_quantize_1x128 returns x_sf with shape (blocked_n, num_tokens),
+            # but moe_a2a_dispatch requires all payloads to have first dim = num_tokens.
+            # Transpose x_sf before dispatch and transpose back after receive, but this may
+            # introduce perf regression. So we don't supports post_quant_comm for fp8_block_scales.
+            # TODO: Consider remove the constraint of the OneSided AlltoAll
+            pass
         elif self.has_w4a16_mxfp4:
             pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
             x = torch.nn.functional.pad(x, (0, pad_size))
@@ -405,6 +409,9 @@ class TRTLLMGenFusedMoE(MoE):
 
         if self.has_deepseek_fp8_block_scales:
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
+            # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
+            if x_sf is None:
+                x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 router_logits,
