@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_bert import \
     BertForSequenceClassification
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 BERT_CONFIG = {
     "architectures": ["BertForSequenceClassification"],
@@ -119,7 +121,9 @@ class TestBertForSequenceClassification(unittest.TestCase):
         token_type_ids = token_type_ids.squeeze(0)
 
         # Run inference
-        with torch.inference_mode():
+        extra_attrs = deepcopy(tllm_model.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             # TRT-LLM model forward
             tllm_outputs = tllm_model(
                 input_ids=input_ids,

@@ -2,7 +2,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Unionle)
 
 import torch
 
@@ -319,18 +319,20 @@ class TrtllmAttentionWrapper:
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
         self.kwargs.update(kwargs)
 
-    def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
+    def create_output(
+        self,
+        q: torch.Tensor,
+        out_dtype: Optional[torch.dtype],
+        use_nvfp4_output: bool,
+        is_gen_only: bool,
+    ):
         num_tokens = q.size(0)
-        attention_input_type = (AttentionInputType(self.attention_input_type)
-                                if self.attention_input_type is not None else
-                                AttentionInputType.mixed)
         if out_dtype is None:
             out_dtype = q.dtype
-        is_gen_only = attention_input_type == AttentionInputType.generation_only
         v_head_size = self.head_size
         if self.is_mla_enable:
             v_head_size = self.kv_lora_rank if is_gen_only else self.v_head_dim
-        if out_dtype == torch.uint8:
+        if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
             size_per_token = self.num_heads * v_head_size
@@ -342,11 +344,12 @@ class TrtllmAttentionWrapper:
             padded_row, padded_col = compute_swizzled_sf_shape(
                 num_tokens, size_per_token // scaling_vector_size)
             output_sf = q.new_empty(padded_row * padded_col, dtype=torch.uint8)
+            return [output, output_sf]
         else:
-            output = q.new_empty((num_tokens, self.num_heads * v_head_size),
-                                 dtype=out_dtype)
-            output_sf = None
-        return output, output_sf
+            return [
+                q.new_empty((num_tokens, self.num_heads * v_head_size),
+                            dtype=out_dtype)
+            ]
 
     def run(
         self,
@@ -355,7 +358,6 @@ class TrtllmAttentionWrapper:
         v: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
-        out_dtype: Optional[torch.dtype] = None,
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
@@ -372,7 +374,6 @@ class TrtllmAttentionWrapper:
             q (torch.Tensor): Query tensor with shape (num_tokens, num_heads * head_dim) or QKV tensor with shape (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim).
             k (Optional[torch.Tensor]): Key tensor with shape (num_tokens, num_kv_heads * head_dim) or None if QKV tensor is provided.
             v (Optional[torch.Tensor]): Value tensor with shape (num_tokens, num_kv_heads * head_dim) or None if QKV tensor is provided.
-            out_dtype (Optional[torch.dtype]): Output data type if provided.
             is_fused_qkv (bool): Whether QKV tensor is provided.
             update_kv_cache (bool): Whether KV cache is updated.
             attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
@@ -451,13 +452,6 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
 
-        if output is None:
-            assert output_sf is None
-            output, output_sf = self.create_output(q, out_dtype)
-        else:
-            # output is provided, expect output_sf be provided as well if has NVFP4 output.
-            assert out_dtype is None or out_dtype != torch.uint8 or output_sf is not None
-
         # packing parameters to avoid maxing out 64 arguments
         rotary_embedding_scales = [
             self.rotary_embedding_scale, self.rotary_embedding_short_m_scale,
@@ -491,7 +485,6 @@ class TrtllmAttentionWrapper:
             v,
             output,
             output_sf,
-            out_dtype,
             self.workspace,
             self.sequence_length,
             self.host_past_key_value_lengths,
@@ -1461,12 +1454,64 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         else:
             return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
 
+    def use_nvfp4_output(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        attention_mask: AttentionMask,
+    ) -> bool:
+        # Not running NVFP4
+        if not self.has_nvfp4:
+            return False
+
+        # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
+        if not os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
+                              "1") == "1":
+            return False
+
+        use_paged_context_fmha = (
+            metadata.runtime_features.chunked_prefill
+            or metadata.runtime_features.cache_reuse
+            or metadata.runtime_features.has_speculative_draft_tokens
+        ) if metadata.runtime_features else False
+
+        return self.wrapper.is_nvfp4_output_kernel_available(
+            tokens_per_block=metadata.tokens_per_block,
+            attention_mask=attention_mask,
+            use_paged_context_fmha=use_paged_context_fmha,
+            is_mla_enable=self.is_mla_enable,
+        )
+
+    def get_output_dtype(self, is_quantize_output: bool,
+                         use_nvfp4_output: bool) -> Optional[torch.dtype]:
+        out_dtype = None
+        if is_quantize_output:
+            if use_nvfp4_output:
+                # Use UINT8 as the container dtype for NVFP4.
+                out_dtype = torch.uint8
+            elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
+                  or self.has_fp8_rowwise
+                  or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache
+                                                   or self.has_fp4_kv_cache):
+                out_dtype = torch.float8_e4m3fn
+        return out_dtype
+
+    def create_output(self, q, *, is_quantize_output: bool,
+                      metadata: TrtllmAttentionMetadata,
+                      attention_mask: AttentionMask, is_gen_only: bool,
+                      **kwargs) -> List[torch.Tensor]:
+        use_nvfp4_output = self.use_nvfp4_output(metadata, attention_mask)
+        out_dtype = self.get_output_dtype(is_quantize_output, use_nvfp4_output)
+        return self.wrapper.create_output(q, out_dtype, use_nvfp4_output,
+                                          is_gen_only)
+
     def forward(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         out_scale_sf: Optional[torch.Tensor] = None,
         kv_scales_sf: Optional[torch.Tensor] = None,
@@ -1480,9 +1525,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
-        enable_attn_nvfp4_output: bool = True,
-        output: Optional[torch.Tensor] = None,
-        output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
         cu_q_seqlens: Optional[torch.Tensor] = None,
@@ -1492,7 +1534,32 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Execute the attention operation.
+        Args:
+            q (torch.Tensor): Query tensor or QKV tensor.
+            k (Optional[torch.Tensor]): Key tensor or None if QKV tensor is provided.
+            v (Optional[torch.Tensor]): Value tensor or None if QKV tensor is provided.
+            metadata (TrtllmAttentionMetadata): Metadata for the attention operation.
+            output (Optional[torch.Tensor]): Output tensor to store the attention output.
+            output_sf (Optional[torch.Tensor]): Output scale factor tensor for NVFP4.
+            out_scale (Optional[torch.Tensor]): Scale factor tensor for quantizing output.
+            out_scale_sf (Optional[torch.Tensor]): Global scale factor tensor for NVFP4 for quantizingoutput.
+            kv_scales_sf (Optional[torch.Tensor]): KV scale factor tensor.
+            kv_scales_sf_inv (Optional[torch.Tensor]): KV scale factor inverse tensor.
+            attention_mask (AttentionMask): Attention mask.
+            attention_input_type (AttentionInputType): Attention input type.
+            latent_cache (Optional[torch.Tensor]): Latent cache tensor.
+            q_pe (Optional[torch.Tensor]): Q position embedding tensor.
+            mrope_config (Optional[dict]): Mrope configuration.
+            attention_window_size (Optional[int]): Attention window size.
+            softmax_stats_tensor (Optional[torch.Tensor]): Softmax statistics tensor.
+            helix_position_offsets (Optional[torch.Tensor]): Helix position offsets tensor.
+            attention_sinks (Optional[torch.Tensor]): Attention sinks tensor.
+            chunked_prefill_buffer_batch_size (int): Chunked prefill buffer batch size.
+        """
+
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1509,16 +1576,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             use_paged_context_fmha = False
 
-        use_nvfp4_output = False
-        if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
-        ):
-            # Runtime check whether the NVFP4 output kernel is available.
-            use_nvfp4_output = self.wrapper.is_nvfp4_output_kernel_available(
-                tokens_per_block=metadata.tokens_per_block,
+        if output is None:
+            # Output is not provided.
+            outputs = self.create_output(
+                q,
+                is_quantize_output=out_scale is not None,
+                metadata=metadata,
                 attention_mask=attention_mask,
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
             )
+
+            output = outputs[0]
+            output_sf = outputs[1] if len(outputs) == 2 else None
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         sparse_attn_indices_block_size = 1
@@ -1561,7 +1631,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             out_scale_sf=out_scale_sf,
             kv_scales_sf=kv_scales_sf,
             kv_scales_sf_inv=kv_scales_sf_inv,
-            use_nvfp4_output=use_nvfp4_output,
+            use_nvfp4_output=output_sf
+            is not None,  # NVFP4 output will setup output_sf tensor
             use_paged_context_fmha=use_paged_context_fmha,
             attention_input_type=attention_input_type,
             latent_cache=latent_cache,
@@ -1593,19 +1664,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
         )
-        out_dtype = None
-        if out_scale is not None:
-            if use_nvfp4_output:
-                # Use UINT8 as the container dtype for NVFP4.
-                out_dtype = torch.uint8
-            elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
-                  or self.has_fp8_rowwise
-                  or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache
-                                                   or self.has_fp4_kv_cache):
-                # TODO(qijun): revisit fp8_context_fmha logic
-                out_dtype = torch.float8_e4m3fn
 
-        output, output_sf = self.wrapper.run(
+        self.wrapper.run(
             q,
             k,
             v,
@@ -1621,11 +1681,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             mla_bmm1_scale=mla_bmm1_scale,
             mla_bmm2_scale=mla_bmm2_scale,
             quant_q_buffer=quant_q_buffer)
-
-        if use_nvfp4_output:
+        if output_sf is None:
+            return output
+        else:
             return output, output_sf
-
-        return output
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -1638,12 +1697,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def support_mla(cls) -> bool:
         return True
-
-    @classmethod
-    def support_nvfp4_output(cls) -> bool:
-        # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
-        return os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
-                              "1") == "1"
 
     def has_cached_kv_for_mla_context(
         self,

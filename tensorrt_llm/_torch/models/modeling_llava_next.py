@@ -27,6 +27,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..utils import attach_attention_metadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
@@ -354,6 +355,9 @@ class LlavaNextVisionModel(nn.Module):
 
     def post_config(self):
         self.config = self.pretrained_config.vision_config
+        if not self.use_hf_vision_tower:
+            self.model_config.extra_attrs.update(
+                self.vision_tower.model_config.extra_attrs)
 
     def pack_image_features(self,
                             image_features,
@@ -486,9 +490,10 @@ class LlavaNextVisionModel(nn.Module):
 
         attn_metadata = self.vision_model.prepare_attn_metadata(
             pixel_values.shape[0])
-        image_features = self.vision_model(
-            pixel_values,
-            attn_metadata=attn_metadata,
+        with attach_attention_metadata(attn_metadata):
+            image_features = self.vision_model(
+                pixel_values,
+                attn_metadata=attn_metadata,
         )
         selected_image_feature = image_features[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
@@ -566,6 +571,7 @@ class LlavaNextModel(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

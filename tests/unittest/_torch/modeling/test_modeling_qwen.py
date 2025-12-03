@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
@@ -99,7 +101,10 @@ class TestQwen(unittest.TestCase):
         model, input_ids, position_ids, past_seen_tokens, attn_metadata, kv_cache_manager = \
             self._prepare_sanity_test("qwen", quant_algo)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(model.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = model.forward(input_ids=input_ids,
                                    position_ids=position_ids,
@@ -107,7 +112,7 @@ class TestQwen(unittest.TestCase):
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
-        with torch.inference_mode():
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = model.forward(input_ids=input_ids,
                                    position_ids=position_ids,
@@ -122,7 +127,9 @@ class TestQwen(unittest.TestCase):
         model, input_ids, position_ids, _, attn_metadata, _ = \
             self._prepare_sanity_test("qwen_prm", quant_algo)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(model.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.max_seq_len = input_ids.size(-1)
             attn_metadata.prepare()
             scores_logits = model.forward(input_ids=input_ids,
@@ -225,7 +232,9 @@ class TestQwen(unittest.TestCase):
         # decoding only.
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
+        extra_attrs = deepcopy(qwen.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = qwen.forward(input_ids=input_ids,
                                   position_ids=position_ids,
@@ -293,7 +302,9 @@ class TestQwen(unittest.TestCase):
         if scenario.use_cuda_graph:
             attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(qwen.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             logits = run_forward(input_ids=gen_input_ids,
                                  position_ids=gen_position_ids,
                                  attn_metadata=attn_metadata)
@@ -364,7 +375,9 @@ class TestQwen(unittest.TestCase):
 
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
+        extra_attrs = deepcopy(qwen.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             logits = qwen.forward(input_ids=input_ids,
                                   position_ids=position_ids,
                                   attn_metadata=attn_metadata)

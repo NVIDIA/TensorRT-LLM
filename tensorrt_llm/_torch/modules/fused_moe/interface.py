@@ -9,8 +9,7 @@ from torch import nn
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
-                      get_model_extra_attrs, is_gated_activation,
-                      is_torch_compiling)
+                      get_model_extra_attrs, is_gated_activation)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -630,7 +629,7 @@ class MoE(nn.Module):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        if self.register_to_config and is_torch_compiling():
+        if self.register_to_config:
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,

@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -9,6 +10,7 @@ from transformers import SiglipVisionModel as HFSiglipVisionModel
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_siglip import SiglipVisionModel
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 # use the default config from HF (https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/configuration_siglip.py#L126-L147)
 DEFAULT_SIGLIP_CONFIG = {
@@ -129,10 +131,13 @@ class TestSiglipVisionModel(unittest.TestCase):
         attn_metadata = tllm_model.prepare_attn_metadata(batch_size)
 
         # TRT-LLM model forward
-        tllm_outputs = tllm_model(
-            pixel_values=pixel_values,
-            attn_metadata=attn_metadata,
-        )
+        extra_attrs = deepcopy(tllm_model.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
+            tllm_outputs = tllm_model(
+                pixel_values=pixel_values,
+                attn_metadata=attn_metadata,
+            )
 
         # Compare all hidden states
 

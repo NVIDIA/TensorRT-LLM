@@ -1,6 +1,8 @@
 import contextlib
 import os
 import re
+import weakref
+from copy import deepcopy
 from typing import Any, Dict
 from unittest import mock
 
@@ -19,6 +21,7 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
 from tensorrt_llm._torch.pyexecutor import resource_manager
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
 
@@ -249,7 +252,10 @@ def test_mistral_3_vlm_sanity(mistral_small_3_1_24b_config, quant_algo):
 
         position_ids = torch.cat(position_ids).unsqueeze(0)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(mistral.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = mistral.forward(
                 input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
@@ -257,7 +263,7 @@ def test_mistral_3_vlm_sanity(mistral_small_3_1_24b_config, quant_algo):
 
         assert len(past_seen_tokens) == logits.shape[0]
 
-        with torch.inference_mode():
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = mistral.forward(
                 input_ids=input_ids,
@@ -368,7 +374,9 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
         # decoding only.
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
+        extra_attrs = deepcopy(mistral.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = mistral.forward(
                 input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
@@ -430,7 +438,10 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
         if use_cuda_graph:
             attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(mistral.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             logits = run_forward(
                 input_ids=gen_input_ids, position_ids=gen_position_ids, attn_metadata=attn_metadata
             )

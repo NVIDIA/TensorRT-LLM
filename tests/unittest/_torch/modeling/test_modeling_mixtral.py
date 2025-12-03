@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -17,6 +18,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.mixtral_weight_mapper import \
     MixtralHfWeightMapper
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -158,14 +160,16 @@ class TestMixtral(unittest.TestCase):
 
         position_ids = torch.cat(position_ids).unsqueeze(0)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(mixtral.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = mixtral.forward(input_ids=input_ids,
                                      position_ids=position_ids,
                                      attn_metadata=attn_metadata)
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
-        with torch.inference_mode():
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = mixtral.forward(input_ids=input_ids,
                                      position_ids=position_ids,
@@ -270,7 +274,9 @@ class TestMixtral(unittest.TestCase):
         # context
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
+        extra_attrs = deepcopy(mixtral.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = mixtral.forward(input_ids=input_ids,
                                      position_ids=position_ids,
@@ -339,7 +345,9 @@ class TestMixtral(unittest.TestCase):
         if scenario.use_cuda_graph:
             attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(mixtral.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             logits = run_forward(input_ids=gen_input_ids,
                                  position_ids=gen_position_ids,
                                  attn_metadata=attn_metadata)
