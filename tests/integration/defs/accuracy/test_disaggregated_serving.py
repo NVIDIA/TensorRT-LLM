@@ -45,9 +45,8 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
-# TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
-DEFAULT_TEST_TIMEOUT = 3600
-DEFAULT_SERVER_WAITING_TIMEOUT = 3600
+DEFAULT_TEST_TIMEOUT = 1200
+DEFAULT_SERVER_WAITING_TIMEOUT = 1200
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
