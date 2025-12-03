@@ -18,6 +18,8 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
+# Import configure command
+from tensorrt_llm.commands.configure import configure
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -465,7 +467,30 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
+            loaded_data = yaml.safe_load(f)
+
+            # Detect recipe format (has 'scenario' and 'llm_api_config' keys)
+            if isinstance(
+                    loaded_data, dict
+            ) and 'scenario' in loaded_data and 'llm_api_config' in loaded_data:
+                # Recipe format - extract llm_api_config section for LLM args
+                llm_args_extra_dict = loaded_data['llm_api_config']
+
+                # TODO: Add llm_api_config validation once PR #8331 merges
+                # (standardizes LlmArgs with Pydantic - validation will happen automatically)
+
+                # Set environment variables from 'env' section (if not already set)
+                env_vars = loaded_data.get('env', {})
+                for key, value in env_vars.items():
+                    if key not in os.environ:
+                        os.environ[key] = str(value)
+                        logger.info(
+                            f"Set environment variable from recipe: {key}={value}"
+                        )
+            else:
+                # Simple format - use loaded data directly
+                llm_args_extra_dict = loaded_data
+
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
@@ -886,6 +911,7 @@ class DefaultGroup(click.Group):
 main = DefaultGroup(
     commands={
         "serve": serve,
+        "configure": configure,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder

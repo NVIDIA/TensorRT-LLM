@@ -84,7 +84,31 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     kv_cache_config = {}
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
+            loaded_data = yaml.safe_load(f)
+
+            # Detect recipe format (has 'scenario' and 'llm_api_config' keys)
+            if isinstance(
+                    loaded_data, dict
+            ) and 'scenario' in loaded_data and 'llm_api_config' in loaded_data:
+                # Recipe format - extract llm_api_config section for LLM args
+                llm_args_dict = loaded_data['llm_api_config']
+
+                # TODO: Add llm_api_config validation once PR #8331 merges
+                # (standardizes LlmArgs with Pydantic - validation will happen automatically)
+
+                # Set environment variables from 'env' section (if not already set)
+                import os
+                env_vars = loaded_data.get('env', {})
+                for key, value in env_vars.items():
+                    if key not in os.environ:
+                        os.environ[key] = str(value)
+                        logger.info(
+                            f"Set environment variable from recipe: {key}={value}"
+                        )
+            else:
+                # Simple format - use loaded data directly
+                llm_args_dict = loaded_data
+
             kv_cache_config = llm_args_dict.get("kv_cache_config", {
                 "dtype": "auto",
             })
