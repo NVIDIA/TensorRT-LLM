@@ -811,7 +811,7 @@ def getMountListForSlurmTest(SlurmCluster cluster)
     return [
         "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
         "/home/svc_tensorrt:/home/svc_tensorrt",
-        "/home/svc_tensorrt/bloom/scripts",
+        "/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts",
         "/home/svc_tensorrt/.cache:/root/.cache"
     ]
 }
