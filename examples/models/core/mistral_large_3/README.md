@@ -37,6 +37,7 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
     --spec_decode_max_draft_len 1 \
     --use_one_model \
     --draft_model_dir ${mistral_large_3_eagle_model_path} \
+    --eagle3_mistral_large_3 \
     --moe_backend TRTLLM \
     --print_iter_log \
     2>&1 | tee debug.log
@@ -92,6 +93,7 @@ speculative_config:
     max_draft_len: 1
     speculative_model_dir: ${mistral_large_3_eagle_model_path}
     eagle3_one_model: true
+    eagle3_mistral_large_3: true
 " > serve.yml
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 -m tensorrt_llm.commands.serve serve \
     ${mistral_large_3_model_path} \

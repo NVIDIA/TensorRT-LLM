@@ -142,7 +142,9 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
-    parser.add_argument('--eagle3_mistral_large_3', default=False, action='store_true')
+    parser.add_argument('--eagle3_mistral_large_3',
+                        default=False,
+                        action='store_true')
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
