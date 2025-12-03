@@ -1548,12 +1548,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     resources:
                       requests:
                         cpu: 12
-                        memory: 96Gi
+                        memory: 64Gi
                         nvidia.com/gpu: 1
                         ephemeral-storage: 300Gi
                       limits:
                         cpu: 12
-                        memory: 96Gi
+                        memory: 64Gi
                         nvidia.com/gpu: 1
                         ephemeral-storage: 300Gi
                     imagePullPolicy: Always
