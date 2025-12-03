@@ -185,6 +185,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         ),
     )
 
+    draft_checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
+    )
+
     ### SEQUENCE INTERFACE CONFIG ##################################################################
     max_input_len: int = Field(default=1024, description="The maximum input length.")
     max_num_tokens: Optional[int] = Field(default=None, description="The maximum number of tokens.")
