@@ -114,42 +114,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             auto srcPtr = computeBlockPointer(src, pools, poolIdx);
             auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
-            // Does it contain block scales?
-            auto containsBlockScales = pools[poolIdx].containsBlockScales;
-
-            // If no partial tokens or if the dataType is not supported for partial copy, copy entire block.
-            // Note that nvfp4 kv cache SFs use an interleaved layout, so we need to copy the entire block.
-            if (numTokensToCopy <= 0 || srcPtr->getDataType() == nvinfer1::DataType::kINT4
-                || srcPtr->getDataType() == nvinfer1::DataType::kFP4 || containsBlockScales)
-            {
-                // For partial copy not implemented with these data types,
-                // just do a full copy.
-                (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
-            }
-            else
-            {
-                int const tokensPerBlock = pools[poolIdx].tokensPerBlock;
-                if (numTokensToCopy >= tokensPerBlock)
-                {
-                    // If requested tokens >= entire block, just do a full copy.
-                    (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
-                }
-                else
-                {
-                    auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
-                    int const numLayers = pools[poolIdx].numLayers;
-                    int const kvFactor = pools[poolIdx].kvFactor;
-                    int const numHeads = pools[poolIdx].numKvHeads;
-                    int const sizePerHead = pools[poolIdx].sizePerHead;
-                    auto shape = srcPtr->getShape();
-
-                    TLLM_CHECK_WITH_INFO(
-                        shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
-
-                    tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
-                        numTokensToCopy, kvFactor, stream);
-                }
-            }
+            // Just do a full copy
+            (isOffload ? mOffloadManager : mOnboardManager).copy(*srcPtr, *dstPtr);
         }
 
         TLLM_LOG_DEBUG("copyBlock: DRAM mode complete. Returning...");
