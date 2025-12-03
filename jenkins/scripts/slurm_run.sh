@@ -35,12 +35,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
     echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
 fi
 
-if [ -n "${DISAGG_SERVER_IDX:-}" ]; then
-    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.${DISAGG_SERVER_IDX}"
-else
-    install_lock_file="install_lock.lock.${SLURM_JOB_ID}"
-fi
-
+install_lock_file="install_lock.lock.${SLURM_JOB_ID}${DISAGG_SERVING_TYPE}"
 if [ $SLURM_PROCID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
@@ -93,11 +88,6 @@ export LD_LIBRARY_PATH=$containerLDLibPath
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
-
-# Run pytest without llmapilaunch for disagg server or benchmark process.
-if [ "${DISAGG_SERVER_IDX:-}" == "BENCHMARK" ] || [ "${DISAGG_SERVER_IDX:-}" == "DISAGG_SERVER" ]; then
-    pytestCommand="$pytestCommandNoLLMAPILaunch"
-fi
 
 echo "Full Command: $pytestCommand"
 

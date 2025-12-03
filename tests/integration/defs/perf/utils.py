@@ -277,7 +277,7 @@ class PerfAggrScriptTestCmds(NamedTuple):
             self.output_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
         try:
             server_envs = copy.deepcopy(os.environ)
-            server_envs.update(self.server_envs[cmd_idx])
+            # server_envs.update(self.server_envs[cmd_idx])
             print_info(
                 f"Starting server. cmd is {self.server_cmds[cmd_idx]} envs are {server_envs}"
             )
@@ -291,7 +291,7 @@ class PerfAggrScriptTestCmds(NamedTuple):
             self.wait_for_endpoint_ready("http://localhost:8000/health",
                                          timeout=self.timeout)
             client_envs = copy.deepcopy(os.environ)
-            client_envs.update(self.client_envs[cmd_idx])
+            # client_envs.update(self.client_envs[cmd_idx])
             print_info(
                 f"Starting client. cmd is {self.client_cmds[cmd_idx]} envs are {client_envs}"
             )
@@ -385,7 +385,7 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
     benchmark_envs: List[Dict[str, str]]
     timeout: int
     hostname: str
-    disagg_server_idx: str
+    disagg_serving_type: str
     num_ctx_servers: int
     num_gen_servers: int
     output_dir: str
@@ -488,13 +488,13 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                                  benchmark_status_file: str,
                                  timeout: int = 7200):
         print_info(
-            f"Server {self.disagg_server_idx} waiting for benchmark status file: {benchmark_status_file}"
+            f"Server {self.disagg_serving_type} waiting for benchmark status file: {benchmark_status_file}"
         )
         start_time = time.time()
         while True:
             if os.path.exists(benchmark_status_file):
                 print_info(
-                    f"Benchmark status file found, terminating server {self.disagg_server_idx}"
+                    f"Benchmark status file found, terminating server {self.disagg_serving_type}"
                 )
                 break
             elapsed_time = time.time() - start_time
@@ -503,7 +503,7 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
             )
             if elapsed_time > timeout:
                 print_error(
-                    f"Timeout waiting for benchmark status file after {timeout}s, terminating server {self.disagg_server_idx}"
+                    f"Timeout waiting for benchmark status file after {timeout}s, terminating server {self.disagg_serving_type}"
                 )
                 break
             time.sleep(10)  # Check every 10 seconds
@@ -536,19 +536,19 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
         server_proc = None
         benchmark_status_file = os.path.join(self.output_dir,
                                              f"benchmark_status.{cmd_idx}.txt")
-        if "CTX" in self.disagg_server_idx or "GEN" in self.disagg_server_idx:
+        if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             server_file_path = os.path.join(
                 self.output_dir,
-                f"trtllm-serve.{cmd_idx}.{self.disagg_server_idx}.log")
-            is_ctx = "CTX" in self.disagg_server_idx
+                f"trtllm-serve.{cmd_idx}.{self.disagg_serving_type}.log")
+            is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = self.ctx_server_cmds[
                 cmd_idx] if is_ctx else self.gen_server_cmds[cmd_idx]
             server_envs = copy.deepcopy(os.environ)
-            server_envs.update(self.ctx_server_envs[cmd_idx]
-                               if is_ctx else self.gen_server_envs[cmd_idx])
+            # server_envs.update(self.ctx_server_envs[cmd_idx]
+            #                    if is_ctx else self.gen_server_envs[cmd_idx])
             try:
                 print_info(
-                    f"Starting server. disagg_server_idx: {self.disagg_server_idx} cmd is {server_cmd} envs are {server_envs}"
+                    f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd} envs are {server_envs}"
                 )
                 with open(server_file_path, 'w') as server_ctx:
                     server_proc = subprocess.Popen(
@@ -560,22 +560,21 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                 self.wait_for_benchmark_ready(benchmark_status_file,
                                               timeout=self.timeout)
             finally:
-                print_info(f"Server {self.disagg_server_idx} stopped")
+                print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
                 server_proc.wait()
-        elif self.disagg_server_idx == "DISAGG_SERVER":
+        elif self.disagg_serving_type == "DISAGG_SERVER":
             disagg_server_file_path = os.path.join(
                 self.output_dir,
-                f"trtllm-serve.{cmd_idx}.{self.disagg_server_idx}.log")
+                f"trtllm-serve.{cmd_idx}.{self.disagg_serving_type}.log")
             disagg_server_cmd = self.disagg_server_cmds[cmd_idx]
             disagg_server_envs = copy.deepcopy(os.environ)
-            disagg_server_envs.update(self.disagg_server_envs[cmd_idx])
-
+            # disagg_server_envs.update(self.disagg_server_envs[cmd_idx])
             try:
                 # Generate disagg server config (this will wait for all hostnames)
                 self._generate_disagg_server_config(cmd_idx)
                 print_info(
-                    f"Starting disagg server. disagg_server_idx: {self.disagg_server_idx} disagg server cmd is {disagg_server_cmd} envs are {disagg_server_envs}"
+                    f"Starting disagg server. disagg_serving_type: {self.disagg_serving_type} disagg server cmd is {disagg_server_cmd} envs are {disagg_server_envs}"
                 )
                 with open(disagg_server_file_path, 'w') as disagg_server_ctx:
                     disagg_server_proc = subprocess.Popen(
@@ -587,10 +586,10 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                 self.wait_for_benchmark_ready(benchmark_status_file,
                                               timeout=self.timeout)
             finally:
-                print_info(f"Disagg server {self.disagg_server_idx} stopped")
+                print_info(f"Disagg server {self.disagg_serving_type} stopped")
                 disagg_server_proc.terminate()
                 disagg_server_proc.wait()
-        elif self.disagg_server_idx == "BENCHMARK":
+        elif self.disagg_serving_type == "BENCHMARK":
             benchmark_file_path = os.path.join(
                 self.output_dir, f"trtllm-benchmark.{cmd_idx}.log")
             try:
@@ -603,14 +602,14 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
                     disagg_server_port
                 ]
                 benchmark_envs = copy.deepcopy(os.environ)
-                benchmark_envs.update(self.benchmark_envs[cmd_idx])
+                # benchmark_envs.update(self.benchmark_envs[cmd_idx])
                 self.wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
                     timeout=self.timeout,
                 )
                 # Run benchmark
                 print_info(
-                    f"Starting benchmark. disagg_server_idx: {self.disagg_server_idx} benchmark cmd is {benchmark_cmd} envs are {benchmark_envs}"
+                    f"Starting benchmark. disagg_serving_type: {self.disagg_serving_type} benchmark cmd is {benchmark_cmd} envs are {benchmark_envs}"
                 )
                 output = subprocess.check_output(
                     benchmark_cmd, env=benchmark_envs,
@@ -738,9 +737,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         is_disagg_server = False
         if self._config.runtime == "multi_node_disagg_server":
-            disagg_server_idx = self._config.disagg_configs[0][
-                'disagg_server_idx']
-            is_disagg_server = disagg_server_idx != "BENCHMARK"
+            disagg_serving_type = self._config.disagg_configs[0][
+                'disagg_serving_type']
+            is_disagg_server = disagg_serving_type != "BENCHMARK"
 
         # Start the timer.
         self._start_timestamp = datetime.utcnow()

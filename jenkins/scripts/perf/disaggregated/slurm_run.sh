@@ -4,12 +4,7 @@
 set -Eeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
-if [ -n "${DISAGG_SERVER_IDX:-}" ]; then
-    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.${DISAGG_SERVER_IDX}"
-else
-    install_lock_file="install_lock.lock.${SLURM_JOB_ID}"
-fi
-
+install_lock_file="install_lock.lock.${SLURM_JOB_ID}${DISAGG_SERVING_TYPE}"
 if [ $SLURM_PROCID -eq 0 ]; then
     echo "Installing dependencies on $(hostname) for process $SLURM_PROCID"
     cd $llmSrcNode
@@ -47,11 +42,6 @@ export LD_LIBRARY_PATH=$containerLDLibPath
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
-
-# Run pytest without llmapilaunch for none-disagg workers
-if [ "${DISAGG_SERVER_IDX:-}" == "BENCHMARK" ] || [ "${DISAGG_SERVER_IDX:-}" == "DISAGG_SERVER" ]; then
-    pytestCommand="$pytestCommandNoLLMAPILaunch"
-fi
 
 echo "Full Command: $pytestCommand"
 

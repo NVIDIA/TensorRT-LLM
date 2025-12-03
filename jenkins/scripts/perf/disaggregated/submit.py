@@ -55,6 +55,7 @@ def get_env_config(config):
     job_workspace = env.get("job_workspace", "")
     worker_env_var = env.get("worker_env_var", "")
     server_env_var = env.get("server_env_var", "")
+    benchmark_env_var = env.get("benchmark_env_var", "")
 
     return {
         "container": container,
@@ -66,6 +67,7 @@ def get_env_config(config):
         "job_workspace": job_workspace,
         "worker_env_var": worker_env_var,
         "server_env_var": server_env_var,
+        "benchmark_env_var": benchmark_env_var,
     }
 
 
@@ -112,6 +114,27 @@ def get_pytest_cmds(llmsrc, llm_models_root, job_workspace, stage_name, test_lis
 
 def remove_whitespace_lines(lines):
     return [line.strip() for line in lines if line.strip()]
+
+
+def get_pytest_command_no_llmapilaunch(script_prefix_lines):
+    pytest_command_line = None
+    for line in script_prefix_lines:
+        if "export pytestCommand=" in line:
+            pytest_command_line = line
+            break
+
+    if not pytest_command_line:
+        return ""
+
+    # Replace pytestCommand with pytestCommandNoLLMAPILaunch
+    replaced_line = pytest_command_line.replace("pytestCommand", "pytestCommandNoLLMAPILaunch")
+
+    # Split by space, find and remove the substring with trtllm-llmapi-launch
+    replaced_line_parts = replaced_line.split()
+    replaced_line_parts_no_llmapi = [
+        part for part in replaced_line_parts if "trtllm-llmapi-launch" not in part
+    ]
+    return " ".join(replaced_line_parts_no_llmapi)
 
 
 def main():
@@ -210,7 +233,6 @@ def main():
                 f"export stageName='{args.stage_name}'",
                 "export perfMode='true'",
                 f"export pytestCommand='{pytest_command}'",
-                f"export pytestCommandNoLLMAPILaunch='{pytest_command_no_llmapi}'",
                 "export NVIDIA_IMEX_CHANNELS=0",
                 (
                     "export NVIDIA_VISIBLE_DEVICES=$(seq -s, 0 "
@@ -231,11 +253,15 @@ def main():
             ]
         )
 
+    # Extract pytestCommand and generate pytestCommandNoLLMAPILaunch
+    pytest_command_no_llmapi_launch = get_pytest_command_no_llmapilaunch(script_prefix_lines)
+
     script_prefix_lines.extend(
         [
-            "export OPEN_SEARCH_DB_BASE_URL='http://gpuwa.nvidia.com'",
-            f"export pytestCommand='unset UCX_TLS && {env_config['worker_env_var']} $pytestCommand'",
-            f"export pytestCommandNoLLMAPILaunch='{env_config['worker_env_var']} $pytestCommandNoLLMAPILaunch'",
+            pytest_command_no_llmapi_launch,
+            f'export pytestCommandWorker="unset UCX_TLS && {env_config["worker_env_var"]} $pytestCommand"',
+            f'export pytestCommandDisaggServer="{env_config["server_env_var"]} $pytestCommandNoLLMAPILaunch"',
+            f'export pytestCommandBenchmark="{env_config["benchmark_env_var"]} $pytestCommandNoLLMAPILaunch"',
             f"export runScript={args.run_sh}",
             f"export numCtxServers={hardware_config['num_ctx_servers']}",
             f"export numGenServers={hardware_config['num_gen_servers']}",
@@ -255,8 +281,8 @@ def main():
     remove_whitespace_lines(srun_args_lines)
     srun_args_lines.extend(
         [
-            "--container-env=DISAGG_SERVER_IDX",
-            "--container-env=OPEN_SEARCH_DB_BASE_URL",
+            "--container-env=DISAGG_SERVING_TYPE",
+            "--container-env=pytestCommand",
         ]
     )
     srun_args_lines = ["srunArgs=("] + [f'  "{line}"' for line in srun_args_lines] + [")"]

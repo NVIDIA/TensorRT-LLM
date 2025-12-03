@@ -18,7 +18,8 @@ chmod +x $runScript
 echo "Starting gen servers..."
 for i in $(seq 0 $((numGenServers - 1))); do
     gen_world_size=$((nodesPerGenServer * gpusPerNode))
-    export DISAGG_SERVER_IDX="GEN_$i"
+    export DISAGG_SERVING_TYPE="GEN_$i"
+    export pytestCommand="$pytestCommandWorker"
     srun "${srunArgs[@]}" --kill-on-bad-exit=1 \
         -N $nodesPerGenServer \
         --ntasks=$gen_world_size \
@@ -31,7 +32,8 @@ done
 echo "Starting ctx servers..."
 for i in $(seq 0 $((numCtxServers - 1))); do
     ctx_world_size=$((nodesPerCtxServer * gpusPerNode))
-    export DISAGG_SERVER_IDX="CTX_$i"
+    export DISAGG_SERVING_TYPE="CTX_$i"
+    export pytestCommand="$pytestCommandWorker"
     srun "${srunArgs[@]}" --kill-on-bad-exit=1 \
         -N $nodesPerCtxServer \
         --ntasks=$ctx_world_size \
@@ -45,7 +47,8 @@ sleep 300
 
 # Start disagg server
 echo "Starting disagg server..."
-export DISAGG_SERVER_IDX="DISAGG_SERVER"
+export DISAGG_SERVING_TYPE="DISAGG_SERVER"
+export pytestCommand="$pytestCommandDisaggServer"
 srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap -l \
     -N 1 \
     --ntasks=1 \
@@ -55,7 +58,8 @@ echo "Started disagg server"
 
 # Start benchmark
 echo "Starting benchmark..."
-export DISAGG_SERVER_IDX="BENCHMARK"
+export DISAGG_SERVING_TYPE="BENCHMARK"
+export pytestCommand="$pytestCommandBenchmark"
 if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap -l \
     -N 1 \
     --ntasks=1 \

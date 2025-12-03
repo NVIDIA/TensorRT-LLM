@@ -605,16 +605,16 @@ class ServerConfig:
     def to_cmd(self,
                output_dir: str,
                numa_bind: bool = False,
-               disagg_server_idx: str = "",
+               disagg_serving_type: str = "",
                hostname: str = "localhost",
                port: int = 8000) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
         config_filename = f"extra-llm-api-config.{self.name}.yml"
-        if "CTX" in disagg_server_idx:
+        if "CTX" in disagg_serving_type:
             config_filename = f"extra-llm-api-config.{self.name}.ctx.yml"
-        elif "GEN" in disagg_server_idx:
+        elif "GEN" in disagg_serving_type:
             config_filename = f"extra-llm-api-config.{self.name}.gen.yml"
         config_path = os.path.join(output_dir, config_filename)
 
@@ -923,7 +923,7 @@ def parse_aggr_config_file(config_file_path: str, select_pattern: str = None):
 
 def parse_multi_node_disagg_config_file(config_file_path: str,
                                         select_pattern: str = None):
-    disagg_server_idx = os.environ.get("DISAGG_SERVER_IDX", "BENCHMARK")
+    disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK")
 
     # Read YAML config file
     with open(config_file_path, 'r') as f:
@@ -984,7 +984,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
 
     # Create disagg_config dict
     disagg_config = {
-        'disagg_server_idx': disagg_server_idx,
+        'disagg_serving_type': disagg_serving_type,
         'hostname': socket.gethostname(),
         'numa_bind': numa_bind,
         'timeout': timeout,
@@ -1771,7 +1771,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             os.makedirs(hostnames_dir, exist_ok=True)
 
         for disagg_config in self._config.disagg_configs:
-            disagg_server_idx = disagg_config['disagg_server_idx']
+            disagg_serving_type = disagg_config['disagg_serving_type']
             hostname = disagg_config['hostname']
             numa_bind = disagg_config['numa_bind']
             ctx_server_cmd = None
@@ -1782,18 +1782,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             disagg_server_env = None
             benchmark_cmd = None
             benchmark_env = None
-            if "CTX" in disagg_server_idx or "GEN" in disagg_server_idx:
+            if "CTX" in disagg_serving_type or "GEN" in disagg_serving_type:
                 # Write hostname to hostnames folder
                 hostname_file = os.path.join(hostnames_dir,
-                                             f"{disagg_server_idx}.txt")
+                                             f"{disagg_serving_type}.txt")
                 with open(hostname_file, 'w') as f:
                     f.write(hostname)
                 # Generate CTX or GEN server commands if this is a CTX or GEN node
-                is_ctx = "CTX" in disagg_server_idx
+                is_ctx = "CTX" in disagg_serving_type
                 server_config = disagg_config[
                     'ctx_server'] if is_ctx else disagg_config['gen_server']
                 server_cmd = server_config.to_cmd(output_dir, numa_bind,
-                                                  disagg_server_idx, hostname,
+                                                  disagg_serving_type, hostname,
                                                   8336)
                 server_env = server_config.to_env()
                 if is_ctx:
@@ -1808,7 +1808,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 config_path = os.path.join(output_dir, config_filename)
                 with open(config_path, 'w') as f:
                     f.write(config_content)
-            elif "DISAGG_SERVER" in disagg_server_idx:
+            elif "DISAGG_SERVER" in disagg_serving_type:
                 timeout = disagg_config['timeout']
                 # Generate DISAGG server command if this is the DISAGG server node
                 disagg_server_cmd = [
@@ -1818,7 +1818,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     str(timeout)
                 ]
                 disagg_server_env = to_env_dict(disagg_config['server_env_var'])
-            elif "BENCHMARK" in disagg_server_idx:
+            elif "BENCHMARK" in disagg_serving_type:
                 # Generate benchmark command if this is the BENCHMARK server node
                 benchmark_cmd = disagg_config['client'].to_cmd(
                     need_hostname=False)
@@ -2143,8 +2143,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 benchmark_envs=benchmark_envs,
                 timeout=self._config.disagg_configs[0]['timeout'],
                 hostname=self._config.disagg_configs[0]['hostname'],
-                disagg_server_idx=self._config.disagg_configs[0]
-                ['disagg_server_idx'],
+                disagg_serving_type=self._config.disagg_configs[0]
+                ['disagg_serving_type'],
                 num_ctx_servers=self._config.disagg_configs[0]['hardware']
                 ['num_ctx_servers'],
                 num_gen_servers=self._config.disagg_configs[0]['hardware']
@@ -2462,7 +2462,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         elif self._config.runtime == "multi_node_disagg_server":
             if self._config.disagg_configs[0][
-                    'disagg_server_idx'] != "BENCHMARK":
+                    'disagg_serving_type'] != "BENCHMARK":
                 return
             job_config = get_job_info()
             job_config["s_gpu_type"] = self._config.gpu_type
