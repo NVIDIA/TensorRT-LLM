@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 import jinja2
@@ -14,16 +15,17 @@ import pandas as pd
 # Parse cmdline
 parser = argparse.ArgumentParser()
 parser.add_argument("--profile-dir", type=str, default="profiles")
-parser.add_argument("--world-size", "--np", type=int)
+parser.add_argument("--world-size", "--np", type=int, required=True)
 parser.add_argument("--rank", type=int, default=0)
 parser.add_argument("--warmup-times", type=int)
+parser.add_argument("--module", type=str)
 parser.add_argument("--query", type=str)
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--error-on-unknown-kernel", action="store_true", dest="error_on_unknown_kernel")
 group.add_argument(
     "--no-error-on-unknown-kernel", action="store_false", dest="error_on_unknown_kernel"
 )
-parser.set_defaults(error_on_unknown_kernel=None)
+parser.set_defaults(error_on_unknown_kernel=False)
 args = parser.parse_args()
 print(args)
 
@@ -124,6 +126,7 @@ for start, text in df.itertuples(index=False):
                 "runs": [],
                 "runs_end": [],
                 "ranges": [],
+                "range_in_module": [],
             }
         )
 
@@ -145,6 +148,28 @@ for start, end, text in df.itertuples(index=False):
         problem_set[problem_id]["runs_end"].append(end)
     else:
         problem_set[problem_id]["ranges"].append((start, end, text))
+
+# Determine whether each range is the first range that matches `args.module`,
+# and store the result in `problem["range_in_module"]`
+for problem in problem_set:
+    if args.module is not None:
+        problem["range_in_module"] = [False] * len(problem["ranges"])
+        run_ids = [bisect.bisect(problem["runs"], start) - 1 for start, _, _ in problem["ranges"]]
+        run2ranges = defaultdict(list)
+        for i, run_id in enumerate(run_ids):
+            run2ranges[run_id].append(i)
+        for run_id, ranges in run2ranges.items():
+            ranges = sorted(ranges, key=lambda i: problem["ranges"][i][0])
+            num_matches = 0
+            for range_id in ranges:
+                if problem["ranges"][range_id][2] == args.module:
+                    problem["range_in_module"][range_id] = True
+                    num_matches += 1
+            if num_matches != 1:
+                raise ValueError(
+                    f'Module "{args.module}" appears {num_matches} times'
+                    f' in "{problem["text"]}"\'s {run_id + 1}-th run'
+                )
 
 query = """SELECT name FROM sqlite_master WHERE type = ?"""
 df = pd.read_sql_query(query, conn, params=("table",))
@@ -187,32 +212,35 @@ for (
     capture_end,
 ) in df.itertuples(index=False):
     problem_id = bisect.bisect(problem_start, start) - 1
-    run_id = bisect.bisect(problem_set[problem_id]["runs"], runtime_start) - 1
+    problem = problem_set[problem_id]
+    run_id = bisect.bisect(problem["runs"], runtime_start) - 1
     if (
         run_id == -1
-        or run_id == len(problem_set[problem_id]["runs"])
-        or runtime_start >= problem_set[problem_id]["runs_end"][run_id]
+        or run_id == len(problem["runs"])
+        or runtime_start >= problem["runs_end"][run_id]
     ):
         run_id = -1
     ranges = [
-        text
-        for range_start, range_end, text in problem_set[problem_id]["ranges"]
+        i
+        for i, (range_start, range_end, text) in enumerate(problem["ranges"])
         if capture_start >= range_start and capture_end <= range_end
     ]
-    kernel_list.append(
-        (
-            problem_id,
-            run_id,
-            ranges,
-            start,
-            end,
-            demangledName,
-            runtime_start,
-            runtime_end,
-            capture_start,
-            capture_end,
+    if args.module is None or any(problem["range_in_module"][i] for i in ranges):
+        range_names = [problem["ranges"][i][2] for i in ranges]
+        kernel_list.append(
+            (
+                problem_id,
+                run_id,
+                range_names,
+                start,
+                end,
+                demangledName,
+                runtime_start,
+                runtime_end,
+                capture_start,
+                capture_end,
+            )
         )
-    )
 
 query = "SELECT * FROM StringIds"
 df = pd.read_sql_query(query, conn)
@@ -466,11 +494,10 @@ js_header_config = [{"name": problem["text"]} for problem in problem_set]
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
 template = jinja2.Environment(loader=loader).get_template("template.html")
 with html_file_path.open("w") as f:
-    f.write(
-        template.render(
-            headerConfig=js_header_config, rawData=js_data, runArgs=json.dumps(run_args, indent=4)
-        )
+    configText = (
+        "Run:\n" + json.dumps(run_args, indent=4) + "\n\nParse:\n" + json.dumps(args.__dict__)
     )
+    f.write(template.render(headerConfig=js_header_config, rawData=js_data, configText=configText))
 
 if args.query is not None:
     print("Query:")
