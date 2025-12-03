@@ -37,8 +37,8 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | Llama4ForConditionalGeneration | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | GPT-OSS                        | Yes               | Yes        | Yes                        | Yes                   | No              | No  | Yes                       | No                        | Yes           | Yes              | No             | N/A                      | Yes                   | Yes             |
 
-[^1]: Chunked Prefill for MLA can only be enabled on SM100.
-[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100 and in BF16/FP8 KV cache dtype.
+[^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
+[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
