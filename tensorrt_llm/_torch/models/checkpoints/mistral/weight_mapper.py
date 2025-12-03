@@ -42,7 +42,7 @@ class MistralWeightMapper(HfWeightMapper):
             "norm": "model.norm",
             # For Eagle3
             "language_model.eagle_linear": "model.fc",
-            "language_model.layers": "model.layers",
+            "language_model.layers": "layers",
         }
         self.mistral_llm_mapping.update(self.pixtral_mapping)
 
