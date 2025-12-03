@@ -2255,14 +2255,10 @@ class PyExecutor:
             else:
                 still_pending_canceled_ids.append(req_id)
 
-        if self.enable_attention_dp:
-            # TODO: revisit the cancel logic of attention dp
-            # When enable attention dp, each rank does not have full copy of requests
-            # so we need to remove the cancel requests not in the local rank
-            self.executor_request_queue.clear_canceled_req_ids()
-        else:
-            # Only keep active requests that did not cancel in canceled req ids list
-            self.executor_request_queue.canceled_req_ids.clear()
+        # Clear list of canceled request ids
+        self.executor_request_queue.canceled_req_ids.clear()
+        if not self.enable_attention_dp:
+            # Add back requests that are still pending cancellation.
             self.executor_request_queue.canceled_req_ids.extend(
                 still_pending_canceled_ids)
 
