@@ -165,6 +165,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "compile_model": {"backend": "torch-cudagraph"},
+                    "gather_logits_before_lm_head": {"enabled": False},
                 },
             },
         ),

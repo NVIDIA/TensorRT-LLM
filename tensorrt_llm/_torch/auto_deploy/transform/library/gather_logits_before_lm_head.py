@@ -53,19 +53,14 @@ def gather_logits_before_lm_head(
             (index of token to gather)
 
     Returns:
-        Gathered hidden states [max_batch_size, hidden] - fixed shape for CUDA graph
+        Gathered hidden states [batch, hidden] for generate, [1, max_batch_size, hidden] for packed
     """
-    # Handle different input formats
-    if hidden_states.dim() == 3:
-        if hidden_states.shape[0] == 1:
-            # Packed format (context): [1, total_tokens, hidden] -> [total_tokens, hidden]
-            hidden_states = hidden_states.squeeze(0)
-        else:
-            # Generate format: [batch, 1, hidden] -> [batch, hidden]
-            hidden_states = hidden_states[:, -1, :]  # [batch, hidden]
-            return hidden_states.clone()
+    # Generate format: [batch, 1, hidden] -> seq_len == 1
+    # Packed format: [1, total_tokens, hidden] -> seq_len > 1
+    if hidden_states.shape[1] == 1:
+        return hidden_states.clone()
 
-    gathered = hidden_states[logit_gather_ids.long()]
+    gathered = hidden_states[:, logit_gather_ids.long(), :]
     return gathered
 
 
@@ -74,10 +69,15 @@ def gather_logits_before_lm_head_fake(
     hidden_states: torch.Tensor,
     logit_gather_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Fake implementation for tracing - returns shape [max_batch_size, hidden_size]."""
+    """Fake implementation for tracing - matches real implementation logic."""
     max_batch_size = logit_gather_ids.shape[0]
     hidden_size = hidden_states.shape[-1]
-    return hidden_states.new_empty(max_batch_size, hidden_size)
+    # Check sequence length dimension to distinguish formats (consistent with real implementation)
+    if hidden_states.shape[1] == 1:
+        batch_size = hidden_states.shape[0]
+        return hidden_states.new_empty(batch_size, 1, hidden_size)
+    # Packed format: return [1, max_batch_size, hidden_size] (keep 3D)
+    return hidden_states.new_empty(1, max_batch_size, hidden_size)
 
 
 def _get_model_device(gm: GraphModule) -> torch.device:

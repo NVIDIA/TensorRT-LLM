@@ -301,14 +301,6 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
-
-        # return a list of tensors
-        return self.cache_seq_interface.info.unnest_sequences(logits)
-
-    @nvtx_range("ad_compute_logits_raw")
-    def _compute_logits_raw(self) -> torch.Tensor:
-        """Run model and return raw logits tensor."""
         return self.model(**self.cache_seq_interface.named_args)[0]
 
     @property
@@ -343,23 +335,25 @@ class ADEngine(ModelEngine):
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
         self.iter_counter += 1
-        # Check if gather before LM head was already done in the model graph
-        if self._gather_before_lm_head_in_graph:
-            # Model outputs [max_batch, vocab] - slice to actual num_seqs
-            logits = self._compute_logits_raw()
-            num_seqs = len(self.cache_seq_interface.info.seq_len)
-            # Slice to actual batch size [num_seqs, vocab]
-            logits_flat = logits[:num_seqs].view(num_seqs, -1)
-            return {"logits": logits_flat}
 
-        # Original path: compute all logits and gather+cat
         logits = self._compute_logits()
-
-        # gather+cat logits
-        logits_flat = torch.cat(
-            [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
-            dim=0,
-        )
+        if self.cache_seq_interface.info.is_generate:
+            logits_flat = logits.squeeze(1)
+        else:
+            logits = logits.squeeze(0)
+            if self._gather_before_lm_head_in_graph:
+                num_seqs = len(self.cache_seq_interface.info.seq_len)
+                logits_flat = logits[:num_seqs]
+            else:
+                logits = list(torch.split(logits, self.cache_seq_interface.info.seq_len))
+                # gather+cat logits
+                logits_flat = torch.cat(
+                    [
+                        ls_one_seq[-last_only:]
+                        for ls_one_seq, last_only in zip(logits, last_logit_only)
+                    ],
+                    dim=0,
+                )
 
         return {"logits": logits_flat}
 
