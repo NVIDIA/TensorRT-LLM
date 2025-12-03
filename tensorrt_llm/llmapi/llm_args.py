@@ -282,6 +282,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                                       description="The topk for the indexer.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
+    # TODO: enable this by default once the memory usage in attention metadata is optimized
+    skip_indexer_for_short_seqs: bool = Field(
+        default=False,
+        description=
+        "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -296,7 +301,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
-        return True
+        return self.skip_indexer_for_short_seqs
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):

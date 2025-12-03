@@ -149,7 +149,7 @@ class CUDAGraphRunner:
         batch_size = batch.batch_size
         if self.sparse_config is not None and self.sparse_config.needs_separate_short_long_cuda_graphs(
         ):
-            # Some sparse attention algorithms need to use different forward pathes for short and long sequences.
+            # Some sparse attention algorithms need to use different forward paths for short and long sequences.
             # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
             # computational overhead. To support this feature, we need to capture separate CUDA graphs for short
             # and long sequences. We need to first collect the sequence length of the requests and then determine

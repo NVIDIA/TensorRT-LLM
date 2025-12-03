@@ -459,18 +459,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         # Topk indices buffer to support skip indexer for requests with short sequence lengths
-        self.topk_indices_buffer = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens, self.sparse_mla_topk),
-            cache_name="topk_indices_buffer",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.host_topk_indices_buffer = torch.zeros_like(
-            self.topk_indices_buffer,
-            device='cpu',
-            pin_memory=True,
-        )
+        if self.sparse_attention_config.skip_indexer_for_short_seqs:
+            self.topk_indices_buffer = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens, self.sparse_mla_topk),
+                cache_name="topk_indices_buffer",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.host_topk_indices_buffer = torch.zeros_like(
+                self.topk_indices_buffer,
+                device='cpu',
+                pin_memory=True,
+            )
         # Create expanded buffers for MTP>1 support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -551,7 +552,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         kv_lens = cached_token_lens + self.seq_lens_kv
 
         # Prepare to support skip indexer
-        if self.num_contexts > 0:
+        if self.num_contexts > 0 and self.sparse_attention_config.skip_indexer_for_short_seqs:
             self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
             ).item() <= self.sparse_mla_topk
             if self.skip_indexer_for_ctx_reqs:
@@ -575,7 +576,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.skip_indexer_for_ctx_reqs = False
 
-        if self.num_generations > 0:
+        if self.num_generations > 0 and self.sparse_attention_config.skip_indexer_for_short_seqs:
             self.skip_indexer_for_gen_reqs = kv_lens[self.num_contexts:self.
                                                      num_seqs].max().item(
                                                      ) <= self.sparse_mla_topk
