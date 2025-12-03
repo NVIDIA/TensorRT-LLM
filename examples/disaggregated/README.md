@@ -212,7 +212,7 @@ In disaggregated serving, the context workers and generation workers have differ
 ### Prerequisites
 
 To enable mixed precision serving, you will need:
-1. A quantized checkpoint created with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+1. A quantized checkpoint created with [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
 2. The original unquantized checkpoint (Can also be quantized)
 3. Both checkpoints must use the same KV cache dtype to ensure compatibility during transfer
 

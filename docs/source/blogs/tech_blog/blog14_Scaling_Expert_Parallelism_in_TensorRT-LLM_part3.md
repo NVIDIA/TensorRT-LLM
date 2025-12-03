@@ -46,7 +46,7 @@ In this third blog of our scaling Expert Parallelism (EP) series, we push the pe
 
 The wo GEMM is the final linear layer within the multi-head attention block that produces the final outputs. While DeepSeek R1's MLA modifies the initial projections for keys and values, the wo GEMM operator remains a critical and standard component for finalizing the attention computation. In the term, "wo" is the abbreviation for the weight matrix for the output.
 
-We've evaluated that quantizing the wo GEMM to FP4 still satisfies the accuracy requirements, maintaining a similar MTP accept rate (AR) while improving end-to-end performance. The [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) team has published checkpoints that additionally quantize the wo module in attention layers to FP4 on HuggingFace:
+We've evaluated that quantizing the wo GEMM to FP4 still satisfies the accuracy requirements, maintaining a similar MTP accept rate (AR) while improving end-to-end performance. The [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) team has published checkpoints that additionally quantize the wo module in attention layers to FP4 on HuggingFace:
 * https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2
 * https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2
 
