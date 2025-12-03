@@ -75,7 +75,7 @@ class CUDAGraphRunnerConfig:
     mapping: Optional[Mapping]
     dist: Optional[MPIDist]
     kv_cache_manager_key: Any
-    sparse_attention_config: Optional[BaseSparseAttentionConfig]
+    sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
 
 class CUDAGraphRunner:
