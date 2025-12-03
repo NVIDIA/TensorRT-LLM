@@ -8,9 +8,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Set, Tuple, Type, TypeAlias, TypeVar, Union, get_args,
-                    get_origin)
+from typing import (Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple,
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -2764,6 +2763,17 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype")
 
     per_worker_gpu_share: Optional[float] = Field(
+        default=None,
+        description="GPU fraction per worker for colocation scenarios. "
+        "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU).",
+        status="prototype")
+
+    placement_where: Optional[List[Tuple[Any, List[int]]]] = Field(
+        default=None,
+        description="List of (PlacementGroup, List[int]) tuples for each node.",
+        status="prototype")
+
+    placement_share: Optional[float] = Field(
         default=None,
         description="GPU fraction per worker for colocation scenarios. "
         "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU).",
