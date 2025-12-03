@@ -685,14 +685,15 @@ struct KernelParams
         // The number of elements in 128B for Q.
         int32_t numEltsIn128BKv = (128 * 8) / get_size_in_bits(kernelMeta.mDataTypeKv);
         // The number of head elts (per token) in each block of shared memory (see above explanation).
-        int32_t numEltsInClampedHeadDimKv = std::min(numEltsIn128BKv, maxHeadDimKv);
+        // HeadDim will be split into multiple headDimStages (128) if maxHeadDimKv > 128.
+        int32_t numEltsInClampedHeadDimKv = std::min({numEltsIn128BKv, maxHeadDimKv, 128});
 
         // Do we have to transform K/V before MMA?
         bool const transformsKv{kernelMeta.mDataTypeKv != kernelMeta.mDataTypeQ};
         // Whether store transformed K/V in TMEM.
         bool const isSwapsMmaAb = isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType));
         bool const storeTransformedKvInTmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1
-            && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 && maxHeadDimKv == 128 && isSwapsMmaAb};
+            && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 && maxHeadDimKv >= 128 && isSwapsMmaAb};
 
         // Shape/stride for gmem tensor Kv.
         auto [shapeK, strideK]
@@ -700,7 +701,7 @@ struct KernelParams
         auto [shapeV, strideV]
             = makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv, /*isK*/ false, storeTransformedKvInTmem);
         // Whether swizzle is needed for K/V.
-        bool const swizzleKv{storeTransformedKvInTmem ? true : !transformsKv};
+        bool const swizzleKv{storeTransformedKvInTmem || !transformsKv};
         // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
         auto const numEltsDivisor = kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;
         // The tileShapes for K/V.

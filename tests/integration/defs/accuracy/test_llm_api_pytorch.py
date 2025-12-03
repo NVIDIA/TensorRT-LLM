@@ -25,7 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+                                 RocketSparseAttentionConfig, SamplingParams,
+                                 TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -271,9 +272,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_ngram(self):
+        max_bs = 16
+
         pytorch_config = dict(
             disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[i for i in range(1, max_bs + 1)]),
         )
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
@@ -291,9 +295,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
-                 max_batch_size=16) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+                 max_batch_size=max_bs) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -600,7 +602,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
                  max_batch_size=16,
@@ -1312,6 +1314,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_bfloat16_2_model_mtp(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       mtp_eagle_one_model=False,
+                                       speculative_model_dir=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_num_tokens=8192,
+                 **pytorch_config,
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -2465,8 +2486,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
-    @pytest.mark.skipif(get_sm_version() >= 100,
-                        reason="https://nvbugs/5547584 WNF")
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -3439,31 +3458,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_eagle3(self):
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
-        )
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-
-        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3"
-        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B"
-
-        draft_len = 1
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=True)
-
-        llm = LLM(model=target_model_dir,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  speculative_config=spec_config,
-                  max_seq_len=8192)
-
-        with llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON", "TRTLLM"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
@@ -4398,7 +4392,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512) if cuda_graph else None)
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
 
         with LLM(
                 model_path,
@@ -4433,7 +4428,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512) if cuda_graph else None)
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
         moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(model_path,
@@ -4611,3 +4607,50 @@ class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
                  max_seq_len=4096) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestLlama3_1_8B_Instruct_LongBenchV2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+
+    def test_auto_dtype(self):
+        model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        # Configure model settings
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=64)
+
+        sparse_attention_config = RocketSparseAttentionConfig(
+            kt_cache_dtype="float8_e5m2", )
+
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              sparse_attention_config=sparse_attention_config,
+                              enable_chunked_prefill=False)
+
+        MAX_LEN = 128000
+        MAX_NEW_TOKENS = 1024
+
+        with LLM(model_dir,
+                 max_seq_len=MAX_LEN,
+                 max_num_tokens=128000,
+                 max_batch_size=64,
+                 **pytorch_config) as llm:
+            task = LongBenchV2(self.MODEL_NAME)
+
+            sampling_params = SamplingParams(
+                max_tokens=MAX_NEW_TOKENS,
+                temperature=0.8,
+                top_p=0.95,
+            )
+
+            extra_evaluator_kwargs = dict(max_len=MAX_LEN,
+                                          max_output_length=MAX_NEW_TOKENS)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)

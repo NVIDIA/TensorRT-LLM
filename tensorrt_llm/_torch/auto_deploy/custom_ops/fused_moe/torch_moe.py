@@ -45,7 +45,9 @@ def _template_moe(
         valid_mask, selected_experts, torch.full_like(selected_experts, num_experts)
     )
     # Create one-hot encoding with an extra class.
-    one_hot = F.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
+    # NOTE: `F.one_hot` only accepts `LongTensor` as an input, and will throw an error if the tensor is of another
+    # dtype, even if `torch.int32`.
+    one_hot = F.one_hot(selected_experts_fixed.long(), num_classes=num_experts + 1)
     expert_mask = one_hot[..., :num_experts].permute(2, 1, 0)
 
     for expert_idx in range(num_experts):
