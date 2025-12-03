@@ -741,7 +741,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         self.draft_config._frozen = False
                         self.draft_config.moe_backend = "DEEPGEMM"
                         self.draft_config._frozen = True
-                    elif get_sm_version() != 90:
+                    elif get_sm_version() == 90:
                         logger.warning(
                             "Switching moe_backend of draft model to CUTLASS for FP8_BLOCK_SCALES quantization on SM!=100"
                         )
