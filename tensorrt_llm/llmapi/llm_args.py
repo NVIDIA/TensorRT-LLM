@@ -1959,11 +1959,19 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype",
     )
 
-    env_overrides: Optional[Dict[str, Any]] = Field(
+    env_overrides: Optional[Dict[str, str]] = Field(
         default=None,
         description=
         "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
         status="prototype")
+
+    @field_validator('env_overrides', mode='before')
+    @classmethod
+    def coerce_env_overrides_to_str(cls, v):
+        """Coerce env_overrides values to strings for os.environ compatibility."""
+        if v is None:
+            return v
+        return {str(k): str(val) for k, val in v.items()}
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
