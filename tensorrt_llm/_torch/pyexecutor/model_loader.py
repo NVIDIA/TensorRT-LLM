@@ -215,7 +215,8 @@ class ModelLoader:
 
     def _load_model_with_moe_load_balancer(self, config: ModelConfig):
         try:
-            with maybe_create_moe_load_balancer(config, self.mapping) as moe_load_balancer:
+            with maybe_create_moe_load_balancer(
+                    config, self.mapping) as moe_load_balancer:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
                 with MetaInitMode():
@@ -234,14 +235,14 @@ class ModelLoader:
                 config = config_copy
                 return model, moe_load_balancer
 
-        except Exception as e:
+        except Exception:
             logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
-                )
-            with maybe_create_moe_load_balancer(config, self.mapping) as moe_load_balancer:
+                f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
+            )
+            with maybe_create_moe_load_balancer(
+                    config, self.mapping) as moe_load_balancer:
                 model = AutoModelForCausalLM.from_config(config)
                 return model, moe_load_balancer
-
 
     def load(
         self,
@@ -263,7 +264,8 @@ class ModelLoader:
         load_format = self.llm_args.load_format
 
         with timing("Model init total"):
-            model, moe_load_balancer = self._load_model_with_moe_load_balancer(config)
+            model, moe_load_balancer = self._load_model_with_moe_load_balancer(
+                config)
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
@@ -285,7 +287,8 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     # FIXME should have a better way to handle the multimodal models
-                    from tensorrt_llm._torch.models.modeling_mistral import Mistral3VLM
+                    from tensorrt_llm._torch.models.modeling_mistral import \
+                        Mistral3VLM
                     if isinstance(model, Mistral3VLM):
                         model_ = model.llm
                     else:
@@ -310,7 +313,8 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     # FIXME should have a better way to handle the multimodal models
-                    from tensorrt_llm._torch.models.modeling_mistral import Mistral3VLM
+                    from tensorrt_llm._torch.models.modeling_mistral import \
+                        Mistral3VLM
                     if isinstance(model, Mistral3VLM):
                         model_ = model.llm
                     else:

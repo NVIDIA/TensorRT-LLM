@@ -253,8 +253,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         if isinstance(self._tokenizer, MistralTokenizer):
             # spatial_merge_size = getattr(config, "spatial_merge_size", None) or getattr(
             #     config.vision_config, "spatial_merge_size")
-            self._processor = PixtralProcessorAdapter(
-                tokenizer=self._tokenizer)
+            self._processor = PixtralProcessorAdapter(tokenizer=self._tokenizer)
         else:
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
