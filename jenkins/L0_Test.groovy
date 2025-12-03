@@ -1356,7 +1356,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             """
 
             // Write env variables to a file
-            sh "env | sort | sed 's/^/export /' > debug_env.sh"
+            sh 'env | sort | sed -E \'s/^([^=]+)=(.*)$/export \\1="\\2"/\' > debug_env.sh'
             sh "cat debug_env.sh"
 
             // The portConfig file is in the VM
