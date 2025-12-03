@@ -51,7 +51,7 @@ group.add_argument(
     "--use-low-precision-moe-combine", action="store_true", dest="use_low_precision_moe_combine"
 )
 group.add_argument(
-    "--no-use-use-low-precision-moe-combine",
+    "--no-use-low-precision-moe-combine",
     action="store_false",
     dest="use_low_precision_moe_combine",
 )

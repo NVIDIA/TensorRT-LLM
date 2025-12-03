@@ -135,6 +135,9 @@ python3 parse.py --world-size 4
 
 # Specify the location of the .nsys-rep file
 python3 parse.py --profile-dir ./profiles --world-size 4 --rank 0
+
+# Parse a specific module. The module must appear exactly once in each run.
+python3 parse.py --world-size 4 --module MoE
 ```
 
 You will receive three reports, each containing kernel timing statistics grouped by module:
