@@ -34,7 +34,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.chat_utils import (load_chat_template,
+                                           parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -81,13 +82,15 @@ class OpenAIServer:
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
                  disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-                 multimodal_server_config: Optional[MultimodalServerConfig] = None):
+                 multimodal_server_config: Optional[MultimodalServerConfig] = None,
+                 chat_template: Optional[str] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        self.chat_template = load_chat_template(chat_template)
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -510,7 +513,7 @@ class OpenAIServer:
                     mm_placeholder_counts=mm_placeholder_counts,
                     tools=tool_dicts,
                     documents=request.documents,
-                    chat_template=request.chat_template,
+                    chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
             prompt = prompt_inputs(prompt)
@@ -908,22 +911,16 @@ class OpenAIServer:
                 request=request,
                 sampling_params=sampling_params,
                 generator=generator,
-                harmony_adapter=self.harmony_adapter,
                 model_name=self.model,
                 conversation_store=self.conversation_store,
+                use_harmony=self.use_harmony,
+                reasoning_parser=self.llm.args.reasoning_parser,
+                tool_parser=self.tool_parser,
                 enable_store=self.enable_store
             ):
                 yield event_data
 
         try:
-            if not self.use_harmony:
-                raise NotImplementedError("Responses API only supports harmony format for now")
-
-            # Initialize HarmonyAdapter
-            # NOTE: WAR for Disagg failure, may affect perf if no warmup
-            if not self.harmony_adapter:
-                self.harmony_adapter = HarmonyAdapter()
-
             if request.background:
                 logger.warning("Request.background is not supported yet, will fallback to foreground processing.")
 
@@ -941,7 +938,15 @@ class OpenAIServer:
                         return self._create_response_id_not_found_error(prev_response_id)
 
             input_tokens, sampling_params = await responses_api_request_preprocess(
-                request, prev_response, self.harmony_adapter, self.conversation_store, self.enable_store)
+                request=request,
+                prev_response=prev_response,
+                conversation_store=self.conversation_store,
+                enable_store=self.enable_store,
+                use_harmony=self.use_harmony,
+                tokenizer=self.tokenizer if not self.use_harmony else None,
+                model_config=self.model_config if not self.use_harmony else None,
+                processor=self.processor if not self.use_harmony else None,
+            )
 
             promise = self.llm.generate_async(
                 inputs=input_tokens,
@@ -964,7 +969,10 @@ class OpenAIServer:
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store)
+                    enable_store=self.enable_store,
+                    use_harmony=self.use_harmony,
+                    reasoning_parser=self.llm.args.reasoning_parser,
+                    tool_parser=self.tool_parser)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

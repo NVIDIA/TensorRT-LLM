@@ -75,6 +75,7 @@ for concurrency in ${concurrency_list}; do
         --dataset-name random \
         --num-prompts "${num_prompts}" \
         --max-concurrency "${concurrency}" \
+        --trust-remote-code \
         --ignore-eos \
         --random-input-len "${input_seq_len}" \
         --random-output-len "${output_seq_len}" \

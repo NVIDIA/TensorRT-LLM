@@ -6,13 +6,17 @@ import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from ..transform.library.sharding import ShardingTransformConfig
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
+from ....functional import AllReduceStrategy
 from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import (
@@ -27,6 +31,79 @@ from .quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
+
+
+def validate_allreduce_strategy(v):
+    """Convert string names like 'AUTO' to AllReduceStrategy enum.
+
+    This is a shared validator for allreduce_strategy fields across all config classes.
+
+    Args:
+        v: Value to validate - can be AllReduceStrategy enum, string name, or integer value
+
+    Returns:
+        AllReduceStrategy enum value
+
+    Raises:
+        ValueError: If the input is an invalid strategy string
+    """
+    if isinstance(v, AllReduceStrategy):
+        return v
+    if isinstance(v, str):
+        # Try to get enum by name
+        try:
+            return AllReduceStrategy[v]
+        except KeyError:
+            raise ValueError(
+                f"Invalid allreduce strategy: {v}. "
+                f"Valid options: {', '.join(s.name for s in AllReduceStrategy)}"
+            )
+    if isinstance(v, int):
+        return AllReduceStrategy(v)
+    return v  # Let Pydantic handle other types
+
+
+def _get_dist_ops(backend: str):
+    """Get the appropriate distributed ops based on backend availability.
+
+    Args:
+        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
+                 'auto' will automatically select based on availability.
+
+    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    """
+    from ..custom_ops.trtllm_dist import is_trtllm_op_available
+
+    # Handle DistBackend enum or string
+    if hasattr(backend, "value"):
+        backend = backend.value
+
+    if backend == "trtllm":
+        # Force TRT-LLM ops
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    elif backend == "torch":
+        # Force PyTorch distributed ops
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+        )
+    else:  # auto
+        # Automatically select based on availability
+        if is_trtllm_op_available():
+            # Use TRT-LLM optimized ops in MPI mode
+            return (
+                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+            )
+        else:
+            # Use PyTorch distributed ops in demollm mode
+            return (
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                torch.ops.auto_deploy.torch_dist_all_reduce.default,
+            )
 
 
 def _load_hook(
@@ -86,21 +163,22 @@ def _validate_sharded_shapes(
         include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
         boundary_condition=is_any_lin_op,
     )
-    for view_node in nodes_to_validate:
-        if len(view_node.args) < 2:
+    for shape_node in nodes_to_validate:
+        # Parameter update must be idempotent
+        if "sharded" in shape_node.meta and shape_node.meta["sharded"]:
             continue
-        if "sharded" in view_node.meta and view_node.meta["sharded"]:
+        if len(shape_node.args) < 2:
             continue
-        view_shape = list(view_node.args[1])
+        view_shape = list(shape_node.args[1])
         if not isinstance(view_shape, list):
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
-            args = list(view_node.args)
+            args = list(shape_node.args)
             view_shape[2] = -1  # view_shape[2] // world_size
             args[1] = tuple(view_shape)
-            view_node.args = tuple(args)
-            view_node.meta["sharded"] = True
-            ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
+            shape_node.args = tuple(args)
+            shape_node.meta["sharded"] = True
+            ad_logger.debug(f"\nUpdated view node {shape_node} arguments to {shape_node.args}")
 
     # if fused_weight_dims is provided, we need to update all split sizes
     if fused_weight_dims is not None:
@@ -110,14 +188,18 @@ def _validate_sharded_shapes(
         split_nodes = subgraph(
             [node],
             [next_lin_node],
-            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+            include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
         )
         for split_node in split_nodes:
+            # Parameter update must be idempotent
+            if "sharded" in split_node.meta and split_node.meta["sharded"]:
+                continue
             orig_sizes = split_node.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
             args = list(split_node.args)
             args[1] = new_sizes
             split_node.args = tuple(args)
+            split_node.meta["sharded"] = True
             ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
 
 
@@ -179,10 +261,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -230,6 +308,8 @@ def _insert_sharded_mamba(
     dim: int,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
     add_dist: bool = False,
     min_local_shape: int = 1,
     weights_to_shard: Optional[list[str]] = None,
@@ -241,6 +321,8 @@ def _insert_sharded_mamba(
 ) -> bool:
     """
     To shard Mamba layer, first column-shard the first linear layer: entry_node,
+
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
     then shard all remaining weight tensors found in the subgraph defined between
     entry_node and the next successor linear node.
     First, validate if this is indeed a mamba module: within the subgraph,
@@ -259,6 +341,10 @@ def _insert_sharded_mamba(
         fused_weight_dims: Optional dict mapping weight keys to their fused dimension lists
         quantization_cb: Optional quantization callback
     """
+    if allreduce_strategy is None:
+        raise ValueError(
+            f"allreduce_strategy must be set for Mamba sharding on node {entry_node.name}"
+        )
     # Find next linear node to define subgraph boundary
     try:
         next_lin_node, depth = bfs(entry_node, is_any_lin_op, include_root=False)
@@ -322,7 +408,9 @@ def _insert_sharded_mamba(
     conv_args[-1] = conv1d_node.args[-1] // world_size
     conv1d_node.args = tuple(conv_args)
 
-    # First, shard the entry_node (the first linear layer)
+    ##############################################################
+    ####### shard the entry_node (the first linear layer) ########
+    ##############################################################
     # Extract entry node's fused_weight_dims by matching weight name against patterns
     entry_fused_dims = None
     if fused_weight_dims:
@@ -338,12 +426,17 @@ def _insert_sharded_mamba(
         dim=SplitDimension.COLUMN,
         rank=rank,
         world_size=world_size,
+        dist_backend=dist_backend,
         add_dist=False,
         min_local_shape=min_local_shape,
         fused_weight_dims=entry_fused_dims,
         quantization_cb=quantization_cb,
+        allreduce_strategy=allreduce_strategy,
     )
 
+    ##############################################################
+    ######## Shard remaining weights: conv1d and RMSNorm #########
+    ##############################################################
     # Get all weight nodes in the subgraph except for out_proj
     weight_nodes = [
         n
@@ -351,7 +444,6 @@ def _insert_sharded_mamba(
         if "out_proj" not in str(n)
     ]
 
-    # Shard remaining weights, such as conv1d or RMSNorm
     for weight_node in weight_nodes:
         weight_key = weight_node.target
 
@@ -394,6 +486,45 @@ def _insert_sharded_mamba(
             f"{weight_param.shape} -> {sharded_shape}"
         )
 
+    ##############################################################
+    ############## update split node parameters ##################
+    ##############################################################
+    next_lin_node, _ = bfs(entry_node, is_any_lin_op, include_root=False)
+
+    split_nodes = subgraph(
+        [entry_node],
+        [next_lin_node],
+        include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
+    )
+    for split_node in split_nodes:
+        orig_sizes = split_node.args[1]
+        new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
+        args = list(split_node.args)
+        args[1] = new_sizes
+        split_node.args = tuple(args)
+        ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
+
+    nodes_to_validate = subgraph(
+        [entry_node],
+        include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
+        boundary_condition=is_any_lin_op,
+    )
+    for reshape_node in nodes_to_validate:
+        if len(reshape_node.args) < 2:
+            continue
+        if "sharded" in reshape_node.meta and reshape_node.meta["sharded"]:
+            continue
+        view_shape = list(reshape_node.args[1])
+        if not isinstance(view_shape, list):
+            continue
+        if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
+            args = list(reshape_node.args)
+            view_shape[2] = -1  # view_shape[2] // world_size
+            args[1] = tuple(view_shape)
+            reshape_node.args = tuple(args)
+            reshape_node.meta["sharded"] = True
+            ad_logger.debug(f"\nUpdated view node {reshape_node} arguments to {reshape_node.args}")
+
 
 def _shard_parameter_node(
     gm: GraphModule,
@@ -401,6 +532,8 @@ def _shard_parameter_node(
     dim: int,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
     add_dist: bool = False,
     min_local_shape: int = 1,
     fused_weight_dims: Optional[list] = None,
@@ -410,8 +543,14 @@ def _shard_parameter_node(
 ) -> None:
     """Replace the node with parametrized weight tensor with a new node that accepts sharded weights.
 
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
+
     The state_dict is also updated to contain the sharded weights.
     """
+    if allreduce_strategy is None:
+        raise ValueError(
+            f"allreduce_strategy must be set for parameter sharding on node {node.name}"
+        )
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
 
@@ -479,22 +618,19 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_any_lin_op(node):
-            _validate_sharded_shapes(
-                node, fused_weight_dims=fused_weight_dims, world_size=world_size
-            )
         return
 
-    # figure out the right dist op
+    # figure out the right dist op (backend-aware)
+    all_gather_op, all_reduce_op = _get_dist_ops(dist_backend)
     dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
+        0: (all_gather_op, -1),
+        1: (all_reduce_op, allreduce_strategy.name),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
     # add reduction node
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(fn_dist, args=(node, *dist_args))
+        dist_node = gm.graph.call_function(fn_dist, args=(node,) + tuple(dist_args))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -565,7 +701,11 @@ class LayerType(Enum):
 
 
 class WeightShardingInfo(ShardingTransformInfo):
-    """Configuration for TP sharding transformations."""
+    """Configuration for TP sharding transformations.
+
+    NOTE: allreduce_strategy will be automatically injected by ShardingConfig.add()
+    if not provided at creation time. The strategy comes from the parent ShardingConfig.
+    """
 
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
@@ -573,6 +713,8 @@ class WeightShardingInfo(ShardingTransformInfo):
     layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
     fused_weight_dims: Optional[list] = None
+    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
+    dist_backend: Optional[str] = None  # Set by ShardingConfig.add() if None
 
     def quantization_cb(
         self,
@@ -615,40 +757,24 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
-            _insert_sharded_mamba(
-                gm=gm,
-                entry_node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims
-                if isinstance(self.fused_weight_dims, dict)
-                else None,
-                quantization_cb=self.quantization_cb,
-            )
-        else:
-            _shard_parameter_node(
-                gm=gm,
-                node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-                quantization_cb=self.quantization_cb,
-            )
+        _shard_parameter_node(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            dist_backend=self.dist_backend,
+            min_local_shape=self.min_local_shape,
+            fused_weight_dims=self.fused_weight_dims,
+            quantization_cb=self.quantization_cb,
+            allreduce_strategy=self.allreduce_strategy,
+        )
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
     """Configuration for node args sharding transformations."""
 
-    target_node: str
-    rank: int
-    world_size: int
     args: tuple
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
@@ -838,6 +964,7 @@ class BMMShardingInfo(ShardingTransformInfo):
     world_size: int
     start_idx: int
     end_idx: int
+    dist_backend: Optional[str] = None  # Set by ShardingConfig.add() if None
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -859,7 +986,8 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Check if the distribution is balanced
         remainder = bmm_batch_size % self.world_size
 
-        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather/trtllm_dist_all_gather
+        #  doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {self.world_size}. "
@@ -924,9 +1052,10 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
         # Add all_gather node after BMM to collect results
+        all_gather_op, _ = _get_dist_ops(self.dist_backend)
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                all_gather_op,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
@@ -938,12 +1067,18 @@ def _insert_sharded_moe(
     node: Node,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
     scale_names: Sequence[str] = (),
 ):
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
+
+    NOTE: allreduce_strategy is MANDATORY.
     """
+    if allreduce_strategy is None:
+        raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
     num_experts = len(node.args[3])
@@ -1012,10 +1147,9 @@ def _insert_sharded_moe(
     node.args = tuple(args)
 
     # -- add an all_reduce node --
+    _, all_reduce_op = _get_dist_ops(dist_backend)
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
-        )
+        dist_node = gm.graph.call_function(all_reduce_op, args=(node, allreduce_strategy.name))
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
 
@@ -1043,12 +1177,15 @@ def _insert_sharded_mxfp4_mlp_ep(
     node: Node,
     rank: int,
     world_size: int,
+    allreduce_strategy: AllReduceStrategy,
+    dist_backend: str,
 ):
-    """
-    Transform a call to auto_deploy::triton_mxfp4_moe into:
-      - sharded expert parameters along dim 0 (this rank's slice),
+    """Transform a call to auto_deploy::triton_mxfp4_moe into:
+      - sharded expert parameters along dim 0 (this rank slice),
       - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
-      - followed by torch_dist_all_reduce.
+      - followed by torch_dist_all_reduce/trtllm_dist_all_reduce.
+
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
 
     Expects the original op signature:
       (hidden_states,
@@ -1057,6 +1194,10 @@ def _insert_sharded_mxfp4_mlp_ep(
        alpha, limit,
        down_blocks, down_bias, down_scales)
     """
+    if allreduce_strategy is None:
+        raise ValueError(
+            f"allreduce_strategy must be set for MXFP4 MLP EP sharding on node {node.name}"
+        )
 
     IDX_GATE_UP_BLOCKS = 4
     IDX_GATE_UP_BIAS = 5
@@ -1084,18 +1225,24 @@ def _insert_sharded_mxfp4_mlp_ep(
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
+    _, all_reduce_op = _get_dist_ops(dist_backend)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
+        red = gm.graph.call_function(all_reduce_op, args=(node, allreduce_strategy.name))
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)
 
 
 class EPShardingInfo(ShardingTransformInfo):
-    """Configuration for EP sharding transformations."""
+    """Configuration for EP sharding transformations.
 
-    rank: int
-    world_size: int
+    NOTE: allreduce_strategy and dist_backend will be automatically injected by
+    ShardingConfig.add() if not provided at creation time. The values come from
+    the parent ShardingConfig.
+    """
+
+    allreduce_strategy: Optional[AllReduceStrategy] = None  # Set by ShardingConfig.add() if None
+    dist_backend: Optional[str] = None  # Set by ShardingConfig.add() if None
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
@@ -1114,7 +1261,9 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, [])
+        _insert_sharded_moe(
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend, []
+        )
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1128,7 +1277,9 @@ class MXFP4EPShardingInfo(EPShardingInfo):
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size)
+        _insert_sharded_mxfp4_mlp_ep(
+            gm, node, self.rank, self.world_size, self.allreduce_strategy, self.dist_backend
+        )
 
 
 class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -1144,7 +1295,15 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        _insert_sharded_moe(
+            gm,
+            node,
+            self.rank,
+            self.world_size,
+            self.allreduce_strategy,
+            self.dist_backend,
+            self.scale_names(),
+        )
 
 
 class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -1160,7 +1319,15 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale", "alpha"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+        _insert_sharded_moe(
+            gm,
+            node,
+            self.rank,
+            self.world_size,
+            self.allreduce_strategy,
+            self.dist_backend,
+            self.scale_names(),
+        )
 
 
 EP_SHARDING_RULES = [
@@ -1187,36 +1354,57 @@ class ShardingSource(Enum):
 
     HEURISTIC = "heuristic"
     FACTORY = "factory"
+    MANUAL = "manual"
 
 
 class ShardingDim(Enum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
     TP = "tp"
     EP = "ep"
     BMM = "bmm"
 
 
-class ShardingConfig(BaseModel):
+class DistBackend(Enum):
+    """Enum for distributed backend."""
+
+    AUTO = "auto"
+    TRTLLM = "trtllm"
+    TORCH = "torch"
+
+
+class ShardingTransformContainer(BaseModel):
     """Configuration for sharding the model."""
 
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    predefined_config: Optional[Dict[str, Any]] = None
+    factory_config: Dict[str, Any] = Field(default_factory=dict)
+    manual_config: Dict[str, Any] = Field(default_factory=dict)
     simple_shard_only: bool = Field(default=False)
-    support_partial_config: bool = False
+    support_partial_config: bool = Field(default=True)
     sharding_source: List[ShardingSource] = Field(
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    allreduce_strategy: AllReduceStrategy = Field(
+        default=AllReduceStrategy.AUTO,
+        description="AllReduce strategy for distributed operations. "
+        "Options: AUTO, NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC, SYMM_MEM",
+    )
+    dist_backend: DistBackend = Field(default=DistBackend.AUTO)
     weight_sharding_transforms: List[WeightShardingInfo] = Field(default_factory=list)
     parameter_update_transforms: List[ParameterUpdateInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+
+    @field_validator("allreduce_strategy", mode="before")
+    @classmethod
+    def _validate_allreduce_strategy(cls, v):
+        """Convert string names like 'AUTO' to AllReduceStrategy enum."""
+        return validate_allreduce_strategy(v)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1227,20 +1415,58 @@ class ShardingConfig(BaseModel):
             ParameterUpdateInfo: self.parameter_update_transforms,
         }
 
-    @model_validator(mode="after")
-    def _validate_and_normalize(self):
-        # Normalize empty dict to None for "no config"
-        if isinstance(self.predefined_config, dict) and not self.predefined_config:
-            self.predefined_config = None
-        # Validate only if provided
-        if self.predefined_config is not None:
-            self.validate_config()
-        return self
+    def init_params(
+        self, other: "ShardingTransformConfig", rank: int = None, world_size: int = None
+    ) -> None:
+        """
+        Copy parameters from ShardingTransformConfig. The class is not
+        imported here to avoid circular imports.
+        """
+        if rank is not None:
+            self.rank = rank
+        if world_size is not None:
+            self.world_size = world_size
+        self.factory_config = other.factory_config
+        self.manual_config = other.manual_config
+        self.simple_shard_only = other.simple_shard_only
+        self.support_partial_config = other.support_partial_config
+        self.sharding_dims = other.sharding_dims
+        self.sharding_source = other.sharding_source
+        # Extract factory_source from factory_config if present
+        self.factory_source = self.factory_config.get("source", ShardingConfigSource.UNKNOWN)
+        self.allreduce_strategy = other.allreduce_strategy
+        self.dist_backend = other.dist_backend
+        self.validate_config(ShardingSource.MANUAL)
+        self.validate_config(ShardingSource.FACTORY)
 
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
+
+        Automatically propagates allreduce_strategy and dist_backend from this config
+        to the transform if the transform doesn't already have them set.
         """
+        # Inject allreduce_strategy and dist_backend from config into transform
+        # if they have the attributes and they're None
+        # This creates a new transform instance with the values set
+        needs_injection = False
+        transform_dict = None
+
+        if hasattr(transform, "allreduce_strategy") and transform.allreduce_strategy is None:
+            if transform_dict is None:
+                transform_dict = transform.model_dump()
+            transform_dict["allreduce_strategy"] = self.allreduce_strategy
+            needs_injection = True
+
+        if hasattr(transform, "dist_backend") and transform.dist_backend is None:
+            if transform_dict is None:
+                transform_dict = transform.model_dump()
+            transform_dict["dist_backend"] = self.dist_backend
+            needs_injection = True
+
+        if needs_injection:
+            transform = type(transform)(**transform_dict)
+
         # Find the appropriate list by checking inheritance
         transform_list = None
         for base_class, transform_list_candidate in self._transform_list_dict.items():
@@ -1258,38 +1484,38 @@ class ShardingConfig(BaseModel):
         transform_list.append(transform)
         return True
 
-    def validate_config(self) -> bool:
-        if self.factory_source != ShardingConfigSource.HUGGINGFACE:
-            ad_logger.warning(
+    def validate_config(self, source: ShardingSource) -> bool:
+        if (
+            source == ShardingSource.FACTORY
+            and self.factory_source != ShardingConfigSource.HUGGINGFACE
+        ):
+            ad_logger.debug(
                 "Sharding config is currently only supported for HuggingFace. Skipping."
             )
             # invalidate the config
-            self.predefined_config = {}
+            self.factory_config.clear()
             return False
 
-        if not isinstance(self.predefined_config, dict):
-            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
+        config = self.manual_config if source == ShardingSource.MANUAL else self.factory_config
+
+        if "head_dim" not in config:
+            ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
             # invalidate the config
-            self.predefined_config = {}
+            config.clear()
             return False
 
-        if "head_dim" not in self.predefined_config:
-            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+        if "tp_plan" not in config or config["tp_plan"] is None:
+            ad_logger.debug("Sharding config does not contain tp_plan. Skipping.")
             # invalidate the config
-            self.predefined_config = {}
+            config.clear()
             return False
-
-        if "tp_plan" not in self.predefined_config or self.predefined_config["tp_plan"] is None:
-            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
-            # invalidate the config
-            self.predefined_config = {}
-            return False
-        tp_plan = self.predefined_config["tp_plan"]
+        tp_plan = config["tp_plan"]
 
         values = set(tp_plan.values())
         supported_modes = {
             "colwise",  # row split and no collective
             "rowwise",  # column split and all-reduce
+            "mamba",  # mamba SSM layer
             "gather",  # simple shard (row + all_gather)
             # TODO: remaining values are not supported yet.
             # They require hybrid EP+TP and/or SP support.
@@ -1300,11 +1526,14 @@ class ShardingConfig(BaseModel):
             # "local",
         }
         if not self.support_partial_config and not values.issubset(supported_modes):
-            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            ad_logger.debug("Sharding config contains invalid values. Skipping.")
             # invalidate the config
-            self.predefined_config = {}
+            config.clear()
             return False
         return True
 
-    def get_predefined_config(self) -> Dict[str, Any]:
-        return self.predefined_config
+    def get_factory_config(self) -> Dict[str, Any]:
+        return self.factory_config
+
+    def get_manual_config(self) -> Dict[str, Any]:
+        return self.manual_config

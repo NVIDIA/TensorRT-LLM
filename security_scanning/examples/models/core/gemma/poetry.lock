@@ -192,23 +192,22 @@ typing-extensions = {version = ">=4.2", markers = "python_version < \"3.13\""}
 
 [[package]]
 name = "anyio"
-version = "4.11.0"
+version = "4.12.0"
 description = "High-level concurrency and networking framework on top of asyncio or Trio"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "anyio-4.11.0-py3-none-any.whl", hash = "sha256:0287e96f4d26d4149305414d4e3bc32f0dcd0862365a4bddea19d7a1ec38c4fc"},
-    {file = "anyio-4.11.0.tar.gz", hash = "sha256:82a8d0b81e318cc5ce71a5f1f8b5c4e63619620b63141ef8c995fa0db95a57c4"},
+    {file = "anyio-4.12.0-py3-none-any.whl", hash = "sha256:dad2376a628f98eeca4881fc56cd06affd18f659b17a747d3ff0307ced94b1bb"},
+    {file = "anyio-4.12.0.tar.gz", hash = "sha256:73c693b567b0c55130c104d0b43a9baf3aa6a31fc6110116509f27bf75e21ec0"},
 ]
 
 [package.dependencies]
 exceptiongroup = {version = ">=1.0.2", markers = "python_version < \"3.11\""}
 idna = ">=2.8"
-sniffio = ">=1.1"
 typing_extensions = {version = ">=4.5", markers = "python_version < \"3.13\""}
 
 [package.extras]
-trio = ["trio (>=0.31.0)"]
+trio = ["trio (>=0.31.0)", "trio (>=0.32.0)"]
 
 [[package]]
 name = "async-timeout"
@@ -506,13 +505,13 @@ lazy-imports = ["etils[ecolab]"]
 
 [[package]]
 name = "exceptiongroup"
-version = "1.3.0"
+version = "1.3.1"
 description = "Backport of PEP 654 (exception groups)"
 optional = false
 python-versions = ">=3.7"
 files = [
-    {file = "exceptiongroup-1.3.0-py3-none-any.whl", hash = "sha256:4d111e6e0c13d0644cad6ddaa7ed0261a0b36971f6d23e7ec9b4b9097da78a10"},
-    {file = "exceptiongroup-1.3.0.tar.gz", hash = "sha256:b241f5885f560bc56a59ee63ca4c6a8bfa46ae4ad651af316d4e81817bb9fd88"},
+    {file = "exceptiongroup-1.3.1-py3-none-any.whl", hash = "sha256:a7a39a3bd276781e98394987d3a5701d0c4edffb633bb7a5144577f82c773598"},
+    {file = "exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219"},
 ]
 
 [package.dependencies]
@@ -873,13 +872,13 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.1.4"
+version = "1.1.7"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.9.0"
 files = [
-    {file = "huggingface_hub-1.1.4-py3-none-any.whl", hash = "sha256:867799fbd2ef338b7f8b03d038d9c0e09415dfe45bb2893b48a510d1d746daa5"},
-    {file = "huggingface_hub-1.1.4.tar.gz", hash = "sha256:a7424a766fffa1a11e4c1ac2040a1557e2101f86050fdf06627e7b74cc9d2ad6"},
+    {file = "huggingface_hub-1.1.7-py3-none-any.whl", hash = "sha256:f3efa4779f4890e44c957bbbb0f197e6028887ad09f0cf95a21659fa7753605d"},
+    {file = "huggingface_hub-1.1.7.tar.gz", hash = "sha256:3c84b6283caca928595f08fd42e9a572f17ec3501dec508c3f2939d94bfbd9d2"},
 ]
 
 [package.dependencies]
@@ -1525,13 +1524,13 @@ test = ["flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.11.28"
+version = "0.11.30"
 description = "Orbax Checkpoint"
 optional = false
 python-versions = ">=3.10"
 files = [
-    {file = "orbax_checkpoint-0.11.28-py3-none-any.whl", hash = "sha256:094273495fca331da88ec845053a96a7f0152b0223c6b51b82a6c1b32f373c3b"},
-    {file = "orbax_checkpoint-0.11.28.tar.gz", hash = "sha256:a72075411c8aa4b48ddd9f2b247348bdfcf7b72f633b4d9c99541648089e90e9"},
+    {file = "orbax_checkpoint-0.11.30-py3-none-any.whl", hash = "sha256:56b15d07af7a4ff655f18d219de850d86944b1552e5143e81f5b15480f240a46"},
+    {file = "orbax_checkpoint-0.11.30.tar.gz", hash = "sha256:5395e9fc80b750ee3644ee19f969923c7e3c83369133da5ea256a86d9bb838a6"},
 ]
 
 [package.dependencies]
@@ -1547,12 +1546,12 @@ protobuf = "*"
 psutil = "*"
 pyyaml = "*"
 simplejson = ">=3.16.0"
-tensorstore = ">=0.1.71"
+tensorstore = ">=0.1.74"
 typing_extensions = "*"
 
 [package.extras]
-docs = ["aiofiles", "flax", "google-cloud-logging", "grain", "opencv-python", "safetensors", "tensorflow_datasets"]
-testing = ["aiofiles", "chex", "flax", "google-cloud-logging", "mock", "pytest", "pytest-xdist", "safetensors"]
+docs = ["aiofiles", "clu", "flax", "google-cloud-logging", "grain", "opencv-python", "safetensors", "tensorflow_datasets"]
+testing = ["aiofiles", "chex", "clu", "flax", "google-cloud-logging", "mock", "pytest", "pytest-xdist", "safetensors", "tensorflow", "torch"]
 
 [[package]]
 name = "packaging"
@@ -2637,17 +2636,6 @@ python-versions = "!=3.0.*,!=3.1.*,!=3.2.*,>=2.7"
 files = [
     {file = "six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"},
     {file = "six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81"},
-]
-
-[[package]]
-name = "sniffio"
-version = "1.3.1"
-description = "Sniff out which async library your code is running under"
-optional = false
-python-versions = ">=3.7"
-files = [
-    {file = "sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2"},
-    {file = "sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc"},
 ]
 
 [[package]]

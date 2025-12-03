@@ -187,25 +187,6 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:2]
 
 
-- condition:
-    terms:
-      supports_fp8: true
-    ranges:
-      system_gpu_count:
-        gte: 2
-      gpu_memory:
-        gt: 80000
-    wildcards:
-      gpu:
-      - '*h100*'
-      - '*h200*'
-      - '*h20*'
-  tests:
-  #pytorch backend
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:2]
-
-
 # 4 gpus test
 - condition:
     ranges:
@@ -274,15 +255,14 @@ llm_perf_core:
 
 - condition:
     ranges:
+      compute_capability:
+        gte: 9.0
+        lt: 12.0
       system_gpu_count:
         gte: 8
       gpu_memory:
         gt: 80000
-    wildcards:
-      gpu:
-      - '*h100*'
-      - '*h200*'
-      - '*h20*'
+
   tests:
   # E2E trtllm-bench
   #mixtral_8x7b_v0.1_instruct
@@ -309,7 +289,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:1000,1000-reqs:3000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-ep:8-tp:8-gpus:8]
-  #rcca case
+  # chunked attention case
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.6-input_output_len:20000,2000-reqs:1000-ep:8-tp:8-gpus:8]
 
   #llama_v4_scout_17b_16e_instruct_fp8

@@ -70,7 +70,9 @@ __global__ void fusedQKNormRopeKernel(
     float factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
     float low,    // threshold for high frequency
     float high,   // threshold for low frequency
-    float attention_factor // attention_factor applied on cos and sin
+    float attention_factor, // attention_factor applied on cos and sin
+    // stop of parameters for yarn
+    bool is_qk_norm // Whether to apply QK norm
 )
 {
     int const warpsPerBlock = blockDim.x / 32;
@@ -136,20 +138,22 @@ __global__ void fusedQKNormRopeKernel(
         }
     }
 
-    // Reduce sum across warp using the utility function
-    sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
-
-    // Compute RMS normalization factor
-    float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
-
-    // Normalize elements
-    for (int i = 0; i < numElemsPerThread; i++)
+    if (is_qk_norm)
     {
-        int dim = laneId * numElemsPerThread + i;
-        float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
-        elements[i] *= rms_rcp * weight;
-    }
+        // Reduce sum across warp using the utility function
+        sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
 
+        // Compute RMS normalization factor
+        float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+
+        // Normalize elements
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            int dim = laneId * numElemsPerThread + i;
+            float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
+            elements[i] *= rms_rcp * weight;
+        }
+    }
     // Apply RoPE to normalized elements
     float elements2[numElemsPerThread]; // Additional buffer required for RoPE.
     float cos_vals[numElemsPerThread];
@@ -276,7 +280,7 @@ __global__ void fusedQKNormRopeKernel(
 void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, int const head_dim, float const eps, void const* q_weight, void const* k_weight,
     float const base, bool const interleave, int const* position_ids, float factor, float low, float high,
-    float attention_factor, cudaStream_t stream)
+    float attention_factor, cudaStream_t stream, bool is_qk_norm)
 {
     if (factor == 1.0f)
     {
@@ -301,7 +305,7 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
             fusedQKNormRopeKernel<64, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
                 reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
-                base, position_ids, num_tokens, factor, low, high, attention_factor);
+                base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
         });
         break;
     case 128:
@@ -309,7 +313,7 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
             fusedQKNormRopeKernel<128, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
                 reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
-                base, position_ids, num_tokens, factor, low, high, attention_factor);
+                base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
         });
         break;
     case 256:
@@ -317,7 +321,7 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
             fusedQKNormRopeKernel<256, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
                 reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
-                base, position_ids, num_tokens, factor, low, high, attention_factor);
+                base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
         });
         break;
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
