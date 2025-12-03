@@ -181,6 +181,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
+        without_comm: bool = False,
     ):
 
         super().__init__(
@@ -196,6 +197,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
         )
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
@@ -485,6 +487,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_dp_padding: Optional[bool] = None,
             repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
+        # Currently, the default path is that ConfigurableMoE calls CuteDslFusedMoE.run_moe.
+        # This forward_chunk method is a reference implementation of the legacy path.
         # Apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)

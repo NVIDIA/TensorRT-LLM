@@ -51,7 +51,6 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from .fused_moe_wide_ep import WideEPMoE
 
 
 class ConfigurableMoE(MoE):
@@ -59,7 +58,7 @@ class ConfigurableMoE(MoE):
     Configurable MoE layer using composition pattern with automatic configuration
 
     This class orchestrates the MoE execution flow by composing:
-    - moe_backend: Existing FusedMoE implementation (CutlassFusedMoE, WideEPMoE, etc.)
+    - moe_backend: Existing FusedMoE implementation (CutlassFusedMoE, CuteDslFusedMoE, etc.)
                    Note: Current FusedMoE implementations are used as backends (transitional).
                          Future will have dedicated MoEBackend interface.
     - Communication: Handles distributed communication (auto-selected)
@@ -800,7 +799,7 @@ class ConfigurableMoE(MoE):
         """
         Get the current MoE backend implementation
 
-        Note: Returns a FusedMoE instance (e.g., CutlassFusedMoE, WideEPMoE)
+        Note: Returns a FusedMoE instance (e.g., CutlassFusedMoE, CuteDslFusedMoE)
         """
         return self._backend
 
@@ -918,10 +917,6 @@ class ConfigurableMoE(MoE):
         # CuteDSL-specific parameters
         elif self.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = self.enable_alltoall
-
-        # WideEP-specific parameters
-        elif self.backend.__class__ == WideEPMoE:
-            pass
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:

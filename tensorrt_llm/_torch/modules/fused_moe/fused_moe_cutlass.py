@@ -76,6 +76,7 @@ class CutlassFusedMoE(MoE):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         init_load_balancer: bool = True,
+        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
@@ -138,49 +139,58 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
-        # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
-        self.alltoall_method_type = self.select_alltoall_method_type()
-        logger.info_once(
-            f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
-            key="alltoall_method_type")
-        self.alltoall_workspace = None
-        self.alltoall_prepare_workspace = None
-        self.use_low_precision_combine = False
-        if self.enable_alltoall:
-            self.use_low_precision_combine = model_config.use_low_precision_moe_combine
+        # When without_comm=True, skip communication initialization (ConfigurableMoE will handle it)
+        if not without_comm:
+            self.alltoall_method_type = self.select_alltoall_method_type()
+            logger.info_once(
+                f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
+                key="alltoall_method_type")
+            self.alltoall_workspace = None
+            self.alltoall_prepare_workspace = None
+            self.use_low_precision_combine = False
+            if self.enable_alltoall:
+                self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
-            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
-                MnnvlMemory.initialize()
-                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                    model_config.mapping)
-                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                    model_config.mapping)
-            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
-                # Calculate required workspace size
-                ep_size = self.mapping.moe_ep_size
-                max_num_tokens = model_config.max_num_tokens
-                hidden_size = self.hidden_size
-                dtype = self.dtype or torch.float16
+                if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
+                    MnnvlMemory.initialize()
+                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                        model_config.mapping)
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                        model_config.mapping)
+                elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                    # Calculate required workspace size
+                    ep_size = self.mapping.moe_ep_size
+                    max_num_tokens = model_config.max_num_tokens
+                    hidden_size = self.hidden_size
+                    dtype = self.dtype or torch.float16
 
-                workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-                    ep_size, self.routing_method.experts_per_token,
-                    max_num_tokens, hidden_size, dtype)
+                    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+                        ep_size, self.routing_method.experts_per_token,
+                        max_num_tokens, hidden_size, dtype)
 
-                self.moe_a2a = MoeAlltoAll(
-                    mapping=self.mapping,
-                    max_num_tokens=model_config.max_num_tokens,
-                    top_k=self.routing_method.experts_per_token,
-                    num_experts=self.num_slots,
-                    workspace_size_per_rank=workspace_size,
-                )
-            elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                raise NotImplementedError(
-                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
-                )
+                    self.moe_a2a = MoeAlltoAll(
+                        mapping=self.mapping,
+                        max_num_tokens=model_config.max_num_tokens,
+                        top_k=self.routing_method.experts_per_token,
+                        num_experts=self.num_slots,
+                        workspace_size_per_rank=workspace_size,
+                    )
+                elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+                    raise NotImplementedError(
+                        "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
+                    )
             else:
-                raise NotImplementedError(
-                    f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
-                )
+                # When without_comm=True, set minimal attributes
+                # Communication will be handled by parent wrapper (e.g., ConfigurableMoE)
+                self.alltoall_method_type = AlltoallMethodType.NotEnabled
+                self.alltoall_workspace = None
+                self.alltoall_prepare_workspace = None
+                self.use_low_precision_combine = False
+                self.moe_a2a = None
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
