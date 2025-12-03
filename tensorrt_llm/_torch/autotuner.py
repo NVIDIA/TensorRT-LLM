@@ -16,7 +16,6 @@ import torch
 from cuda.bindings import driver
 
 import tensorrt_llm
-from tensorrt_llm._utils import mpi_barrier, mpi_broadcast
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 
@@ -226,22 +225,20 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True,
-             cache_path: str = None,
-             mapping: "tensorrt_llm.Mapping" = None):
-    # if cache_path is provided, use the file
+def autotune(tune_mode: bool = True, cache_path: str = None, rank: int = 0):
+    # if cache_path is provided, use the rank-specific file
     tune_required = tune_mode
     if cache_path is not None:
-        # check if the file exists
+        # check if the rank-specific file exists
         cache_path_no_ext = os.path.splitext(cache_path)[0]
-        cache_path = cache_path_no_ext + ".json"
-        # if the file exists, load it
-        file_exists = os.path.exists(cache_path)
-        # if the file exists, do not enable tuning mode
-        tune_required = tune_required and not os.path.exists(cache_path)
+        cache_path_no_ext_rank = cache_path_no_ext + f".rank{rank}.json"
+        # if the rank-specific file exists, load it
+        file_exists = os.path.exists(cache_path_no_ext_rank)
+        # if the rank-specific file exists, do not enable tuning mode
         if file_exists:
-            logger.info(f"[Autotuner] Loading cache from {cache_path}")
-            AutoTuner.get().profiling_cache.load_cache(cache_path)
+            logger.info(
+                f"[Autotuner] Loading cache from {cache_path_no_ext_rank}")
+            AutoTuner.get().profiling_cache.load_cache(cache_path_no_ext_rank)
 
     # record the old tuning mode
     old_mode = AutoTuner.get().is_tuning_mode
@@ -256,20 +253,10 @@ def autotune(tune_mode: bool = True,
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
 
-        # Broadcast the cache from rank 0 to all other ranks
-        if mapping is not None and mapping.world_size > 1:
-            # Synchronize all ranks before broadcasting
-            mpi_barrier()
-            cache_data = AutoTuner.get().profiling_cache.cache
-            cache_data = mpi_broadcast(cache_data, root=0)
-            AutoTuner.get().profiling_cache.cache = cache_data
-
-        # Note: this awkwardness is due to circular dependency between Mapping and Autotuner.
-        if (mapping is None) or (mapping is not None and mapping.rank == 0):
-            # save cache
-            if cache_path is not None:
-                logger.info(f"[Autotuner] Saving cache to {cache_path}")
-                AutoTuner.get().profiling_cache.save_cache(cache_path)
+        # save cache
+        if cache_path is not None:
+            logger.info(f"[Autotuner] Saving cache to {cache_path_no_ext_rank}")
+            AutoTuner.get().profiling_cache.save_cache(cache_path_no_ext_rank)
 
 
 @dataclass
