@@ -483,12 +483,11 @@ class ADEngine(ModelEngine):
         return last_logit_only
 
     @nvtx_range("ad_compute_logits")
-    def _compute_logits(self) -> List[torch.Tensor]:
+    def _compute_logits(self) -> torch.Tensor:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
-        # return a list of tensors
-        return self.cache_seq_interface.info.unnest_sequences(logits)
+        return logits
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -512,11 +511,17 @@ class ADEngine(ModelEngine):
         # compute all logits
         logits = self._compute_logits()
 
-        # gather+cat logits
-        logits_flat = torch.cat(
-            [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
-            dim=0,
-        )
+        if self.cache_seq_interface.info.is_generate:
+            logits_flat = logits.squeeze(1)  # [b,1,vocab_size]->[b,vocab_size]
+        else:
+            # mixed prefill and decode
+            logits = logits.squeeze(0)
+            logits = list(torch.split(logits, self.cache_seq_interface.info.seq_len))
+            # gather+cat logits
+            logits_flat = torch.cat(
+                [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
+                dim=0,
+            )
 
         return {"logits": logits_flat}
 
