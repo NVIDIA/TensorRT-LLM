@@ -42,7 +42,7 @@ tar -czf /third-party-source/Mooncake-${MOONCAKE_VERSION}.tar.gz Mooncake
 cd Mooncake
 git submodule update --init --recursive --depth 1
 mkdir build && cd build
-cmake .. -DUSE_CUDA=ON -DUSE_MNNVL=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
     -DCMAKE_INSTALL_PREFIX=${MOONCAKE_INSTALL_PATH}
 make -j
 make install
