@@ -6,8 +6,8 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
-    BaseCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
+    AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
@@ -278,8 +278,16 @@ class ModelLoader:
                 ):
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model_dir)
+
+                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                        0]
+                    draft_weight_mapper = AutoCheckpointMapper.get(
+                        checkpoint_loader.checkpoint_format, draft_model_arch)
+                    draft_weight_mapper.init_model_and_config(
+                        model.draft_model, model.draft_config)
+
                     self._call_load_weights(model.load_draft_weights, weights,
-                                            self.weight_mapper)
+                                            draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
