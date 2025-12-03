@@ -546,8 +546,6 @@ class PerfMultiNodeDisaggScriptTestCmds(NamedTuple):
             server_envs = copy.deepcopy(os.environ)
             server_envs.update(self.ctx_server_envs[cmd_idx]
                                if is_ctx else self.gen_server_envs[cmd_idx])
-            # Unset UCX_TLS for CTX/GEN servers
-            server_envs.pop('UCX_TLS', None)
             try:
                 print_info(
                     f"Starting server. disagg_server_idx: {self.disagg_server_idx} cmd is {server_cmd} envs are {server_envs}"

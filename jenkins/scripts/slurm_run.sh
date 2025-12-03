@@ -99,11 +99,6 @@ if [ "${DISAGG_SERVER_IDX:-}" == "BENCHMARK" ] || [ "${DISAGG_SERVER_IDX:-}" == 
     pytestCommand="$pytestCommandNoLLMAPILaunch"
 fi
 
-# Unset UCX_TLS for disagg server or benchmark process.
-if [[ "${DISAGG_SERVER_IDX:-}" == *CTX* ]] || [[ "${DISAGG_SERVER_IDX:-}" == *GEN* ]]; then
-    unset UCX_TLS
-fi
-
 echo "Full Command: $pytestCommand"
 
 # For single-node test runs, clear all environment variables related to Slurm and MPI.

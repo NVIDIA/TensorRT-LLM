@@ -712,7 +712,7 @@ class ServerConfig:
             self.speculative_model_dir,
             "s_server_log_link":
             "",
-            "s_server_env_vars":
+            "s_server_env_var":
             self.env_vars,
         }
         return db_data
@@ -993,7 +993,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
         'hardware': hardware,
         'ctx_server': ServerConfig(ctx_server_config_data, worker_env_var),
         'gen_server': ServerConfig(gen_server_config_data, worker_env_var),
-        'server_env_vars': server_env_var,
+        'server_env_var': server_env_var,
         'client': ClientConfig(client_config_data, model_name, client_env_var),
     }
     print_info(f"disagg_config: {disagg_config}")
@@ -1817,8 +1817,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     str(timeout), "-r",
                     str(timeout)
                 ]
-                disagg_server_env = to_env_dict(
-                    disagg_config['server_env_vars'])
+                disagg_server_env = to_env_dict(disagg_config['server_env_var'])
             elif "BENCHMARK" in disagg_server_idx:
                 # Generate benchmark command if this is the BENCHMARK server node
                 benchmark_cmd = disagg_config['client'].to_cmd(
@@ -2493,7 +2492,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Build new_data
                 new_data = {
                     "s_runtime": "multi_node_disagg_server",
-                    "s_server_env_vars": disagg_config['server_env_var']
+                    "s_server_env_var": disagg_config['server_env_var']
                 }
                 new_data.update(job_config)
                 new_data.update(ctx_server_config_dict)

@@ -152,6 +152,9 @@ def main():
     hardware_config = get_hardware_config(config)
     print(f"Hardware configuration: {hardware_config}")
 
+    env_config = get_env_config(config)
+    print(f"Environment configuration: {env_config}")
+
     script_prefix_lines = []
     srun_args_lines = []
     if args.run_ci:
@@ -162,9 +165,6 @@ def main():
             srun_args_content = f.read()
         srun_args_lines = srun_args_content.split()
     else:
-        env_config = get_env_config(config)
-        print(f"Environment configuration: {env_config}")
-
         slurm_config = get_slurm_config(config, env_config["job_workspace"])
         print(f"SLURM configuration: {slurm_config}")
 
@@ -234,8 +234,8 @@ def main():
     script_prefix_lines.extend(
         [
             "export OPEN_SEARCH_DB_BASE_URL='http://gpuwa.nvidia.com'",
-            # f"export WORKER_ENV_VAR='{env_config['worker_env_var']}'",
-            # f"export SERVER_ENV_VAR='{env_config['server_env_var']}'",
+            f"export pytestCommand='unset UCX_TLS && {env_config['worker_env_var']} $pytestCommand'",
+            f"export pytestCommandNoLLMAPILaunch='{env_config['worker_env_var']} $pytestCommandNoLLMAPILaunch'",
             f"export runScript={args.run_sh}",
             f"export numCtxServers={hardware_config['num_ctx_servers']}",
             f"export numGenServers={hardware_config['num_gen_servers']}",
@@ -257,8 +257,6 @@ def main():
         [
             "--container-env=DISAGG_SERVER_IDX",
             "--container-env=OPEN_SEARCH_DB_BASE_URL",
-            # "--container-env=WORKER_ENV_VAR",
-            # "--container-env=SERVER_ENV_VAR",
         ]
     )
     srun_args_lines = ["srunArgs=("] + [f'  "{line}"' for line in srun_args_lines] + [")"]
