@@ -5,25 +5,25 @@ slurm:
   account: "blackwell"
   job_time: "04:00:00"
   job_name: "coreai_comparch_trtllm"
-  numa_bind: true # Only enable for GB200 NVL72
+  numa_bind: true
   timeout: 7200
 
 # Benchmark Mode
 benchmark:
-  mode: "e2e"  # Options: e2e, gen_only
-  multi_round: 8  # Number of benchmark rounds
-  benchmark_ratio: 0.8  # Benchmark ratio
-  streaming: true  # Enable streaming mode
+  mode: "e2e"
+  multi_round: 8
+  benchmark_ratio: 0.8
+  streaming: true
   concurrency_list: "16"
-  input_length: 1024  # Input sequence length
-  output_length: 1024  # Output sequence length
+  input_length: 1024
+  output_length: 1024
   dataset_file: ""
 
 # Hardware Configuration
 hardware:
-  gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 1  # Number of context servers
-  num_gen_servers: 1  # Number of generation servers
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
   gpus_per_ctx_server: 4
   gpus_per_gen_server: 4
 
@@ -37,21 +37,10 @@ environment:
   model_name: "deepseek_r1_0528_fp4_v2"
   llm_models_root: "/home/scratch.trt_llm_data/llm-models"
   trtllm_repo: "/home/scratch.chenfeiz_gpu/another_repo/tekit-2"
-  build_wheel: false  # Don't build the wheel when launching multiple jobs
-  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  build_wheel: false
+  trtllm_wheel_path: ""
   worker_env_var: ""
   server_env_var: ""
-
-# Profiling Configuration
-profiling:
-  nsys_on: false  # Set to true to enable profiling
-
-# Accuracy Configuration
-accuracy:
-  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
-  model: "local-completions"  # Model type for lm_eval
-  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
-  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"  # Extra model arguments for lm_eval
 
 worker_config:
   gen:

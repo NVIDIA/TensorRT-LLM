@@ -939,6 +939,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def pytestCommandNoLLMAPILaunch = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
+                    waivesListPathNode,
                     perfMode,
                     jobWorkspace,
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
@@ -1002,7 +1003,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
-                def srunArgs = [
+                srunArgs = [
                     "--container-image=$containerImageArg",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=$mounts",
