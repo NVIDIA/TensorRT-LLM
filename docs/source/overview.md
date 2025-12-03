@@ -49,8 +49,8 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 ### 🔧 **Latest GPU Architecture Support**
 
 TensorRT LLM supports the full spectrum of NVIDIA GPU architectures:
-- **NVIDIA Blackwell**: B200, GB200, RTX Pro 6000 SE with FP4 optimization
-- **NVIDIA Hopper**: H100, H200,GH200 with FP8 acceleration
+- **NVIDIA Blackwell**: B200, B300, GB200, GB300, RTX Pro 6000 SE with FP4 optimization
+- **NVIDIA Hopper**: H100, H200, GH200 with FP8 acceleration
 - **NVIDIA Ada Lovelace**: L40/L40S, RTX 40 series with FP8 acceleration
 - **NVIDIA Ampere**: A100, RTX 30 series for production workloads
 
