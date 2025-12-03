@@ -1684,7 +1684,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                               intermediate_size_per_partition_padded *
                               module.intermediate_size_expand_ratio,
                               w3_w1_hidden_size_padded // weight_vec_size)
-        w2_weight_shape = (module.expert_size_per_partition, w2_hidden_size_padded,
+        w2_weight_shape = (module.expert_size_per_partition,
+                           w2_hidden_size_padded,
                            intermediate_size_per_partition_padded //
                            weight_vec_size)
 
@@ -1692,9 +1693,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # column parallel
         w3_w1_weight_scale = nn.Parameter(
             torch.ones(module.expert_size_per_partition,
-                        intermediate_size_per_partition_padded *
+                       intermediate_size_per_partition_padded *
                        module.intermediate_size_expand_ratio,
-                       w3_w1_hidden_size_padde // module.scaling_vector_size //
+                       w3_w1_hidden_size_padded // module.scaling_vector_size //
                        block_scales_vec_size,
                        dtype=block_scales_dtype),
             requires_grad=False)

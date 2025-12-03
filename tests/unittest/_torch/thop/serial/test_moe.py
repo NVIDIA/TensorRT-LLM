@@ -1857,8 +1857,6 @@ class TestMoeFp4:
                 n_groups,
                 top_k_groups,
                 intermediate_size,
-                None,
-                None,
                 0,
                 num_experts,
                 routed_scaling,
