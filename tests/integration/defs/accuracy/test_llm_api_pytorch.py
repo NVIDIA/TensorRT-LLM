@@ -30,9 +30,9 @@ from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
+                        parametrize_with_ids, print_device_memory,
+                        skip_no_hopper, skip_post_blackwell, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV2)
@@ -2207,6 +2207,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, enable_lm_head_tp_in_adp,
                               cuda_graph, overlap_scheduler, max_batch_size,
                               moe_backend):
+        print_device_memory()
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(

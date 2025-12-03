@@ -1992,38 +1992,48 @@ def get_device_count():
     return len(get_gpu_device_list())
 
 
+def get_device_memory_str():
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        suffix = ".exe" if is_windows() else ""
+        cmd = " ".join([
+            "nvidia-smi" + suffix,
+            "--query-gpu=memory.total,memory.reserved,memory.used,memory.free",
+            "--format=csv,noheader"
+        ])
+        output = check_output(cmd, shell=True, cwd=temp_dirname)
+        return output.strip()
+
+
 def get_device_memory():
     "get gpu memory"
     memory = 0
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join([
-            "nvidia-smi" + suffix, "--query-gpu=memory.total",
-            "--format=csv,noheader"
-        ])
-        # Try to get memory from nvidia-smi first, if failed, fallback to system memory from /proc/meminfo
-        # This fallback is needed for systems with unified memory (e.g. DGX Spark)
+    # Try to get memory from nvidia-smi first, if failed, fallback to system memory from /proc/meminfo
+    # This fallback is needed for systems with unified memory (e.g. DGX Spark)
+    try:
+        output = get_device_memory_str()
+        memory_str = output.strip().split()[0]
+        # Check if nvidia-smi returned a valid numeric value
+        if "N/A" in memory_str:
+            raise ValueError("nvidia-smi returned invalid memory info")
+        memory = int(memory_str)
+    except (sp.CalledProcessError, ValueError, IndexError):
+        # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
         try:
-            output = check_output(cmd, shell=True, cwd=temp_dirname)
-            memory_str = output.strip().split()[0]
-            # Check if nvidia-smi returned a valid numeric value
-            if "N/A" in memory_str:
-                raise ValueError("nvidia-smi returned invalid memory info")
-            memory = int(memory_str)
-        except (sp.CalledProcessError, ValueError, IndexError):
-            # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
-            try:
-                with open("/proc/meminfo", "r") as f:
-                    for line in f:
-                        if line.startswith("MemTotal:"):
-                            memory = int(
-                                line.split()[1]) // 1024  # Convert kB to MiB
-                            break
-            except:
-                memory = 8192  # Default 8GB if all else fails
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        memory = int(
+                            line.split()[1]) // 1024  # Convert kB to MiB
+                        break
+        except:
+            memory = 8192  # Default 8GB if all else fails
 
     return memory
+
+
+def print_device_memory():
+    memory_str = get_device_memory_str()
+    print(f"Device Memory:\ntotal:   reserved:   used:   free:  \n{memory_str}")
 
 
 def pytest_addoption(parser):
