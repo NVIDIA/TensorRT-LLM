@@ -8,6 +8,9 @@ All published functionality in the Release Notes has been fully tested and verif
 
 TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now stable and the default experience, and the LLM API is now stable. For more details on new developments in 1.0, please see below.
 
+### Breaking Changes
+- **Chunked Prefill Now Enabled by Default**: The `enable_chunked_prefill` parameter in the LLM API now defaults to `True` instead of `False`. This improves usability by automatically handling long sequences that exceed `max_num_tokens` through chunking, rather than throwing an error. Short sequences are processed as a single chunk with no performance impact. For models that don't support chunked prefill (e.g., RNN-based models), it is automatically disabled with a warning. To restore the previous behavior, explicitly set `enable_chunked_prefill=False`.
+
 ### Key Features and Enhancements
 - **Model Support**
   - Add Mistral3.1 VLM model support
