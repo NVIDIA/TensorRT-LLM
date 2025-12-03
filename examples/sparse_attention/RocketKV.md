@@ -4,14 +4,14 @@ This document details enabling RocketKV sparse attention within TensorRT LLM.
 
 RocketKV is a training-free, two-stage KV cache compression method designed to accelerate long-context LLM inference. It combines permanent KV token eviction (in context phase) with dynamic KV token selection (in generation phase) to significantly reduce memory bandwidth usage and increase throughput while maintaining high accuracy.
 
-For more technical details, please refer to the paper: [RocketKV: Accelerating Long-Context LLM Inference via Two-Stage KV Cache Compression](https://arxiv.org/pdf/2502.14051).
+For more technical details, please refer to the paper: [RocketKV: Accelerating Long-Context LLM Inference via Two-Stage KV Cache Compression](https://arxiv.org/pdf/2502.14051). Here is an official implement which provides a reference: [RocketKV Repo](https://github.com/NVlabs/RocketKV).
 
 ## Overview
 
 In Transformer-based LLM inference, the KV cache grows linearly with sequence length, becoming a major bottleneck. RocketKV mitigates this issue through a two-stage process:
 
 1.  **Context Phase (Stage 1):** It performs **permanent KV cache eviction**. Instead of storing the full history, it selects and keeps a `prompt_budget` of the most important tokens based on attention scores.
-2.  **Generation Phase (Stage 2):** It utilizes a **blocked Top-K sparse attention**. It maintains a lightweight, compressed auxiliary cache (KT Cache) to dynamically predict which blocks of the KV cache are relevant for the current token, and loading only those blocks to do the attention computation.
+2.  **Generation Phase (Stage 2):** It utilizes a **dynamic Top-K token selection**. It maintains a lightweight, compressed auxiliary cache (KT Cache) to dynamically predict which tokens of the KV cache are relevant for the current token, and loading only those tokens to do the attention computation.
 
 RocketKV is integrated into TensorRT LLM as a specialized attention backend, accessible via the LLM API. Specifically, the core sparse KV prediction kernels are implemented using **Triton** kernels, achieving highly optimized performance on modern NVIDIA GPUs.
 
@@ -35,7 +35,6 @@ To enable RocketKV, configure `RocketSparseAttentionConfig` and pass it to the `
 ### Python API
 
 Integrate RocketKV into your workflows using the `tensorrt_llm.llmapi` interface.
-
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -109,6 +108,16 @@ kv_cache_config:
 enable_chunked_prefill: false
 ```
 
+Run the command with the config file:
+```bash
+trtllm-eval/trtllm-bench/trtllm-serve --model <model_path> --extra_llm_api_options extra_config.yaml ...
+```
+
+For example, users can evaluate a model with trtllm-eval on LongBenchV2 task like this:
+
+```bash
+trtllm-eval --model <path_to_model> --extra_llm_api_options extra_config.yaml longbench_v2 --max_output_length 1024 ...
+```
 
 ## Configuration Arguments
 
@@ -122,4 +131,4 @@ The `RocketSparseAttentionConfig` allows fine-grained control over compression r
 *   **`kt_cache_dtype`** (str, default='float8_e5m2'): The data type for the auxiliary "Key-Token" (KT) cache used for relevance prediction.
     *   `float8_e5m2`: Recommended. Provides memory savings for the auxiliary structure and speedup for the prediction kernels.
     *   `bfloat16`: Standard precision.
-*   **`page_size`** (int, default=4): The granularity of the sparse selection (KT page). Currently, only **powers of 2** are supported due to Triton kernel limitations. Accuracy is generally maintained well for `page_size <= 4`.
+*   **`page_size`** (int, default=4): The granularity of the sparse token selection (KT page). Currently, only **powers of 2** are supported due to Triton kernel limitations. Accuracy is generally maintained well for `page_size <= 4`.
