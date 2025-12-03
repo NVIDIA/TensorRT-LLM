@@ -109,7 +109,7 @@ _logger_instance: Optional[DisaggLogger] = None
 
 class LazyLogger:
     """Lazy logger proxy that initializes on first access."""
-    
+
     def _ensure_logger(self) -> DisaggLogger:
         """Ensure logger is initialized and return it."""
         global _logger_instance
@@ -118,6 +118,7 @@ class LazyLogger:
             # Auto-setup file logging on first access
             try:
                 from .common import EnvManager
+
                 output_path = EnvManager.get_output_path()
                 if output_path and not output_path.startswith("<"):
                     _logger_instance.setup_file_logging(output_path)
@@ -125,11 +126,15 @@ class LazyLogger:
                     _logger_instance.warning(
                         f"OUTPUT_PATH not configured (current: '{output_path}'). Logging to console only."
                     )
-                    _logger_instance.info("Set OUTPUT_PATH environment variable to enable file logging.")
+                    _logger_instance.info(
+                        "Set OUTPUT_PATH environment variable to enable file logging."
+                    )
             except Exception as e:
-                _logger_instance.warning(f"Failed to setup file logging: {e}. Logging to console only.")
+                _logger_instance.warning(
+                    f"Failed to setup file logging: {e}. Logging to console only."
+                )
         return _logger_instance
-    
+
     def __getattr__(self, name):
         """Delegate all attribute access to the real logger."""
         return getattr(self._ensure_logger(), name)
