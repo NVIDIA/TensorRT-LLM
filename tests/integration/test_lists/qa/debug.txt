@@ -1,1 +1,0 @@
-perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-ep:1-tp:4-gpus:4] TIMEOUT(120)
