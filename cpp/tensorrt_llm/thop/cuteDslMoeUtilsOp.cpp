@@ -257,7 +257,8 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
 
 void moe_output_memset_inplace(torch::Tensor const& input, torch::Tensor const& tile_idx_to_mn_limit,
     torch::Tensor const& expanded_idx_to_permuted_idx, torch::Tensor const& permuted_idx_to_expanded_idx,
-    torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k)
+    torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k,
+    int64_t const ep_size, bool const enable_alltoall = false)
 {
     TORCH_CHECK(input.dim() == 2, "input must be 2D.");
     int64_t const num_tokens = input.size(0);
@@ -286,10 +287,20 @@ void moe_output_memset_inplace(torch::Tensor const& input, torch::Tensor const& 
     auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
 #define DISPATCH_MOE_OUTPUT_MEMSET(InputType)                                                                          \
-    tensorrt_llm::kernels::cute_dsl::moeOutputMemset<InputType>(static_cast<InputType*>(input.data_ptr()),             \
-        tile_idx_to_mn_limit.data_ptr<int32_t>(), expanded_idx_to_permuted_idx.data_ptr<int32_t>(),                    \
-        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(),                   \
-        max_num_permuted_tokens, hidden_size, top_k, tile_tokens_dim, stream)
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (!enable_alltoall || ep_size <= top_k)                                                                      \
+        {                                                                                                              \
+            cudaMemsetAsync(input.data_ptr(), 0x0, sizeof(InputType) * num_tokens * hidden_size, stream);              \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            tensorrt_llm::kernels::cute_dsl::moeOutputMemset<InputType>(static_cast<InputType*>(input.data_ptr()),     \
+                tile_idx_to_mn_limit.data_ptr<int32_t>(), expanded_idx_to_permuted_idx.data_ptr<int32_t>(),            \
+                permuted_idx_to_expanded_idx.data_ptr<int32_t>(), num_non_exiting_tiles.data_ptr<int32_t>(),           \
+                max_num_permuted_tokens, hidden_size, top_k, tile_tokens_dim, stream);                                 \
+        }                                                                                                              \
+    } while (0)
 
     if (input.scalar_type() == torch::kHalf)
     {
@@ -477,7 +488,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx, Tensor topk_scales) -> Tensor");
     m.def(
         "moe_output_memset_inplace(Tensor(a!) input, Tensor tile_idx_to_mn_limit, Tensor expanded_idx_to_permuted_idx, "
-        "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> ()");
+        "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k, int "
+        "ep_size, bool enable_alltoall = False) -> ()");
     m.def(
         "moe_swiglu(Tensor input, Tensor tile_idx_to_mn_limit, Tensor num_non_exiting_tiles, "
         "int tile_tokens_dim) -> Tensor");

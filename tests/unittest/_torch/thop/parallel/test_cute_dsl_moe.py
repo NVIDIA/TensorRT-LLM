@@ -228,14 +228,18 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_moe_output_memset_inplace(dtype: str, num_tokens: int, top_k: int, tile_size: int):
+def test_moe_output_memset_inplace(
+    dtype: str, num_tokens: int, top_k: int, ep_size: int, tile_size: int
+):
     dtype = getattr(torch, dtype)
     hidden_size = 4096
     num_experts = 256
-    num_local_experts = num_experts // 32
+    num_local_experts = num_experts // ep_size
+    enable_alltoall = True
 
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
@@ -268,9 +272,12 @@ def test_moe_output_memset_inplace(dtype: str, num_tokens: int, top_k: int, tile
         num_non_exiting_tiles,
         tile_size,
         top_k,
+        ep_size,
+        enable_alltoall=enable_alltoall,
     )
-    x_ref = torch.ones_like(x)
-    x_ref[(expanded_idx_to_permuted_idx >= 0).any(dim=-1)] = 0
+    x_ref = torch.zeros_like(x)
+    if enable_alltoall and ep_size > top_k:
+        x_ref[(expanded_idx_to_permuted_idx < 0).all(dim=-1)] = 1
     torch.testing.assert_close(x, x_ref)
 
 
