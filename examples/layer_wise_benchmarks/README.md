@@ -15,9 +15,6 @@ pip install -e ../..
 **Step 3:** In the container, run benchmarks and generate profiles:
 
 ```bash
-# Set autotune cache path
-export TLLM_AUTOTUNER_CACHE_PATH=autotune/cache.json
-
 # Run DeepSeek-R1 NVFP4
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml
@@ -96,9 +93,6 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
-# Set autotune cache path
-export TLLM_AUTOTUNER_CACHE_PATH=autotune/cache.json
-
 # Run DeepSeek-R1 NVFP4 with wide ep: uses MNNVL A2A if applicable
 SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
