@@ -64,9 +64,10 @@ def enforce_single_worker(monkeypatch):
 
 
 def generate_and_sleep(model, *args, **kwargs):
-    # When using the overlap scheduler, we generate an extra token. We want to be able to track calls to the connector made with this extra token.
-    # This is problematic since the final calls to the connector API occur after the final response has been returned.
-    # To get around this, we sleep for a short period of time to account for this additional time.
+    # Some KV connector API calls are made after a full response is returned. We want to be able to track these calls.
+    # However, we don't have any indication of when all the calls are complete.
+    # To compensate for this, we sleep between the generate call and the return of the outputs.
+    # TODO(jthomson04): Surely there's a better way to do this?
     outputs = model.generate(*args, **kwargs)
     time.sleep(1)
     return outputs
