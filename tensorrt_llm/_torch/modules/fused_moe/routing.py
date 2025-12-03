@@ -1,7 +1,7 @@
 import math
 import warnings
 from enum import IntEnum
-from typing import Dict, Optional, Type
+from typing import Callable, Dict, Optional, Type
 
 import torch
 import torch.nn.functional as F
@@ -331,7 +331,7 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
             n_group: int,
             topk_group: int,
             routed_scaling_factor: float,
-            e_score_correction_bias: torch.Tensor,
+            callable_e_score_correction_bias: Callable[[], torch.Tensor],
             is_fused: bool = True,  # fuse_routing_kernel
     ):
         super().__init__()
@@ -342,12 +342,16 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
             routed_scaling_factor=routed_scaling_factor,
             is_fused=is_fused,
         )
-        # Bypass nn.Module's __setattr__ to avoid registering as a parameter
-        object.__setattr__(self, 'e_score_correction_bias',
-                           e_score_correction_bias)
+        # Pass a callable to fetch the tensor from DeepseekV3Gate at runtime, ensuring it is on the correct device
+        assert callable(callable_e_score_correction_bias)
+        self.callable_e_score_correction_bias = callable_e_score_correction_bias
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.routing_impl.apply(logits, self.e_score_correction_bias)
+
+    @property
+    def e_score_correction_bias(self) -> torch.Tensor:
+        return self.callable_e_score_correction_bias()
 
     @property
     def top_k(self):

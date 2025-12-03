@@ -713,7 +713,9 @@ class DeepseekV3Gate(nn.Module):
             topk_group=self.routing_impl.topk_group,
             routed_scaling_factor=self.routing_impl.routed_scaling_factor,
             is_fused=self.routing_impl.is_fused,
-            e_score_correction_bias=self.e_score_correction_bias,
+            # Pass a callable to fetch the tensor from DeepseekV3Gate at runtime, ensuring it is on the correct device
+            callable_e_score_correction_bias=lambda: self.
+            e_score_correction_bias,
         )
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

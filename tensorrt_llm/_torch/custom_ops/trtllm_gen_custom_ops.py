@@ -79,10 +79,9 @@ def prepare_dummy_topk_and_hook(
             routed_scaling_factor,
             'is_fused':
             False,  # fuse_routing_kernel
-            'e_score_correction_bias':
-            torch.randn(num_experts,
-                        dtype=torch.bfloat16,
-                        device=hidden_states.device)
+            'callable_e_score_correction_bias':
+            lambda: torch.randn(
+                num_experts, dtype=torch.bfloat16, device=hidden_states.device)
         })
     routing_method = ROUTING_METHOD_TYPE_TO_CLASS[routing_method_type](
         top_k=top_k, **routing_cls_kwargs)
