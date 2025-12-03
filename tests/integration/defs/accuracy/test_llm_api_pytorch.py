@@ -4392,7 +4392,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512) if cuda_graph else None)
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
 
         with LLM(
                 model_path,
@@ -4427,7 +4428,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512) if cuda_graph else None)
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
         moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(model_path,
