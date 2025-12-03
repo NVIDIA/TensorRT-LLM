@@ -181,8 +181,8 @@ public:
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
-            TORCH_CHECK(mla_tensor_params.size() == 1,
-                "Expecting 1 tensor for custom MLA tensor params: helix_position_offsets.");
+            TORCH_CHECK(mla_tensor_params.size() == 2,
+                "Expecting 2 tensors for custom MLA tensor params: helix_position_offsets and helix_is_inactive_rank.");
             if (is_context && op.mUseSparseAttention)
             {
                 if (latent_cache.has_value())
@@ -227,9 +227,14 @@ public:
 
                 // For generation, helix position is in ropeOp
                 auto& mla_helix_position_offsets = mla_tensor_params[0];
+                auto& mla_helix_is_inactive_rank = mla_tensor_params[1];
                 if (mla_helix_position_offsets.has_value())
                 {
                     mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
+                }
+                if (mla_helix_is_inactive_rank.has_value())
+                {
+                    mla_params.helix_is_inactive_rank = mla_helix_is_inactive_rank->data_ptr<bool>();
                 }
             }
             else

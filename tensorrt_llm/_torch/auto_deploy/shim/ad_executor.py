@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -18,18 +19,27 @@ import torch
 from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.llm_request import get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    ContextChunkingPolicy,
+    LoadFormat,
+    SpeculativeConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
-from ...pyexecutor.model_engine import ModelEngine
+from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
 from ...pyexecutor.sampler import TorchSampler
@@ -92,6 +102,102 @@ class _CacheManagerWithFakePool(KVCacheManager):
         return self.num_blocks, 0
 
 
+def construct_draft_llm_args(
+    ad_config: LlmArgs,
+) -> TorchLlmArgs:
+    """Construct a TorchLlmArgs for the draft model from AutoDeploy config.
+
+    Args:
+        ad_config: The AutoDeploy LLM configuration
+
+    Returns:
+        A TorchLlmArgs instance suitable for creating a PyTorchModelEngine
+    """
+    # Extract common fields as a dict
+    common_fields = {
+        "model": ad_config.model,
+        "tokenizer": ad_config.tokenizer,
+        "max_batch_size": ad_config.max_batch_size,
+        "max_seq_len": ad_config.max_seq_len,
+        "max_beam_width": ad_config.max_beam_width,
+        "max_num_tokens": ad_config.max_num_tokens,
+        "max_input_len": ad_config.max_input_len,
+        "kv_cache_config": ad_config.kv_cache_config,
+        "enable_chunked_prefill": ad_config.enable_chunked_prefill,
+        "attn_backend": ad_config.attn_backend,
+        "disable_overlap_scheduler": ad_config.disable_overlap_scheduler,
+        "speculative_config": ad_config.speculative_config,
+        "checkpoint_loader": getattr(ad_config, "draft_checkpoint_loader", None),
+    }
+
+    # Add other fields that may exist in ad_config
+    optional_fields = [
+        "dtype",
+        "trust_remote_code",
+        "sparse_attention_config",
+        "lora_config",
+        "scheduler_config",
+        "garbage_collection_gen0_threshold",
+        "skip_tokenizer_init",
+        "tokenizer_mode",
+        "revision",
+        "tokenizer_revision",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "context_parallel_size",
+        "gpus_per_node",
+        "enable_lora",
+        "guided_decoding_backend",
+        "peft_cache_config",
+        "cache_transceiver_config",
+        "decoding_config",
+    ]
+
+    for field in optional_fields:
+        if hasattr(ad_config, field):
+            value = getattr(ad_config, field)
+            if value is not None:  # Only add if not None
+                common_fields[field] = value
+
+    draft_llm_args = TorchLlmArgs(**common_fields)
+
+    # Handle load_format separately
+    if ad_config.speculative_config.load_format == "dummy":
+        draft_llm_args.load_format = LoadFormat.DUMMY
+
+    draft_llm_args.tensor_parallel_size = ad_config.world_size
+
+    return draft_llm_args
+
+
+def create_draft_kv_cache_manager_maybe(
+    draft_model_engine: Optional[PyTorchModelEngine],
+    ad_config: LlmArgs,
+    dist_mapping: Mapping,
+) -> Optional[KVCacheManager]:
+    if draft_model_engine is None or not draft_model_engine.model.model_config.is_generation:
+        return None
+
+    # Get the appropriate KV cache manager class
+    kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
+
+    return _create_kv_cache_manager(
+        model_engine=draft_model_engine,
+        kv_cache_manager_cls=kv_cache_manager_cls,
+        mapping=dist_mapping,
+        kv_cache_config=ad_config.kv_cache_config,
+        tokens_per_block=ad_config.attn_page_size,
+        max_seq_len=ad_config.max_seq_len,
+        max_batch_size=ad_config.max_batch_size,
+        spec_config=ad_config.speculative_config,
+        sparse_attn_config=ad_config.sparse_attention_config,
+        max_num_tokens=ad_config.max_num_tokens,
+        max_beam_width=ad_config.max_beam_width,
+        kv_connector_manager=None,  # KV connector manager not used in AutoDeploy (no disagg support)
+        estimating_kv_cache=False,
+    )
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -143,7 +249,15 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device, max_beam_width, reporting_info)
+        return cls(
+            build_and_optimize,
+            seq_info,
+            device,
+            max_beam_width,
+            ad_config.speculative_config,
+            ad_config.disable_overlap_scheduler,
+            reporting_info,
+        )
 
     @torch.inference_mode()
     def __init__(
@@ -152,6 +266,8 @@ class ADEngine(ModelEngine):
         seq_info: SequenceInfo,
         device: DeviceLikeType,
         max_beam_width: int = 1,
+        spec_config: Optional[SpeculativeConfig] = None,
+        disable_overlap_scheduler: bool = False,
         reporting_info: ReportingInfo = ReportingInfo(),
     ) -> None:
         """Initialize the engine with model and sequence information."""
@@ -169,10 +285,23 @@ class ADEngine(ModelEngine):
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
         self.iter_states = {}
+        self.llm_args.max_seq_len = seq_info.max_seq_len
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
+        self._disable_overlap_scheduler = disable_overlap_scheduler
+
+        self.spec_config = spec_config
+
+        # TODO(govind): Enable overlap scheduler for speculation.
+        assert self.spec_config is None or self._disable_overlap_scheduler, (
+            "Overlap scheduler is not supported \
+            for speculative decoding in AutoDeploy."
+        )
+
+        # For compatibility with PyTorchModelEngine utilities
+        self.batch_size = seq_info.max_batch_size
 
         # construct cache sequence interface
         self.cache_seq_interface = CachedSequenceInterface(
@@ -200,15 +329,22 @@ class ADEngine(ModelEngine):
 
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
-        gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
-
+        extend_requests = [
+            r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
+        ]
+        generation_requests = [
+            r for r in scheduled_requests.generation_requests if get_draft_token_length(r) == 0
+        ]
+        gen_requests = extend_requests + generation_requests
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
-        flat_gather_idx: List[int] = []
+
+        # gather indices are used to gather tokens in new_tokens into input_ids
+        flat_gather_indices: List[List[int]] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         dummy_token = -1
@@ -246,26 +382,78 @@ class ADEngine(ModelEngine):
                 for k, v in request.py_multimodal_data.items():
                     extra_args[k].append(v)
 
-        # look at generate requests next
-        # TODO: we should also handle extend requests (for speculative decoding) here
-        for request in gen_requests:
-            # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
-                input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
-                input_pos.append(request.max_beam_num_tokens - 1)
+        def _use_overlap_scheduler(request) -> bool:
+            """Check if we should use overlap scheduler behavior."""
+            return (
+                not self._disable_overlap_scheduler
+                and new_tokens is not None
+                and not request.is_dummy
+                and request.py_batch_idx is not None
+            )
+
+        def _compute_num_tokens_seen(request) -> int:
+            """Compute num_tokens_seen based on request. Note that we treat extend requests
+            (corresponding to running target model in speculative decoding) differently from
+            normal generation requests.
+            """
+            is_extend = get_draft_token_length(request) > 0
+
+            if is_extend:
+                return request.max_beam_num_tokens - 1
             else:
-                input_ids.append([dummy_token])
-                input_pos.append(request.max_beam_num_tokens)
-                flat_gather_idx.append(request.py_batch_idx)
+                # When overlap scheduler is disabled, or when new_tokens is not available,
+                # we use the previous token count
+                use_overlap = _use_overlap_scheduler(request)
+                if use_overlap:
+                    return request.max_beam_num_tokens
+                else:
+                    return request.max_beam_num_tokens - 1
 
-            num_generation_tokens += 1
+        def _build_input_ids(request) -> Tuple[List[int], List[int]]:
+            """Build input_ids and gather indices for a request.
+            Gather indices are used to gather tokens from new_tokens into input_ids when we run the overlap scheduler.
+            """
+            is_extend = get_draft_token_length(request) > 0
+
+            # Check if we should use overlap scheduler behavior
+            use_overlap = _use_overlap_scheduler(request)
+
+            if not use_overlap:
+                # No overlap scheduler or dummy request
+                if is_extend:
+                    input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)] + [
+                        token for token in request.py_draft_tokens
+                    ]
+                else:
+                    input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)]
+                gather_indices = []
+            else:
+                # Overlap scheduler enabled
+                if is_extend:
+                    gather_indices = [
+                        x * new_tokens.shape[1] + request.py_batch_idx
+                        for x in range(len(request.py_draft_tokens) + 1)
+                    ]
+
+                    dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
+                    input_ids = [dummy_token] + dummy_draft_tokens
+                else:
+                    gather_indices = [request.py_batch_idx]
+                    input_ids = [dummy_token]
+
+            return input_ids, gather_indices
+
+        for request in gen_requests:
+            num_tokens_seen = _compute_num_tokens_seen(request)
+            input_ids_for_request, gather_indices_to_append = _build_input_ids(request)
+
+            input_ids.append(input_ids_for_request)
+            input_pos.append(num_tokens_seen)
+            flat_gather_indices.extend(gather_indices_to_append)
+
+            num_generation_tokens += 1 + get_draft_token_length(request)
             request.py_batch_idx = request.seq_slot
-
-            # store seq slot idx
-            # TODO: double-check if this is correct for the overlap scheduler
             slot_idx.append(request.seq_slot)
-
-            # return all logits
             last_logit_only.append(False)
 
             # get cache indices
@@ -284,7 +472,7 @@ class ADEngine(ModelEngine):
         if new_tokens is not None:
             self.cache_seq_interface.info.rescatter_input_ids(
                 ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
-                gather_idx=flat_gather_idx,
+                gather_idx=flat_gather_indices,
                 scatter_ref=dummy_token,
             )
 
@@ -333,6 +521,59 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
+def create_draft_model_engine_maybe(
+    ad_config: LlmArgs, engine, dist_mapping: Mapping, mpi_dist: MPIDist
+) -> Optional[PyTorchModelEngine]:
+    """Create a draft model engine for speculative decoding.
+
+    Args:
+        ad_config: The AutoDeploy LLM configuration
+        engine: The target model engine (ADEngine)
+        dist_mapping: The distributed mapping configuration
+        mpi_dist: The MPI distribution object
+
+    Returns:
+        PyTorchModelEngine configured as a draft model, or None if not needed
+    """
+    spec_config = ad_config.speculative_config
+
+    if spec_config is None or not spec_config.spec_dec_mode.has_draft_model():
+        return None
+
+    has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
+
+    draft_spec_config = copy.copy(spec_config)
+
+    kv_cache_config = ad_config.kv_cache_config
+
+    attn_runtime_features = AttentionRuntimeFeatures(
+        chunked_prefill=ad_config.enable_chunked_prefill,
+        cache_reuse=kv_cache_config.enable_block_reuse,
+        has_speculative_draft_tokens=has_spec_drafter,
+        chunk_size=engine.llm_args.max_num_tokens,
+    )
+
+    # Construct TorchLlmArgs for the draft model
+    draft_llm_args = construct_draft_llm_args(
+        ad_config=ad_config,
+    )
+
+    draft_model_engine = PyTorchModelEngine(
+        model_path=draft_spec_config.speculative_model_dir,
+        llm_args=draft_llm_args,
+        mapping=dist_mapping,
+        attn_runtime_features=attn_runtime_features,
+        dist=mpi_dist,
+        spec_config=draft_spec_config,
+        is_draft_model=True,
+        drafting_loop_wrapper=None,
+    )
+
+    draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+
+    return draft_model_engine
+
+
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
     The tokenizer is required for guided decoding.
@@ -365,6 +606,24 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
 
+    spec_config = ad_config.speculative_config
+    if spec_config is not None and not spec_config.spec_dec_mode.is_draft_target():
+        raise ValueError(
+            "Currently, AutoDeploy only supports speculative decoding in draft target mode."
+        )
+
+    if spec_config is not None and ad_config.guided_decoding_backend is not None:
+        raise ValueError(
+            "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
+        )
+
+    # Speculative resource manager not needed for DraftTargetDecoding.
+    spec_resource_manager = None
+
+    draft_model_engine = create_draft_model_engine_maybe(
+        ad_config=ad_config, engine=engine, dist_mapping=dist_mapping, mpi_dist=mpi_dist
+    )
+
     # check kvcache config for partial block reuse
     # TODO: copy_on_partial_reuse is not supported yet, see
     # https://github.com/NVIDIA/TensorRT-LLM/issues/7142 for more details.
@@ -396,10 +655,17 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_batch_size=ad_config.max_batch_size,
     )
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
+
+    draft_kv_cache_manager = create_draft_kv_cache_manager_maybe(
+        draft_model_engine, ad_config, dist_mapping
+    )
+
     resource_manager = ResourceManager(
         {
             ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_kv_cache_manager,
             ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+            ResourceManagerType.SPEC_RESOURCE_MANAGER: spec_resource_manager,
         }
     )
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
@@ -436,10 +702,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=ad_config.max_beam_width,
+        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
     )
     sampler = TorchSampler(sampler_args)
 
-    # Guided (istructured) decoding.
+    # Guided (structured) decoding.
     guided_decoder = None
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
@@ -458,6 +725,13 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             vocab_size_padded=vocab_size_padded,
         )
 
+    drafter = get_spec_drafter(
+        model_engine=engine,
+        draft_model_engine=draft_model_engine,
+        sampler=sampler,
+        spec_resource_manager=spec_resource_manager,
+    )
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -473,5 +747,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_total_draft_tokens=max_total_draft_tokens,
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
+        drafter=drafter,
     )
     return py_executor

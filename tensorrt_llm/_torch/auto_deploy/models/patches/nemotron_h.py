@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
 from tensorrt_llm._torch.auto_deploy.models.patches.bamba import _bamba_mixer_torch_forward
 
@@ -93,14 +93,15 @@ def _nemotron_h_topk_router_forward(self, hidden_states):
     Forward pass for NemotronHTopkRouter using the optimized noaux_tc_op kernel.
 
     This replaces the original forward method which used pure PyTorch operations
-    with a fused CUDA kernel that performs:
-    1. Sigmoid activation of logits
-    2. Group-based expert selection
-    3. Top-k selection within selected groups
-    4. Normalized weight computation
+    with optimized CUDA kernels:
     """
     hidden_states = hidden_states.view(-1, self.config.hidden_size)
-    router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+    if self.weight.dtype == torch.float32:
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight)
+    else:
+        router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+        )
 
     # Use the fused noaux_tc_op kernel which applies sigmoid internally
     # and performs group-based top-k selection with normalization
@@ -188,42 +189,6 @@ def get_model_from_config_patched(config, **kwargs):
 
 # TODO: figure out how this can be incorporated into the export patch system
 AutoModelForCausalLM.from_config = get_model_from_config_patched
-
-_config_from_pretrained_original = AutoConfig.from_pretrained
-_nemotron_h_base_model_tp_plan = {
-    # mamba SSM layer
-    "in_proj": "mamba",
-    "out_proj": "rowwise",
-    # attention layer
-    "q_proj": "colwise",
-    "k_proj": "colwise",
-    "v_proj": "colwise",
-    "o_proj": "rowwise",
-    # NOTE: consider not sharding shared experts and/or
-    # latent projections at all, keeping them replicated.
-    # To do so, comment out the corresponding entries.
-    # moe layer: SHARED experts
-    "up_proj": "colwise",
-    "down_proj": "rowwise",
-    # MoLE: latent projections: simple shard
-    "fc1_latent_proj": "gather",
-    "fc2_latent_proj": "gather",
-}
-
-
-def get_config_from_pretrained_patched(*args, **kwargs):
-    ret = _config_from_pretrained_original(*args, **kwargs)
-    config = ret[0] if isinstance(ret, tuple) else ret
-    # heuristic to check if it's a NemotronH MoE Model
-    model_type = getattr(config, "model_type", None)
-    num_moe_layers = getattr(config, "layers_block_type", []).count("moe")
-    if model_type == "nemotron_h" and num_moe_layers > 0:
-        config.base_model_tp_plan = _nemotron_h_base_model_tp_plan
-    return (config, *ret[1:]) if isinstance(ret, tuple) else config
-
-
-# TODO: figure out how this can be incorporated into the export patch system
-AutoConfig.from_pretrained = get_config_from_pretrained_patched
 
 # TODO: figure out how this can be incorporated into the export patch system
 # Only patch if the module isn't available

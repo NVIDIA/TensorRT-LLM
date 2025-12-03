@@ -34,8 +34,11 @@ class CacheConfig(BaseModel):
 
     dtype: Optional[torch.dtype] = Field(default=None, description="KV cache dtype.")
     mamba_dtype: Optional[torch.dtype] = Field(default=None, description="Mamba cache dtype.")
+    delta_dtype: Optional[torch.dtype] = Field(
+        default=torch.float32, description="Delta cache dtype. Defaults to float32."
+    )
 
-    @field_validator("dtype", "mamba_dtype", mode="before")
+    @field_validator("dtype", "mamba_dtype", "delta_dtype", mode="before")
     @classmethod
     def _coerce_dtype(cls, value):
         if value is None or isinstance(value, torch.dtype):
@@ -612,15 +615,7 @@ class SequenceInfo:
 
     @nvtx_range("ad_get_unique_value")
     def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
-        """Get un unoccupied value from the range indicated by max_val.
-
-        In addition, this function performs a sanity check to ensure that no value in the occupied
-        set is out of bounds.
-        """
-        # Validate without materializing the full range set
-        out_of_range = [v for v in occupied if v < 0 or v >= max_val]
-        assert not out_of_range, f"Out of range values: {out_of_range}"
-
+        """Get un unoccupied value from the range indicated by max_val."""
         # Return the smallest free value; fall back to 0 if none
         for candidate in range(max_val):
             if candidate not in occupied:

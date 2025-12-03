@@ -456,10 +456,11 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.attentionSinksPtr = params.attention_sinks;
         tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
+        // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
-        // TRTLLM-GEN kernels always use the Log2 scale
-        tllmRunnerParams.scaleSoftmaxLog2Ptr
-            = reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr);
+        tllmRunnerParams.scaleSoftmaxLog2Ptr = launchParams.bmm1_scale_ptr
+            ? reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr)
+            : nullptr;
         tllmRunnerParams.oSfScalePtr = params.fp4_out_sf_scale;
 
         tllmRunnerParams.oPtr = params.output;

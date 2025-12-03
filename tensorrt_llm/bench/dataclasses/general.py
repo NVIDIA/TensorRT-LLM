@@ -14,6 +14,7 @@ class BenchmarkEnvironment(BaseModel):
     model: str
     checkpoint_path: Optional[Path]
     workspace: Path
+    revision: Optional[str] = None
 
 
 class InferenceRequest(BaseModel):

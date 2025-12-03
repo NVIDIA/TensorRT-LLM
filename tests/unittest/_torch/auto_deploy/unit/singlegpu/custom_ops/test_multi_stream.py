@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.multi_stream import (
+from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe import (
     aux_stream_wrapper,
+    cuda_stream_manager,
     record_event_wrapper,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -56,10 +57,12 @@ def replace_multi_stream_linear_with_aux_stream_wrapper(gm: GraphModule) -> Tupl
         if target_input_node is None:
             raise ValueError(f"Target input node not found for node {n}")
         with graph.inserting_before(target_input_node):
+            kwargs = target_input_node.kwargs.copy()
+            kwargs["device"] = torch.cuda.current_device()
             new_node = graph.call_function(
                 record_event_wrapper,
                 args=(target_input_node.target, *target_input_node.args),
-                kwargs=target_input_node.kwargs,
+                kwargs=kwargs,
             )
             target_input_node.replace_all_uses_with(new_node)
             graph.erase_node(target_input_node)
@@ -95,7 +98,7 @@ class ParallelTwoLinear(nn.Module):
 
 def test_multi_stream_linear():
     in_dim, out_dim = 128, 256
-
+    cuda_stream_manager.add_device(torch.cuda.current_device())
     model = (
         nn.Sequential(ParallelTwoLinear(in_dim, out_dim), ParallelTwoLinear(out_dim, out_dim))
         .eval()
