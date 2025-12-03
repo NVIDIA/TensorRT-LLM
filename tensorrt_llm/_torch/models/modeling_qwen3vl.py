@@ -5,7 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
+<<<<<<< HEAD
 from transformers.activations import ACT2FN as HF_ACT2FN
+=======
+from transformers.activations import ACT2FN
+>>>>>>> 5e7dde7bc (fix: set dtype to None in Linear to improve accuracy)
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
@@ -368,10 +372,27 @@ class Qwen3VLVisionMLP(MLP):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             bias=True,
+<<<<<<< HEAD
             activation=HF_ACT2FN[config.hidden_act],
             # dtype=model_config.pretrained_config.text_config.dtype,
             config=model_config,
             layer_idx=layer_idx,
+=======
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.linear_fc2 = Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=True,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
+            allreduce_strategy=model_config.allreduce_strategy,
+>>>>>>> 5e7dde7bc (fix: set dtype to None in Linear to improve accuracy)
         )
 
 
@@ -390,8 +411,14 @@ class Qwen3VLVisionBlock(torch.nn.Module):
             eps=model_config.pretrained_config.text_config.rms_norm_eps,
             dtype=model_config.pretrained_config.text_config.dtype,
         )
+<<<<<<< HEAD
         self.attn = Qwen3VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen3VLVisionMLP(model_config, layer_idx)
+=======
+        self.attn = Qwen3_VLVisionAttention(model_config, layer_idx)
+        self.mlp = Qwen3_VLVisionMLP(model_config)
+        # self.mlp = Qwen3VLVisionMLP(config)
+>>>>>>> 5e7dde7bc (fix: set dtype to None in Linear to improve accuracy)
 
     @torch.inference_mode()
     def forward(
