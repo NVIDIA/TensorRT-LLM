@@ -219,7 +219,7 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.Default
 
 
-class Deepseekv3RoutingImpl():
+class Deepseekv3RoutingImpl:
 
     def __init__(
             self,
@@ -556,7 +556,6 @@ class RenormalizeNaiveMoeRoutingMethod(RenormalizeMoeRoutingMethod):
         return RoutingMethodType.RenormalizeNaive
 
 
-# Mapping from RoutingMethodType to the corresponding class
 ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
                                    Type[BaseMoeRoutingMethod]] = {
                                        RoutingMethodType.Default:

@@ -56,6 +56,11 @@ def prepare_dummy_topk_and_hook(
         Tuple of (routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook)
     """
 
+    # NOTE: This prevents auto-tuning related code from being executed in actual runs
+    tuner = AutoTuner.get()
+    if not tuner.is_tuning_mode:
+        return routing_logits, topk_weights, topk_ids, base_tuning_config
+
     if routing_logits is None:
         routing_logits_for_tuner = torch.randn(hidden_states.shape[0],
                                                num_experts,
@@ -91,6 +96,7 @@ def prepare_dummy_topk_and_hook(
         # Attention DP: topk is pre-computed, no routing needed
         topk_ids_for_tuner, topk_weights_for_tuner = routing_method.apply(
             routing_logits_for_tuner)
+        topk_weights_for_tuner = topk_weights_for_tuner.to(torch.bfloat16)
         # Don't pass routing_logits to avoid C++ warning about all three being provided
         routing_logits_for_tuner = None
     else:
@@ -122,7 +128,7 @@ def prepare_dummy_topk_and_hook(
                 topk_ids_for_tuner, topk_weights_for_tuner = routing_method.apply(
                     routing_logits_for_tuner)
                 inputs[-1] = topk_ids_for_tuner
-                inputs[-2] = topk_weights_for_tuner
+                inputs[-2] = topk_weights_for_tuner.to(torch.bfloat16)
             # Note: routing_logits is None in attention DP, no need to adjust
             assert inputs[0] is None
 
