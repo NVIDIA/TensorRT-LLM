@@ -5,6 +5,7 @@ from abc import ABC
 from typing import Callable, List, Optional
 
 import openai
+from enum import Enum
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
@@ -365,24 +366,45 @@ class MCPWorker(Worker):
         return worker
 
     async def _main_loop_async_client_iter(self, url: str, index: int):
+        class TaskType(Enum):
+            TOOL_CALL = "tool_call"
+            WAIT_QUEUE = "wait_queue"
+
         async with sse_client(url) as streams:
             async with ClientSession(*streams) as session:
                 await session.initialize()
                 response = await session.list_tools()
                 tools = response.tools
+                pending_dict = {asyncio.create_task(self.queues[index].get()) : (TaskType.WAIT_QUEUE, None)}
+                pending = pending_dict.keys()
                 while True:
-                    obj = await self.queues[index].get()
-                    if obj is None:
-                        break
-                    # tool_call is a ToolCall object
-                    tool_call = obj
-                    tool_name = tool_call.tool_name
-                    args = tool_call.args
-                    if tool_name in [tool.name for tool in tools]:
-                        response = await session.call_tool(tool_name, args)
-                        tool_call.set_result(response.content[0].text)
-                    else:
-                        tool_call.set_result(None)
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+                    for task in done:
+                        task_type, obj = pending_dict[task]
+                        if task_type == TaskType.TOOL_CALL:
+                            response = task.result()
+                            tool_call = obj
+                            tool_call.set_result(response.content[0].text)
+                        else: # TaskType.WAIT_QUEUE
+                            queue_obj = task.result()
+                            if queue_obj is None:
+                                # quit
+                                return
+                            else:
+                                tool_name = queue_obj.tool_name
+                                args = queue_obj.args
+                                if tool_name in [tool.name for tool in tools]:
+                                    new_task = asyncio.create_task(session.call_tool(tool_name, args))
+                                    pending_dict[new_task] = (TaskType.TOOL_CALL, queue_obj)
+                                    pending.add(new_task)
+                                else:
+                                    queue_obj.set_result(None)
+                            # Wait next queue object
+                            new_wait_queue_task = asyncio.create_task(self.queues[index].get())
+                            pending_dict[new_wait_queue_task] = (TaskType.WAIT_QUEUE, None)
+                            pending.add(new_wait_queue_task)
+
 
     async def init_in_asyncio_event_loop(self):
         for index in range(len(self.urls)):

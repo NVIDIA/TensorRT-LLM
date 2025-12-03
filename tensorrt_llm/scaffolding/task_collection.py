@@ -1,9 +1,10 @@
 import time
+import json
 from enum import Enum
 from typing import Any, Dict, List, Tuple, Type
 
 from .controller import ParallelProcess
-from .task import ChatTask, DropKVCacheTask, GenerationTask, Task
+from .task import ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task
 
 
 class TaskCollection:
@@ -165,6 +166,27 @@ class TaskTimer(TaskCollection):
     def get_global_info() -> Any:
         return TaskTimer.statistics
 
+
+class QueryCollector(TaskCollection):
+    file_name = "query_result.json"
+    query_dict = {}    
+
+    def __init__(self):
+        super().__init__()
+
+    def after_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if not isinstance(task, MCPCallTask):
+                continue
+            args = json.loads(task.args)
+            if 'query' in args:
+                QueryCollector.query_dict[args['query']] = task.result_str
+
+    def get_global_info() -> Any:
+        with open(QueryCollector.file_name, 'w') as f:
+            json.dump(QueryCollector.query_dict, f, indent=4)
+        return None
+    
 
 class SubRequestMarker(TaskCollection):
 
