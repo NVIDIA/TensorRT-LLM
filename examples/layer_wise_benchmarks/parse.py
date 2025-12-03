@@ -161,12 +161,20 @@ if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
         FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
 query = f"""SELECT unified.start, unified.end, unified.demangledName,
        R.start AS runtime_start, R.end AS runtime_end,
-       CGE2.start AS capture_start, CGE2.end AS capture_end
+       R.start AS capture_start, R.end AS capture_end
 FROM ({unified_subquery}) AS unified
 JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
-LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
-                                            CGE1.originalGraphNodeId IS NOT NULL
-LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
+WHERE unified.graphNodeId IS NULL"""
+if "CUDA_GRAPH_NODE_EVENTS" in tables:
+    query += f""" UNION ALL
+    SELECT unified.start, unified.end, unified.demangledName,
+           R.start AS runtime_start, R.end AS runtime_end,
+           CGE2.start AS capture_start, CGE2.end AS capture_end
+    FROM ({unified_subquery}) AS unified
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
+    LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
+                                                CGE1.originalGraphNodeId IS NOT NULL
+    LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
 df = pd.read_sql_query(query, conn)
 kernel_list = []
 for (
@@ -205,7 +213,6 @@ for (
             capture_end,
         )
     )
-# TODO: Parse CTX phases
 
 query = "SELECT * FROM StringIds"
 df = pd.read_sql_query(query, conn)

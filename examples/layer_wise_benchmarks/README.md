@@ -143,8 +143,6 @@ python3 parse.py --world-size 4
 python3 parse.py --profile-dir ./profiles --world-size 4 --rank 0
 ```
 
-It can parse only GEN phase profiles for now.
-
 You will receive three reports, each containing kernel timing statistics grouped by module:
 1. A printed report on stdout
 2. A CSV report at `profiles/report_np4_rank0.csv`
