@@ -15,6 +15,7 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8TPShardingInfo,
+    LayerType,
     ShardingTransformConfig,
     SplitDimension,
     WeightShardingInfo,
@@ -285,8 +286,6 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
-                            dist_backend="auto",
                             layer_type=LayerType.ATTENTION,
                         )
                     )
@@ -308,8 +307,7 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
-                            dist_backend="auto",
+                            layer_type=LayerType.MLP,
                         )
                     )
         elif model_cls == nn.Linear:
@@ -323,8 +321,7 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op="all_gather",
                             min_local_shape=1,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
-                            dist_backend="auto",
+                            layer_type=LayerType.MLP,
                         )
                     )
         elif model_cls == FP8MLP:
@@ -345,8 +342,6 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=1,
-                            allreduce_strategy=AllReduceStrategy.AUTO,
-                            dist_backend="auto",
                         )
                     )
 
