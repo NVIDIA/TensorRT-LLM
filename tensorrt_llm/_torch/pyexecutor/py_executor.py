@@ -53,7 +53,8 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
 from .sampler import Sampler, SampleState, SampleStateTensors
-from .scheduler import RequestScheduler, ScheduledRequests
+from .scheduler import (RequestScheduler, ScheduledRequests,
+                        SerializableSchedulerOutput)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -179,6 +180,7 @@ class PyExecutor:
         self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
         self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
         self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
+        self.max_pp_retry_count = self.llm_args.max_pp_retry_count
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -232,6 +234,8 @@ class PyExecutor:
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
+        # schedule handle for PP to propagate the first PP rank's schedule result
+        self.send_schedule_handler = None
 
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
@@ -786,6 +790,73 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
+    def _pp_schedule_and_propagate(self):
+        """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
+        # Tag used for schedule result propagation
+        tag = self.dist.pp_size + 1
+
+        # The first PP rank schedules the requests, other ranks receive the schedule result from the previous PP rank.
+        if self.dist.is_first_pp_rank:
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+            )
+            serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
+                scheduled_batch, fitting_disagg_gen_init_requests,
+                num_fitting_reqs)
+        else:
+            with nvtx_range("recv_schedule_from_prev_pp"):
+                serializable_schedule = self.dist.recv_object(
+                    self.dist.prev_pp_rank, tag)
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
+                self.active_requests)
+
+        # Propagate the schedule result to the next PP rank except the last PP rank.
+        if not self.dist.is_last_pp_rank:
+            if self.send_schedule_handler is not None:
+                with nvtx_range("wait_send_schedule_handler"):
+                    self.send_schedule_handler.wait()
+            with nvtx_range("send_schedule_to_next_pp"):
+                self.send_schedule_handler = self.dist.isend_object(
+                    serializable_schedule, self.dist.next_pp_rank, tag)
+        return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
+
+    def _pp_retry_until_can_schedule(self, scheduled_batch):
+        """Retry until current rank can run the given scheduled batch."""
+        scheduled_batch_requests = scheduled_batch.all_requests()
+        if self.scheduler.can_schedule(scheduled_batch_requests):
+            return
+
+        logger.warning(
+            "Cannot run first PP's schedule result due to limited KV cache resources. This may cause bubbles in the PP pipeline. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value."
+        )
+        if self.kv_cache_transceiver is None:
+            raise RuntimeError(
+                "KV cache transceiver is not enabled, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
+            )
+        if not self.ctx_in_transmission_requests:
+            raise RuntimeError(
+                "No context cache transmission is in progress, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
+            )
+        if self.block_reuse_enabled and self._disagg_pp_termination_handler is not None:
+            raise RuntimeError(
+                "Cannot terminate requests in cache transmission and release their KV cache resources when block reuse is enabled. Please consider increasing the KV cache size."
+            )
+
+        for retry_count in range(self.max_pp_retry_count):
+            if self.scheduler.can_schedule(scheduled_batch_requests):
+                break
+            logger.debug(
+                f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.max_pp_retry_count})"
+            )
+
+            # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
+            self._check_disagg_ctx_cache_transfer_status(1)
+            self._check_kv_transfer_timeout()
+            self._terminate_disagg_ctx_finished_requests()
+        else:
+            raise RuntimeError(
+                f"Reach maximum PP retry count ({self.max_pp_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `max_pp_retry_count` to a larger value to allow more retries."
+            )
+
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
@@ -799,6 +870,8 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
@@ -816,11 +889,18 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
+                # If current rank cannot run this schedule result, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
+                #   1. Wait for cache transceiver to finish at least one cache transmission.
+                #   2. Terminate requests that have finished context cache transmission.
+                #   3. Check if current rank has enough KV cache resources to run this schedule result.
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                 )
+                if not self.dist.is_first_pp_rank:
+                    self._pp_retry_until_can_schedule(scheduled_batch)
 
+                # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
-                    # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
@@ -840,7 +920,6 @@ class PyExecutor:
                 )
 
                 can_queue = self._can_queue(scheduled_batch)
-
                 if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
@@ -1746,24 +1825,26 @@ class PyExecutor:
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
-        if not self.enable_batch_waiting:
-            return context_requests
+        """
+        Return an empty list if scheduled requests fulfill the waiting conditions, otherwise return the original context requests.
+        Waiting conditions:
+        - The number of scheduled tokens (both context and generation) is smaller than `self.batch_wait_max_tokens_ratio * self.max_num_tokens`
+        - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
+        """
 
-        waited_context_requests = []
-        stop_waiting = False
         num_scheduled_ctx_tokens = sum(
             len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)
         num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
-        stop_waiting = self.batch_wait_iters_count >= self.batch_wait_timeout_iters or num_scheduled_tokens >= self.batch_wait_max_tokens_ratio * self.max_num_tokens
-        if stop_waiting:
-            waited_context_requests = context_requests
-            self.batch_wait_iters_count = 0
-        else:
+        should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        if should_waiting:
             self.batch_wait_iters_count += 1
-        return waited_context_requests
+            return []
+
+        self.batch_wait_iters_count = 0
+        return context_requests
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1775,10 +1856,11 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
-        # if no generation requests, no need to wait, to avoid dead waiting
-        if not self.enable_attention_dp and self.enable_batch_waiting and len(
-                scheduler_output.context_requests) > 0 and len(
-                    scheduler_output.generation_requests) > 0:
+        # If no generation requests, no need to wait, to avoid dead waiting
+        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
+            scheduler_output.context_requests) > 0 and len(
+                scheduler_output.generation_requests) > 0
+        if should_check_waiting:
             scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
@@ -2403,7 +2485,10 @@ class PyExecutor:
 
     @nvtx_range("_terminate_disagg_ctx_finished_requests")
     def _terminate_disagg_ctx_finished_requests(self):
-        for request_id in list(self.ctx_in_transmission_requests.keys()):
+        # make a copy of the keys, since we are modifying the dictionary in the loop
+        in_transmission_requests_id = list(
+            self.ctx_in_transmission_requests.keys())
+        for request_id in in_transmission_requests_id:
             request, block_id, counter = self.ctx_in_transmission_requests[
                 request_id]
 
