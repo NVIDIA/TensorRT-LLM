@@ -324,7 +324,7 @@ class ADEngine(ModelEngine):
         logits = self._compute_logits()
 
         if self.cache_seq_interface.info.is_generate:
-            logits = logits.squeeze(1)  # [b,1,vocab_size]->[b,vocab_size]
+            logits_flat = logits.squeeze(1)  # [b,1,vocab_size]->[b,vocab_size]
         else:
             # mixed prefill and decode
             logits = logits.squeeze(0)
