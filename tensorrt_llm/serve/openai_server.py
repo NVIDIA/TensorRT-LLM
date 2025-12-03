@@ -1011,38 +1011,16 @@ class OpenAIServer:
         return JSONResponse(content={"detail": "None"})
 
     async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        #await self.llm.sleep_async(level=2)
-
-        tags = ["sampler",
-            "drafter",
-            "guided_decoder",
-            "spec_resource_manager",
-            "_no_capture_model_extra",
-            "executor_extra",
-            "kv_cache",
-            "model",
-            "draft_model"]
-        #self.llm._collective_rpc('sleep', args=(tags,))
-        print(f"HTTP received: release_memory {tags}")
+        print(f"HTTP received: release_memory {request.tags}")
+        self.llm._collective_rpc('sleep', args=(request.tags,))
         return JSONResponse(content={"status": "success"})
 
     async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        #await self.llm.wakeup_async(level=2)
-        tags = ["sampler",
-            "drafter",
-            "guided_decoder",
-            "spec_resource_manager",
-            "_no_capture_model_extra",
-            "executor_extra",
-            "kv_cache",
-            "model",
-            "draft_model"]
-        #self.llm._collective_rpc('wakeup', args=(tags,))
-        print(f"HTTP received: resume_memory {tags}")
+        print(f"HTTP received: resume_memory {request.tags}")
+        self.llm._collective_rpc('wakeup', args=(request.tags,))
         return JSONResponse(content={"status": "success"})
 
     async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
-        #await self.llm.update_weights_from_ipc_handles_async(request.weights)
         print(f"HTTP received: update_weights")
         self.llm._collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
