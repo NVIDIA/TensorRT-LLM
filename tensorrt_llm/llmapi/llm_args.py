@@ -2579,10 +2579,10 @@ class TorchLlmArgs(BaseLlmArgs):
     sampler_force_async_worker: bool = Field(
         default=False,
         description="Force usage of the async worker in the sampler for D2H "
-        "copies, even if confidential compute is not active\n"
-        "Normally, the async worker should only be used when confidential "
-        "compute is active. This argument is provided to enable it for testing "
-        "purposes, irrespective of confidential compute state.",
+        "copies, even if confidential compute is not active. Normally, the "
+        "async worker should only be used when confidential compute is active. "
+        "This argument is provided to enable it for testing purposes, "
+        "irrespective of confidential compute state.",
         status="prototype")
 
     enable_iter_perf_stats: bool = Field(
