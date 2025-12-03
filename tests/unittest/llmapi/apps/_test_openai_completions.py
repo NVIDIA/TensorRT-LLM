@@ -5,6 +5,7 @@ from typing import List
 
 import openai
 import pytest
+from utils.util import similar
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -206,7 +207,7 @@ async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
 
 
 @pytest.mark.asyncio(loop_scope="module")
-@pytest.mark.parametrize("prompts", [["Hello, my name is", "What is the AI?"]])
+@pytest.mark.parametrize("prompts", [["Hello, my name is"] * 2])
 async def test_batch_completions_with_option_n_streaming(
         async_client: openai.AsyncOpenAI, model_name, prompts):
     # test beam search with streaming
@@ -215,7 +216,7 @@ async def test_batch_completions_with_option_n_streaming(
         prompt=prompts,
         n=3,  # number of completions to generate for each prompt.
         max_tokens=5,
-        temperature=0.0,
+        temperature=0.0001,
         stream=True,
     )
     texts = [""] * 6  # 2 prompts × 3 generations per prompt = 6 choices
@@ -224,7 +225,10 @@ async def test_batch_completions_with_option_n_streaming(
         choice = chunk.choices[0]
         texts[choice.index] += choice.text
 
-    assert [""] not in texts  # Assert all the generations are not empty
+    assert "" not in texts  # Assert all the generations are not empty
+
+    for i, j in zip(texts[:3], texts[3:]):
+        assert similar(i, j, threshold=0.8)
 
 
 @pytest.mark.asyncio(loop_scope="module")
