@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 import jinja2
@@ -14,15 +15,17 @@ import pandas as pd
 # Parse cmdline
 parser = argparse.ArgumentParser()
 parser.add_argument("--profile-dir", type=str, default="profiles")
-parser.add_argument("--world-size", "--np", type=int)
+parser.add_argument("--world-size", "--np", type=int, required=True)
 parser.add_argument("--rank", type=int, default=0)
 parser.add_argument("--warmup-times", type=int)
-group = parser.add_mutually_exclusive_group(required=False)
+parser.add_argument("--module", type=str)
+parser.add_argument("--query", type=str)
+group = parser.add_mutually_exclusive_group()
 group.add_argument("--error-on-unknown-kernel", action="store_true", dest="error_on_unknown_kernel")
 group.add_argument(
     "--no-error-on-unknown-kernel", action="store_false", dest="error_on_unknown_kernel"
 )
-parser.set_defaults(error_on_unknown_kernel=None)
+parser.set_defaults(error_on_unknown_kernel=False)
 args = parser.parse_args()
 print(args)
 
@@ -123,6 +126,7 @@ for start, text in df.itertuples(index=False):
                 "runs": [],
                 "runs_end": [],
                 "ranges": [],
+                "range_in_module": [],
             }
         )
 
@@ -145,6 +149,28 @@ for start, end, text in df.itertuples(index=False):
     else:
         problem_set[problem_id]["ranges"].append((start, end, text))
 
+# Determine whether each range is the first range that matches `args.module`,
+# and store the result in `problem["range_in_module"]`
+for problem in problem_set:
+    if args.module is not None:
+        problem["range_in_module"] = [False] * len(problem["ranges"])
+        run_ids = [bisect.bisect(problem["runs"], start) - 1 for start, _, _ in problem["ranges"]]
+        run2ranges = defaultdict(list)
+        for i, run_id in enumerate(run_ids):
+            run2ranges[run_id].append(i)
+        for run_id, ranges in run2ranges.items():
+            ranges = sorted(ranges, key=lambda i: problem["ranges"][i][0])
+            num_matches = 0
+            for range_id in ranges:
+                if problem["ranges"][range_id][2] == args.module:
+                    problem["range_in_module"][range_id] = True
+                    num_matches += 1
+            if num_matches != 1:
+                raise ValueError(
+                    f'Module "{args.module}" appears {num_matches} times'
+                    f' in "{problem["text"]}"\'s {run_id + 1}-th run'
+                )
+
 query = """SELECT name FROM sqlite_master WHERE type = ?"""
 df = pd.read_sql_query(query, conn, params=("table",))
 tables = df["name"].tolist()
@@ -160,12 +186,20 @@ if "CUPTI_ACTIVITY_KIND_MEMSET" in tables:
         FROM CUPTI_ACTIVITY_KIND_MEMSET AS T3"""
 query = f"""SELECT unified.start, unified.end, unified.demangledName,
        R.start AS runtime_start, R.end AS runtime_end,
-       CGE2.start AS capture_start, CGE2.end AS capture_end
+       R.start AS capture_start, R.end AS capture_end
 FROM ({unified_subquery}) AS unified
 JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
-LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
-                                            CGE1.originalGraphNodeId IS NOT NULL
-LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
+WHERE unified.graphNodeId IS NULL"""
+if "CUDA_GRAPH_NODE_EVENTS" in tables:
+    query += f""" UNION ALL
+    SELECT unified.start, unified.end, unified.demangledName,
+           R.start AS runtime_start, R.end AS runtime_end,
+           CGE2.start AS capture_start, CGE2.end AS capture_end
+    FROM ({unified_subquery}) AS unified
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS R ON unified.correlationId = R.correlationId
+    LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE1 ON unified.graphNodeId = CGE1.graphNodeId AND
+                                                CGE1.originalGraphNodeId IS NOT NULL
+    LEFT JOIN CUDA_GRAPH_NODE_EVENTS AS CGE2 ON CGE1.originalGraphNodeId = CGE2.graphNodeId"""
 df = pd.read_sql_query(query, conn)
 kernel_list = []
 for (
@@ -178,33 +212,35 @@ for (
     capture_end,
 ) in df.itertuples(index=False):
     problem_id = bisect.bisect(problem_start, start) - 1
-    run_id = bisect.bisect(problem_set[problem_id]["runs"], runtime_start) - 1
+    problem = problem_set[problem_id]
+    run_id = bisect.bisect(problem["runs"], runtime_start) - 1
     if (
         run_id == -1
-        or run_id == len(problem_set[problem_id]["runs"])
-        or runtime_start >= problem_set[problem_id]["runs_end"][run_id]
+        or run_id == len(problem["runs"])
+        or runtime_start >= problem["runs_end"][run_id]
     ):
         run_id = -1
     ranges = [
-        text
-        for range_start, range_end, text in problem_set[problem_id]["ranges"]
+        i
+        for i, (range_start, range_end, text) in enumerate(problem["ranges"])
         if capture_start >= range_start and capture_end <= range_end
     ]
-    kernel_list.append(
-        (
-            problem_id,
-            run_id,
-            ranges,
-            start,
-            end,
-            demangledName,
-            runtime_start,
-            runtime_end,
-            capture_start,
-            capture_end,
+    if args.module is None or any(problem["range_in_module"][i] for i in ranges):
+        range_names = [problem["ranges"][i][2] for i in ranges]
+        kernel_list.append(
+            (
+                problem_id,
+                run_id,
+                range_names,
+                start,
+                end,
+                demangledName,
+                runtime_start,
+                runtime_end,
+                capture_start,
+                capture_end,
+            )
         )
-    )
-# TODO: Parse CTX phases
 
 query = "SELECT * FROM StringIds"
 df = pd.read_sql_query(query, conn)
@@ -267,6 +303,7 @@ parser_keywords = [
     ("memsetExpertIds", "memsetExpertIdsDevice"),
     ("blockSum", "blockExpertPrefixSumKernel"),
     ("globalSum", "globalExpertPrefixSumKernel"),
+    ("globalSumLarge", "globalExpertPrefixSumLargeKernel"),
     ("mergePrefix", "mergeExpertPrefixSumKernel"),
     ("fusedBuildExpertMaps", "fusedBuildExpertMapsSortFirstTokenKernel"),
     ("swiglu", "silu_and_mul_kernel"),
@@ -288,6 +325,7 @@ parser_keywords = [
     ("per_token_quant", "_per_token_quant_and_transform_kernel"),
     ("triton_fused_layer_norm", "triton_per_fused__to_copy_native_layer_norm_0"),
     ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<"),
+    ("flashinferRoPE", "flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheKernel<"),
     ("fp8_blockscale_gemm", "tensorrt_llm::kernels::fp8_blockscale_gemm"),
     ("triton_fused_mul_squeeze", "triton_poi_fused_mul_squeeze_0"),
     ("indexerKCacheScatter", "tensorrt_llm::kernels::indexerKCacheScatterUnifiedKernel"),
@@ -308,12 +346,17 @@ parser_keywords = [
     ("softmax_warp_forward", "softmax_warp_forward<"),
     ("torchSigmoid", "at::native::sigmoid_kernel_cuda"),
     ("torchMul", "at::native::binary_internal::MulFunctor<"),
+    ("computeSeqAndPaddingOffsets", "tensorrt_llm::kernels::computeSeqAndPaddingOffsets<"),
     ("applyBiasRopeUpdateKVCache", "tensorrt_llm::kernels::applyBiasRopeUpdateKVCacheV2<"),
     ("routingIndicesHistogramScores", "routingRenormalize::routingIndicesHistogramScoresKernel<"),
     ("routingIndicesHistogram", "routingIndicesHistogramKernel<"),
     ("routingIndicesOffsets", "routingIndicesOffsetsKernel<"),
     ("torchReduceSum", ["at::native::reduce_kernel<", "at::native::sum_functor<"]),
     ("CuteDSLMoePermute", "cute_dsl::moePermuteKernel"),
+    (
+        "CuteDSLGemm",
+        ["cute_dsl_kernels", "blockscaled_gemm_persistent"],
+    ),
     (
         "CuteDSLGroupedGemmSwiglu",
         ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"],
@@ -342,7 +385,11 @@ def parse_kernel_name(demangledName):
         warned_names.add(name)
         if args.error_on_unknown_kernel:
             raise NotImplementedError(f"Unknown kernel name: {name}")
-    return name[:30]
+    if "<" in name:
+        name = name[: name.index("<")]
+    if "(" in name:
+        name = name[: name.index("(")]
+    return name
 
 
 converted_seqs = []
@@ -390,6 +437,9 @@ for problem_id, converted_seq in enumerate(converted_seqs):
         merged_data[cur][problem_id] = t
         cur += 1
 
+print("Run args:")
+print(run_args)
+
 print("Problem set:")
 for problem in problem_set:
     print(
@@ -401,7 +451,7 @@ stack = []
 csv_data = [["", *[problem["text"] for problem in problem_set]]]
 js_data = []
 js_stack = [js_data]
-max_title_len = max((len(title) - 1) * 3 + len(title[-1]) for title in merged_title)
+max_title_len = max((len(title) - 1) * 3 + len(title[-1][:40]) for title in merged_title)
 for title, time_data in zip(merged_title, merged_data):
     while stack != list(title[: len(stack)]):
         level_title = stack[-1]
@@ -418,11 +468,13 @@ for title, time_data in zip(merged_title, merged_data):
         stack.append(level_title)
         level = len(stack)
         print("|--" * (level - 1) + level_title)
-        csv_data.append(["|--" * (level - 1) + level_title])
+        csv_data.append(["|--" * (level - 1) + level_title] + [""] * len(problem_set))
         js_stack.append([])
     level = len(stack) + 1
     print(
-        "|--" * (level - 1) + title[-1] + " " * (max_title_len - (level - 1) * 3 - len(title[-1])),
+        "|--" * (level - 1)
+        + title[-1][:40]
+        + " " * (max_title_len - (level - 1) * 3 - len(title[-1][:40])),
         *[f"{x / 1000:-6.1f}" for x in time_data],
     )
     csv_data.append(["|--" * (level - 1) + title[-1], *[f"{x / 1000:.1f}" for x in time_data]])
@@ -442,8 +494,21 @@ js_header_config = [{"name": problem["text"]} for problem in problem_set]
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
 template = jinja2.Environment(loader=loader).get_template("template.html")
 with html_file_path.open("w") as f:
-    f.write(
-        template.render(
-            headerConfig=js_header_config, rawData=js_data, runArgs=json.dumps(run_args, indent=4)
-        )
+    configText = (
+        "Run:\n" + json.dumps(run_args, indent=4) + "\n\nParse:\n" + json.dumps(args.__dict__)
     )
+    f.write(template.render(headerConfig=js_header_config, rawData=js_data, configText=configText))
+
+if args.query is not None:
+    print("Query:")
+    for query in args.query.split(","):
+        query = query.strip()
+        query_matched = [0.0] * len(problem_set)
+        for title, time_data in zip(merged_title, merged_data):
+            if query in ".".join(title):
+                for i, x in enumerate(time_data):
+                    query_matched[i] += x
+        print(
+            query + " " * (max_title_len - len(query)),
+            *[f"{x / 1000:-6.1f}" for x in query_matched],
+        )
