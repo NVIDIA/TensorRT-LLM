@@ -245,3 +245,21 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-30B-A3B-Instruct"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
+    )
+
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
