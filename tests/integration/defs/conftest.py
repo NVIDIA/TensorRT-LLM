@@ -2160,6 +2160,15 @@ def pytest_addoption(parser):
         help="Enable GPU clock locking during tests. "
         "By default, GPU clock locking is disabled.",
     )
+    parser.addoption(
+        "--periodic-save-unfinished-test",
+        action="store_true",
+        default=False,
+        help=
+        "Save unfinished test name to unfinished_test.txt during test execution (default: False). "
+        "This helps identify which test was running when a timeout or crash occurs. "
+        "Only used with --periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2269,6 +2278,8 @@ def pytest_configure(config):
     if periodic and output_dir:
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
+        periodic_save_unfinished_test = config.getoption(
+            "--periodic-save-unfinished-test", default=False)
 
         # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
         # that may need to write to the same directory (e.g., pytest-split)
@@ -2285,6 +2296,7 @@ def pytest_configure(config):
                 'info': print_info,
                 'warning': print_warning
             },
+            save_unfinished_test=periodic_save_unfinished_test,
         )
 
         # Configure and register the reporter
@@ -2296,6 +2308,7 @@ def pytest_configure(config):
             f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
         )
         print_info(f"  Batch size: {periodic_batch_size} tests")
+        print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
     elif periodic and not output_dir:
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
@@ -2357,6 +2370,8 @@ def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
     if periodic and output_dir:
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
+        periodic_save_unfinished_test = config.getoption(
+            "--periodic-save-unfinished-test", default=False)
 
         # Create the reporter with logger
         xmlpath = os.path.join(output_dir, "results.xml")
@@ -2368,6 +2383,7 @@ def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
                 'info': print_info,
                 'warning': print_warning
             },
+            save_unfinished_test=periodic_save_unfinished_test,
         )
 
         # Configure and register the reporter
@@ -2379,6 +2395,7 @@ def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
             f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
         )
         print_info(f"  Batch size: {periodic_batch_size} tests")
+        print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
     elif periodic and not output_dir:
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
