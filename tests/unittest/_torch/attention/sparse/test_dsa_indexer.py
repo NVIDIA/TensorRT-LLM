@@ -384,7 +384,8 @@ def _create_mock_metadata(request_ids,
                           indexer_max_chunk_size=8194,
                           max_draft_tokens=0,
                           enable_context_mla_with_cached_kv=False,
-                          index_topk=2048):
+                          index_topk=2048,
+                          enable_indexer_skip=False):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -402,6 +403,7 @@ def _create_mock_metadata(request_ids,
             self.num_seqs = num_contexts + num_generations
             self.max_draft_tokens = max_draft_tokens
             self.sparse_mla_topk = index_topk
+            self.enable_indexer_skip = enable_indexer_skip
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
@@ -518,7 +520,7 @@ def _create_mock_metadata(request_ids,
                 (num_tokens, self.sparse_mla_topk),
                 device='cuda',
                 dtype=torch.int32)
-            if self.num_contexts > 0:
+            if self.num_contexts > 0 and self.enable_indexer_skip:
                 self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
                 ).item() <= self.sparse_mla_topk
                 if self.skip_indexer_for_ctx_reqs:
@@ -535,14 +537,13 @@ def _create_mock_metadata(request_ids,
                     range_row = torch.arange(self.sparse_mla_topk)
                     mask = range_row <= position_ids.unsqueeze(1)
                     ctx_range = slice(self.num_ctx_tokens)
-                    # get the dense topk indices with causal mask
                     host_topk_indices_buffer = torch.where(mask, range_row, -1)
                     self.topk_indices_buffer[ctx_range, :].copy_(
                         host_topk_indices_buffer, non_blocking=True)
             else:
                 self.skip_indexer_for_ctx_reqs = False
 
-            if self.num_generations > 0:
+            if self.num_generations > 0 and self.enable_indexer_skip:
                 next_n = self.max_draft_tokens + 1
                 self.skip_indexer_for_gen_reqs = kv_lens[
                     self.num_contexts:self.num_seqs].max().item(
@@ -568,6 +569,36 @@ def _create_mock_metadata(request_ids,
                 self.skip_indexer_for_gen_reqs = False
 
     return MockMetadata()
+
+
+def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
+    """
+    Validate the similarity between two topk indices.
+    """
+    num_exact_matches = 0
+    total_similarity = 0.0
+    min_similarity = 1.0
+
+    for token_idx in range(total_tokens):
+        valid_0 = topk_indices_0[token_idx][topk_indices_0[token_idx] != -1]
+        valid_1 = topk_indices_1[token_idx][topk_indices_1[token_idx] != -1]
+
+        if torch.equal(valid_0, valid_1):
+            num_exact_matches += 1
+            similarity = 1.0
+            total_similarity += similarity
+        else:
+            valid_0_set = set(valid_0.cpu().tolist())
+            valid_1_set = set(valid_1.cpu().tolist())
+            intersection = len(valid_0_set & valid_1_set)
+            union = len(valid_0_set | valid_1_set)
+            similarity = intersection / union if union > 0 else 0.0
+            total_similarity += similarity
+
+        # Track min similarity
+        min_similarity = min(min_similarity, similarity)
+
+    return num_exact_matches, total_similarity, min_similarity
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -1628,7 +1659,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
 @pytest.mark.parametrize("batch_size", [1, 16, 64])
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("seq_len_range", [(2048, 8192)])
+@pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
 def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                            seq_len_range):
     """
@@ -1645,6 +1676,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
     - Different batch sizes
     - Different next_n values (1, 2, 4 for speculative decode)
     - Variable sequence lengths (90% >= 2048 to test realistic long sequences)
+    - Short sequences (512, 1024) to test the indexer skip functionality
     """
     torch.manual_seed(42)
     random.seed(42)
@@ -1655,6 +1687,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
     max_model_len = 16384
     layer_idx = 0
     min_seq_len, max_seq_len = seq_len_range
+    enable_indexer_skip = max_seq_len <= 2048
 
     # Generate KV cache lengths (90% >= 2048 to test realistic scenarios)
     kv_lens = torch.zeros(batch_size, dtype=torch.int32)
@@ -1812,35 +1845,58 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                                         weights,
                                                         use_custom_topk=False)
 
+    # Test with indexer skip enabled
+    if enable_indexer_skip:
+        metadata_skip = _create_mock_metadata(request_ids,
+                                              batch_size,
+                                              0,
+                                              batch_size,
+                                              seq_lens.clone(),
+                                              final_lens.clone(),
+                                              num_cached_tokens,
+                                              cache_manager,
+                                              0,
+                                              num_gen_tokens,
+                                              max_model_len,
+                                              max_draft_tokens=next_n - 1,
+                                              enable_indexer_skip=True)
+
+        Indexer.prepare(metadata_skip)
+        indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
+
+        try:
+            topk_indices_skip = indexer.sparse_attn_indexer(
+                metadata_skip,
+                hidden_states,
+                q_fp8,
+                k_fp8,
+                k_scale,
+                weights,
+                use_custom_topk=True)
+        except Exception as e:
+            raise RuntimeError(f"Error when testing indexer skip: {e}")
+
     # Validation
+    ## Custom vs fallback
     num_ctx_tokens = 0
     custom_decode = topk_indices_custom[num_ctx_tokens:num_ctx_tokens +
                                         num_gen_tokens, :]
     fallback_decode = topk_indices_fallback[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens, :]
-
-    num_exact_matches = 0
-    total_similarity = 0.0
-
-    for token_idx in range(num_gen_tokens):
-        custom_valid = custom_decode[token_idx][custom_decode[token_idx] != -1]
-        fallback_valid = fallback_decode[token_idx][fallback_decode[token_idx]
-                                                    != -1]
-
-        if torch.equal(custom_valid, fallback_valid):
-            num_exact_matches += 1
-            total_similarity += 1.0
-        elif custom_valid.shape[0] > 0 or fallback_valid.shape[0] > 0:
-            custom_set = set(custom_valid.cpu().tolist())
-            fallback_set = set(fallback_valid.cpu().tolist())
-            intersection = len(custom_set & fallback_set)
-            union = len(custom_set | fallback_set)
-            total_similarity += intersection / union if union > 0 else 0.0
-
+    num_exact_matches, total_similarity, _ = validate_topk_indices(
+        custom_decode, fallback_decode, num_gen_tokens)
     avg_similarity = total_similarity / num_gen_tokens
-
     assert avg_similarity >= 0.95, \
         f"Decode custom vs fallback differ: avg similarity {avg_similarity:.4f} < 0.95"
+    ## Custom vs skip
+    if enable_indexer_skip:
+        skip_decode = topk_indices_skip[num_ctx_tokens:num_ctx_tokens +
+                                        num_gen_tokens, :]
+        num_exact_matches, total_similarity, _ = validate_topk_indices(
+            custom_decode, skip_decode, num_gen_tokens)
+        avg_similarity = total_similarity / num_gen_tokens
+        assert avg_similarity >= 0.95, \
+            f"Decode custom vs skip differ: avg similarity {avg_similarity:.4f} < 0.95"
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -1953,27 +2009,9 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
                                                         use_custom_topk=False)
 
     # Validation
-    num_exact_matches = 0
-    total_similarity = 0.0
-
-    for token_idx in range(total_tokens):
-        custom_valid = topk_indices_custom[token_idx][
-            topk_indices_custom[token_idx] != -1]
-        fallback_valid = topk_indices_fallback[token_idx][
-            topk_indices_fallback[token_idx] != -1]
-
-        if torch.equal(custom_valid, fallback_valid):
-            num_exact_matches += 1
-            total_similarity += 1.0
-        elif custom_valid.shape[0] > 0 or fallback_valid.shape[0] > 0:
-            custom_set = set(custom_valid.cpu().tolist())
-            fallback_set = set(fallback_valid.cpu().tolist())
-            intersection = len(custom_set & fallback_set)
-            union = len(custom_set | fallback_set)
-            total_similarity += intersection / union if union > 0 else 0.0
-
+    num_exact_matches, total_similarity, _ = validate_topk_indices(
+        topk_indices_custom, topk_indices_fallback, total_tokens)
     avg_similarity = total_similarity / total_tokens
-
     assert avg_similarity >= 0.95, \
         f"Chunked prefill differ: avg similarity {avg_similarity:.4f} < 0.95"
 
@@ -1998,11 +2036,13 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
     layer_idx = 0
     min_seq_len, max_seq_len = seq_len_range
 
+    # Generate variable context lengths per sequence
     seq_lens = torch.randint(min_seq_len,
                              max_seq_len, (batch_size, ),
                              dtype=torch.int32)
     total_tokens = seq_lens.sum().item()
 
+    # Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
@@ -2018,6 +2058,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
                                      is_gen=False,
                                      prepare_resource=True)
 
+    # Generate test data
     q = torch.randn((total_tokens, heads, head_dim),
                     device="cuda",
                     dtype=torch.bfloat16)
@@ -2078,28 +2119,44 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
                                                         weights,
                                                         use_custom_topk=False)
 
+    # Test with indexer skip enabled
+    metadata_skip = _create_mock_metadata(request_ids,
+                                          batch_size,
+                                          batch_size,
+                                          0,
+                                          seq_lens.clone(),
+                                          seq_lens.clone(), [0] * batch_size,
+                                          cache_manager,
+                                          total_tokens,
+                                          total_tokens,
+                                          max_model_len,
+                                          enable_indexer_skip=True)
+    Indexer.prepare(metadata_skip)
+    indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
+    metadata_skip.indexer_prefill_chunks = None
+
+    try:
+        topk_indices_skip = indexer.sparse_attn_indexer(metadata_skip,
+                                                        hidden_states,
+                                                        q_fp8,
+                                                        k_fp8,
+                                                        k_scale,
+                                                        weights,
+                                                        use_custom_topk=True)
+    except Exception as e:
+        raise RuntimeError(f"Indexer skip not available: {e}")
+
     # Validation
-    num_exact_matches = 0
-    total_similarity = 0.0
-
-    for token_idx in range(total_tokens):
-        custom_valid = topk_indices_custom[token_idx][
-            topk_indices_custom[token_idx] != -1]
-        fallback_valid = topk_indices_fallback[token_idx][
-            topk_indices_fallback[token_idx] != -1]
-
-        if torch.equal(custom_valid, fallback_valid):
-            num_exact_matches += 1
-            total_similarity += 1.0
-        else:
-            custom_set = set(custom_valid.cpu().tolist())
-            fallback_set = set(fallback_valid.cpu().tolist())
-            intersection = len(custom_set & fallback_set)
-            union = len(custom_set | fallback_set)
-            total_similarity += intersection / union if union > 0 else 0.0
-
+    ## Custom vs fallback
+    num_exact_matches, total_similarity, _ = validate_topk_indices(
+        topk_indices_custom, topk_indices_fallback, total_tokens)
     avg_similarity = total_similarity / total_tokens
-
+    assert avg_similarity >= 0.95, \
+        f"Single-pass prefill differ: avg similarity {avg_similarity:.4f} < 0.95"
+    ## Custom vs skip
+    num_exact_matches, total_similarity, _ = validate_topk_indices(
+        topk_indices_custom, topk_indices_skip, total_tokens)
+    avg_similarity = total_similarity / total_tokens
     assert avg_similarity >= 0.95, \
         f"Single-pass prefill differ: avg similarity {avg_similarity:.4f} < 0.95"
 
@@ -2248,31 +2305,9 @@ def test_indexer_topk_multi_request_with_different_cache():
     print(f"  ✓ All large-window tokens have {index_topk} valid indices")
 
     # Validation
-    num_exact_matches = 0
-    total_similarity = 0.0
-    min_similarity = 1.0
-
-    for token_idx in range(total_tokens):
-        custom_valid = topk_custom[token_idx][topk_custom[token_idx] >= 0]
-        fallback_valid = topk_fallback[token_idx][topk_fallback[token_idx] >= 0]
-
-        if torch.equal(custom_valid, fallback_valid):
-            num_exact_matches += 1
-            similarity = 1.0
-            total_similarity += similarity
-        else:
-            custom_set = set(custom_valid.cpu().tolist())
-            fallback_set = set(fallback_valid.cpu().tolist())
-            intersection = len(custom_set & fallback_set)
-            union = len(custom_set | fallback_set)
-            similarity = intersection / union if union > 0 else 0.0
-            total_similarity += similarity
-
-        # Track min similarity
-        min_similarity = min(min_similarity, similarity)
-
+    num_exact_matches, total_similarity, min_similarity = validate_topk_indices(
+        topk_custom, topk_fallback, total_tokens)
     avg_similarity = total_similarity / total_tokens
-
     print(f"  Exact matches: {num_exact_matches}/{total_tokens}")
     print(
         f"  Similarity - Min: {min_similarity:.4f}, Avg: {avg_similarity:.4f}")
