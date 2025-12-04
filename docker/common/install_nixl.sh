@@ -4,7 +4,7 @@ set -ex
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="0.7.1"
+NIXL_VERSION="0.8.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
@@ -22,6 +22,9 @@ pip3 install --no-cache-dir meson ninja pybind11
 
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
+
+# Remove POSIX backend compilation from meson.build
+sed -i "/^subdir('posix')/d" src/plugins/meson.build
 
 CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
 
