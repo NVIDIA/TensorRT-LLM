@@ -2134,6 +2134,8 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
+    weight_alignment = 32
+    input_hidden_alignment = 32
 
     # Cache the permute indices during weight loading to avoid recompute
     # This assumes the same input shape always results in the same permute indices
@@ -2148,9 +2150,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
             # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
             self.input_hidden_alignment = 256
-        else:
-            self.weight_alignment = 1
-            self.input_hidden_alignment = 1
 
         super().create_weights(
             module,
