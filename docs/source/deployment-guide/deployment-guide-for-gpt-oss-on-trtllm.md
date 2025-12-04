@@ -379,3 +379,13 @@ $$
 $$
 \text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
 $$
+
+## Preconfigured Recipes
+
+The following table lists recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-openai/gpt-oss-120b
+   :end-before: .. end-openai/gpt-oss-120b
+```

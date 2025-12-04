@@ -154,7 +154,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 #### `trust_remote_code`
 
-&emsp;**Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 #### `kv_cache_config`
 
@@ -429,3 +429,19 @@ $$
 $$
 \text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
 $$
+
+## Preconfigured Recipes
+
+The following tables list recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
+   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
+```
+
+```{eval-rst}
+.. include:: comprehensive_table.rst
+   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
+   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
+```
