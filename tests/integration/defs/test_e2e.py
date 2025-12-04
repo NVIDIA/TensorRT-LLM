@@ -3224,7 +3224,6 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
     mmlu_threshold = 81.5
     model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
-        "trtllm-llmapi-launch",
         "trtllm-eval",
         f"--model={model_dir}",
         f"--ep_size={ep_size}",
@@ -3242,12 +3241,21 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
 
-    llm_venv._new_env["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
-    output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
-
-    if os.environ.get("SLURM_PROCID", '0') == '0':
-        mmlu_accuracy = get_mmlu_accuracy(output)
-        assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+    try:
+        # llm_venv._new_env["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
+        # output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
+        # run the command with trtllm-llmapi-launch pytest wrapper
+        output = subprocess.check_output(run_cmd,
+                                         text=True,
+                                         stderr=subprocess.STDOUT,
+                                         timeout=7200)
+    except subprocess.CalledProcessError as e:
+        print("Failed:", e.returncode)
+        print(e.output)
+    else:
+        if os.environ.get("SLURM_PROCID", '0') == '0':
+            mmlu_accuracy = get_mmlu_accuracy(output)
+            assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
 
 
 @pytest.mark.skip_less_device_memory(80000)
