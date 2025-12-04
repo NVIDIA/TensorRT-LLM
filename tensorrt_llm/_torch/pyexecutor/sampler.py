@@ -648,6 +648,13 @@ class BeamHistory:
     cum_logprobs: torch.Tensor | None = None
 
 
+class SamplingRequestsMetadata(NamedTuple):
+    req_num_generated_tokens: torch.Tensor
+    req_num_beams: torch.Tensor
+    req_num_steps: torch.Tensor
+    req_offsets: torch.Tensor
+
+
 @dataclass(kw_only=True)
 class SampleStateTensorsHostTorch(SampleStateTensors):
     finish_reasons: torch.Tensor
@@ -2128,7 +2135,7 @@ class TorchSampler(Sampler):
         raw_logits_cuda: torch.Tensor,
         *,
         num_context_logits_prefix_sum: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[SamplingRequestsMetadata, torch.Tensor]:
         requests = scheduled_requests.all_requests()
 
         req_num_generation_steps_list = [1 + get_draft_token_length(req) for req in requests]
@@ -2157,6 +2164,14 @@ class TorchSampler(Sampler):
             if scheduled_requests.generation_requests
             else 0
         )
+
+        sampling_requests_metadata = SamplingRequestsMetadata(
+            req_num_generated_tokens=req_num_generated_tokens,
+            req_num_beams=req_num_beams,
+            req_num_steps=req_num_generation_steps,
+            req_offsets=req_offsets,
+        )
+
         num_logits_to_keep = sum_num_generated_tokens
 
         # raw_logits should contain only the generated logits.
@@ -2214,13 +2229,7 @@ class TorchSampler(Sampler):
 
         logits_cuda = raw_logits_cuda[:num_logits_to_keep]
 
-        return (
-            req_num_generated_tokens,
-            req_num_beams,
-            req_num_generation_steps,
-            req_offsets,
-            logits_cuda,
-        )
+        return sampling_requests_metadata, logits_cuda
 
     @staticmethod
     def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
@@ -2497,35 +2506,36 @@ class TorchSampler(Sampler):
         requests = scheduled_requests.all_requests()
         cuda_device = raw_logits_cuda.device
 
-        req_num_generated_tokens, req_num_beams, req_num_steps, req_offsets, logits_cuda = (
-            self._select_generated_logits(
-                scheduled_requests,
-                raw_logits_cuda,
-                num_context_logits_prefix_sum=num_context_logits_prefix_sum,
-            )
+        sampling_requests_metadata, logits_cuda = self._select_generated_logits(
+            scheduled_requests,
+            raw_logits_cuda,
+            num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
 
         # Handle embedding bias
-        self._apply_embedding_bias(logits_cuda, requests, req_num_steps)
+        self._apply_embedding_bias(logits_cuda, requests, sampling_requests_metadata.req_num_steps)
 
         logits_cuda = self._apply_min_length_penalty(
-            logits_cuda, requests, req_num_steps, req_num_beams
+            logits_cuda,
+            requests,
+            sampling_requests_metadata.req_num_steps,
+            sampling_requests_metadata.req_num_beams,
         )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
         steps_dim_size = new_tokens_cuda.size(0)
         logits_cuda_indexer = _PackedStepIndexer(
-            num_steps=req_num_generated_tokens,
+            num_steps=sampling_requests_metadata.req_num_generated_tokens,
             max_steps=steps_dim_size * self.max_beam_width,
-            req_offsets=req_offsets,
+            req_offsets=sampling_requests_metadata.req_offsets,
         )
 
         self._handle_log_probs(
             requests,
             logits_cuda,
             logits_cuda_indexer=logits_cuda_indexer,
-            req_num_generated_tokens=req_num_generated_tokens,
+            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
         )
 
         # Perform sampling in batches
@@ -2535,10 +2545,10 @@ class TorchSampler(Sampler):
             model_outputs,
             cuda_device=cuda_device,
             logits_cuda_indexer=logits_cuda_indexer,
-            req_offsets=req_offsets,
+            req_offsets=sampling_requests_metadata.req_offsets,
             seq_slots=seq_slots,
             seq_lens=seq_lens,
-            req_num_generated_tokens=req_num_generated_tokens,
+            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
             token_dtype=new_tokens_cuda.dtype,
         )
 
@@ -2546,7 +2556,7 @@ class TorchSampler(Sampler):
         new_tokens_host = self._unbatch_sampling_results(
             batched_sampling_result,
             new_tokens_cuda=new_tokens_cuda,
-            req_num_generated_tokens=req_num_generated_tokens,
+            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
             seq_slots=seq_slots,
         )
 

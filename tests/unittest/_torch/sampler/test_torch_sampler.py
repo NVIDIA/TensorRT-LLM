@@ -590,10 +590,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         def _uut(res=res):
             (
-                req_num_generated_tokens,
-                req_num_beams,
-                req_num_steps,
-                req_offsets,
+                sampling_requests_metadata,
                 selected_logits,
             ) = TorchSampler._select_generated_logits(
                 cast(ScheduledRequests, ScheduledRequestsMock()),
@@ -601,10 +598,10 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 num_context_logits_prefix_sum=num_context_logits_prefix_sum,
             )
             res.result = UutResult(
-                req_num_generated_tokens=req_num_generated_tokens,
-                req_num_beams=req_num_beams,
-                req_num_steps=req_num_steps,
-                req_offsets=req_offsets,
+                req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
+                req_num_beams=sampling_requests_metadata.req_num_beams,
+                req_num_steps=sampling_requests_metadata.req_num_steps,
+                req_offsets=sampling_requests_metadata.req_offsets,
                 selected_logits=selected_logits,
             )
 
