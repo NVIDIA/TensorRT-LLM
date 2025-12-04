@@ -1029,8 +1029,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
                     def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
                     def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
-                    def configName = testList.replaceFirst("_perf_sanity", "")
-                    def configPathLocal = "${llmSrcLocal}/tests/scripts/perf-sanity/${configName}.yaml"
                     def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
 
                     if(nodeCount > 1) {
@@ -1043,7 +1041,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sh """
                         python3 ${scriptSubmitLocalPath} \\
                         --run-ci \\
-                        --config-yaml ${configPathLocal} \\
+                        --llm-src ${llmSrcLocal} \\
+                        --test-list ${testListPathLocal} \\
                         --draft-launch-sh ${scriptLaunchDraftPathLocal} \\
                         --launch-sh ${scriptLaunchPathLocal} \\
                         --run-sh ${scriptRunPathNode} \\

@@ -137,6 +137,38 @@ def get_pytest_command_no_llmapilaunch(script_prefix_lines):
     return " ".join(replaced_line_parts_no_llmapi)
 
 
+def get_config_yaml(test_list_path, llm_src):
+    with open(test_list_path, "r") as f:
+        first_line = f.readline().strip()
+
+    # Extract content between [ and ]
+    if "[" not in first_line or "]" not in first_line:
+        raise ValueError(
+            f"Invalid test list format. Expected test name with brackets: {first_line}"
+        )
+
+    bracket_content = first_line.split("[")[-1].split("]")[0]
+
+    # Split by - and get the second part (config_base_name)
+    parts = bracket_content.split("-")
+    if len(parts) < 2:
+        raise ValueError(
+            f"Invalid test name format. Expected format: prefix-config_name, got: {bracket_content}"
+        )
+
+    config_base_name = parts[1]
+
+    # Construct config yaml path
+    config_yaml_path = os.path.join(
+        llm_src, "tests", "scripts", "perf-sanity", f"{config_base_name}.yaml"
+    )
+
+    if not os.path.exists(config_yaml_path):
+        raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
+
+    return config_yaml_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate SLURM launch script for both CI and local modes"
@@ -147,15 +179,17 @@ def main():
         default=False,
         help="Run in CI mode (true) or local mode (false)",
     )
-    parser.add_argument("--config-yaml", required=True, help="Path to config YAML file")
     parser.add_argument("--draft-launch-sh", required=True, help="Path to draft-launch.sh script")
     parser.add_argument("--launch-sh", required=True, help="Path to output launch.sh script")
     parser.add_argument("--run-sh", required=True, help="Path to slurm_run.sh script")
 
     # Optional arguments for local mode
+    parser.add_argument("--config-yaml", required=True, help="Path to config YAML file")
     parser.add_argument("--stage-name", default="", help="Stage name (optional, local mode only)")
 
     # Optional arguments for CI mode
+    parser.add_argument("--llm-src", required=True, help="Path to LLM source code")
+    parser.add_argument("--test-list", required=True, help="Path to test list file")
     parser.add_argument(
         "--script-prefix",
         default="",
@@ -169,7 +203,12 @@ def main():
 
     args = parser.parse_args()
 
-    with open(args.config_yaml, "r") as f:
+    if args.run_ci:
+        config_yaml = get_config_yaml(args.test_list, args.llm_src)
+    else:
+        config_yaml = args.config_yaml
+
+    with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
 
     hardware_config = get_hardware_config(config)
@@ -197,7 +236,7 @@ def main():
         os.makedirs(env_config["job_workspace"], exist_ok=True)
         # Write test case to test_list.txt
         with open(test_list_path, "w") as f:
-            config_basename = os.path.basename(args.config_yaml)
+            config_basename = os.path.basename(config_yaml)
             yaml_name = config_basename.replace(".yaml", "").replace(".yml", "")
             f.write(f"perf/test_perf.py::test_perf[perf_sanity_upload-{yaml_name}]\n")
 
@@ -210,7 +249,7 @@ def main():
             test_list_path,
         )
 
-        trtllm_config_folder = os.path.dirname(args.config_yaml)
+        trtllm_config_folder = os.path.dirname(config_yaml)
 
         # Build script-prefix
         script_prefix_lines.extend(
