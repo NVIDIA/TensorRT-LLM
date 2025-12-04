@@ -236,6 +236,9 @@ class OpenAIServer:
             status_code=HTTPStatus.NOT_FOUND,
         )
 
+    def _check_health(self) -> bool:
+        return self.llm._check_health()
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
@@ -296,7 +299,10 @@ class OpenAIServer:
                                methods=["POST"])
 
     async def health(self) -> Response:
-        return Response(status_code=200)
+        if self._check_health():
+            return Response(status_code=200)
+        else:
+            return Response(status_code=503, content="LLM is unavailable. Please check the server logs for more details.")
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -911,22 +917,16 @@ class OpenAIServer:
                 request=request,
                 sampling_params=sampling_params,
                 generator=generator,
-                harmony_adapter=self.harmony_adapter,
                 model_name=self.model,
                 conversation_store=self.conversation_store,
+                use_harmony=self.use_harmony,
+                reasoning_parser=self.llm.args.reasoning_parser,
+                tool_parser=self.tool_parser,
                 enable_store=self.enable_store
             ):
                 yield event_data
 
         try:
-            if not self.use_harmony:
-                raise NotImplementedError("Responses API only supports harmony format for now")
-
-            # Initialize HarmonyAdapter
-            # NOTE: WAR for Disagg failure, may affect perf if no warmup
-            if not self.harmony_adapter:
-                self.harmony_adapter = HarmonyAdapter()
-
             if request.background:
                 logger.warning("Request.background is not supported yet, will fallback to foreground processing.")
 
@@ -944,7 +944,15 @@ class OpenAIServer:
                         return self._create_response_id_not_found_error(prev_response_id)
 
             input_tokens, sampling_params = await responses_api_request_preprocess(
-                request, prev_response, self.harmony_adapter, self.conversation_store, self.enable_store)
+                request=request,
+                prev_response=prev_response,
+                conversation_store=self.conversation_store,
+                enable_store=self.enable_store,
+                use_harmony=self.use_harmony,
+                tokenizer=self.tokenizer if not self.use_harmony else None,
+                model_config=self.model_config if not self.use_harmony else None,
+                processor=self.processor if not self.use_harmony else None,
+            )
 
             promise = self.llm.generate_async(
                 inputs=input_tokens,
@@ -967,7 +975,10 @@ class OpenAIServer:
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store)
+                    enable_store=self.enable_store,
+                    use_harmony=self.use_harmony,
+                    reasoning_parser=self.llm.args.reasoning_parser,
+                    tool_parser=self.tool_parser)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

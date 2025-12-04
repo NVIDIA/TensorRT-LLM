@@ -283,7 +283,8 @@ class PyTorchModelEngine(ModelEngine):
                     enable_piecewise_cuda_graph=self.
                     _torch_compile_piecewise_cuda_graph,
                     capture_num_tokens=self._piecewise_cuda_graph_num_tokens,
-                    max_num_streams=torch_compile_max_num_streams)
+                    max_num_streams=torch_compile_max_num_streams,
+                    mapping=self.mapping)
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
@@ -1224,6 +1225,11 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))
         return None
 
+    def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
+        if self.enable_attention_dp:
+            return list(self.dist.tp_allgather(num_ctx_requests))
+        return None
+
     def _get_padding_params(
         self, total_num_tokens: int, num_ctx_requests: int,
         attn_all_rank_num_tokens: Optional[List[int]]
@@ -1237,6 +1243,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         padded_num_tokens = total_num_tokens
 
+        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+            num_ctx_requests)
+
         def get_padded_piecewise_tokens(tokens):
             captured_num_tokens = self._torch_compile_backend.capture_num_tokens
             return captured_num_tokens[bisect.bisect_left(
@@ -1249,7 +1258,12 @@ class PyTorchModelEngine(ModelEngine):
                 -1]
             # Torch piecewise cuda graph is enabled.
             if attn_all_rank_num_tokens is not None:
-                can_run_piecewise_cuda_graph = (num_ctx_requests != 0 and
+                # Any rank has context requests, we enable piecewise cuda graph.
+                has_ctx_requests = num_ctx_requests != 0 or (
+                    all_rank_ctx_requests is not None
+                    and any(ctx_requests != 0
+                            for ctx_requests in all_rank_ctx_requests))
+                can_run_piecewise_cuda_graph = (has_ctx_requests and
                                                 max(attn_all_rank_num_tokens)
                                                 <= max_captured_num_tokens)
                 all_ranks_can_run_piecewise_cuda_graph = list(
@@ -2824,7 +2838,7 @@ class PyTorchModelEngine(ModelEngine):
         return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
-        if self.mapping.tp_size <= 1:
+        if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
             return False
 
         # Disable UB for unsupported platforms

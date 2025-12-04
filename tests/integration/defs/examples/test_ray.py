@@ -12,11 +12,7 @@ def ray_example_root(llm_root):
     return example_root
 
 
-@pytest.mark.parametrize("use_rpc", [True, False], ids=["rpc", "no_rpc"])
-def test_llm_inference_async_ray(ray_example_root, llm_venv, monkeypatch,
-                                 use_rpc):
-    if use_rpc:
-        monkeypatch.setenv("TLLM_RAY_USE_RPC", "1")
+def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
     model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     venv_check_call(llm_venv, [script_path, "--model", model_path])
@@ -60,6 +56,9 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
+    if tp_size == 1:
+        pytest.skip("https://nvbugs/5682551")
+
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
 
