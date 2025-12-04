@@ -294,12 +294,10 @@ class KvCacheCreator:
         ) // self._tokens_per_block * self._tokens_per_block
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        # return min(
-        #     num_cache_blocks * self._tokens_per_block *
-        #     self._dummy_reqs[0].sampling_config.beam_width,
-        #     max_num_tokens_in_memory)
-        return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
-            0].sampling_config.beam_width
+        return min(
+            num_cache_blocks * self._tokens_per_block *
+            self._dummy_reqs[0].sampling_config.beam_width,
+            max_num_tokens_in_memory)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
