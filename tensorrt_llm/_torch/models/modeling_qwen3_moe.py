@@ -374,8 +374,8 @@ class Qwen3MoEModel(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        mrope_config: Optional[dict[str, torch.Tensor]] = None,
-        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        mrope_config: Optional[Dict[str, torch.Tensor]] = None,
+        deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):

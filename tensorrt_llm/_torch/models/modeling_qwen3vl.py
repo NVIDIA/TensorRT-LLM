@@ -143,7 +143,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
 
         # Since we use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2>
@@ -282,7 +282,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             return position_ids, mrope_position_deltas
 
     def _preprocess(
-        self, text: dict[str, any], mm_data: dict[str, any], mm_processor_kwargs: Dict[str, Any]
+        self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]
     ):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -427,7 +427,7 @@ class Qwen3VLVisionBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -705,7 +705,7 @@ class Qwen3VisionModelBase(nn.Module):
 
     def load_weights(self, weights: Dict):
         visual_weights = filter_weights("model.visual", weights)
-        converted_weights = dict()
+        converted_weights = {}
 
         qkv_pattern = re.compile(r"(.*?)attn\.qkv\.(.*)")
         for name in visual_weights:
@@ -828,15 +828,15 @@ class Qwen3VLModelBase(PreTrainedModel):
     ) -> None:
         self.original_arch = model_config.pretrained_config.architectures[0]
 
-        disabble_fuse_rope = kwargs.get("disable_fuse_rope", False)
-        model_config.pretrained_config.text_config.disable_fuse_rope = disabble_fuse_rope
+        disable_fuse_rope = kwargs.get("disable_fuse_rope", False)
+        model_config.pretrained_config.text_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.text_config.rope_scaling["type"] = "mrope"
         config = model_config.pretrained_config
 
         self._supports_sdpa = True
         self._supports_flash_attn = True
         super().__init__(config)
-        if not disabble_fuse_rope:
+        if not disable_fuse_rope:
             self.init_mrope_embedding(model_config)
 
         self.model_config = model_config
