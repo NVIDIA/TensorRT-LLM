@@ -397,15 +397,17 @@ class OpenAIDisaggServer:
 
                             first_response = await anext(gen_response.body_iterator)
                             raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                            bytes_count += len(first_response)
                             yield first_response
                             async for chunk in gen_response.body_iterator:
                                 bytes_count += len(chunk)
                                 yield chunk
+                            break
                         except (aiohttp.ClientError, OSError) as e:
                             # We will retry if no tokens have been yielded as otherwise we will need to discard the tokens
                             # that have been yielded.
                             if attempt == self.max_retries or bytes_count > 0:
-                                raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error after {token_count} tokens") from e
+                                raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error after {bytes_count} bytes") from e
                             logger.warning(f"Client error: {e} - retry {attempt} of {self.max_retries}")
                             # TODO : add a configurable retry interval
                             await asyncio.sleep(1)
