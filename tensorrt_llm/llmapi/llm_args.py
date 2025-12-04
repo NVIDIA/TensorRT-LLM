@@ -2758,7 +2758,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    max_pp_retry_count: int = Field(
+    pp_scheduler_max_retry_count: int = Field(
         default=10,
         description=
         "Maximum number of times a PP rank retries when it cannot run first PP's schedule result due to limited KV cache resources.",
@@ -3057,10 +3057,10 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode='after')
-    def validate_max_pp_retry_count(self) -> 'TorchLlmArgs':
-        if self.max_pp_retry_count < 0:
+    def validate_pp_scheduler_max_retry_count(self) -> 'TorchLlmArgs':
+        if self.pp_scheduler_max_retry_count < 0:
             raise ValueError(
-                f"max_pp_retry_count must be non-negative, got {self.max_pp_retry_count}"
+                f"pp_scheduler_max_retry_count must be non-negative, got {self.pp_scheduler_max_retry_count}"
             )
         return self
 

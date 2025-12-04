@@ -66,6 +66,8 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
 # Unique tag base to avoid collisions with token/logits comms
 TERMINATION_COMM_TAG_BASE = 20000
+PP_COMM_TAG_SCHEDULE_RESULT = 21000
+PP_COMM_TAG_SAMPLE_STATE_BASE = 21001
 
 
 @functools.cache
@@ -235,8 +237,8 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
         # schedule handle for PP to propagate the first PP rank's schedule result
         self.send_schedule_handler = None
-        self.max_pp_retry_count = getattr(self.llm_args, 'max_pp_retry_count',
-                                          10)
+        self.pp_scheduler_max_retry_count = getattr(
+            self.llm_args, 'pp_scheduler_max_retry_count', 10)
 
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
@@ -793,8 +795,6 @@ class PyExecutor:
 
     def _pp_schedule_and_propagate(self):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
-        # Tag used for schedule result propagation
-        tag = self.dist.pp_size + 1
 
         # The first PP rank schedules the requests, other ranks receive the schedule result from the previous PP rank.
         if self.dist.is_first_pp_rank:
@@ -806,7 +806,7 @@ class PyExecutor:
         else:
             with nvtx_range("recv_schedule_from_prev_pp"):
                 serializable_schedule = self.dist.recv_object(
-                    self.dist.prev_pp_rank, tag)
+                    self.dist.prev_pp_rank, PP_COMM_TAG_SCHEDULE_RESULT)
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
                 self.active_requests)
 
@@ -817,11 +817,17 @@ class PyExecutor:
                     self.send_schedule_handler.wait()
             with nvtx_range("send_schedule_to_next_pp"):
                 self.send_schedule_handler = self.dist.isend_object(
-                    serializable_schedule, self.dist.next_pp_rank, tag)
+                    serializable_schedule, self.dist.next_pp_rank,
+                    PP_COMM_TAG_SCHEDULE_RESULT)
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
-        """Retry until current rank can run the given scheduled batch."""
+        """
+        If current rank cannot run the scheduled batch, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
+        1. Wait for cache transceiver to finish at least one cache transmission.
+        2. Terminate requests that have finished context cache transmission.
+        3. Check if current rank has enough KV cache resources to run the scheduled batch.
+        """
         scheduled_batch_requests = scheduled_batch.all_requests()
         if self.scheduler.can_schedule(scheduled_batch_requests):
             return
@@ -842,11 +848,11 @@ class PyExecutor:
                 "Cannot terminate requests in cache transmission and release their KV cache resources when block reuse is enabled. Please consider increasing the KV cache size."
             )
 
-        for retry_count in range(self.max_pp_retry_count):
+        for retry_count in range(self.pp_scheduler_max_retry_count):
             if self.scheduler.can_schedule(scheduled_batch_requests):
                 break
             logger.debug(
-                f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.max_pp_retry_count})"
+                f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.pp_scheduler_max_retry_count})"
             )
 
             # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
@@ -855,7 +861,7 @@ class PyExecutor:
             self._terminate_disagg_ctx_finished_requests()
         else:
             raise RuntimeError(
-                f"Reach maximum PP retry count ({self.max_pp_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `max_pp_retry_count` to a larger value to allow more retries."
+                f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `pp_scheduler_max_retry_count` to a larger value to allow more retries."
             )
 
     def _executor_loop_pp(self):
@@ -891,13 +897,10 @@ class PyExecutor:
                 self._pad_attention_dp_dummy_request()
 
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
-                # If current rank cannot run this schedule result, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
-                #   1. Wait for cache transceiver to finish at least one cache transmission.
-                #   2. Terminate requests that have finished context cache transmission.
-                #   3. Check if current rank has enough KV cache resources to run this schedule result.
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                 )
                 if not self.dist.is_first_pp_rank:
+                    # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1008,6 +1011,7 @@ class PyExecutor:
                 prev_microbatch_id = (microbatch_id +
                                       offset) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
+                tag = PP_COMM_TAG_SAMPLE_STATE_BASE + prev_microbatch_id
                 if previous_batch is not None:
                     sample_state = previous_batch.sample_state
                     if not self.dist.is_last_pp_rank:
@@ -1017,7 +1021,7 @@ class PyExecutor:
                         with nvtx_range("recv_sample_state"):
                             sample_state.host = recv_object_funct(
                                 src=self.dist.prev_pp_rank,
-                                tag=prev_microbatch_id,
+                                tag=tag,
                             )
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
@@ -1029,7 +1033,7 @@ class PyExecutor:
                                 prev_microbatch_id] = self.dist.isend_object(
                                     sample_state.host,
                                     dest=self.dist.next_pp_rank,
-                                    tag=prev_microbatch_id)
+                                    tag=tag)
 
                 # Stage 3: Finalize previous batch that finished sample state communication
                 # In last pp rank, stage 2 and 3 process different previous batches
