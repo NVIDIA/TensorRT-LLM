@@ -311,7 +311,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
+    def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -345,7 +345,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             image_grid_thw: torch.LongTensor,
             video_grid_thw: torch.LongTensor,
             attention_mask: torch.Tensor,
-            second_per_grid_ts: torch.Tensor = None) -> dict[str, torch.Tensor]:
+            second_per_grid_ts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         mrope_position_ids, mrope_position_deltas = Qwen2VLInputProcessorBase.get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
@@ -435,7 +435,7 @@ class Qwen2VisionModelBase(nn.Module):
 
     def load_weights(self, weights: Dict):
         visual_weights = filter_weights("visual", weights)
-        converted_weights = dict()
+        converted_weights = {}
 
         qkv_pattern = re.compile(r'(.*?)attn\.qkv\.(.*)')
         for name in visual_weights:
@@ -558,7 +558,7 @@ class Qwen2_5_VLVisionAttention(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         **kwargs,
     ) -> torch.Tensor:
         # NOTE: Need separate Attention forward() for Qwen2.5-VL for multiple reasons
@@ -631,7 +631,7 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -762,7 +762,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return rotary_pos_emb
 
     def get_window_index(self, grid_thw):
-        window_index: list = []
+        window_index: List[torch.Tensor] = []
         seq_lens = []
         window_index_id = 0
         vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
@@ -879,8 +879,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         self.original_arch = model_config.pretrained_config.architectures[0]
 
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
-        disabble_fuse_rope = kwargs.get('disable_fuse_rope', False)
-        model_config.pretrained_config.disable_fuse_rope = disabble_fuse_rope
+        disable_fuse_rope = kwargs.get('disable_fuse_rope', False)
+        model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
 
@@ -892,7 +892,7 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         if model_config.attn_backend != 'TRTLLM':
             raise ValueError("Qwen2/2.5-VL only supports TRTLLM backend now")
-        if not disabble_fuse_rope:
+        if not disable_fuse_rope:
             self.init_mrope_embedding(model_config)
 
         llm_model_config = copy.deepcopy(model_config)
