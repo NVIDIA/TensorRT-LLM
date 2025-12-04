@@ -10,8 +10,8 @@ from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed, Qwen2_5_VisionRotaryEmbedding,
-    Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLMLP,
-    Qwen2_5_VLVisionBlock, apply_rotary_pos_emb_vision)
+    Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLVisionBlock,
+    apply_rotary_pos_emb_vision)
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
 
@@ -22,7 +22,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.modules.attention import Attention
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -38,6 +38,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
+from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
@@ -323,8 +324,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-            # transformers=4.53.1 does not support GPU video tensors in Qwen2VL processor.
-            videos = [[frame.to("cpu") for frame in video] for video in videos]
         return self.processor(text=[text],
                               images=images,
                               videos=videos,
@@ -565,7 +564,7 @@ class Qwen2_5_VLVisionAttention(Attention):
         # NOTE: Need separate Attention forward() for Qwen2.5-VL for multiple reasons
         # 1. We don't have the route for handing over position_embeddings to the Attention forward()
         # 2. Could not override the apply_rope() as we don't have the position_ids in the Vision Attention's rotary embedding.
-        # (TODO: yechank-nvidia) Make OOTO path more modular and reusable for Attention's Rotary Embedding.
+        # (TODO: yechank-nvidia) Make OOTB path more modular and reusable for Attention's Rotary Embedding.
 
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv, None, None
@@ -593,20 +592,39 @@ class Qwen2_5_VLVisionAttention(Attention):
         return attn_output
 
 
+class Qwen2_5_VLMLP(GatedMLP):
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int):
+        config = model_config.pretrained_config.vision_config
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=True,
+            activation=F.silu,
+            dtype=model_config.pretrained_config.torch_dtype,
+            config=model_config,
+            layer_idx=layer_idx,
+        )
+
+
 class Qwen2_5_VLVisionBlock(torch.nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: Optional[int]):
+                 layer_idx: int):
         super().__init__()
-        config = model_config.pretrained_config.vision_config
-        self.norm1 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=model_config.pretrained_config.rms_norm_eps,
-                             dtype=model_config.pretrained_config.torch_dtype)
-        self.norm2 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=model_config.pretrained_config.rms_norm_eps,
-                             dtype=model_config.pretrained_config.torch_dtype)
-        self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
-        self.mlp = Qwen2_5_VLMLP(config, bias=True)
+        self.model_config = model_config
+        config = self.model_config.pretrained_config.vision_config
+        self.norm1 = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=self.model_config.pretrained_config.rms_norm_eps,
+            dtype=self.model_config.pretrained_config.torch_dtype)
+        self.norm2 = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=self.model_config.pretrained_config.rms_norm_eps,
+            dtype=self.model_config.pretrained_config.torch_dtype)
+        self.attn = Qwen2_5_VLVisionAttention(self.model_config, layer_idx)
+        self.mlp = Qwen2_5_VLMLP(self.model_config, layer_idx)
 
     @torch.inference_mode()
     def forward(
@@ -650,21 +668,25 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
                    out_features=self.hidden_size,
                    bias=True,
                    dtype=model_config.pretrained_config.torch_dtype,
-                   mapping=model_config.mapping),
+                   mapping=model_config.mapping,
+                   tensor_parallel_mode=TensorParallelMode.COLUMN,
+                   allreduce_strategy=model_config.allreduce_strategy),
             torch.nn.GELU(),
             Linear(in_features=self.hidden_size,
                    out_features=dim,
                    bias=True,
                    dtype=model_config.pretrained_config.torch_dtype,
-                   mapping=model_config.mapping),
+                   mapping=model_config.mapping,
+                   tensor_parallel_mode=TensorParallelMode.ROW,
+                   allreduce_strategy=model_config.allreduce_strategy),
         )
 
     @torch.inference_mode()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x)
-        x = x.view(-1, self.hidden_size)
-        x = self.mlp(x)
-        return x
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.ln_q(hidden_states)
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states
 
 
 class Qwen2_5_VisionModel(torch.nn.Module):
@@ -865,9 +887,6 @@ class Qwen2VLModelBase(PreTrainedModel):
         self._supports_sdpa = True
         super().__init__(config)
 
-        if not disabble_fuse_rope:
-            self.init_mrope_embedding(model_config)
-
         self.model_config = model_config
         self.config = model_config.pretrained_config
 
@@ -977,21 +996,28 @@ class Qwen2VLModelBase(PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         mrope_config = {}
-        if len(multimodal_params) > 0:
+        # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts, so we need to separate the mm_multimodal_params from the text-only prompts.
+        mm_multimodal_params = [
+            multimodal_param for multimodal_param in multimodal_params
+            if multimodal_param.multimodal_data.get("image", {}).get(
+                "pixel_values") is not None or multimodal_param.multimodal_data.
+            get("video", {}).get("pixel_values_videos") is not None
+        ]
+        if len(mm_multimodal_params) > 0:
             if not DISAGG:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=multimodal_params[:num_context_requests])
+                    multimodal_params=mm_multimodal_params)
             else:
                 raise NotImplementedError(
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds, multimodal_params[:num_context_requests])
-            if not self.model_config.pretrained_config.disable_fuse_rope:
-                mrope_config = self.prepare_mrope_config(
-                    multimodal_params, num_context_requests)
+            mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
+
+        if not self.model_config.pretrained_config.disable_fuse_rope:
+            mrope_config = self.prepare_mrope_config(multimodal_params,
+                                                     num_context_requests)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds,
@@ -1063,8 +1089,9 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         kwargs['vision_model_class'] = Qwen2_5_VisionModel
-        kwargs[
-            'disable_fuse_rope'] = False  # TODO: Make this ModelConfig's argument
+        kwargs['disable_fuse_rope'] = kwargs.get(
+            'disable_fuse_rope',
+            False)  # TODO: Make this ModelConfig's argument
         super().__init__(model_config, *args, **kwargs)
 
     @property
