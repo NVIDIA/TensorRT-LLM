@@ -272,7 +272,7 @@
 <div class="config-panel">
     <details>
         <summary>🔧 Configuration (Click to expand)</summary>
-        <pre>{{ runArgs }}</pre>
+        <pre>{{ configText }}</pre>
     </details>
 </div>
 
@@ -412,7 +412,7 @@
 
             // Name Col
             html += `<td onclick="toggleFold('${uniqueId}', event)" style="padding-left: ${10 + level * 20}px">
-                        <div class="cell-content">${toggleIcon} ${node.name}</div>
+                        <div class="cell-content" title="${node.name}">${toggleIcon} ${node.name}</div>
                      </td>`;
 
             // Data Cols
@@ -747,15 +747,15 @@
         if (container) {
             container.innerHTML = '';
             for (let i = 1; i < maxDepth; i++) {
-                 const btn = document.createElement('button');
-                 btn.innerText = 'Level ' + i;
-                 btn.onclick = function() { expandToLevel(i); };
-                 // Copy styles from other buttons if possible, or rely on CSS
-                 // The existing buttons don't have inline styles, just CSS class likely.
-                 // But wait, <button> elements in this file might be styled by tag selector.
-                 container.appendChild(btn);
-                 // Add a space
-                 container.appendChild(document.createTextNode(' '));
+                const btn = document.createElement('button');
+                btn.innerText = 'Level ' + i;
+                btn.onclick = function() { expandToLevel(i); };
+                // Copy styles from other buttons if possible, or rely on CSS
+                // The existing buttons don't have inline styles, just CSS class likely.
+                // But wait, <button> elements in this file might be styled by tag selector.
+                container.appendChild(btn);
+                // Add a space
+                container.appendChild(document.createTextNode(' '));
             }
         }
     }

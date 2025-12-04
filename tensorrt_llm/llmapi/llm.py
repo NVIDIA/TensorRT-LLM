@@ -788,6 +788,17 @@ class BaseLLM:
             self.mpi_session.shutdown()
             self.mpi_session = None
 
+    def _check_health(self) -> bool:
+        """Check if the LLM is healthy.
+
+        Returns:
+            bool: True if the executor is running and not shutdown, False otherwise.
+        """
+        if hasattr(self, "_executor") and self._executor is not None:
+            return not self._executor.is_shutdown()
+
+        return False
+
     @staticmethod
     def _shutdown_wrapper(self_ref):
         # Retrieve the instance if it still exists

@@ -3,7 +3,7 @@ import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -848,3 +848,19 @@ def pp_recv(tensor):
 def pp_send(tensor):
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_recv_tensors", mutates_args=("tensors", ))
+def pp_recv_tensors(tensors: List[torch.Tensor]) -> None:
+    """
+    Receive tensors from previous pp rank.
+    """
+    for tensor in tensors:
+        pp_recv(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_send_tensors", mutates_args=("tensors", ))
+def pp_send_tensors(tensors: List[torch.Tensor]) -> None:
+    """Send tensors to next pp rank."""
+    for tensor in tensors:
+        pp_send(tensor)

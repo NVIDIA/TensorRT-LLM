@@ -388,7 +388,7 @@ class ToolCall(OpenAIBaseModel):
 
 class DeltaToolCall(OpenAIBaseModel):
     id: Optional[str] = None
-    type: Optional[Literal["function"]] = None
+    type: Literal["function"] = "function"
     index: int
     function: Optional[DeltaFunctionCall] = None
 
