@@ -180,10 +180,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
         args.hidden_size = hidden_states.sizes()[1] * 2;
     }
-    args.output_hidden_size = valid_hidden_size.has_value()
-        ? tensorrt_llm::common::roundUp(valid_hidden_size.value(), 256)
-        : args.hidden_size;
-    // Unpadded size.
     args.valid_hidden_size = valid_hidden_size;
     args.top_k = top_k;
     args.n_group = n_group.value_or(0);
