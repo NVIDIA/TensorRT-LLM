@@ -639,6 +639,15 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
         quant_config = self.model_config.quant_config
         if quant_config.exclude_modules:
+            if quant_config.quant_algo == "NVFP4":
+                quant_config.exclude_modules = [
+                    'block.*.attn.qkv',
+                    'block.*.attn.out',
+                    'block.*.mlp.gate',
+                    'embedding',
+                    'unembedding',
+                ]
+
             for i, module in enumerate(quant_config.exclude_modules):
                 names = module.split(".")
                 if names[-1] in params_map_reverse:
@@ -658,8 +667,12 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             if 'q_proj' in k:
                 is_ori_model = False
 
+        is_nvfp4 = self.model_config.quant_config.quant_mode.has_nvfp4()
+
         if is_ori_model:
             self.load_ori_weights(weights)
+        elif is_nvfp4:
+            self.load_nvfp4_weights(weights)
         else:
             self.load_hf_weights(weights)
 
@@ -786,6 +799,105 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                             moe_weights[
                                 f"{i}.w2.weight_scale_inv"] = module_weights[
                                     'down_proj_scales'][i, :, :]
+
+                module.load_weights(weights=[moe_weights])
+            elif hasattr(module, "load_weights"):
+                if 'qkv' in name:
+                    # For qkv_proj
+                    q_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'q_proj'), weights)
+                    k_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'k_proj'), weights)
+                    v_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'v_proj'), weights)
+                    module.load_weights(
+                        weights=[q_weight_bias, k_weight_bias, v_weight_bias])
+                else:
+                    # For o_proj, sinks.
+                    module.load_weights(weights=[module_weights])
+            else:
+                # Load four LN weights (attn.norm, mlp.norm, input_layernorm, post_attention_layernorm).
+                if 'next_layer_layernorm' in name:
+                    continue
+
+                for n, p in module._parameters.items():
+                    if p is not None:
+                        p.data.copy_(module_weights[n][:])
+
+    def load_nvfp4_weights(self, weights: Dict):
+        num_expert = self.config.num_local_experts
+
+        for name, module in tqdm(list(self.named_modules()),
+                                 desc="Loading weights"):
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+
+            module_weights = {}
+            for k, v in self.hf_params_map.items():
+                name = name.replace(k, v)
+            module_weights = filter_weights(name, weights)
+
+            if isinstance(module, MoE):
+                assert getattr(module, "quant_config", None) is not None and \
+                   module.quant_config.quant_mode.has_nvfp4()
+                gate_up = module_weights.get('gate_up_proj', None)
+                down = module_weights.get('down_proj', None)
+                gate_up_bias = module_weights.get('gate_up_proj_bias', None)
+                down_bias = module_weights.get('down_proj_bias', None)
+
+                def deinterleave(tensor):
+                    g, u = tensor[..., ::2], tensor[..., 1::2]
+                    return torch.cat([g, u], dim=-1)
+
+                gate_up = deinterleave(gate_up)
+                gate_up_bias = deinterleave(gate_up_bias)
+
+                # Only fp32 bias is supported for NVFP4 MoE.
+                if gate_up_bias.dtype != torch.float32:
+                    gate_up_bias = gate_up_bias.to(torch.float32)
+                if down_bias.dtype != torch.float32:
+                    down_bias = down_bias.to(torch.float32)
+
+                moe_weights = {}
+                if gate_up is not None:
+                    moe_weights['gate_up_proj'] = [
+                        gate_up[i, :, :] for i in range(num_expert)
+                    ]
+                if down is not None:
+                    moe_weights['down_proj'] = [
+                        down[i, :, :] for i in range(num_expert)
+                    ]
+                if gate_up_bias is not None:
+                    moe_weights['gate_up_proj.bias'] = [
+                        gate_up_bias[i, :] for i in range(num_expert)
+                    ]
+                if down_bias is not None:
+                    moe_weights['down_proj.bias'] = [
+                        down_bias[i, :] for i in range(num_expert)
+                    ]
+
+                # Per-expert block scales (transpose to expected layout)
+                if 'gate_up_proj_weight_scale' in module_weights:
+                    gu_ws = module_weights['gate_up_proj_weight_scale']
+                    gu_ws = deinterleave(gu_ws)
+                    moe_weights['gate_up_proj_weight_scale'] = [
+                        gu_ws[i, :, :] for i in range(num_expert)
+                    ]
+                if 'down_proj_weight_scale' in module_weights:
+                    dp_ws = module_weights['down_proj_weight_scale']
+                    moe_weights['down_proj_weight_scale'] = [
+                        dp_ws[i, :, :] for i in range(num_expert)
+                    ]
+
+                # Module-level globals for NVFP4 loaders
+                for src_key in [
+                        'gate_up_proj_weight_scale_2',
+                        'down_proj_weight_scale_2',
+                        'gate_up_proj_input_scale',
+                        'down_proj_input_scale',
+                ]:
+                    if src_key in module_weights:
+                        moe_weights[src_key] = module_weights[src_key]
 
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
