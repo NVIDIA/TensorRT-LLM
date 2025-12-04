@@ -45,6 +45,8 @@ def load_pretrained_config(model_name_or_path: str,
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
+
+    # FIXME this should not be needed with VLM enabled
     if checkpoint_format == "mistral_large_3":
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader

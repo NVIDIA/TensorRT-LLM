@@ -560,8 +560,8 @@ class DecoderModelForCausalLM(nn.Module,
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: List[str] = [],
                      params_map: Optional[Dict] = None,
+                     skip_modules: List[str] = [],
                      allow_partial_loading: bool = False):
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
