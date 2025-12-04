@@ -246,28 +246,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self,
                      output_dtype: torch.dtype,
                      to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = True):
+                     use_tvm_ffi: bool = True,
+                     enable_file_cache: bool = True):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
                 raise ValueError(
                     f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
                 )
+            if enable_file_cache and not use_tvm_ffi:
+                raise ValueError(
+                    f"Only supported enable_file_cache when use_tvm_ffi is True on nvidia-cutlass-dsl==4.3.1"
+                    f"Please use use_tvm_ffi=True if you want to enable enable_file_cache"
+                )
             self.output_dtype = output_dtype
             self.to_userbuffers = to_userbuffers
             self.use_tvm_ffi = use_tvm_ffi
+            self.enable_file_cache = enable_file_cache
 
         def unique_id(self):
-            return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
+            return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi,
+                    self.enable_file_cache)
 
         def __hash__(self):
-            return hash(
-                (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi))
+            return hash((self.output_dtype, self.to_userbuffers,
+                         self.use_tvm_ffi, self.enable_file_cache))
 
         def __eq__(self, other):
             if not isinstance(other, self.__class__):
                 return False
-            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi
+            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi and self.enable_file_cache == other.enable_file_cache
 
         def get_valid_tactics(
             self,
@@ -534,7 +542,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_b_sf_ptr = b_sf_ptr
 
             if cache_key not in self.__class__.kernel_cache:
-                if self.use_tvm_ffi:
+                if self.enable_file_cache:
                     fname = str(sf_vec_size) + "_" + str(
                         mma_tiler_mn[0]) + "x" + str(
                             mma_tiler_mn[1]) + "_" + str(
@@ -628,7 +636,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     self.__class__.kernel_cache[cache_key] = compiled_gemm
 
-                    if self.use_tvm_ffi:
+                    if self.enable_file_cache:
                         fpath = os.path.join(tempfile.gettempdir(),
                                              "cute_dsl_kernels")
                         os.makedirs(fpath, exist_ok=True)
@@ -711,6 +719,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
         use_tvm_ffi: bool = True,
+        enable_file_cache: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -723,6 +732,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_dtype: Output data type (must be bfloat16)
             to_userbuffers: Whether to allocate output from UserBuffers pool
             use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
+            enable_file_cache: Whether to enable file cache for the kernel. Enable this option could help reduce the kernel compilation overhead for 2nd and following runs.
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
@@ -740,7 +750,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tuner = AutoTuner.get()
 
         runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers,
-                                             use_tvm_ffi)
+                                             use_tvm_ffi, enable_file_cache)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
@@ -762,6 +772,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
         use_tvm_ffi: bool = True,
+        enable_file_cache: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
