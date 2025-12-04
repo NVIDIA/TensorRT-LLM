@@ -530,9 +530,10 @@ class Eagle3OneModelWorker(nn.Module):
             dim=-1).sum(1)
         # Check for environment variable override
         if self.force_num_accepted_tokens != 0:
-            force_num_accepted_tokens = min(self.force_num_accepted_tokens,
-                                            self.max_draft_len + 1)
-            num_accepted_tokens[num_contexts:] = force_num_accepted_tokens
+            # total tokens per iteration = accepted draft tokens + 1 target token
+            force_total_tokens = min(self.force_num_accepted_tokens + 1,
+                                     self.max_draft_len + 1)
+            num_accepted_tokens[num_contexts:] = force_total_tokens
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
