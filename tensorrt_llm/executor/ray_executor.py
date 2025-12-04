@@ -23,6 +23,7 @@ from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
+from .utils import has_event_loop
 
 __all__ = [
     "RayExecutor",
@@ -90,28 +91,25 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     "Forcing allreduce_strategy to NCCL as a workaround for RL integration."
                 )
 
-            # self.init_rpc_executor()
-            # self.worker_kwargs['rpc_addr'] = self.rpc_addr
-            # if not has_event_loop():
-            #     self.init_workers_sync()
-            # self.setup_engine_remote()
-            # self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
-            #                     thread_name="ray_executor_main_loop")
-            # logger.info(f"Connecting to RPC server at {self.rpc_addr}")
-
             self.init_rpc_executor()
             # Inject the generated HMAC key into worker_kwargs for workers
             self.worker_kwargs['hmac_key'] = self.hmac_key
             self.worker_kwargs['rpc_addr'] = self.rpc_addr
+            defer_workers_init = getattr(self.worker_kwargs['llm_args'],
+                                         'ray_defer_workers_init', False)
 
-            # Always use async initialization in RPC mode to avoid blocking ray.get()
-            self.workers = []  # Placeholder, will be initialized in setup_async
-            self._needs_async_setup = True
-            self._mainloop_started = False  # Track if mainloop has been started
-            # DO NOT start mainloop until after setup_engine_remote_async is called
-            logger.info(
-                f"Will connect to RPC server at {self.rpc_addr} after async init"
-            )
+            if defer_workers_init:
+                self.workers = [
+                ]  # Placeholder, will be initialized in setup_async
+                self._needs_async_setup = True
+                self._mainloop_started = False  # Track if mainloop has been started
+                # DO NOT start mainloop until after setup_engine_remote_async is called
+            else:
+                if not has_event_loop():
+                    self.init_workers_sync()
+                self.setup_engine_remote()
+                self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
+                                    thread_name="ray_executor_main_loop")
 
         except Exception as e:
             self.shutdown()

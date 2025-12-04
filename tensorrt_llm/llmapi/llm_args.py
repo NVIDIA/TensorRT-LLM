@@ -2748,6 +2748,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
+    # TODO: change to internal
+    ray_defer_workers_init: bool = Field(
+        default=False,
+        description="Defer Ray worker initialization until async setup.",
+        exclude=True,
+        repr=False)
+
     # Ray placement group config. Namings TBD.
     placement_groups: Optional[List[Any]] = Field(
         default=None,

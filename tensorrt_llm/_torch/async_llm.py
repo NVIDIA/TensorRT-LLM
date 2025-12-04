@@ -7,11 +7,13 @@ from .virtual_memory import ExecutorMemoryType
 class AsyncLLM(LLM):
     """AsyncLLM is a subclass of LLM that supports asynchronous setup, release and
     resume operations that are necessary for RL or agentic scenarios.
+
+    Currently, RL APIs are only supported with Ray orchestrator.
     """
 
     def __init__(self, *args, **kwargs):
-        # AsyncLLM is only supported with Ray orchestrator now.
         kwargs["orchestrator_type"] = "ray"
+        kwargs["ray_defer_workers_init"] = True
         if 'ray_worker_extension_cls' not in kwargs:
             kwargs['ray_worker_extension_cls'] = 'tensorrt_llm.llmapi.rlhf_utils.WorkerExtension'
         super().__init__(*args, **kwargs)
@@ -21,6 +23,7 @@ class AsyncLLM(LLM):
         """Setup the LLM asynchronously."""
         if not self._async_initialized:
             await self._executor.init_workers_async()
+            await self._executor.setup_engine_remote_async()
             self._async_initialized = True
         return self
 
