@@ -14,7 +14,7 @@ from _model_test_utils import FakeFP8Linear
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
-    FP8TPShardingInfo,
+    FP8WeightShardingInfo,
     LayerType,
     ShardingTransformConfig,
     SplitDimension,
@@ -336,7 +336,7 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
-                        FP8TPShardingInfo(
+                        FP8WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             config=config,
