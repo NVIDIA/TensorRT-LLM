@@ -98,9 +98,6 @@ class SequenceInfo:
       with sequence 1 in the batch.
     - slot_idx: [s_0, s_1, ..., s_{b-1}]
       Corresponds to the slot index of each sequence in the batch.
-    - logit_gather_ids: [l_0, l_1, ..., l_{b-1}]
-      Corresponds to the index of the last token in the sequence that needs to be gathered for each
-      sequence in the batch.
 
     ################################################################################################
 
@@ -204,7 +201,6 @@ class SequenceInfo:
             "cache_loc": torch.empty(max_num_cache_loc_assignments, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
             "slot_idx": torch.empty(self.max_batch_size, dtype=torch.long),
-            "logit_gather_ids": torch.empty(self.max_batch_size, dtype=torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
         }
@@ -213,14 +209,8 @@ class SequenceInfo:
         }
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
-        self._cached_arg_names = (
-            "seq_len",
-            "input_pos",
-            "cache_loc",
-            "pages_per_seq",
-            "slot_idx",
-            "logit_gather_ids",
-        )
+        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        self._registered_args: Dict[str, List[Number]] = {}
         # page_size is the size of attentionkv-cache pages.
         # chunk_size is used in mamba prefill kernels to split the context into chunks.
         self._cached_constants = ("page_size", "chunk_size")
@@ -260,7 +250,10 @@ class SequenceInfo:
         return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
     def _named_args(
-        self, include_extra_args: bool = True, include_cached_args: bool = True
+        self,
+        include_extra_args: bool = True,
+        include_cached_args: bool = True,
+        include_registered_args: bool = True,
     ) -> Dict[str, torch.Tensor]:
         # start with uncached args and shape them along the way
         args = {k: self._shape_for_forward(self._args_device[k]) for k in self._uncached_arg_names}
@@ -271,6 +264,9 @@ class SequenceInfo:
 
         if include_cached_args:
             args.update({k: self._args_device[k] for k in self._cached_arg_names})
+
+        if include_registered_args:
+            args.update({k: self._args_device[k] for k in self._registered_args})
 
         return args
 
@@ -284,19 +280,7 @@ class SequenceInfo:
         Cached arguments are only included if the attention mode is cached to reflect that after
         switching to cached attention, the cached arguments are required for a forward pass.
         """
-        return self._named_args(include_extra_args=True, include_cached_args=self._is_cached_attn)
-
-    @property
-    def named_standard_args(self) -> Dict[str, torch.Tensor]:
-        """Return a dictionary of named standard arguments.
-
-        We define standard arguments as the arguments that are part of the model's forward function
-        by default (i.e., without the extra arguments).
-
-        Just liked ``named_args``, this property includes cached attention arguments if the
-        attention mode is cached.
-        """
-        return self._named_args(include_extra_args=False, include_cached_args=self._is_cached_attn)
+        return self._named_args(include_cached_args=self._is_cached_attn)
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -321,13 +305,7 @@ class SequenceInfo:
         # is part of the graph, e.g., in situations where the graph is a submodule of the overall
         # model. In such instances, the graph usually sees inputs_embeds. However, we assume for
         # now that position_ids is always part of the graph.
-        # NOTE: logit_gather_ids is NOT included in args_for_prepare_metadata because it's not
-        # needed for prepare_metadata operations, but it IS included in _cached_arg_names so it
-        # gets added as a model input via update_in_out_nodes.
-        cached_args_for_prepare_metadata = tuple(
-            arg for arg in self._cached_arg_names if arg != "logit_gather_ids"
-        )
-        return ("position_ids",) + cached_args_for_prepare_metadata
+        return ("position_ids",) + self._cached_arg_names
 
     @property
     def const_args_for_prepare_metadata(self) -> Tuple[Constant, ...]:
@@ -575,6 +553,11 @@ class SequenceInfo:
         """
         self.set_generate_only_batch()
 
+    def register_arg(self, name: str, tnsr_default: torch.Tensor) -> None:
+        self._args_device[name] = tnsr_default.to(self.device)
+        self._args_host[name] = tnsr_default.tolist()
+        self._registered_args[name] = self._args_host[name]
+
     @staticmethod
     def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
         return [
@@ -655,7 +638,6 @@ class SequenceInfo:
         input_pos: Optional[Union[Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
         slot_idx: Optional[Sequence[int]] = None,
-        logit_gather_ids: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -666,7 +648,6 @@ class SequenceInfo:
             input_pos: Absolute starting position in the cache for each sequence.
             page_assignments: List of sequences of page assignments for each sequence.
             slot_idx: List of slot indices for each sequence.
-            logit_gather_ids: List of logit gather indices for each sequence.
             extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly. Reset values are
@@ -702,12 +683,6 @@ class SequenceInfo:
             free_slot_idx = self._get_unique_value(set(slot_idx), self.max_batch_size)
             self._store_arg("slot_idx", slot_idx, reset_val=free_slot_idx)
 
-        # check for updated logit_gather_ids
-        if logit_gather_ids is not None:
-            self._store_arg("logit_gather_ids", logit_gather_ids, reset_val=0)
-        else:
-            self._store_arg("logit_gather_ids", list(0 for _ in range(self.max_batch_size)))
-
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
         self._store_arg("input_ids", self._flatten(input_ids))
@@ -720,7 +695,12 @@ class SequenceInfo:
             ]
         self._store_arg("position_ids", self._flatten(position_ids))
 
-        ### UPDATE EXTRA INPUTS ####################################################################
+        ### UPDATE REGISTERED ARGS #################################################################
+        for name, val_default in self._registered_args.items():
+            arg_value = extra_args.pop(name, val_default)
+            self._store_arg(name, arg_value, reset_val=val_default[0])
+
+        ### UPDATE UNREGISTERED EXTRA INPUTS #######################################################
         self._extra_args = {}
         for key, value in extra_args.items():
             self._store_extra_arg(key, value)

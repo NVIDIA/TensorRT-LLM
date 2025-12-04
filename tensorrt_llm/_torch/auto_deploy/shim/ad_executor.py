@@ -191,7 +191,8 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
-    ) -> List[bool]:
+        gather_context_logits: bool = False,
+    ):
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -205,8 +206,7 @@ class ADEngine(ModelEngine):
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
-        last_logit_only: List[bool] = []
-        logit_gather_ids: List[int] = []
+        logits_gather_mask: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
         flat_gather_idx: List[int] = []
@@ -232,8 +232,8 @@ class ADEngine(ModelEngine):
             input_pos.append(begin_compute)
 
             request.py_batch_idx = request.seq_slot
-            last_logit_only.append(True)
-            logit_gather_ids.append(num_ctx_tokens - 1)
+            logits_gather_mask.extend([gather_context_logits] * len(prompt_tokens))
+            logits_gather_mask[-1] = True
 
             # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -268,8 +268,7 @@ class ADEngine(ModelEngine):
             slot_idx.append(request.seq_slot)
 
             # return all logits
-            last_logit_only.append(False)
-            logit_gather_ids.append(num_ctx_tokens + num_generation_tokens - 1)
+            logits_gather_mask.append(True)
 
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -281,7 +280,7 @@ class ADEngine(ModelEngine):
             input_pos=input_pos,
             page_assignments=page_assignments,
             slot_idx=slot_idx,
-            logit_gather_ids=logit_gather_ids,
+            logits_gather_mask=logits_gather_mask,
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
@@ -296,25 +295,12 @@ class ADEngine(ModelEngine):
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
-        return last_logit_only
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        return self.model(**self.cache_seq_interface.named_args)[0]
-
-    @property
-    def _gather_before_lm_head_in_graph(self) -> bool:
-        """Check if gather_logits_before_lm_head transform was applied to the model."""
-        # Check on the model itself (for unwrapped GraphModule)
-        if hasattr(self.model, "_gather_logits_before_lm_head_applied"):
-            return self.model._gather_logits_before_lm_head_applied
-        # Check on wrapped model (for CapturedGraph or other wrappers)
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "_gather_logits_before_lm_head_applied"
-        ):
-            return self.model.model._gather_logits_before_lm_head_applied
-        return False
+        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
+        return logits
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -331,31 +317,13 @@ class ADEngine(ModelEngine):
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
-        assert not gather_context_logits, "gather_context_logits is not supported yet"
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
-        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
+        self._prepare_inputs(
+            scheduled_requests, resource_manager, new_tokens, gather_context_logits
+        )
         self.iter_counter += 1
 
-        logits = self._compute_logits()
-        if self.cache_seq_interface.info.is_generate:
-            logits_flat = logits.squeeze(1)
-        else:
-            logits = logits.squeeze(0)
-            if self._gather_before_lm_head_in_graph:
-                num_seqs = len(self.cache_seq_interface.info.seq_len)
-                logits_flat = logits[:num_seqs]
-            else:
-                logits = list(torch.split(logits, self.cache_seq_interface.info.seq_len))
-                # gather+cat logits
-                logits_flat = torch.cat(
-                    [
-                        ls_one_seq[-last_only:]
-                        for ls_one_seq, last_only in zip(logits, last_logit_only)
-                    ],
-                    dim=0,
-                )
-
-        return {"logits": logits_flat}
+        return {"logits": self._compute_logits()}
 
 
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):

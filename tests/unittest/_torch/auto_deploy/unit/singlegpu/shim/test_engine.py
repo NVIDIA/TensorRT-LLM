@@ -71,11 +71,7 @@ def test_engine(engine_cls: Type[ADEngine], attn_page_size: int):
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
         logits = engine._compute_logits()
-        if isinstance(logits, torch.Tensor):
-            # Already a tensor, ensure it has the right shape [seq_len, vocab]
-            if logits.dim() == 3:
-                logits = logits.squeeze(0)  # Remove batch dimension if present
-
+        logits = torch.stack(logits)
         assert logits is not None, "Logits are None"
 
         mock_input = None
@@ -109,10 +105,7 @@ def test_demo_engine_sampling(attn_page_size: int):
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
         logits = engine._compute_logits()
-        if isinstance(logits, torch.Tensor):
-            # Already a tensor, ensure it has the right shape [seq_len, vocab]
-            if logits.dim() == 3:
-                logits = logits.squeeze(0)  # Remove batch dimension if present
+        logits = torch.stack(logits)
 
         vocab_size = logits.size(-1)
         sampling_params = SamplingParams(top_k=5, temperature=1.0)

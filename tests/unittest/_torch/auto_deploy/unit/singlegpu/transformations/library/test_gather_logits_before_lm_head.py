@@ -194,10 +194,6 @@ class TestGatherLogitsBeforeLmHeadTransform:
         # Check that gather op was inserted
         assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
 
-        # Check that model has the marker
-        assert hasattr(gm_transformed, "_gather_logits_before_lm_head_applied")
-        assert gm_transformed._gather_logits_before_lm_head_applied is True
-
         # Test forward pass
         output = gm_transformed(hidden_states, logit_gather_ids, seq_len)
         assert output.shape == (batch_size, 1, vocab_size)
