@@ -549,16 +549,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 cluster_shape_mn[0]) + "x" + str(
                                     cluster_shape_mn[1]) + "_" + str(
                                         swap_ab) + "_" + str(use_prefetch)
-                    full_obj_path = os.path.join(tempfile.gettempdir(),
-                                                 "cute_dsl_kernels",
-                                                 fname + ".so")
-                    if os.path.isfile(full_obj_path):
+                    shared_lib_path = os.path.join(tempfile.gettempdir(),
+                                                   "cute_dsl_kernels",
+                                                   "nvfp4_gemm", fname + ".so")
+                    if os.path.isfile(shared_lib_path):
                         file_hit = True
                     else:
                         file_hit = False
-                    shared_lib_path = os.path.join(tempfile.gettempdir(),
-                                                   "cute_dsl_kernels",
-                                                   fname + ".so")
                     # print(f"tempfile.gettempdir(): {tempfile.gettempdir()}")
                     # print(f"full_path: {full_obj_path}")
                 else:
@@ -638,7 +635,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     if self.enable_file_cache:
                         fpath = os.path.join(tempfile.gettempdir(),
-                                             "cute_dsl_kernels")
+                                             "cute_dsl_kernels", "nvfp4_gemm")
                         os.makedirs(fpath, exist_ok=True)
                         # print(f"export_to_c: fpath: {fpath}")
                         fname = str(sf_vec_size) + "_" + str(
