@@ -2255,7 +2255,7 @@ class PyExecutor:
             else:
                 still_pending_canceled_ids.append(req_id)
 
-        # Clear list of requests marked for cancelation and add back those that failed to cancel.
+        # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.executor_request_queue.canceled_req_ids.clear()
         self.executor_request_queue.canceled_req_ids.extend(
             still_pending_canceled_ids)
