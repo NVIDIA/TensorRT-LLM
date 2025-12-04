@@ -1282,6 +1282,18 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None, description="The dynamic batch config to use")
 
+    max_pending_requests: int = Field(
+        default=0,
+        description=
+        "Max number of context requests allowed to be hold from being scheduled"
+    )
+
+    max_pending_iterations: int = Field(
+        default=1,
+        description=
+        "Max number of iterations allowed to hold context requests from being scheduled"
+    )
+
     def _to_pybind(self):
         return _SchedulerConfig(
             capacity_scheduler_policy=self.capacity_scheduler_policy._to_pybind(

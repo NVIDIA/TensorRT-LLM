@@ -2489,6 +2489,19 @@ def test_llm_dynamic_batch_config():
                      scheduler_config=scheduler_config)
 
 
+def test_llm_context_batching_config():
+    scheduler_config = SchedulerConfig(
+        max_pending_requests=4,
+        max_pending_iterations=4,
+    )
+    llm_test_harness(llama_model_path,
+                     prompts * 32, ["D E F G H I J K"] * 32,
+                     sampling_params=SamplingParams(max_tokens=9),
+                     backend="pytorch",
+                     max_batch_size=8,
+                     scheduler_config=scheduler_config)
+
+
 def run_llm_with_postprocess_parallel(tp_size: int = 1):
     sampling_params = SamplingParams(max_tokens=6)
 

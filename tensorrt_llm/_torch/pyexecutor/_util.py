@@ -38,7 +38,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler)
+                        ContextBatchingScheduler, SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -813,7 +813,13 @@ def create_py_executor_instance(
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                            ctx_chunk_config)
-    scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+    if scheduler_config.max_pending_requests != 0:
+        scheduler = ContextBatchingScheduler(
+            capacity_scheduler, mb_scheduler,
+            scheduler_config.max_pending_requests,
+            scheduler_config.max_pending_iterations)
+    else:
+        scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(

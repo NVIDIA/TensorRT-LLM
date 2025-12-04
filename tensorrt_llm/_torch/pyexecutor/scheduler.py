@@ -216,3 +216,45 @@ class SimpleScheduler(RequestScheduler):
                                list(generation_requests), list(paused_requests),
                                list(fitting_disagg_gen_init_requests),
                                len(fitting_requests))
+
+
+class ContextBatchingScheduler(SimpleScheduler):
+
+    def __init__(self, capacity_scheduler: CapacityScheduler,
+                 micro_batch_scheduler: MicroBatchScheduler,
+                 max_pending_requests: int, max_pending_iterations: int):
+        super().__init__(capacity_scheduler, micro_batch_scheduler)
+        self.max_pending_requests = max_pending_requests
+        self.max_pending_iterations = max_pending_iterations
+
+        self.last_pending_requests = 0
+        self.pending_iterations = 0
+
+    def schedule_request(self, active_requests: RequestList,
+                         inflight_request_ids: set[int]) -> SchedulerOutput:
+        output = super().schedule_request(active_requests, inflight_request_ids)
+
+        num_pending_requests = len(output.context_requests)
+        if num_pending_requests >= self.max_pending_requests:
+            # If we get enough context requests, process them
+            self.last_pending_requests = 0
+            self.pending_iterations = 0
+        else:
+            # If we are not getting new context requests, increase the iteration count
+            if num_pending_requests <= self.last_pending_requests:
+                self.pending_iterations += 1
+            else:
+                self.pending_iterations = 0
+            self.last_pending_requests = num_pending_requests
+
+            if self.pending_iterations < self.max_pending_iterations:
+                # Hold off processing context requests
+                output = SchedulerOutput(
+                    [], output.generation_requests, output.paused_requests,
+                    output.fitting_disagg_gen_init_requests,
+                    output.num_fitting_requests)
+            else:
+                # Process context requests after max pending iterations
+                self.pending_iterations = 0
+
+        return output
