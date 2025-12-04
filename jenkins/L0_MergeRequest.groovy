@@ -368,6 +368,7 @@ def mergeWaiveList(pipeline, globalVars)
         """
         trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
         echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
+        error "test"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
