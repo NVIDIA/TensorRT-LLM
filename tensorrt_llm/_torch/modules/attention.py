@@ -978,6 +978,8 @@ class MLA(nn.Module):
                                        'original_max_position_embeddings', 8192)
             self.attn_scale = getattr(config.pretrained_config.llama_4_scaling,
                                       'beta', 0.1)
+        else:
+            self.llama_4_scaling = False
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
