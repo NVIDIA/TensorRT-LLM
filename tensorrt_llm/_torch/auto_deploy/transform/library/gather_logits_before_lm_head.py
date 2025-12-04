@@ -90,7 +90,7 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
 
         # assume lm head node is the input to the output node
         lm_head_node = gm.graph.find_nodes(op="output")[0].all_input_nodes[0]
-        if is_linear_op(lm_head_node) and False:
+        if is_linear_op(lm_head_node):
             node_to_gather = lm_head_node.all_input_nodes[0]
             ad_logger.info(f"Found LM head node: {lm_head_node.name}")
         else:
