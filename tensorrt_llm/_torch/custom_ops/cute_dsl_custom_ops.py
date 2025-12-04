@@ -1,4 +1,7 @@
 import itertools
+import os
+import subprocess
+import tempfile
 from typing import List, Optional, Tuple
 
 import torch
@@ -237,6 +240,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
             use_cold_l2_cache=True,
         )
+
+        # obj_files = []
 
         def __init__(self,
                      output_dtype: torch.dtype,
@@ -530,68 +535,127 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if cache_key not in self.__class__.kernel_cache:
                 if self.use_tvm_ffi:
-                    a_ptr = self.make_cute_dsl_global_pointer(
-                        a_tensor, cutlass.Float4E2M1FN, 32)
-                    b_ptr = self.make_cute_dsl_global_pointer(
-                        b_tensor, cutlass.Float4E2M1FN, 32)
-                    a_sf_ptr = self.make_cute_dsl_global_pointer(
-                        a_sf_tensor, cutlass.Float8E4M3FN, 16)
-                    b_sf_ptr = self.make_cute_dsl_global_pointer(
-                        b_sf_tensor, cutlass.Float8E4M3FN, 16)
-                    c_ptr = self.make_cute_dsl_global_pointer(
-                        c_tensor, cutlass.BFloat16, 16)
-                    alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
-                    # make faked stream
-                    stream = cute.runtime.make_fake_stream(
-                        use_tvm_ffi_env_stream=True)
-
-                    if swap_ab:
-                        kernel_a_ptr = b_ptr
-                        kernel_a_sf_ptr = b_sf_ptr
-                        kernel_b_ptr = a_ptr
-                        kernel_b_sf_ptr = a_sf_ptr
+                    fname = str(sf_vec_size) + "_" + str(
+                        mma_tiler_mn[0]) + "x" + str(
+                            mma_tiler_mn[1]) + "_" + str(
+                                cluster_shape_mn[0]) + "x" + str(
+                                    cluster_shape_mn[1]) + "_" + str(
+                                        swap_ab) + "_" + str(use_prefetch)
+                    full_obj_path = os.path.join(tempfile.gettempdir(),
+                                                 "cute_dsl_kernels",
+                                                 fname + ".so")
+                    if os.path.isfile(full_obj_path):
+                        file_hit = True
                     else:
-                        kernel_a_ptr = a_ptr
-                        kernel_a_sf_ptr = a_sf_ptr
-                        kernel_b_ptr = b_ptr
-                        kernel_b_sf_ptr = b_sf_ptr
+                        file_hit = False
+                    shared_lib_path = os.path.join(tempfile.gettempdir(),
+                                                   "cute_dsl_kernels",
+                                                   fname + ".so")
+                    # print(f"tempfile.gettempdir(): {tempfile.gettempdir()}")
+                    # print(f"full_path: {full_obj_path}")
+                else:
+                    file_hit = False
+                # print(f"file_hit: {file_hit}")
 
-                gemm = self.__class__.kernel_class(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    use_prefetch,
-                )
-                # Compute max active clusters on current device
-                hardware_info = cutlass.utils.HardwareInfo()
-                max_active_clusters = hardware_info.get_max_active_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                if file_hit:
+                    loaded_fn = cute.runtime.load_module(shared_lib_path)
+                    compiled_gemm = getattr(loaded_fn, fname)
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
 
-                # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
-                # so we make alpha as the cute.Tensor type in the jit func.
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    kernel_m,
-                    kernel_n,
-                    real_k,
-                    kernel_sf_m // 128,
-                    kernel_sf_n // 128,
-                    sf_k // 4,
-                    1,  # batch
-                    kernel_a_ptr,
-                    kernel_b_ptr,
-                    kernel_a_sf_ptr,
-                    kernel_b_sf_ptr,
-                    c_ptr,
-                    alpha_cute_tensor,
-                    max_active_clusters,
-                    stream,
-                    swap_ab,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
-                )
+                else:
+                    if self.use_tvm_ffi:
+                        a_ptr = self.make_cute_dsl_global_pointer(
+                            a_tensor, cutlass.Float4E2M1FN, 32)
+                        b_ptr = self.make_cute_dsl_global_pointer(
+                            b_tensor, cutlass.Float4E2M1FN, 32)
+                        a_sf_ptr = self.make_cute_dsl_global_pointer(
+                            a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                        b_sf_ptr = self.make_cute_dsl_global_pointer(
+                            b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                        c_ptr = self.make_cute_dsl_global_pointer(
+                            c_tensor, cutlass.BFloat16, 16)
+                        alpha_cute_tensor = cute.runtime.from_dlpack(
+                            alpha_tensor)
+                        # make faked stream
+                        stream = cute.runtime.make_fake_stream(
+                            use_tvm_ffi_env_stream=True)
 
-                self.__class__.kernel_cache[cache_key] = compiled_gemm
+                        if swap_ab:
+                            kernel_a_ptr = b_ptr
+                            kernel_a_sf_ptr = b_sf_ptr
+                            kernel_b_ptr = a_ptr
+                            kernel_b_sf_ptr = a_sf_ptr
+                        else:
+                            kernel_a_ptr = a_ptr
+                            kernel_a_sf_ptr = a_sf_ptr
+                            kernel_b_ptr = b_ptr
+                            kernel_b_sf_ptr = b_sf_ptr
+
+                    gemm = self.__class__.kernel_class(
+                        sf_vec_size,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        use_prefetch,
+                    )
+                    # Compute max active clusters on current device
+                    hardware_info = cutlass.utils.HardwareInfo()
+                    max_active_clusters = hardware_info.get_max_active_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                    # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
+                    # so we make alpha as the cute.Tensor type in the jit func.
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        kernel_sf_m // 128,
+                        kernel_sf_n // 128,
+                        sf_k // 4,
+                        1,  # batch
+                        kernel_a_ptr,
+                        kernel_b_ptr,
+                        kernel_a_sf_ptr,
+                        kernel_b_sf_ptr,
+                        c_ptr,
+                        alpha_cute_tensor,
+                        max_active_clusters,
+                        stream,
+                        swap_ab,
+                        options=f"--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
+
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+
+                    if self.use_tvm_ffi:
+                        fpath = os.path.join(tempfile.gettempdir(),
+                                             "cute_dsl_kernels")
+                        os.makedirs(fpath, exist_ok=True)
+                        # print(f"export_to_c: fpath: {fpath}")
+                        fname = str(sf_vec_size) + "_" + str(
+                            mma_tiler_mn[0]) + "x" + str(
+                                mma_tiler_mn[1]) + "_" + str(
+                                    cluster_shape_mn[0]) + "x" + str(
+                                        cluster_shape_mn[1]) + "_" + str(
+                                            swap_ab) + "_" + str(use_prefetch)
+                        compiled_gemm.export_to_c(fpath + "/" + fname + ".o",
+                                                  function_name=fname)
+                        # print(f"export_to_c: fname: {fname}")
+                        # self.__class__.obj_files.append(fpath + "/" + fname + ".o")
+                        # obtain necessary runtime libs for loading the shared library
+                        runtime_libs = cute.runtime.find_runtime_libraries(
+                            enable_tvm_ffi=self.use_tvm_ffi)
+                        # compile the object file to a shared library
+                        # TODO: packaging multiple .o into a single .so will trigger multiple definition error.
+                        # cmd = ["gcc", "-shared", "-o", fpath + "/" + "nvfp4_gemm.so", *self.__class__.obj_files, *runtime_libs]
+                        cmd = [
+                            "gcc", "-shared", "-o", fpath + "/" + fname + ".so",
+                            fpath + "/" + fname + ".o", *runtime_libs
+                        ]
+                        # print(cmd)
+                        subprocess.run(cmd, check=True)
+                        # print(f"Successfully created shared library: {fpath + "/" + fname + ".so"}")
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
