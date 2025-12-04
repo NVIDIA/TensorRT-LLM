@@ -1,7 +1,7 @@
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -18,6 +18,9 @@ __all__ = [
     "LoRARequest",
     "PromptAdapterRequest",
     "GenerationRequest",
+    "TruncateKVCacheRequest",
+    "KVCacheHintRequest",
+    "CancellingRequest",
 ]
 
 
@@ -134,6 +137,21 @@ class GenerationRequest:
         assert self.id is None, f"Request ID is already set: {self.id}"
         self.id = id
         return self
+
+
+class KVCacheHintRequest:
+    ''' The request to set KV cache hints. '''
+
+    def __init__(self, action: Literal["truncate"]):
+        self.action = action
+
+
+class TruncateKVCacheRequest(KVCacheHintRequest):
+
+    def __init__(self, messages_to_retain: List[int], messages: List[int]):
+        super().__init__("truncate")
+        self.messages_to_retain = messages_to_retain
+        self.messages = messages
 
 
 class CancellingRequest:

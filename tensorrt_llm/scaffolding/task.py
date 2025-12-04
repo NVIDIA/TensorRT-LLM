@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -140,7 +141,10 @@ class RoleMessage:
     prefix: Optional[str] = field(default=None)
 
     def __str__(self) -> str:
-        return f"{self.role}: {self.content}\n"
+        return json.dumps({
+            "role": self.role,
+            "content": self.content,
+        })
 
     def __repr__(self) -> str:
         return f"{self.role}: {self.content}\n"
@@ -175,6 +179,21 @@ class AssistantMessage(RoleMessage):
         self.reasoning = reasoning
         self.reasoning_content = reasoning_content
         self.tool_calls = tool_calls
+
+    def __str__(self) -> str:
+        # return f"role: assistant, content: {self.content}, reasoning: {self.reasoning}, reasoning_content: {self.reasoning_content}, tool_calls: {self.tool_calls}"
+        return json.dumps({
+            "role":
+            "assistant",
+            "content":
+            self.content,
+            "reasoning":
+            self.reasoning,
+            "reasoning_content":
+            self.reasoning_content,
+            "tool_calls": [str(tool) for tool in self.tool_calls]
+            if self.tool_calls is not None else None,
+        })
 
 
 @dataclass
@@ -281,20 +300,24 @@ class MCPCallTask(Task):
 
 @dataclass
 class DropKVCacheTask(Task):
-    # input field
-    prefix: Optional[str] = field(default=None)
-    messages: list[RoleMessage] = field(default_factory=list)
+    messages_to_retain: list[RoleMessage] = field(default_factory=list)
+    partial_prefix: Optional[str] = field(
+        default=None)  # Currently unused since it's hard to tackle
+    chat_task: ChatTask = field(default=None)
 
     def __init__(self, chat_task: ChatTask, worker_tag: str):
         self.worker_tag = worker_tag
-        self.messages = chat_task.messages
-        self.prefix = ""
-        for message in self.messages:
-            if message.role == "system" or message.role == "user":
+
+        self.messages_to_retain = []
+        self.partial_prefix = None
+        self.chat_task = chat_task
+
+        retain = True
+        for message in chat_task.messages:
+            if (message.role == "system" or message.role == "user") and retain:
                 if message.prefix is not None:
-                    self.prefix += message.prefix
+                    self.messages_to_retain.append(message)
                 if message.prefix is None or len(message.prefix) < len(
                         message.content):
-                    break
-            else:  # assistant message
-                break
+                    self.partial_prefix = message.prefix
+                    retain = False

@@ -856,6 +856,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         return v
 
 
+class KVCacheHintRequest(ChatCompletionRequest):
+    action: Literal["truncate"]
+    messages_to_retain: List[ChatCompletionMessageParam]
+
+
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
                                            ResponseReasoningItem,
                                            ResponseFunctionToolCall]
