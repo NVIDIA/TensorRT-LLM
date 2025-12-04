@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import itertools
 import os
 import unittest.mock
 import weakref
@@ -38,24 +39,24 @@ def round_up(a, b):
 
 
 def get_balanced_selection_no_cache(
-    num_tokens, top_k, num_experts, dtype, device, world_size, rank
+    num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
 ):
     # First, each sender selects target rank
-    target_rank_before_mod = torch.arange(num_tokens * world_size * top_k).view(
-        num_tokens, world_size, top_k
+    target_rank_before_mod = torch.arange(num_tokens * dp_size * top_k).view(
+        num_tokens, dp_size, top_k
     )
-    target_rank_before_mod += top_k * torch.arange(num_tokens).view(
-        num_tokens, 1, 1
-    )  # Shift `top_k` ranks for the next token on each rank, to balance network traffic
-    target_rank = target_rank_before_mod % world_size
+    # Shift `top_k` ranks for each loop, to balance network traffic
+    assert ep_size % dp_size == 0
+    target_rank_before_mod += top_k * (target_rank_before_mod // (ep_size * top_k))
+    target_rank = target_rank_before_mod % ep_size
     # Second, each receiver selects target expert
     target_expert = torch.empty_like(target_rank)
-    for reciever_rank in range(world_size):
+    for reciever_rank in range(ep_size):
         mask = target_rank == reciever_rank
-        experts_per_rank = num_experts // world_size
-        local_expert = torch.arange(num_tokens * top_k) % experts_per_rank
+        experts_per_rank = num_experts // ep_size
+        local_expert = torch.arange(mask.sum()) % experts_per_rank
         target_expert[mask] = (reciever_rank * experts_per_rank) + local_expert
-    token_selected_experts = target_expert[:, rank].sort(dim=-1).values
+    token_selected_experts = target_expert[:, dp_rank].sort(dim=-1).values
     return token_selected_experts.contiguous().to(dtype=dtype, device=device)
 
 
@@ -64,47 +65,62 @@ get_balanced_selection = functools.cache(get_balanced_selection_no_cache)
 
 def test_get_balanced_selection():
     dtype = torch.long
-    for num_tokens in range(1, 33):
-        for num_experts in range(1, 65):
-            print(f"{num_tokens=} {num_experts=}")
-            for top_k in range(1, min(11, num_experts)):
-                for world_size in range(1, 65):
-                    if num_experts % world_size == 0:
-                        tokens_per_expert = torch.zeros(num_experts)
-                        for rank in range(world_size):
-                            token_selected_experts = get_balanced_selection_no_cache(
-                                num_tokens, top_k, num_experts, dtype, "cpu", world_size, rank
+    for num_tokens, num_experts, enable_attention_dp in itertools.product(
+        range(1, 35), range(1, 35), [False, True]
+    ):
+        print(f"{num_tokens=} {num_experts=} {enable_attention_dp=}")
+        for top_k in range(1, min(10, num_experts) + 1):
+            for world_size in range(1, 35):
+                dp_size = world_size if enable_attention_dp else 1
+                ep_size = world_size
+                if num_experts % ep_size == 0:
+                    tokens_per_expert = torch.zeros(num_experts)
+                    for dp_rank in range(dp_size):
+                        token_selected_experts = get_balanced_selection_no_cache(
+                            num_tokens, top_k, num_experts, dtype, "cpu", dp_size, dp_rank, ep_size
+                        )
+                        sorted_selection = token_selected_experts.sort(dim=-1).values
+                        if (sorted_selection[:, :-1] == sorted_selection[:, 1:]).any():
+                            raise ValueError(f"duplicated experts on rank {dp_rank}")
+                        experts_per_rank = num_experts // ep_size
+                        tokens_per_rank = (
+                            (token_selected_experts // experts_per_rank)
+                            .view(-1)
+                            .bincount(minlength=ep_size)
+                        )
+                        if tokens_per_rank.max() - tokens_per_rank.min() > 1:
+                            raise ValueError(f"tokens sent from rank {dp_rank} is not balanced")
+                        unique_tokens_per_rank = (
+                            (
+                                torch.arange(ep_size).view(ep_size, 1, 1)
+                                == token_selected_experts // experts_per_rank
                             )
-                            sorted_selection = token_selected_experts.sort(dim=-1).values
-                            if (sorted_selection[:, :-1] == sorted_selection[:, 1:]).any():
-                                raise ValueError(f"duplicated experts on rank {rank}")
-                            experts_per_rank = num_experts // world_size
-                            tokens_per_rank = (
-                                (token_selected_experts // experts_per_rank)
-                                .view(-1)
-                                .bincount(minlength=world_size)
+                            .any(dim=2)
+                            .sum(dim=1)
+                        )
+                        if unique_tokens_per_rank.max() - unique_tokens_per_rank.min() > 1:
+                            raise ValueError(
+                                f"tokens sent from rank {dp_rank} is not balanced after removing duplicates"
                             )
-                            if tokens_per_rank.max() - tokens_per_rank.min() > 1:
-                                raise ValueError(f"tokens sent from rank {rank} is not balanced")
-                            tokens_per_expert += token_selected_experts.view(-1).bincount(
-                                minlength=num_experts
-                            )
-                        if tokens_per_expert.max() - tokens_per_expert.min() > 1:
-                            raise ValueError("tokens per expert is not balanced")
+                        tokens_per_expert += token_selected_experts.view(-1).bincount(
+                            minlength=num_experts
+                        )
+                    if tokens_per_expert.max() - tokens_per_expert.min() > 1:
+                        raise ValueError("tokens per expert is not balanced")
 
 
-def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_size, rank):
+def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size):
     num_tokens, top_k = imbalanced_experts.shape
     dtype = imbalanced_experts.dtype
     device = imbalanced_experts.device
     balanced_experts = get_balanced_selection_no_cache(
-        num_tokens, top_k, num_experts, dtype, device, world_size, rank
+        num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
     )
     if balance_ratio == 0.0:
         num_balanced_tokens = 0
     else:
         # Activate all experts
-        min_num_balanced_tokens = min(num_tokens, ceil_div(num_experts, world_size * top_k))
+        min_num_balanced_tokens = min(num_tokens, ceil_div(num_experts, dp_size * top_k))
         num_balanced_tokens = min_num_balanced_tokens + round(
             (num_tokens - min_num_balanced_tokens) * balance_ratio
         )
@@ -116,43 +132,57 @@ def apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_si
 
 @functools.cache
 def get_all_to_one_selection(
-    num_tokens, top_k, num_experts, balance_ratio, dtype, device, world_size, rank
+    num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
 ):
-    experts_per_rank = num_experts // world_size
+    experts_per_rank = num_experts // ep_size
     if top_k > experts_per_rank:
         raise ValueError(
             "Cannot send all tokens to a single rank because `top_k > experts_per_rank`"
         )
     imbalanced_experts = (
         torch.arange(
-            rank * num_tokens * top_k, (rank + 1) * num_tokens * top_k, dtype=dtype, device=device
+            dp_rank * num_tokens * top_k,
+            (dp_rank + 1) * num_tokens * top_k,
+            dtype=dtype,
+            device=device,
         ).view(num_tokens, top_k)
         % experts_per_rank
     )
     imbalanced_experts = imbalanced_experts.sort(dim=-1).values
-    return apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_size, rank)
+    return apply_balance_ratio(
+        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
+    )
 
 
 @functools.cache
 def get_balanced_rank_imbalanced_expert_selection(
-    num_tokens, top_k, num_experts, balance_ratio, dtype, device, world_size, rank
+    num_tokens, top_k, num_experts, balance_ratio, dtype, device, dp_size, dp_rank, ep_size
 ):
-    experts_per_rank = num_experts // world_size
-    active_experts_per_rank = ceil_div(top_k, world_size)
-    # Select expert from [0, active_experts_per_rank * world_size),
-    # then scale to [0, experts_per_rank * world_size)
+    experts_per_rank = num_experts // ep_size
+    active_experts_per_rank = ceil_div(top_k, ep_size)
+    # Select expert from [0, active_experts_per_rank * ep_size),
+    # then scale to [0, experts_per_rank * ep_size)
     narrow_experts = get_balanced_selection_no_cache(
-        num_tokens, top_k, active_experts_per_rank * world_size, dtype, device, world_size, rank
+        num_tokens,
+        top_k,
+        active_experts_per_rank * ep_size,
+        dtype,
+        device,
+        dp_size,
+        dp_rank,
+        ep_size,
     )
     imbalanced_experts = (
         narrow_experts // active_experts_per_rank * experts_per_rank
         + narrow_experts % active_experts_per_rank
     )
-    return apply_balance_ratio(imbalanced_experts, num_experts, balance_ratio, world_size, rank)
+    return apply_balance_ratio(
+        imbalanced_experts, num_experts, balance_ratio, dp_size, dp_rank, ep_size
+    )
 
 
 def make_balanced_routing_method(
-    apply_method_orig, num_experts, balance_method, balance_ratio, world_size, rank
+    apply_method_orig, num_experts, balance_method, balance_ratio, dp_size, dp_rank, ep_size
 ):
     def balanced_routing_method(router_logits):
         token_selected_experts, token_final_scales = apply_method_orig(router_logits)
@@ -165,8 +195,9 @@ def make_balanced_routing_method(
                 num_experts,
                 token_selected_experts.dtype,
                 token_selected_experts.device,
-                world_size,
-                rank,
+                dp_size,
+                dp_rank,
+                ep_size,
             )
         elif balance_method == BalanceMethod.ImbalancedRanks:
             token_selected_experts = get_all_to_one_selection(
@@ -176,8 +207,9 @@ def make_balanced_routing_method(
                 balance_ratio,
                 token_selected_experts.dtype,
                 token_selected_experts.device,
-                world_size,
-                rank,
+                dp_size,
+                dp_rank,
+                ep_size,
             )
         elif balance_method == BalanceMethod.ImbalancedExperts:
             token_selected_experts = get_balanced_rank_imbalanced_expert_selection(
@@ -187,8 +219,9 @@ def make_balanced_routing_method(
                 balance_ratio,
                 token_selected_experts.dtype,
                 token_selected_experts.device,
-                world_size,
-                rank,
+                dp_size,
+                dp_rank,
+                ep_size,
             )
         else:
             raise NotImplementedError(f"Not support balance_method {balance_method}")
@@ -418,6 +451,9 @@ class RunnerMixin(ABC):
                 'Not support replace routing method for moe_backend "TRTLLM" with attention TP,'
                 ' please set balance_method to "NotModified"'
             )
+        dp_rank = self.model_config.mapping.rank // (
+            self.model_config.mapping.world_size // self.model_config.mapping.dp_size
+        )
         apply_methods_orig = [layer.mlp.experts.routing_method.apply for layer in self.layers]
         try:
             for layer, apply_method_orig in zip(self.layers, apply_methods_orig):
@@ -426,8 +462,9 @@ class RunnerMixin(ABC):
                     layer.mlp.experts.num_experts,
                     balance_method,
                     balance_ratio,
-                    layer.mlp.experts.ep_size,
-                    layer.mlp.experts.ep_rank,
+                    self.model_config.mapping.dp_size,
+                    dp_rank,
+                    self.model_config.mapping.moe_ep_size,
                 )
             yield
         finally:
