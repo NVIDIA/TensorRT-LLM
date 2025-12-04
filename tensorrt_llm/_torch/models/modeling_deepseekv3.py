@@ -878,18 +878,23 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.gate = DeepseekV3Gate(
-            hidden_size,
-            num_experts,
-            top_k=top_k,
-            n_group=config.n_group,
-            topk_group=config.topk_group,
-            routed_scaling_factor=config.routed_scaling_factor,
-            dtype=dtype,
-            fuse_routing_kernel=True,
-            apply_routing=False,
-            moe_backend=model_config.moe_backend,
-            topk_method=getattr(config, "topk_method", "noaux_tc"))
+        gate_cls = DeepseekV3Gate
+        if hasattr(model_config.pretrained_config, "gate_cls"):
+            if model_config.pretrained_config.gate_cls == "Mistral3Gate":
+                from ..models.modeling_mistral import Mistral3Gate
+                gate_cls = Mistral3Gate
+        self.gate = gate_cls(hidden_size,
+                             num_experts,
+                             top_k=top_k,
+                             n_group=config.n_group,
+                             topk_group=config.topk_group,
+                             routed_scaling_factor=config.routed_scaling_factor,
+                             dtype=dtype,
+                             fuse_routing_kernel=True,
+                             apply_routing=False,
+                             moe_backend=model_config.moe_backend,
+                             topk_method=getattr(config, "topk_method",
+                                                 "noaux_tc"))
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,

@@ -45,6 +45,8 @@ from tensorrt_llm.llmapi.tokenizer import (MistralTokenizer,
                                            PixtralProcessorAdapter)
 from tensorrt_llm.logger import logger
 
+from ..modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
+
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
 
@@ -350,6 +352,37 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         ])
 
 
+class Mistral3Gate(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        dtype: Optional[torch.dtype] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
+                                               dtype=dtype),
+                                   requires_grad=False)
+        self.top_k = top_k
+        self.dtype = dtype
+        self.routing_method = RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits: torch.Tensor = torch.ops.trtllm.cublas_mm(hidden_states,
+                                                          self.weight.t(),
+                                                          bias=None,
+                                                          out_dtype=self.dtype)
+        return logits
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+
+        self.weight.copy_(weights[0]["weight"][:])
+
+
 @register_auto_model("Mistral3ForConditionalGeneration")
 @register_auto_model("PixtralForConditionalGeneration")
 @register_input_processor(
@@ -412,6 +445,7 @@ class Mistral3VLM(PreTrainedModel):
             llm_class = DeepseekV3ForCausalLM
         # This is necessary for the auto weight mapper to figure out what it needs.
         llm_model_config.pretrained_config.architectures = config.architectures
+        llm_model_config.pretrained_config.gate_cls = "Mistral3Gate"
         self.llm = llm_class(llm_model_config)
         self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
         # NOTE: current `modelopt` does not support quantizing the vision portion.
