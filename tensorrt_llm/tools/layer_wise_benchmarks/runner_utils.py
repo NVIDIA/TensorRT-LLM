@@ -316,7 +316,9 @@ class RunnerMixin(ABC):
     def create_run_pack(
         self,
         run_type: str,
+        *,
         batch_size: int,
+        request_id_begin: int,
         seq_len_q: int,
         seq_len_kv_cache: int,
         kv_cache_manager: KVCacheManager,
@@ -330,7 +332,7 @@ class RunnerMixin(ABC):
         )
         attn_metadata = AttentionCls.Metadata(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
-            request_ids=list(range(batch_size)),
+            request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
             num_contexts={
                 "CTX": batch_size,
@@ -355,8 +357,6 @@ class RunnerMixin(ABC):
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         attn_metadata.prepare()
-        with model_extra_attrs(self.model_config.extra_attrs):
-            get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
         hidden_size = self.model_config.pretrained_config.hidden_size
         position_ids = torch.tensor(
             [list(range(seq_len_kv_cache, seq_len_kv_cache + seq_len_q)) * batch_size],
@@ -377,12 +377,20 @@ class RunnerMixin(ABC):
             mamba_metadata.prepare(attn_metadata)
             kwargs["mamba_metadata"] = mamba_metadata
 
-        def run_pack():
+        def run_pack(*, check=False):
             output = hidden_states, residual
             with model_extra_attrs(self.model_config.extra_attrs):
+                get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
                 with torch.inference_mode():
                     for layer in self.layers:
                         output = layer(position_ids, output[0], attn_metadata, output[1], **kwargs)
+            if check:
+                if output[0].isnan().any():
+                    raise ValueError("Has nan, please fix weights initialization")
+                if output[0].isinf().any():
+                    raise ValueError("Has inf, please fix weights initialization")
+                if (output[0] == 0).sum() > 0.5 * output[0].numel():
+                    raise ValueError("Too many zeros, please fix weights initialization")
             return output
 
         return run_pack
