@@ -316,6 +316,13 @@ class TRTLLMGenFusedMoE(MoE):
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
+                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+                # fc31_act_scale shape: (1, hidden_size)
+                # x shape: (num_tokens, hidden_size)
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    x = x * self.fc31_act_scale
                 x_row = x.shape[0]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,

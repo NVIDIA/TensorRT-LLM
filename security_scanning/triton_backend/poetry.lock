@@ -174,13 +174,13 @@ test = ["hypothesis (<6.136.0)", "levenshtein (<=0.27.1)", "pip", "pylint (<3.3.
 
 [[package]]
 name = "fsspec"
-version = "2025.10.0"
+version = "2025.12.0"
 description = "File-system specification"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 files = [
-    {file = "fsspec-2025.10.0-py3-none-any.whl", hash = "sha256:7c7712353ae7d875407f97715f0e1ffcc21e33d5b24556cb1e090ae9409ec61d"},
-    {file = "fsspec-2025.10.0.tar.gz", hash = "sha256:b6789427626f068f9a83ca4e8a3cc050850b6c0f71f99ddb4f542b8266a26a59"},
+    {file = "fsspec-2025.12.0-py3-none-any.whl", hash = "sha256:8bf1fe301b7d8acfa6e8571e3b1c3d158f909666642431cc78a1b7b4dbc5ec5b"},
+    {file = "fsspec-2025.12.0.tar.gz", hash = "sha256:c505de011584597b1060ff778bb664c1bc022e87921b0e4f10cc9c44f9635973"},
 ]
 
 [package.extras]

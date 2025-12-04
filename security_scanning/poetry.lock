@@ -2150,13 +2150,13 @@ dev = ["nanobind (==2.4.0)", "numpy", "pre-commit", "setuptools (>=80)", "torch"
 
 [[package]]
 name = "mlx-lm"
-version = "0.28.3"
+version = "0.28.4"
 description = "LLMs with MLX and the Hugging Face Hub"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "mlx_lm-0.28.3-py3-none-any.whl", hash = "sha256:ec103e2c9a06bd2cbafd41aafc975e40262176f7360d4f53ec342cebb9e0e6ea"},
-    {file = "mlx_lm-0.28.3.tar.gz", hash = "sha256:75df2b925d343ebaf50b63008dede4fe98cd3b02b1b24b7da71ebeb198d674f0"},
+    {file = "mlx_lm-0.28.4-py3-none-any.whl", hash = "sha256:64ff7bff02e902f1df7daafdbf27ffc836b9a7c9b332b9fc3ea40c19e31147ca"},
+    {file = "mlx_lm-0.28.4.tar.gz", hash = "sha256:3661d8ef5f0e2695d52993e0df1ed2c1f93ca1d094258146c18d9cec0c50514e"},
 ]
 
 [package.dependencies]
@@ -2165,6 +2165,7 @@ mlx = {version = ">=0.29.2", markers = "platform_system == \"Darwin\""}
 numpy = "*"
 protobuf = "*"
 pyyaml = "*"
+sentencepiece = "*"
 transformers = ">=4.39.3"
 
 [package.extras]
