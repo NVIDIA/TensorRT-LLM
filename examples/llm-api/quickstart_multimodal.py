@@ -278,6 +278,8 @@ def main():
                                              modality=args.modality,
                                              prompts=args.prompt,
                                              media=args.media,
+                                             keep_source_media=(args.checkpoint_format=="mistral_large_3"),
+                                             processor=getattr(llm, "input_processor", None),
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
                                              device=args.device)

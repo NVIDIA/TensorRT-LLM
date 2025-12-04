@@ -343,7 +343,6 @@ class ModelConfig(Generic[TConfig]):
 
                 block_size = (128, 128)
                 quant_config.group_size = block_size[0]
-                logger.info(f"quant_config: {quant_config}")
 
         # MXFP4 checkpoints.
         elif hf_quant_config.get("quant_method") == "mxfp4":

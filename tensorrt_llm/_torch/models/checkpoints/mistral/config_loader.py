@@ -10,36 +10,45 @@ from tensorrt_llm._torch.models.modeling_utils import register_config_loader
 
 ###################
 # vllm code here
-# https://github.com/vllm-project/vllm/blob/e1098ced95146d98a4ed46c81ee709013d54fb1f/vllm/transformers_utils/configs/mistral.py
+# https://github.com/vllm-project/vllm/blob/48a5fff66e78985a634abac0d8d7f271da744000/vllm/transformers_utils/configs/mistral.py
 ###################
 
 
-def adapt_config_dict(config_dict: dict[str, Any], **kwargs) -> PretrainedConfig:
-    config_dict.update(kwargs)
+def adapt_config_dict(
+    config_dict: dict[str, Any],
+    defaults: dict[str, Any] = {},
+) -> PretrainedConfig:
     config_dict = _remap_general_mistral_args(config_dict)
 
     if bool(config_dict.get("quantization")):
         config_dict = _remap_mistral_quantization_args(config_dict)
 
     is_moe = bool(config_dict.get("moe"))
-    is_mistral_large_3 = is_moe and (config_dict["moe"].get("num_shared_experts") or 0) > 0
-    if is_moe:
-        if is_mistral_large_3:
-            config_dict = _remap_moe_args(config_dict)
-            config_dict["model_type"] = "deepseek_v3"
-            config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
-            config_dict["torch_dtype"] = "bfloat16"
+    is_mistral_large_3 = (
+        is_moe and (config_dict["moe"].get("num_shared_experts") or 0) > 0
+    )
+    if config_dict.get("model_type") == "mamba":
+        config_dict["architectures"] = ["Mamba2ForCausalLM"]
+    elif is_moe and is_mistral_large_3:
+        config_dict = _remap_moe_args(config_dict)
+        config_dict["model_type"] = "deepseek_v3"
+        config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
 
-            assert "llama_4_scaling" in config_dict, "MistralLarge3 expect llama4 scaling config."
-            llama_4_scaling_config_keys = ["original_max_position_embeddings", "beta"]
-            assert all(
-                [key in config_dict["llama_4_scaling"] for key in llama_4_scaling_config_keys]
-            ), (
-                "llama_4_scaling config should define the keys: "
-                f"{','.join(llama_4_scaling_config_keys)}"
-            )
-        else:
-            config_dict["architectures"] = ["MixtralForCausalLM"]
+        assert "llama_4_scaling" in config_dict, (
+            "MistralLarge3 expect llama4 scaling config."
+        )
+        llama_4_scaling_config_keys = ["original_max_position_embeddings", "beta"]
+        assert all(
+            [
+                key in config_dict["llama_4_scaling"]
+                for key in llama_4_scaling_config_keys
+            ]
+        ), (
+            "llama_4_scaling config should define the keys: "
+            f"{','.join(llama_4_scaling_config_keys)}"
+        )
+    elif is_moe:
+        config_dict["architectures"] = ["MixtralForCausalLM"]
     else:
         config_dict["architectures"] = ["MistralForCausalLM"]
 
@@ -49,14 +58,22 @@ def adapt_config_dict(config_dict: dict[str, Any], **kwargs) -> PretrainedConfig
     if bool(config_dict.get("llama_4_scaling")):
         llama_4_scaling_config_keys = ["original_max_position_embeddings", "beta"]
         assert all(
-            [key in config_dict["llama_4_scaling"] for key in llama_4_scaling_config_keys]
-        ), f"llama_4_scaling config should define the keys: {','.join(llama_4_scaling_config_keys)}"
+            [
+                key in config_dict["llama_4_scaling"]
+                for key in llama_4_scaling_config_keys
+            ]
+        ), (
+            "llama_4_scaling config should define the keys: "
+            f"{','.join(llama_4_scaling_config_keys)}"
+        )
 
-    is_vision = (config_dict.get("multimodal") or {}).get("vision_encoder_args") or config_dict.get(
-        "vision_encoder"
-    )
+    is_vision = (config_dict.get("multimodal") or {}).get(
+        "vision_encoder_args"
+    ) or config_dict.get("vision_encoder")
     is_audio = bool(
-        ((config_dict.get("multimodal") or {}).get("whisper_model_args") or {}).get("encoder_args")
+        ((config_dict.get("multimodal") or {}).get("whisper_model_args") or {}).get(
+            "encoder_args"
+        )
     )
 
     assert not (is_vision and is_audio), "Vision and audio are mutually exclusive"
@@ -65,6 +82,9 @@ def adapt_config_dict(config_dict: dict[str, Any], **kwargs) -> PretrainedConfig
         config_dict = _remap_mistral_vision_args(config_dict)
     if is_audio:
         config_dict = _remap_mistral_audio_args(config_dict)
+
+    for k, v in defaults.items():
+        config_dict.setdefault(k, v)
 
     config = PretrainedConfig.from_dict(config_dict)
 
@@ -98,13 +118,17 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         "apply_scale": "apply_yarn_scaling",
     }
     yarn_config = config.get("yarn") or {}
-    config["rope_scaling"] = {
+    config["rope_parameters"] = {
         "rope_type": "yarn",
         "mscale_all_dim": 1,
     }
+
+    if rope_theta := config.pop("rope_theta", None):
+        config["rope_parameters"]["rope_theta"] = rope_theta
+
     for old_name, new_name in yarn_config_map.items():
         if old_name in yarn_config:
-            config["rope_scaling"][new_name] = yarn_config.pop(old_name)
+            config["rope_parameters"][new_name] = yarn_config.pop(old_name)
 
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
 
@@ -126,7 +150,7 @@ def _remap_general_mistral_args(config: dict) -> dict:
         "model_type": ("model_type", "transformer"),
         "hidden_act": ("activation", "silu"),
         "tie_word_embeddings": ("tied_embeddings", False),
-        "max_seq_len": ("max_seq_len", 128_000),
+        "max_seq_len": ("max_seq_len", config.get("max_position_embeddings", 128_000)),
         "max_position_embeddings": ("max_position_embeddings", 128_000),
     }
 
@@ -233,10 +257,12 @@ class MistralConfigLoader(BaseConfigLoader):
         return None
 
     # Adaptation of
-    # https://github.com/vllm-project/vllm/blob/e1098ced95146d98a4ed46c81ee709013d54fb1f/vllm/transformers_utils/config.py#L171
+    # https://github.com/vllm-project/vllm/blob/48a5fff66e78985a634abac0d8d7f271da744000/vllm/transformers_utils/config.py#L175
     def _parse_mistral_config(self, checkpoint_dir: str):
         config_file_name = "params.json"
 
+        # This function loads a params.json config which
+        # should be used when loading models in mistral format
         config_dict = self._load_mistral_config_dict(checkpoint_dir, config_file_name)
         if config_dict is None:
             raise ValueError(
@@ -245,7 +271,6 @@ class MistralConfigLoader(BaseConfigLoader):
             )
         assert isinstance(config_dict, dict)
 
-        # https://github.com/vllm-project/vllm/blob/e1098ced95146d98a4ed46c81ee709013d54fb1f/vllm/transformers_utils/config.py#L1090
         if (max_position_embeddings := config_dict.get("max_position_embeddings")) is None:
             max_position_embeddings = 128_000
             config_dict["max_position_embeddings"] = max_position_embeddings
