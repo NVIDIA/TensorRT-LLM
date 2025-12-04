@@ -56,9 +56,12 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, requestAndReceiveAsync, llmRequest);
     }
 
-    void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    using RequestStatuses = tb::RequestStatuses;
+
+    RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum);
+        PYBIND11_OVERLOAD_PURE(
+            RequestStatuses, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum);
     }
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
@@ -84,7 +87,14 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
-        .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus)
+        .def(
+            "check_context_transfer_status",
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum)
+            {
+                auto result = self.checkContextTransferStatus(atLeastRequestNum);
+                return py::make_tuple(result.completedRequestIds, result.errorRequestIds);
+            },
+            py::arg("at_least_request_num") = std::nullopt)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
