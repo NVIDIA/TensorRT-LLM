@@ -500,7 +500,7 @@ class ConfigLoader:
         """
         metadata = config.get("metadata", {})
         dataset_file = metadata.get("dataset_file", "")
-        return os.path.join(EnvManager.get_model_dir(), dataset_file)
+        return os.path.join(EnvManager.get_dataset_dir(), dataset_file)
 
     def _get_script_file(self, config: dict) -> str:
         """Get script file by combining scripts directory with script file name.
