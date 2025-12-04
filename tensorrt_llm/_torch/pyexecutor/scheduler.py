@@ -219,6 +219,14 @@ class SimpleScheduler(RequestScheduler):
 
 
 class ContextBatchingScheduler(SimpleScheduler):
+    """ContextBatchingScheduler batches context requests when scheduling.
+
+    Tries to batch context requests up to max_pending_requests.
+    Schedule immediately, if there are no generation request,
+    or if no new context requests arrive for max_pending_iterations.
+
+    Can be enabled via SchedulerConfig.
+    """
 
     def __init__(self, capacity_scheduler: CapacityScheduler,
                  micro_batch_scheduler: MicroBatchScheduler,
@@ -235,8 +243,9 @@ class ContextBatchingScheduler(SimpleScheduler):
         output = super().schedule_request(active_requests, inflight_request_ids)
 
         num_pending_requests = len(output.context_requests)
-        if num_pending_requests >= self.max_pending_requests:
-            # If we get enough context requests, process them
+        if num_pending_requests == 0 or num_pending_requests >= self.max_pending_requests or len(
+                output.generation_requests) == 0:
+            # If we get enough context requests, or we have only context requests, process them
             self.last_pending_requests = 0
             self.pending_iterations = 0
         else:
