@@ -59,7 +59,7 @@ worker_config:
       backend: CUTLASS
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: DEFAULT
+      backend: NIXL
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
@@ -82,7 +82,7 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
-      backend: DEFAULT
+      backend: NIXL
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 1
