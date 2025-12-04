@@ -1911,21 +1911,23 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                                                       args.gemm2_scales_global)
 
     # set topk_weights and topk_ids
+    expert_logits = expert_logits.to(
+        torch.bfloat16) if use_routing_scales_on_input else expert_logits
     topk_weights = None
     topk_ids = None
     if use_topk_as_input:
         topk_ids = permute_info["topKIndices"].to(torch.int32).cuda()
         topk_weights = permute_info["topKLogits"].to(torch.bfloat16).cuda()
+        expert_logits = None
 
     AutoTuner.get().clear_cache()
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits.to(torch.bfloat16)
-        if use_routing_scales_on_input else expert_logits, routing_bias,
-        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
-        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
-        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
-        routing_method_type, topk_weights, topk_ids)
+        expert_logits, routing_bias, hidden_states_quant,
+        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
+        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
+        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+        use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
+        topk_weights, topk_ids)
     torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
 
