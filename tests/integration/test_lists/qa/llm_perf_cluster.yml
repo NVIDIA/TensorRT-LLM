@@ -80,7 +80,7 @@ llm_perf_cluster:
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:1000,1000-reqs:2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-kv_frac:0.85-input_output_len:1000,2000-reqs:3000-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:20000-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-ep:1-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-tp:4-gpus:4] TIMEOUT(120)
   # for chunked prefill cases
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500-reqs:200-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000-reqs:200-ep:4-tp:4-gpus:4] TIMEOUT(120)

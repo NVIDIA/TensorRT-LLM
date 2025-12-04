@@ -81,7 +81,7 @@ def get_model_yaml_config(model_label: str,
         },
         {
             'patterns': [
-                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-ep:1-gpus:4'
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-gpus:4'
             ],
             'config': {
                 'enable_iter_perf_stats': True,
