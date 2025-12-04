@@ -1298,6 +1298,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def nodeLabelPrefix = ""
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
+    def tolerations = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -1371,7 +1372,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def storageSize = "300Gi"
         def driverVersion = REQUIRED_OPEN_DRIVER_TYPES.any { type.contains(it) } ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
-        def tolerations = ""
 
         if (hasMultipleGPUs)
         {
