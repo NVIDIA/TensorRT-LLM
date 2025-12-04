@@ -48,6 +48,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse,
+                                                KVCacheHintRequest,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
                                                 ResponsesRequest,
@@ -264,6 +265,8 @@ class OpenAIServer:
         self.app.add_api_route("/steady_clock_offset", self.set_steady_clock_offset, methods=["POST"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
+        self.app.add_api_route("/v1/kv_cache_hints_legacy", self.set_kv_cache_hints_legacy, methods=["POST"])
+        self.app.add_api_route("/v1/kv_cache_hints", self.set_kv_cache_hints if not self.use_harmony else self.set_kv_cache_hints_harmony, methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -461,6 +464,136 @@ class OpenAIServer:
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
+
+    async def set_kv_cache_hints_legacy(self, hints: Annotated[dict, Body(embed=False)]) -> Response:
+        if 'action' not in hints.keys():
+            return self.create_error_response(
+                message="Missing 'action' in hints",
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST)
+
+        if hints['action'] == "truncate":
+            self.llm.set_kv_cache_hints(
+                action="truncate",
+                messages_to_retain=hints['messages_to_retain'],
+                messages=hints['messages'],
+            )
+            return Response(status_code=200)
+        else:
+            return self.create_error_response(
+                message=f"Invalid action: {hints['action']}",
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST
+            )
+
+    async def set_kv_cache_hints(self, request: KVCacheHintRequest) -> Response:
+        # Currently only support truncate action
+        if request.action != "truncate":
+            return self.create_error_response(
+                message=f"Invalid action: {request.action}",
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST
+            )
+
+        sampling_params = request.to_sampling_params(
+            vocab_size=self.tokenizer.tokenizer.vocab_size,
+            gather_generation_logits=self.llm.args.gather_generation_logits,
+            backend=self.llm.args.backend
+        )
+
+        tool_dicts = None if request.tools is None else [
+            tool.model_dump() for tool in request.tools
+        ]
+        add_generation_prompt = request.add_generation_prompt
+        documents =request.documents
+        chat_template = request.chat_template
+        chat_template_kwargs = request.chat_template_kwargs or {}
+
+        from openai.types.chat import ChatCompletionMessageParam
+        def convert_messages(messages: List[ChatCompletionMessageParam]) -> List[int]:
+            try:
+                conversation: List[ConversationMessage] = []
+                conversation, _, __ = parse_chat_messages_coroutines(messages, self.model_config, None)
+                prompt: str = apply_chat_template(
+                    model_type=self.model_config.model_type,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=add_generation_prompt,
+                    mm_placeholder_counts=[],
+                    tools=tool_dicts,
+                    documents=documents,
+                    chat_template=chat_template,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                return prompt
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                return self.create_error_response(str(e))
+
+        messages_to_retain = convert_messages(request.messages_to_retain)
+        messages = convert_messages(request.messages)
+
+        self.llm.set_kv_cache_hints(
+            action="truncate",
+            messages_to_retain=messages_to_retain,
+            messages=messages,
+            sampling_params=sampling_params,
+        )
+
+        return Response(status_code=200)
+
+    def set_kv_cache_hints_harmony(self, request: KVCacheHintRequest) -> Response:
+        if request.action != "truncate":
+            return self.create_error_response(
+                message=f"Invalid action: {request.action}",
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST
+            )
+
+        if not self.harmony_adapter:
+            self.harmony_adapter = get_harmony_adapter()
+
+        tools_dict = None
+        if request.tools:
+            tools_dict = [tool.model_dump() for tool in request.tools]
+        reasoning_effort = maybe_transform_reasoning_effort(request.reasoning_effort)
+        tool_choice = getattr(request, 'tool_choice', None)
+
+        from openai.types.chat import ChatCompletionMessageParam
+        def convert_messages(messages: List[ChatCompletionMessageParam]) -> List[int]:
+            try:
+                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                    messages,
+                    tools_dict,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice
+                )
+                return harmony_tokens
+            except Exception as e:
+                raise e
+
+        messages_to_retain = convert_messages(request.messages_to_retain)
+        messages = convert_messages(request.messages)
+
+        harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
+        if request.stop_token_ids:
+            request.stop_token_ids.extend(harmony_stop_tokens)
+        else:
+            request.stop_token_ids = harmony_stop_tokens
+
+        sampling_params = request.to_sampling_params(
+            vocab_size=self.tokenizer.tokenizer.vocab_size)
+        sampling_params.detokenize = False
+
+        self.llm.set_kv_cache_hints(
+            action="truncate",
+            messages_to_retain=messages_to_retain,
+            messages=messages,
+            sampling_params=sampling_params,
+        )
+        return Response(status_code=200)
+
 
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:

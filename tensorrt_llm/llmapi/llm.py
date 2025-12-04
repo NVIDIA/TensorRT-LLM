@@ -624,6 +624,45 @@ class BaseLLM:
         '''
         return self._executor.aget_kv_events(timeout=timeout)
 
+    @set_api_status("beta")
+    def set_kv_cache_hints(
+            self,
+            action: Literal["truncate"],
+            messages_to_retain: Union[str, List[int]],
+            messages: Union[str, List[int]],
+            sampling_params: Optional[SamplingParams] = None) -> None:
+        '''Set KV cache hints.
+        '''
+        messages_to_retain = prompt_inputs(messages_to_retain)
+        messages = prompt_inputs(messages)
+
+        def get_token_ids(inputs: PromptInputs) -> List[int]:
+            if "prompt_token_ids" in inputs:
+                prompt_token_ids = inputs['prompt_token_ids']
+            elif "prompt" in inputs:
+                if 'multi_modal_data' in inputs or 'multi_modal_embeddings' in inputs:
+                    raise NotImplementedError(
+                        "Multi-modal data is not supported for KV cache hints")
+                else:
+                    with nvtx_range_debug("input_processor"):
+                        prompt_token_ids, _ = self.input_processor(
+                            inputs, sampling_params)
+            else:
+                raise TypeError(
+                    f"The inputs must be type str or list of int, but got {type(inputs)}"
+                )
+
+            return prompt_token_ids
+
+        messages_to_retain_token_ids = get_token_ids(messages_to_retain)
+        messages_token_ids = get_token_ids(messages)
+
+        self._executor.set_kv_cache_hints(
+            action=action,
+            messages_to_retain=messages_to_retain_token_ids,
+            messages=messages_token_ids,
+        )
+
     def _process_env_overrides(self,
                                env_overrides: Optional[dict[str, str]]) -> None:
         if env_overrides is None:
