@@ -82,7 +82,11 @@ class EnvManager:
 
     @staticmethod
     def get_model_dir() -> str:
-        return os.getenv("MODEL_DIR", "<Your model and dataset directory>")
+        return os.getenv("MODEL_DIR", "<Your model directory>")
+    
+    @staticmethod
+    def get_dataset_dir() -> str:
+        return os.getenv("DATASET_DIR", "<Your dataset directory>")
 
     @staticmethod
     def get_output_path() -> str:
