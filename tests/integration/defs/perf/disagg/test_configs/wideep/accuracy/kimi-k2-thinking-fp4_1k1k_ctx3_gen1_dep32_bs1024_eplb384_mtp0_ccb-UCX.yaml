@@ -9,6 +9,12 @@ metadata:
   benchmark_type: 1k1k
   config_index: 6
   dataset_file: datasets/kimi-k2-1024-1024-100000-ratio-1_for_serve.json
+  accuracy:
+    datasets:
+    - dataset_name: gsm8k
+      expected_value: 0.9454
+      threshold_type: hypothesis_test
+      filter_type: flexible-extract
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -41,7 +47,7 @@ environment:
 profiling:
   nsys_on: false
 accuracy:
-  enable_accuracy_test: false
+  enable_accuracy_test: true
   model: local-completions
   tasks: gsm8k
   model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
