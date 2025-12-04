@@ -413,8 +413,10 @@ class MistralLarge3DraftModel(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        self.layers[0].next_layer_layernorm = self.norm
         self.embed_tokens = None
+
+    def post_load_weights(self):
+        self.layers[0].next_layer_layernorm = self.norm
 
     def forward(
         self,
