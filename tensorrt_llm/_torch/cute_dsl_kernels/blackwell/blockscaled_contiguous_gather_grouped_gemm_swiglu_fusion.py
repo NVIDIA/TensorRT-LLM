@@ -443,6 +443,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.mma_tiler[2],
         )
 
+        self.cta_tile_shape_mnk_sfa = (
+            self.mma_tiler_sfa[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler_sfa[1],
+            self.mma_tiler_sfa[2],
+        )
+
         self.mma_tiler_c = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1] // 2,
@@ -467,9 +473,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
 
         # Compute number of multicast CTAs for A/B
-        # self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
-        # self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
@@ -629,11 +633,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
-        # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-        # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        # sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
-        # sfa = cute.make_tensor(sfa.iterator, sfa_layout)
-
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
         sfb = cute.make_tensor(sfb.iterator, sfb_layout)
@@ -665,20 +664,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # Setup TMA load for A
-        # a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-        #     self.cluster_shape_mn, tiled_mma.thr_id
-        # )
-        # a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        # tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-        #     a_op,
-        #     a,
-        #     a_smem_layout,
-        #     self.mma_tiler,
-        #     tiled_mma,
-        #     self.cluster_layout_vmnk.shape,
-        # )
-
         # Setup TMA load for B
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
@@ -690,23 +675,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tiled_mma,
             self.cluster_layout_vmnk.shape,
         )
-
-        # Setup TMA load for SFA
-        # sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
-        #     self.cluster_shape_mn, tiled_mma.thr_id
-        # )
-        # sfa_smem_layout = cute.slice_(
-        #     self.sfa_smem_layout_staged, (None, None, None, 0)
-        # )
-        # tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-        #     sfa_op,
-        #     sfa,
-        #     sfa_smem_layout,
-        #     self.mma_tiler,
-        #     tiled_mma,
-        #     self.cluster_layout_vmnk.shape,
-        #     internal_type=cutlass.Int16,
-        # )
 
         # Setup TMA load for SFB
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma.thr_id)
@@ -744,9 +712,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tma_tensor_sfb_new_layout = cute.make_layout(new_shape, stride=new_stride)
             tma_tensor_sfb = cute.make_tensor(tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout)
 
-        # a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        # sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (b_copy_size + sfb_copy_size) * atom_thr_size
 
@@ -818,13 +784,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.kernel(
             tiled_mma,
             tiled_mma_sfb,
-            # tma_atom_a,
-            # tma_tensor_a,
             a,
             tma_atom_b,
             tma_tensor_b,
-            # tma_atom_sfa,
-            # tma_tensor_sfa,
             sfa,
             tma_atom_sfb,
             tma_tensor_sfb,
@@ -905,11 +867,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self,
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
-        # tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
-        # tma_atom_sfa: cute.CopyAtom,
         mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
@@ -1080,15 +1040,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
         if cutlass.const_expr(self.is_b_mcast or use_2cta_instrs):
-            # a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-            #     cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            # )
             b_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
             )
-            # sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
-            #     cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            # )
             sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1
             )
@@ -1107,7 +1061,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # (bM, bK, RestM, RestK, RestL)
         gSFA_mkl = cute.local_tile(
-            mSFA_mkl, cute.slice_(self.cta_tile_shape_mnk, (None, 0, None)), (None, None, None)
+            mSFA_mkl, cute.slice_(self.cta_tile_shape_mnk_sfa, (None, 0, None)), (None, None, None)
         )
 
         # (bN, bK, RestN, RestK, RestL)
@@ -1132,12 +1086,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
-        # tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
         tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
-        # tCgSFA = thr_mma.partition_A(gSFA_mkl)
         # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
@@ -1146,19 +1096,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         #
         # Partition global/shared tensor for TMA load B
         #
-        # TMA load A partition_S/D
-        # a_cta_layout = cute.make_layout(
-        #     cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-        # )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
-        # tAsA, tAgA = cpasync.tma_partition(
-        #     tma_atom_a,
-        #     block_in_cluster_coord_vmnk[2],
-        #     a_cta_layout,
-        #     cute.group_modes(sA, 0, 3),
-        #     cute.group_modes(tCgA, 0, 3),
-        # )
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
         # ((atom_v, rest_v), STAGE)
@@ -1170,22 +1107,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cute.group_modes(sB, 0, 3),
             cute.group_modes(tCgB, 0, 3),
         )
-
-        #  TMA load SFA partition_S/D
-        # sfa_cta_layout = a_cta_layout
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestM, RestK, RestL)
-
-        # tAsSFA, tAgSFA = cute.nvgpu.cpasync.tma_partition(
-        #     tma_atom_sfa,
-        #     block_in_cluster_coord_vmnk[2],
-        #     sfa_cta_layout,
-        #     cute.group_modes(sSFA, 0, 3),
-        #     cute.group_modes(tCgSFA, 0, 3),
-        # )
-
-        # tAsSFA = cute.filter_zeros(tAsSFA)
-        # tAgSFA = cute.filter_zeros(tAgSFA)
 
         # TMA load SFB partition_S/D
         sfb_cta_layout = cute.make_layout(
@@ -1589,8 +1510,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), loopK)
-                # tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
-                # ((atom_v, rest_v), loopK)
                 tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
                 # ((atom_v, rest_v), RestK)
@@ -1616,25 +1535,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Conditionally wait for B buffer empty
                     b_pipeline.producer_acquire(b_producer_state, peek_ab_empty_status)
 
-                    # tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
                     tBgB_k = tBgB_slice[(None, b_producer_state.count)]
-                    # tAgSFA_k = tAgSFA_slice[(None, ab_producer_state.count)]
                     tBgSFB_k = tBgSFB_slice[(None, b_producer_state.count)]
-                    # tAsA_pipe = tAsA[(None, ab_producer_state.index)]
                     tBsB_pipe = tBsB[(None, b_producer_state.index)]
-                    # tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
                     tBsSFB_pipe = tBsSFB[(None, b_producer_state.index)]
 
                     tma_bar = b_pipeline.producer_get_barrier(b_producer_state)
 
-                    # TMA load A/B
-                    # cute.copy(
-                    #     tma_atom_a,
-                    #     tAgA_k,
-                    #     tAsA_pipe,
-                    #     tma_bar_ptr=tma_bar,
-                    #     mcast_mask=a_full_mcast_mask,
-                    # )
+                    # TMA load B
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
@@ -1643,13 +1551,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         mcast_mask=b_full_mcast_mask,
                     )
 
-                    # cute.copy(
-                    #     tma_atom_sfa,
-                    #     tAgSFA_k,
-                    #     tAsSFA_pipe,
-                    #     tma_bar_ptr=tma_bar,
-                    #     mcast_mask=sfa_full_mcast_mask,
-                    # )
+                    # TMA load SFB
                     cute.copy(
                         tma_atom_sfb,
                         tBgSFB_k,
@@ -2573,8 +2475,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Default ACC stages
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
-        # num_acc_stage = 1
-
         # Default C stages
         num_c_stage = 2
 
@@ -2822,12 +2722,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
-        # {$nv-internal-release begin}
         # TODO: Currently we don't support m major output for Float4E2M1FN,
         # Need to support it in the future.
         if c_dtype is cutlass.Float4E2M1FN and c_major == "m":
             is_valid = False
-        # {$nv-internal-release end}
         return is_valid
 
     @staticmethod
