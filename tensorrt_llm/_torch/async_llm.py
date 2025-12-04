@@ -15,10 +15,14 @@ class AsyncLLM(LLM):
         if 'ray_worker_extension_cls' not in kwargs:
             kwargs['ray_worker_extension_cls'] = 'tensorrt_llm.llmapi.rlhf_utils.WorkerExtension'
         super().__init__(*args, **kwargs)
+        self._async_initialized = False
 
     async def setup_async(self):
         """Setup the LLM asynchronously."""
-        await self._executor.init_workers_async()
+        if not self._async_initialized:
+            await self._executor.init_workers_async()
+            self._async_initialized = True
+        return self
 
     async def release(self, tags: list[str]):
         """Release the GPU memory used by the LLM asynchronously.
@@ -66,3 +70,16 @@ class AsyncLLM(LLM):
         return await self._executor.collective_rpc_async(
             method, args, kwargs, unique_reply_rank=unique_reply_rank
         )
+
+    def __await__(self):
+        return self.setup_async().__await__()
+
+    def __enter__(self):
+        raise RuntimeError("Please use 'async with AsyncLLM' instead")
+
+    async def __aenter__(self):
+        await self.setup_async()
+        return super().__enter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return super().__exit__(exc_type, exc_val, exc_tb)

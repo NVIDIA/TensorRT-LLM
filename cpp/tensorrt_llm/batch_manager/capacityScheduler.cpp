@@ -275,14 +275,15 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     auto const numGenRequests = scheduledRequests.size();
     auto const numCtxRequests = pendingRequests.size();
 
-    if (numGenRequests != 0 &&  // We have generation requests to handle
-        numCtxRequests < mMaxPendingRequests)  // We don't have enough context requests yet
+    if (numGenRequests != 0 &&                // We have generation requests to handle
+        numCtxRequests < mMaxPendingRequests) // We don't have enough context requests yet
     {
         // Heuristic: wait a bit to see if there will be new context requests
         if (numCtxRequests == mLastPendingRequests)
         {
             ++mPendingIterations;
-        } else
+        }
+        else
         {
             mPendingIterations = 0;
         }

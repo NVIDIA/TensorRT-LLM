@@ -3,7 +3,7 @@
 import base64
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Union, Tuple
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import xgrammar
@@ -975,8 +975,7 @@ class MemoryUpdateRequest(OpenAIBaseModel):
 class UpdateWeightsRequest(OpenAIBaseModel):
     weights: Optional[Dict[str, str]] = Field(
         default=None,
-        description="Weight handles dict, or None to finalize update"
-    )
+        description="Weight handles dict, or None to finalize update")
 
 
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:

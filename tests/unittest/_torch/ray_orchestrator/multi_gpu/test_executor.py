@@ -83,7 +83,7 @@ def test_placement_env_vars(monkeypatch):
         (2, [1]),
         # (4, [2, 3]),
     ],
-    ids=["gpu2_tp1"] # , "gpu4_tp2"
+    ids=["gpu2_tp1"]  # , "gpu4_tp2"
 )
 def test_placement_api(monkeypatch, n_gpus, bundle_indices):
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
@@ -111,7 +111,9 @@ def test_placement_api(monkeypatch, n_gpus, bundle_indices):
         inference_actor_uuids = llm._collective_rpc("report_device_id")
         expected_uuids = [get_device_uuid(idx) for idx in bundle_indices]
 
-        print(f"{inference_actor_uuids=}, all_uuids={[get_device_uuid(i) for i in range(n_gpus)]}")
+        print(
+            f"{inference_actor_uuids=}, all_uuids={[get_device_uuid(i) for i in range(n_gpus)]}"
+        )
 
         assert sorted(inference_actor_uuids) == sorted(expected_uuids), \
             f"Workers not placed on expected GPUs. Expected: {expected_uuids}, Got: {inference_actor_uuids}"

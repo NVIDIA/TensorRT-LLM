@@ -9,6 +9,28 @@ from utils.util import get_current_process_gpu_memory
 
 @pytest.mark.ray
 @pytest.mark.asyncio
+async def test_async_llm_awaitable():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
+
+    prompt = "The future of AI is"
+    sampling_params = SamplingParams(temperature=0, max_tokens=12)
+
+    llm = await AsyncLLM(
+        model=llama_model_path,
+        enable_sleep=True,
+        cuda_graph_config=None,
+        kv_cache_config=kv_cache_config,
+    )
+
+    output = await llm.generate_async(prompt, sampling_params)
+    print('Output text:', output.outputs[0].text)
+
+    del llm
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
     """Verifies that:
@@ -22,13 +44,12 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
     sampling_params = SamplingParams(temperature=0, max_tokens=12)
     tags = [tag.value for tag in ExecutorMemoryType]
 
-    with AsyncLLM(
+    async with AsyncLLM(
         model=llama_model_path,
         enable_sleep=True,
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
     ) as llm:
-        await llm.setup_async()
 
         # Generate baseline
         output_before = await llm.generate_async(prompt, sampling_params)

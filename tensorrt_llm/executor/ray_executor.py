@@ -23,7 +23,6 @@ from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
-from .utils import has_event_loop
 
 __all__ = [
     "RayExecutor",
@@ -87,7 +86,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             # which will cause convergence issue when using multiple rollout instances.
             if not self.has_start_local_cluser:
                 self.worker_kwargs['llm_args'].allreduce_strategy = 'NCCL'
-                logger.info("Forcing allreduce_strategy to NCCL as a workaround for RL integration.")
+                logger.info(
+                    "Forcing allreduce_strategy to NCCL as a workaround for RL integration."
+                )
 
             # self.init_rpc_executor()
             # self.worker_kwargs['rpc_addr'] = self.rpc_addr
@@ -104,8 +105,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.worker_kwargs['rpc_addr'] = self.rpc_addr
 
             # Always use async initialization in RPC mode to avoid blocking ray.get()
-            self.workers = [
-            ]  # Placeholder, will be initialized in setup_async
+            self.workers = []  # Placeholder, will be initialized in setup_async
             self._needs_async_setup = True
             self._mainloop_started = False  # Track if mainloop has been started
             # DO NOT start mainloop until after setup_engine_remote_async is called

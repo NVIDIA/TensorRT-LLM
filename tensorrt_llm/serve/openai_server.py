@@ -46,12 +46,12 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
-                                                ErrorResponse, ModelCard,
+                                                ErrorResponse,
+                                                MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
-                                                ResponsesRequest, UsageInfo,
-                                                to_llm_disaggregated_params,
-                                                MemoryUpdateRequest,
-                                                UpdateWeightsRequest)
+                                                ResponsesRequest,
+                                                UpdateWeightsRequest, UsageInfo,
+                                                to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
     chat_harmony_post_processor, chat_harmony_streaming_post_processor,
