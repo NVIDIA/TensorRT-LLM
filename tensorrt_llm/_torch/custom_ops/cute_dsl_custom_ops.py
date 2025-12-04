@@ -542,6 +542,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_b_sf_ptr = b_sf_ptr
 
             if cache_key not in self.__class__.kernel_cache:
+                logger.info(
+                    f"CuteDSL: cache_key: {cache_key}, not in kernel_cache, need to check file cache"
+                )
                 if self.enable_file_cache:
                     fname = str(sf_vec_size) + "_" + str(
                         mma_tiler_mn[0]) + "x" + str(
@@ -556,18 +559,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         file_hit = True
                     else:
                         file_hit = False
-                    # print(f"tempfile.gettempdir(): {tempfile.gettempdir()}")
-                    # print(f"full_path: {full_obj_path}")
                 else:
                     file_hit = False
-                # print(f"file_hit: {file_hit}")
 
                 if file_hit:
+                    logger.info(
+                        f"CuteDSL: file_hit: {file_hit}, loading cached kernel from file: {shared_lib_path}"
+                    )
                     loaded_fn = cute.runtime.load_module(shared_lib_path)
                     compiled_gemm = getattr(loaded_fn, fname)
                     self.__class__.kernel_cache[cache_key] = compiled_gemm
-
                 else:
+                    logger.info(
+                        f"CuteDSL: file_hit: {file_hit}, need to compile kernel"
+                    )
                     if self.use_tvm_ffi:
                         a_ptr = self.make_cute_dsl_global_pointer(
                             a_tensor, cutlass.Float4E2M1FN, 32)
@@ -637,7 +642,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         fpath = os.path.join(tempfile.gettempdir(),
                                              "cute_dsl_kernels", "nvfp4_gemm")
                         os.makedirs(fpath, exist_ok=True)
-                        # print(f"export_to_c: fpath: {fpath}")
                         fname = str(sf_vec_size) + "_" + str(
                             mma_tiler_mn[0]) + "x" + str(
                                 mma_tiler_mn[1]) + "_" + str(
@@ -646,8 +650,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                             swap_ab) + "_" + str(use_prefetch)
                         compiled_gemm.export_to_c(fpath + "/" + fname + ".o",
                                                   function_name=fname)
-                        # print(f"export_to_c: fname: {fname}")
                         # self.__class__.obj_files.append(fpath + "/" + fname + ".o")
+                        logger.info(f"CuteDSL: Exporting path: {fpath}")
+                        logger.info(
+                            f"CuteDSL: Exporting object file name: {fname}.o")
                         # obtain necessary runtime libs for loading the shared library
                         runtime_libs = cute.runtime.find_runtime_libraries(
                             enable_tvm_ffi=self.use_tvm_ffi)
@@ -658,10 +664,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             "gcc", "-shared", "-o", fpath + "/" + fname + ".so",
                             fpath + "/" + fname + ".o", *runtime_libs
                         ]
-                        # print(cmd)
+                        logger.info(
+                            f"CuteDSL: Packaging object file and runtime libraries to shared library by command: {cmd}"
+                        )
                         subprocess.run(cmd, check=True)
-                        # print(f"Successfully created shared library: {fpath + "/" + fname + ".so"}")
+                        logger.info(
+                            f"CuteDSL: Successfully packaged into shared library: {fpath}/{fname}.so"
+                        )
             else:
+                logger.info(
+                    f"CuteDSL: cache_key: {cache_key}, in kernel_cache, loading cached kernel from kernel_cache"
+                )
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
             # launch gemm kernel
