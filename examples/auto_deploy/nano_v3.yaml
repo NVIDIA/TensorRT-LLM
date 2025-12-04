@@ -15,6 +15,7 @@ transforms:
   detect_sharding:
     sharding_source: ['factory', 'heuristic']
     sharding_dims: ['ep', 'bmm']
+    allreduce_strategy: 'AUTO'
   multi_stream_moe:
     stage: compile
     enabled: true
