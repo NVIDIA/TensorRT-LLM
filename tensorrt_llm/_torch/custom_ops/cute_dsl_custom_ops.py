@@ -644,7 +644,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = False,
+        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -656,6 +656,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             alpha: Scaling factor
             output_dtype: Output data type (must be bfloat16)
             to_userbuffers: Whether to allocate output from UserBuffers pool
+            use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Open this option could help reduce the kernel host launch overhead.
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
@@ -694,6 +695,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
+        use_tvm_ffi: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
