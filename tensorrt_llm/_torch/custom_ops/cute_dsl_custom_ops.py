@@ -756,9 +756,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_tokens_per_expert: List of token counts per expert
 
             Returns:
-                List of token IDs, where token_id_mapping[permuted_idx] = original_token_idx
+                List of token IDs with length = max_num_permuted_tokens,
+                where token_id_mapping[permuted_idx] = original_token_idx
                 Padding tokens are marked with -1
             """
+            max_num_permuted_tokens = self.get_max_num_permuted_tokens(
+                num_tokens)
             token_id_mapping = []
             colmajor_expanded_idx = 0
             for i, curr_num_tokens in enumerate(num_tokens_per_expert):
@@ -771,6 +774,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         colmajor_expanded_idx += 1
                     else:
                         token_id_mapping.append(-1)  # Padding token
+            # Pad to max_num_permuted_tokens
+            while len(token_id_mapping) < max_num_permuted_tokens:
+                token_id_mapping.append(-1)
             return token_id_mapping
 
         def inputs_pre_hook(self,
@@ -1976,7 +1982,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b.dtype == torch.float4_e2m1fn_x2
             assert b.dim() == 3
             assert a_sf.dtype == torch.uint8
-            assert a_sf.dim() == 1
+            assert a_sf.dim() == 2
             assert b_sf.dtype == torch.uint8
             assert b_sf.dim() == 3
             assert alpha.dtype == torch.float32
@@ -1993,7 +1999,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert k % (self.scaling_vector_size * 4) == 0
             assert n % (self.scaling_vector_size * 4 * 2) == 0
             assert b.size(2) * 2 == k
-            assert a_sf.size(0) == orig_m * scale_k
+            assert a_sf.size(0) == orig_m
+            assert a_sf.size(1) == scale_k
             assert b_sf.size(0) == l
             assert b_sf.size(1) == n
             assert b_sf.size(2) == scale_k
@@ -2193,7 +2200,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = input.size(0)
+        m = token_id_mapping.size(0)
         n = weight.size(1)
         interm_size = n // 2
         output = torch.empty(m,

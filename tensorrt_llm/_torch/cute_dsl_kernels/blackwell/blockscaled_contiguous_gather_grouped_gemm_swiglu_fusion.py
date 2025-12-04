@@ -1029,7 +1029,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         # (bidx, bidy, bidz, valid)
-        info_layout = cute.make_layout((4, self.num_tile_stage), stride=(1, 4))
+        info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
 
         #
@@ -2969,10 +2969,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
         a_sf = cute.make_tensor(
-            a_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, orig_m // 128, 4, scale_k // 4, 1), order=(2, 1, 4, 0, 3, 5)
-            ),
+            a_sf_ptr, layout=cute.make_ordered_layout((orig_m, scale_k, 1), order=(1, 0, 2))
         )
         b_sf = cute.make_tensor(
             b_sf_ptr,

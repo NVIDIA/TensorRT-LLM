@@ -798,7 +798,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
     a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
     a = a.view(torch.float4_e2m1fn_x2)
-    a_sf_unswizzled = unswizzle_sf(a_sf, num_tokens, hidden_size)
+    a_sf_unswizzled = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
     b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
     b = b.view(torch.float4_e2m1fn_x2)
     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
@@ -817,23 +817,17 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     )
 
     # Compute reference: manually gather, compute GEMM, apply SwiGLU, then quantize
-    a_gathered = torch.zeros(
+    a_gathered = torch.empty(
         max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype, device=a.device
     )
-    a_sf_gathered = torch.zeros(
-        max_num_permuted_tokens * hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
+    a_sf_gathered = torch.empty(
+        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
     )
     for i in range(num_valid_permuted_tokens):
         token_id = token_id_mapping[i].item()
         if token_id >= 0:
             a_gathered[i] = a[token_id]
-            a_sf_gathered[i * hidden_size // sf_vec_size : (i + 1) * hidden_size // sf_vec_size] = (
-                a_sf_unswizzled[
-                    token_id * hidden_size // sf_vec_size : (token_id + 1)
-                    * hidden_size
-                    // sf_vec_size
-                ]
-            )
+            a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
     # Swizzle a_sf_gathered for reference GEMM
     a_sf_gathered_swizzled = swizzle_sf(
@@ -858,16 +852,11 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
-    # Swizzle a_sf back for kernel input
-    a_sf_swizzled = swizzle_sf(
-        a_sf_unswizzled.view(num_tokens, hidden_size // sf_vec_size), num_tokens, hidden_size
-    )
-
     # Call gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         a,
         b_interleaved,
-        a_sf_swizzled,
+        a_sf_unswizzled,
         b_sf_interleaved,
         alpha,
         tile_idx_to_group_idx,
@@ -893,7 +882,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     num_valid_tokens = valid_token_mask.sum().item()
     if num_valid_tokens > 0:
         # Compare output values only for valid tokens
-        c_valid = c[:num_valid_permuted_tokens][valid_token_mask]
+        c_valid = c[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
         c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_token_mask]
         match_ratio = (
             c_valid.view(torch.uint8) == c_ref_valid.view(torch.uint8)
@@ -902,17 +891,18 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             f"Output match ratio {match_ratio} < 0.95 (compared {num_valid_tokens} valid tokens)"
         )
 
+        c_sf_unswizzled = unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
+        c_sf_ref_unswizzled = unswizzle_sf(
+            c_sf_ref, max_num_permuted_tokens, interm_size, sf_vec_size
+        )
+
         # Compare scale factors only for valid tokens
-        # For each valid token, we have interm_size // sf_vec_size scale factor elements
-        sf_elements_per_token = interm_size // sf_vec_size
         c_sf_valid = []
         c_sf_ref_valid = []
         for i in range(num_valid_permuted_tokens):
             if token_id_mapping[i].item() >= 0:
-                start_idx = i * sf_elements_per_token
-                end_idx = (i + 1) * sf_elements_per_token
-                c_sf_valid.append(c_sf[start_idx:end_idx])
-                c_sf_ref_valid.append(c_sf_ref[start_idx:end_idx])
+                c_sf_valid.append(c_sf_unswizzled[i])
+                c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
 
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
@@ -921,3 +911,14 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             f"Scale factor match ratio {match_ratio} < 0.95 "
             f"(compared {num_valid_tokens} valid tokens)"
         )
+
+
+if __name__ == "__main__":
+    # Run the gather grouped gemm test with default parameters
+    test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        num_tokens=515,
+        top_k=1,
+        ep_size=8,
+        tile_size=128,
+    )
+    print("Test passed!")
