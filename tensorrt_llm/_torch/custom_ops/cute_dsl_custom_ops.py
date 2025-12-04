@@ -658,7 +658,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             alpha: Scaling factor
             output_dtype: Output data type (must be bfloat16)
             to_userbuffers: Whether to allocate output from UserBuffers pool
-            use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Open this option could help reduce the kernel host launch overhead.
+            use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
