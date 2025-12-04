@@ -539,7 +539,9 @@ class Mistral3VLM(PreTrainedModel):
         if name == "text_config":
             sub_model_config._frozen = False
             sub_model_config.skip_create_weights_in_init = True
-            if not hasattr(sub_model_config.pretrained_config, "architectures") or sub_model_config.pretrained_config.architectures is None:
+            if not hasattr(
+                    sub_model_config.pretrained_config, "architectures"
+            ) or sub_model_config.pretrained_config.architectures is None:
                 sub_model_config.pretrained_config.architectures = model_config.pretrained_config.architectures
             sub_model_config._frozen = True
 
