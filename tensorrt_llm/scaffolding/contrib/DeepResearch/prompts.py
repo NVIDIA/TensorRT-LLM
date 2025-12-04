@@ -149,7 +149,7 @@ Think like a human researcher with limited time. Follow these steps:
 </Hard Limits>
 
 <Show Your Thinking>
-After each search tool call, use reflection to analyze the results:
+After each tavily_search call, use reflection to analyze the results:
 - What key information did I find?
 - What's missing?
 - Do I have enough to answer the question comprehensively?

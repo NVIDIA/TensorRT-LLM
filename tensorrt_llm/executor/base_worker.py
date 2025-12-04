@@ -32,7 +32,8 @@ from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
-from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
+from .request import (GenerationRequest, KVCacheHintRequest, LoRARequest,
+                      PromptAdapterRequest)
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
@@ -310,6 +311,9 @@ class BaseWorker(GenerationExecutor):
             return self.engine.get_latest_kv_cache_events()
         else:
             return self.engine.get_latest_kv_cache_events()
+
+    def set_kv_cache_hints(self, request: KVCacheHintRequest):
+        self.engine.enqueue_kv_cache_hint_request(request)
 
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
