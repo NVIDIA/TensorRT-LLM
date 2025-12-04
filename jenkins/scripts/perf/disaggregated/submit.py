@@ -184,12 +184,12 @@ def main():
     parser.add_argument("--run-sh", required=True, help="Path to slurm_run.sh script")
 
     # Optional arguments for local mode
-    parser.add_argument("--config-yaml", required=True, help="Path to config YAML file")
+    parser.add_argument("--config-yaml", default="", help="Path to config YAML file")
     parser.add_argument("--stage-name", default="", help="Stage name (optional, local mode only)")
 
     # Optional arguments for CI mode
-    parser.add_argument("--llm-src", required=True, help="Path to LLM source code")
-    parser.add_argument("--test-list", required=True, help="Path to test list file")
+    parser.add_argument("--llm-src", default="", help="Path to LLM source code")
+    parser.add_argument("--test-list", default="", help="Path to test list file")
     parser.add_argument(
         "--script-prefix",
         default="",
