@@ -567,6 +567,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
+                # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
+                # so we make alpha as the cute.Tensor type in the jit func.
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
                     kernel_m,
@@ -575,7 +577,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_sf_m // 128,
                     kernel_sf_n // 128,
                     sf_k // 4,
-                    1,
+                    1,  # batch
                     kernel_a_ptr,
                     kernel_b_ptr,
                     kernel_a_sf_ptr,
