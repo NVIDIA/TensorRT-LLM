@@ -2257,7 +2257,8 @@ class PyExecutor:
 
         # Clear list of requests marked for cancelation and add back those that failed to cancel.
         self.executor_request_queue.canceled_req_ids.clear()
-        self.executor_request_queue.canceled_req_ids.extend(still_pending_canceled_ids)
+        self.executor_request_queue.canceled_req_ids.extend(
+            still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
