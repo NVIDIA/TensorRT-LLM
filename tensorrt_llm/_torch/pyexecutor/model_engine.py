@@ -20,7 +20,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -46,20 +47,19 @@ from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
 from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
-from ..speculative.drafting_loops import ChainDrafter
-from ..speculative.eagle3 import Eagle3ResourceManager
+from ..speculative.drafting_loops import BaseDraftingLoopWrapper
+from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
-from .config import PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
-from .cuda_graph_runner import CUDAGraphRunner
+from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import get_draft_token_length
-from .model_loader import ModelLoader
+from .llm_request import LlmRequest, get_draft_token_length
+from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -73,14 +73,13 @@ class ModelEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def forward(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: ResourceManager,
-        new_tensors_device: Optional[SampleStateTensors],
-        gather_context_logits: bool = False,
-        cache_indirection_buffer: Optional[torch.Tensor] = None,
-    ):
+    def forward(self,
+                scheduled_requests: ScheduledRequests,
+                resource_manager: ResourceManager,
+                new_tensors_device: Optional[SampleStateTensors],
+                gather_context_logits: bool = False,
+                cache_indirection_buffer: Optional[torch.Tensor] = None,
+                num_accepted_tokens_device: Optional[torch.Tensor] = None):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -131,7 +130,7 @@ class PyTorchModelEngine(ModelEngine):
         self,
         *,
         model_path: str,
-        pytorch_backend_config: PyTorchConfig,
+        llm_args: TorchLlmArgs,
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
@@ -140,10 +139,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
-        llm_args: Optional[TorchLlmArgs] = None,
     ):
-        assert llm_args is not None, "llm_args must be provided for PyTorchModelEngine"
-
         self.forward_pass_callable = None
         self.ub_buffers = None
         (
@@ -168,7 +164,7 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
-        self.pytorch_backend_config = pytorch_backend_config
+        self.llm_args = llm_args
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
@@ -185,14 +181,19 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-        self.input_processor = create_input_processor(model_path, None)
+
+        self.input_processor = create_input_processor(
+            model_path,
+            tokenizer=None,
+            checkpoint_format=llm_args.checkpoint_format)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
-            loader = ModelLoader(
-                pytorch_backend_config=pytorch_backend_config,
+            # Keep the model_loader to support reloading the model weights later
+            self.model_loader = ModelLoader(
+                llm_args=llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
                 sparse_attention_config=self.sparse_attention_config,
@@ -200,7 +201,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
             )
-            self.model, moe_load_balancer = loader.load(
+            self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
@@ -211,10 +212,11 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
+        self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
+        if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
             if self.model.model_config and self.model.model_config.pretrained_config and self.model.model_config.pretrained_config.architectures:
@@ -223,19 +225,39 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
+        self._disable_overlap_scheduler = self.llm_args.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
-        self._torch_compile_backend = None
+        self.cuda_graph_config = self.llm_args.cuda_graph_config
+        cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
+            'batch_sizes'].default
+        cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
+            'enable_padding'].default
+
+        self.torch_compile_config = self.llm_args.torch_compile_config
+        torch_compile_enabled = bool(self.torch_compile_config is not None)
+        torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_fullgraph'].default
+        torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_inductor'].default
+        torch_compile_piecewise_cuda_graph = self.torch_compile_config.enable_piecewise_cuda_graph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_piecewise_cuda_graph'].default
+        torch_compile_piecewise_cuda_graph_num_tokens = self.torch_compile_config.capture_num_tokens if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'capture_num_tokens'].default
+        torch_compile_enable_userbuffers = self.torch_compile_config.enable_userbuffers if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'enable_userbuffers'].default
+        torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+            'max_num_streams'].default
+
         # Eagle3 draft model now does not support torch.compile
-        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled and not is_draft_model
-        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
+        self._torch_compile_enabled = torch_compile_enabled
+        self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
         piecewise_cuda_graph_num_tokens = (
-            pytorch_backend_config.torch_compile_piecewise_cuda_graph_num_tokens
-            or pytorch_backend_config.cuda_graph_batch_sizes or [])
+            torch_compile_piecewise_cuda_graph_num_tokens
+            or cuda_graph_batch_sizes or [])
 
         self._piecewise_cuda_graph_num_tokens = [
             i for i in piecewise_cuda_graph_num_tokens
@@ -244,33 +266,35 @@ class PyTorchModelEngine(ModelEngine):
 
         try:
             use_ub_for_nccl = (
-                pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+                self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
-                    pytorch_backend_config.torch_compile_enable_userbuffers
+                    torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
+                self.backend_num_streams = Backend.Streams([
+                    torch.cuda.Stream()
+                    for _ in range(torch_compile_max_num_streams - 1)
+                ])
                 self._torch_compile_backend = Backend(
-                    pytorch_backend_config.torch_compile_inductor_enabled,
+                    torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
                     enable_piecewise_cuda_graph=self.
                     _torch_compile_piecewise_cuda_graph,
                     capture_num_tokens=self._piecewise_cuda_graph_num_tokens,
-                    max_num_streams=pytorch_backend_config.
-                    torch_compile_max_num_streams)
+                    max_num_streams=torch_compile_max_num_streams,
+                    mapping=self.mapping)
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
-                    )
+                        fullgraph=torch_compile_fullgraph)
                 else:
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=pytorch_backend_config.torch_compile_fullgraph
-                    )
+                        fullgraph=torch_compile_fullgraph)
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
@@ -282,7 +306,7 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
 
         self.attn_backend = get_attention_backend(
-            pytorch_backend_config.attn_backend,
+            self.llm_args.attn_backend,
             sparse_attn_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
@@ -328,13 +352,12 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
-        self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
+        self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
-            pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
-            self.max_num_tokens, self.original_max_total_draft_tokens,
-            self._cuda_graph_padding_enabled
-        ) if pytorch_backend_config.cuda_graph_batch_sizes else []
+            cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
+            self.original_max_total_draft_tokens,
+            self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
@@ -351,14 +374,60 @@ class PyTorchModelEngine(ModelEngine):
         if self.use_mrope:
             self.mrope_position_ids_cuda = torch.empty(
                 (3, 1, self.max_num_tokens), dtype=torch.int, device='cuda')
-        self.iter_counter = 0
+
+        # Pre-allocated buffers for draft model to avoid implicit synchronization
+        # These are used to build index tensors without creating tensors from Python lists
+        if is_draft_model:
+            # Buffers for context and first_draft input_ids updates
+            self.draft_ctx_token_indices_cuda = torch.empty((self.batch_size, ),
+                                                            dtype=torch.long,
+                                                            device='cuda')
+            self.draft_ctx_seq_slots_cuda = torch.empty((self.batch_size, ),
+                                                        dtype=torch.long,
+                                                        device='cuda')
+            # Buffers for first_draft requests (max_draft_len+1 tokens per request)
+            max_first_draft_tokens = self.batch_size * (
+                self.original_max_draft_len +
+                1) if spec_config else self.batch_size
+            self.draft_first_draft_indices_cuda = torch.empty(
+                (max_first_draft_tokens, ), dtype=torch.long, device='cuda')
+            self.draft_first_draft_seq_slots_cuda = torch.empty(
+                (max_first_draft_tokens, ), dtype=torch.long, device='cuda')
+            # Buffers for seq_slots and request indices
+            self.draft_seq_slots_buffer_cuda = torch.empty((self.batch_size, ),
+                                                           dtype=torch.int,
+                                                           device='cuda')
+            self.draft_request_indices_buffer_cuda = torch.empty(
+                (self.batch_size, ), dtype=torch.int, device='cuda')
 
         # We look up this key in resource_manager during forward to find the
         # kv cache manager. Can be changed to support multiple model engines
         # with different KV cache managers.
-        self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_runner = CUDAGraphRunner(self)
+
+        # Create config and runner
+        cuda_graph_runner_config = CUDAGraphRunnerConfig(
+            use_cuda_graph=self.cuda_graph_config is not None,
+            cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
+            cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
+            max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
+            max_beam_width=self.max_beam_width,
+            spec_config=self.spec_config,
+            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            max_num_tokens=self.max_num_tokens,
+            use_mrope=self.use_mrope,
+            original_max_draft_len=self.original_max_draft_len,
+            original_max_total_draft_tokens=self.
+            original_max_total_draft_tokens,
+            is_draft_model=self.is_draft_model,
+            enable_attention_dp=self.enable_attention_dp,
+            batch_size=self.batch_size,
+            mapping=self.mapping,
+            dist=self.dist,
+            kv_cache_manager_key=self.kv_cache_manager_key,
+        )
+        self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -499,12 +568,13 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
-            logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
-                        cp_type.name)
-            return
+            if cp_type in [CpType.ULYSSES, CpType.STAR]:
+                logger.info(
+                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                    cp_type.name)
+                return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -553,7 +623,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
-        if not self.pytorch_backend_config.enable_autotuner:
+        if not self.llm_args.enable_autotuner:
             return
 
         logger.info("Running autotuner warmup...")
@@ -572,6 +642,13 @@ class PyTorchModelEngine(ModelEngine):
             with self._release_batch_context(warmup_request,
                                              resource_manager) as batch:
                 if batch is not None:
+                    # Reset the flag is_first_draft for the draft model.
+                    # This is necessary for overlap scheduler.
+                    spec_resource_manager = resource_manager.get_resource_manager(
+                        ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                    if self.is_draft_model and isinstance(
+                            spec_resource_manager, Eagle3ResourceManager):
+                        spec_resource_manager.is_first_draft = True
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
@@ -709,8 +786,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_num_extra_decoding_steps(self) -> int:
         """Determines extra decoding steps needed for fused drafting loops."""
-        if isinstance(self.model, ChainDrafter):
-            return self.model.max_draft_len
+        if isinstance(self.model, BaseDraftingLoopWrapper):
+            return self.model.max_total_draft_tokens
         else:
             assert not self.model_is_wrapped, (
                 f"Please add logic to determine num_extra_decoding_steps for drafting loop {type(self.model)}"
@@ -894,6 +971,18 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        num_attention_heads = getattr(self.model.model_config.pretrained_config,
+                                      'num_attention_heads', None)
+        config = self.model.model_config.pretrained_config
+
+        num_attention_heads = getattr(config, 'num_attention_heads', None)
+        num_key_value_heads = getattr(config, 'num_key_value_heads', None)
+
+        if num_attention_heads is not None and num_key_value_heads is not None:
+            num_heads_per_kv = num_attention_heads // num_key_value_heads
+        else:
+            num_heads_per_kv = 1
+
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -906,7 +995,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
-                sparse_attention_config=self.sparse_attention_config)
+                sparse_attention_config=self.sparse_attention_config,
+                num_heads_per_kv=num_heads_per_kv)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -924,7 +1014,9 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
-            sparse_attention_config=self.sparse_attention_config)
+            sparse_attention_config=self.sparse_attention_config,
+            num_heads_per_kv=num_heads_per_kv,
+        )
 
         return self.attn_metadata
 
@@ -1070,8 +1162,7 @@ class PyTorchModelEngine(ModelEngine):
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] += (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                # Only TrtllmAttentionMetadata has kv_lens_cuda.
-                if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
+                if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
                         inputs['attn_metadata'].kv_lens_cuda[
@@ -1087,6 +1178,7 @@ class PyTorchModelEngine(ModelEngine):
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
+                    inputs['attn_metadata'].on_update_kv_lens()
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -1133,6 +1225,11 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))
         return None
 
+    def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
+        if self.enable_attention_dp:
+            return list(self.dist.tp_allgather(num_ctx_requests))
+        return None
+
     def _get_padding_params(
         self, total_num_tokens: int, num_ctx_requests: int,
         attn_all_rank_num_tokens: Optional[List[int]]
@@ -1146,6 +1243,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         padded_num_tokens = total_num_tokens
 
+        all_rank_ctx_requests = self._get_all_rank_ctx_requests(
+            num_ctx_requests)
+
         def get_padded_piecewise_tokens(tokens):
             captured_num_tokens = self._torch_compile_backend.capture_num_tokens
             return captured_num_tokens[bisect.bisect_left(
@@ -1158,7 +1258,12 @@ class PyTorchModelEngine(ModelEngine):
                 -1]
             # Torch piecewise cuda graph is enabled.
             if attn_all_rank_num_tokens is not None:
-                can_run_piecewise_cuda_graph = (num_ctx_requests != 0 and
+                # Any rank has context requests, we enable piecewise cuda graph.
+                has_ctx_requests = num_ctx_requests != 0 or (
+                    all_rank_ctx_requests is not None
+                    and any(ctx_requests != 0
+                            for ctx_requests in all_rank_ctx_requests))
+                can_run_piecewise_cuda_graph = (has_ctx_requests and
                                                 max(attn_all_rank_num_tokens)
                                                 <= max_captured_num_tokens)
                 all_ranks_can_run_piecewise_cuda_graph = list(
@@ -1209,10 +1314,14 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+            cache_indirection_buffer: Optional[torch.Tensor] = None,
+            num_accepted_tokens_device: Optional[torch.Tensor] = None,
+            req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
+            resource_manager: Optional[ResourceManager] = None):
         """
         Prepare inputs for Pytorch Model.
         """
+
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
@@ -1242,6 +1351,22 @@ class PyTorchModelEngine(ModelEngine):
         multimodal_params_list = []
         mrope_position_ids = []
         num_accepted_draft_tokens = []  # per request
+        # if using tree decoding, we need to store the request type and accepted path for each request,
+        # which will be used to update the hidden_states_read_indices.
+        request_accepted_path = {}  # per request
+
+        # Variables for updating the inputs of draft model
+        # Base values for gather_ids computation
+        first_draft_base_gather_ids = []
+        # seq_slots to index into num_accepted_tokens_device
+        first_draft_seq_slots = []
+        # Indices in the num_accepted_draft_tokens list
+        first_draft_request_indices = []
+
+        # (start_idx, end_idx, seq_slot) for context requests
+        context_input_ids_positions = []
+        # (start_idx, end_idx, seq_slot) for first_draft requests
+        first_draft_input_ids_positions = []
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -1252,10 +1377,26 @@ class PyTorchModelEngine(ModelEngine):
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
-            input_ids.extend(prompt_tokens)
+
+            # Track position for updating the inputs of draft model
+            if self.is_draft_model and num_accepted_tokens_device is not None:
+                start_idx = len(input_ids)
+                input_ids.extend(prompt_tokens)
+                end_idx = len(input_ids)
+                slot_idx = req_id_to_old_request[
+                    request.py_request_id].py_seq_slot
+                context_input_ids_positions.append(
+                    (start_idx, end_idx - 1,
+                     slot_idx))  # end_idx-1 is the last token position
+            else:
+                input_ids.extend(prompt_tokens)
+
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             num_accepted_draft_tokens.append(len(prompt_tokens) - 1)
+            request_accepted_path[
+                request.
+                py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
@@ -1330,11 +1471,22 @@ class PyTorchModelEngine(ModelEngine):
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
             ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
+        spec_resource_manager, spec_tree_manager = None, None
+        if spec_config is not None:
+            spec_resource_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_resource_manager is not None and hasattr(
+                    spec_resource_manager, 'spec_tree_manager'):
+                spec_tree_manager = spec_resource_manager.spec_tree_manager
+
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
         for request in extend_requests:
             request_ids.append(request.py_request_id)
+            request_accepted_path[
+                request.
+                py_request_id] = request.py_num_accepted_draft_tokens_indices
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
@@ -1352,7 +1504,7 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend):
+                        self.attn_backend) and spec_config.is_linear_tree:
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
                     prompt_lengths.append(1 + num_draft_tokens)
@@ -1365,10 +1517,20 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num,
-                              past_seen_token_num + 1 + num_draft_tokens)))
+                # For the target model + tree decoding
+                if not self.is_draft_model and not spec_config.is_linear_tree:
+                    assert spec_tree_manager is not None
+                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
+                    position_ids.extend(
+                        past_seen_token_num +
+                        spec_tree_manager.spec_dec_position_offsets[
+                            0]  # [max_total_draft_tokens + 1]
+                    )
+                else:
+                    position_ids.extend(
+                        list(
+                            range(past_seen_token_num,
+                                  past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
@@ -1388,25 +1550,31 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num, past_seen_token_num + 1 +
-                              self.runtime_draft_len)))
+                # For the target model + tree decoding
+                if not self.is_draft_model and not spec_config.is_linear_tree:
+                    assert spec_tree_manager is not None
+                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
+                    position_ids.extend(
+                        past_seen_token_num +
+                        spec_tree_manager.spec_dec_position_offsets[
+                            0]  # [max_total_draft_tokens + 1]
+                    )
+                else:
+                    position_ids.extend(
+                        list(
+                            range(
+                                past_seen_token_num, past_seen_token_num + 1 +
+                                self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             (1 + self.runtime_draft_len))
-                if self.spec_config.spec_dec_mode.has_draft_model():
-                    # In the overlap scheduler workflow, if having draft model, we already updated the previous batch before launching the target model,
-                    # so we only need to add the runtime_draft_len to the past_seen_token_num.
-                    num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                     self.runtime_draft_len)
-                else:
-                    num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                     self.runtime_draft_len + 1)
+
+                num_cached_tokens_per_seq.append(past_seen_token_num +
+                                                 self.runtime_draft_len + 1)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend):
+                        self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(1 + self.runtime_draft_len)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
@@ -1421,13 +1589,42 @@ class PyTorchModelEngine(ModelEngine):
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
-            input_ids.extend(prompt_tokens)
-            gather_ids.append(
-                len(input_ids) - 1 - (self.original_max_draft_len -
-                                      request.py_num_accepted_draft_tokens))
+
+            # Track position for updating the inputs of draft model
+            if self.is_draft_model and num_accepted_tokens_device is not None:
+                start_idx = len(input_ids)
+                input_ids.extend(prompt_tokens)
+                end_idx = len(input_ids)
+                # For first_draft, we need to replace the last original_max_draft_len+1 tokens
+                slot_idx = req_id_to_old_request[
+                    request.py_request_id].py_seq_slot
+                first_draft_input_ids_positions.append(
+                    (start_idx, end_idx, slot_idx))
+
+                # Store info for GPU computation of gather_ids and num_accepted_draft_tokens
+                base_gather_id = len(
+                    input_ids) - 1 - self.original_max_draft_len
+                # Placeholder, will be corrected on GPU
+                gather_ids.append(base_gather_id)
+                first_draft_base_gather_ids.append(base_gather_id)
+                first_draft_seq_slots.append(slot_idx)
+                first_draft_request_indices.append(
+                    len(num_accepted_draft_tokens))
+
+                # Placeholder, will be corrected on GPU
+                num_accepted_draft_tokens.append(0)
+            else:
+                input_ids.extend(prompt_tokens)
+                gather_ids.append(
+                    len(input_ids) - 1 - (self.original_max_draft_len -
+                                          request.py_num_accepted_draft_tokens))
+                num_accepted_draft_tokens.append(
+                    request.py_num_accepted_draft_tokens)
+
             sequence_lengths.append(1 + self.original_max_draft_len)
-            num_accepted_draft_tokens.append(
-                request.py_num_accepted_draft_tokens)
+            request_accepted_path[
+                request.
+                py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
@@ -1435,6 +1632,7 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
+        helix_is_inactive_rank = [] if self.mapping.has_cp_helix() else None
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1447,7 +1645,17 @@ class PyTorchModelEngine(ModelEngine):
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
-                        input_ids.append(request.get_last_tokens(beam))
+                        # Track position for GPU update (draft model only)
+                        if self.is_draft_model and num_accepted_tokens_device is not None:
+                            start_idx = len(input_ids)
+                            input_ids.append(request.get_last_tokens(beam))
+                            end_idx = len(input_ids)
+                            slot_idx = req_id_to_old_request[
+                                request.py_request_id].py_seq_slot
+                            first_draft_input_ids_positions.append(
+                                (start_idx, end_idx, slot_idx))
+                        else:
+                            input_ids.append(request.get_last_tokens(beam))
                     past_seen_token_num = request.max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
@@ -1457,16 +1665,26 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+
                 position_id = past_seen_token_num
                 if self.mapping.has_cp_helix():
-                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
-                    past_seen_token_nums = self.dist.cp_allgather(
-                        past_seen_token_num)
-                    position_id = sum(past_seen_token_nums)
+                    # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
+                    if not self.is_warmup and not request.is_cuda_graph_dummy:
+                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
+                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
+                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                    else:
+                        # past_seen_token_num doesn't grow on inactive ranks.
+                        past_seen_token_num = request.orig_prompt_len
+
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
+                if self.mapping.has_cp_helix():
+                    helix_is_inactive_rank.append(
+                        request.py_helix_is_inactive_rank)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)
@@ -1515,13 +1733,87 @@ class PyTorchModelEngine(ModelEngine):
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
         assert total_num_tokens <= self.max_num_tokens, (
-            "total_num_tokens should be less than or equal to max_num_tokens")
+            f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
+        )
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
                                      dtype=torch.int,
                                      pin_memory=True)
             self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+
+            # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
+            if self.is_draft_model and num_accepted_tokens_device is not None:
+                # For context requests: replace the last token with new_tensors_device[0, seq_slot, 0]
+                if len(context_input_ids_positions) > 0:
+                    # Build tensors on CPU first, then copy to GPU to avoid implicit sync
+                    num_ctx_positions = len(context_input_ids_positions)
+                    ctx_token_indices_cpu = torch.tensor([
+                        last_token_idx
+                        for _, last_token_idx, _ in context_input_ids_positions
+                    ],
+                                                         dtype=torch.long,
+                                                         pin_memory=True)
+                    ctx_seq_slots_cpu = torch.tensor([
+                        seq_slot
+                        for _, _, seq_slot in context_input_ids_positions
+                    ],
+                                                     dtype=torch.long,
+                                                     pin_memory=True)
+                    # Copy to pre-allocated GPU buffers
+                    self.draft_ctx_token_indices_cuda[:num_ctx_positions].copy_(
+                        ctx_token_indices_cpu, non_blocking=True)
+                    self.draft_ctx_seq_slots_cuda[:num_ctx_positions].copy_(
+                        ctx_seq_slots_cpu, non_blocking=True)
+                    self.input_ids_cuda[
+                        self.
+                        draft_ctx_token_indices_cuda[:num_ctx_positions]] = new_tensors_device.new_tokens[
+                            0,
+                            self.draft_ctx_seq_slots_cuda[:num_ctx_positions],
+                            0]
+
+                # For first_draft requests: replace the last (original_max_draft_len+1) tokens
+                # with new_tensors_device[:, seq_slot, 0]
+                if len(first_draft_input_ids_positions) > 0:
+                    # All first_draft requests have same token length (original_max_draft_len + 1)
+                    # Build index tensors on CPU first, then copy to GPU to avoid implicit sync
+                    num_requests = len(first_draft_input_ids_positions)
+                    tokens_per_request = first_draft_input_ids_positions[0][
+                        1] - first_draft_input_ids_positions[0][0]
+
+                    # Create flat index array for all tokens to update on CPU
+                    all_indices = []
+                    all_seq_slots = []
+                    for start_idx, end_idx, seq_slot in first_draft_input_ids_positions:
+                        all_indices.extend(range(start_idx, end_idx))
+                        all_seq_slots.extend([seq_slot] * (end_idx - start_idx))
+
+                    # Create CPU tensors with pinned memory
+                    total_tokens = len(all_indices)
+                    idx_tensor_cpu = torch.tensor(all_indices,
+                                                  dtype=torch.long,
+                                                  pin_memory=True)
+                    seq_slots_tensor_cpu = torch.tensor(all_seq_slots,
+                                                        dtype=torch.long,
+                                                        pin_memory=True)
+
+                    # Copy to pre-allocated GPU buffers
+                    self.draft_first_draft_indices_cuda[:total_tokens].copy_(
+                        idx_tensor_cpu, non_blocking=True)
+                    self.draft_first_draft_seq_slots_cuda[:total_tokens].copy_(
+                        seq_slots_tensor_cpu, non_blocking=True)
+
+                    # Create token position indices (repeating 0..tokens_per_request for each request)
+                    token_positions = torch.arange(
+                        tokens_per_request, dtype=torch.long,
+                        device='cuda').repeat(num_requests)
+
+                    self.input_ids_cuda[
+                        self.
+                        draft_first_draft_indices_cuda[:total_tokens]] = new_tensors_device.new_tokens[
+                            token_positions, self.
+                            draft_first_draft_seq_slots_cuda[:total_tokens], 0]
+
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens,
                                         dtype=torch.int,
@@ -1535,6 +1827,33 @@ class PyTorchModelEngine(ModelEngine):
             self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
                                                   non_blocking=True)
+
+            # Update num_accepted_draft_tokens_cuda for first_draft_requests directly from num_accepted_tokens_device (draft model only)
+            if self.is_draft_model and len(first_draft_seq_slots) > 0:
+                # Build tensors on CPU first, then copy to GPU to avoid implicit sync
+                num_first_draft = len(first_draft_seq_slots)
+                first_draft_seq_slots_cpu = torch.tensor(first_draft_seq_slots,
+                                                         dtype=torch.int,
+                                                         pin_memory=True)
+                first_draft_indices_cpu = torch.tensor(
+                    first_draft_request_indices,
+                    dtype=torch.int,
+                    pin_memory=True)
+
+                # Copy to pre-allocated GPU buffers
+                self.draft_seq_slots_buffer_cuda[:num_first_draft].copy_(
+                    first_draft_seq_slots_cpu, non_blocking=True)
+                self.draft_request_indices_buffer_cuda[:num_first_draft].copy_(
+                    first_draft_indices_cpu, non_blocking=True)
+
+                # Extract accepted tokens for first_draft requests from device tensor
+                accepted_tokens = num_accepted_tokens_device[
+                    self.draft_seq_slots_buffer_cuda[:num_first_draft]]
+                # Update the correct positions in num_accepted_draft_tokens_cuda
+                self.num_accepted_draft_tokens_cuda[
+                    self.
+                    draft_request_indices_buffer_cuda[:
+                                                      num_first_draft]] = accepted_tokens
         if next_draft_tokens_device is not None:
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
@@ -1640,6 +1959,34 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
 
+            # Update gather_ids for first_draft_requests on GPU (draft model only)
+            if self.is_draft_model and len(first_draft_seq_slots) > 0:
+                # Build tensors on CPU first, then copy to GPU to avoid implicit sync
+                num_first_draft = len(first_draft_seq_slots)
+                first_draft_seq_slots_cpu = torch.tensor(first_draft_seq_slots,
+                                                         dtype=torch.int,
+                                                         pin_memory=True)
+                first_draft_indices_cpu = torch.tensor(
+                    first_draft_request_indices,
+                    dtype=torch.int,
+                    pin_memory=True)
+
+                # Copy to pre-allocated GPU buffers
+                self.draft_seq_slots_buffer_cuda[:num_first_draft].copy_(
+                    first_draft_seq_slots_cpu, non_blocking=True)
+                self.draft_request_indices_buffer_cuda[:num_first_draft].copy_(
+                    first_draft_indices_cpu, non_blocking=True)
+
+                # Extract accepted tokens for first_draft requests from device tensor
+                accepted_tokens = num_accepted_tokens_device[
+                    self.draft_seq_slots_buffer_cuda[:num_first_draft]]
+                # Update gather_ids: gather_id = base_gather_id + num_accepted_tokens
+                # (since gather_id = len(input_ids) - 1 - (max_draft_len - num_accepted))
+                self.gather_ids_cuda[
+                    self.
+                    draft_request_indices_buffer_cuda[:
+                                                      num_first_draft]] += accepted_tokens
+
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
@@ -1656,8 +2003,11 @@ class PyTorchModelEngine(ModelEngine):
             is_cuda_graph_during_warmup = self.is_warmup and attn_metadata.is_cuda_graph
             if cache_indirection_buffer is not None:
                 #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
+                # Convert to GPU tensor to avoid implicit sync
+                gen_request_seq_slots_tensor = torch.tensor(
+                    gen_request_seq_slots, dtype=torch.long, device='cuda')
                 self.cache_indirection_attention[:num_generation_requests].copy_(
-                    cache_indirection_buffer[gen_request_seq_slots])
+                    cache_indirection_buffer[gen_request_seq_slots_tensor])
             if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:
                 attn_metadata.beam_width = self.max_beam_width
         else:
@@ -1665,12 +2015,15 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
         attn_metadata.num_chunked_ctx_requests = 0
         if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                self.attn_backend):
+                self.attn_backend) and spec_config.is_linear_tree:
+            # For the tree decoding, we want to use XQA to process the draft tokens for the target model.
+            # Therefore, we do not treat them as the chunked context requests.
             attn_metadata.num_contexts += len(extend_requests)
             attn_metadata.num_chunked_ctx_requests = len(extend_requests)
 
@@ -1734,6 +2087,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
+            if isinstance(spec_metadata, Eagle3SpecMetadata):
+                spec_metadata.request_accepted_path = request_accepted_path
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -2238,7 +2593,10 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+            cache_indirection_buffer: Optional[torch.Tensor] = None,
+            num_accepted_tokens_device: Optional[torch.Tensor] = None,
+            req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
+            resource_manager: Optional[ResourceManager] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -2254,19 +2612,21 @@ class PyTorchModelEngine(ModelEngine):
         return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                        attn_metadata, spec_metadata,
                                        new_tensors_device,
-                                       cache_indirection_buffer)
+                                       cache_indirection_buffer,
+                                       num_accepted_tokens_device,
+                                       req_id_to_old_request, resource_manager)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
-    def forward(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: ResourceManager,
-        new_tensors_device: Optional[SampleStateTensors] = None,
-        gather_context_logits: bool = False,
-        cache_indirection_buffer: Optional[torch.Tensor] = None,
-        spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
-    ):
+    def forward(self,
+                scheduled_requests: ScheduledRequests,
+                resource_manager: ResourceManager,
+                new_tensors_device: Optional[SampleStateTensors] = None,
+                gather_context_logits: bool = False,
+                cache_indirection_buffer: Optional[torch.Tensor] = None,
+                spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
+                num_accepted_tokens_device: Optional[torch.Tensor] = None,
+                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -2274,6 +2634,9 @@ class PyTorchModelEngine(ModelEngine):
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            spec_tree_manager = None
+            if isinstance(spec_resource_manager, Eagle3ResourceManager):
+                spec_tree_manager = spec_resource_manager.spec_tree_manager
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)
@@ -2282,9 +2645,16 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
                 self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
             attn_metadata.update_spec_dec_param(
-                is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
-                spec_metadata.is_spec_dec_dynamic_tree,
-                self.original_max_draft_len, spec_decoding_tensor)
+                batch_size=scheduled_requests.batch_size,
+                is_spec_decoding_enabled=is_spec_dec_mode,
+                is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
+                is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
+                max_draft_len=self.original_max_draft_len,
+                max_total_draft_tokens=self.original_max_total_draft_tokens,
+                model_is_wrapped=self.model_is_wrapped,
+                spec_metadata=spec_metadata,
+                spec_tree_manager=spec_tree_manager,
+                spec_decoding_tensor=spec_decoding_tensor)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -2298,18 +2668,27 @@ class PyTorchModelEngine(ModelEngine):
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 # Special handling for multimodal encoder only mode
-                if self.pytorch_backend_config.mm_encoder_only:
+                if self.llm_args.mm_encoder_only:
                     return self._forward_step_mm_encoder_only(
                         inputs, scheduled_requests)
                 else:
                     return self._forward_step(inputs, gather_ids,
                                               gather_context_logits)
         with self.cuda_graph_runner.pad_batch(
-                scheduled_requests, resource_manager) as padded_requests:
+                scheduled_requests, resource_manager,
+                self.runtime_draft_len) as padded_requests:
 
-            maybe_graph, maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_requests, spec_resource_manager)
-            if maybe_graph:
+            maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
+                padded_requests,
+                enable_spec_decode=self.enable_spec_decode,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_tokens_cuda=self.draft_tokens_cuda
+                if self.is_spec_decode else None,
+                spec_resource_manager=spec_resource_manager,
+            )
+            can_run_graph = key is not None
+            if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
             else:
@@ -2321,11 +2700,12 @@ class PyTorchModelEngine(ModelEngine):
 
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer)
+                new_tensors_device, cache_indirection_buffer,
+                num_accepted_tokens_device, req_id_to_old_request,
+                resource_manager)
 
-            self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
-                if not maybe_graph:
+                if not can_run_graph:
                     # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self._forward_step(inputs, gather_ids,
@@ -2343,9 +2723,12 @@ class PyTorchModelEngine(ModelEngine):
                         def capture_postprocess_fn(inputs: Dict[str, Any]):
                             self._postprocess_inputs(inputs)
 
-                        self.cuda_graph_runner.capture(key, capture_forward_fn,
-                                                       inputs,
-                                                       capture_postprocess_fn)
+                        self.cuda_graph_runner.capture(
+                            key,
+                            capture_forward_fn,
+                            inputs,
+                            enable_spec_decode=self.enable_spec_decode,
+                            postprocess_fn=capture_postprocess_fn)
 
                         # here we don't need to use context since cuda graph capture didn't run kernel.
                         # maybe we need a cleaner way to do this.
@@ -2370,8 +2753,7 @@ class PyTorchModelEngine(ModelEngine):
         if self._torch_compile_backend is not None:
             # Register aux streams and events to model extra attrs.
             # The streams and events are list which could be updated during compilation.
-            attrs["aux_streams"] = weakref.ref(
-                self._torch_compile_backend.aux_streams)
+            attrs["aux_streams"] = weakref.ref(self.backend_num_streams)
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
@@ -2456,13 +2838,13 @@ class PyTorchModelEngine(ModelEngine):
         return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
-        if self.mapping.tp_size <= 1:
+        if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
             return False
 
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+        use_nccl_symmetric = self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
         ub.initialize_userbuffers_manager(
             self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
             self.mapping.rank, self.mapping.gpus_per_node,

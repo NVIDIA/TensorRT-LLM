@@ -19,7 +19,6 @@ from .._common import default_net
 from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
                           cp_split_plugin, gather_last_token_logits,
@@ -31,6 +30,7 @@ from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Dora, Lora
 from ..layers.moe import MOE, MoeOOTB
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList

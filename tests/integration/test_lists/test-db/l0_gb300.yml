@@ -8,6 +8,7 @@ l0_gb300:
     wildcards:
       gpu:
       - '*gb110*'
+      - '*gb300*'
       linux_distribution_name: ubuntu*
       cpu: aarch64
     terms:

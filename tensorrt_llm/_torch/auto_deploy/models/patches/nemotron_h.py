@@ -88,11 +88,40 @@ def _nemotron_h_block_forward(
         return hidden_states
 
 
+def _nemotron_h_topk_router_forward(self, hidden_states):
+    """
+    Forward pass for NemotronHTopkRouter using the optimized noaux_tc_op kernel.
+
+    This replaces the original forward method which used pure PyTorch operations
+    with optimized CUDA kernels:
+    """
+    hidden_states = hidden_states.view(-1, self.config.hidden_size)
+    if self.weight.dtype == torch.float32:
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight)
+    else:
+        router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+        )
+
+    # Use the fused noaux_tc_op kernel which applies sigmoid internally
+    # and performs group-based top-k selection with normalization
+    topk_weights, topk_indices = torch.ops.trtllm.noaux_tc_op(
+        router_logits,
+        self.e_score_correction_bias,
+        self.n_group,
+        self.topk_group,
+        self.top_k,
+        self.routed_scaling_factor,
+    )
+
+    return topk_indices, topk_weights
+
+
 # Note: we assume experts have no bias for now
 def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     """
     Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe
-    with act_fn='relu2'. Falls back to original forward if any expert has bias.
+    with act_fn='relu2'. Handles both latent MOE and direct MOE architectures.
     """
 
     residuals = hidden_states
@@ -100,6 +129,18 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     topk_indices, topk_weights = self.gate(hidden_states)
     x_flat = hidden_states.view(-1, hidden_states.shape[-1])
 
+    # NOTE: So far we've seen that the dispatch order in eager code is the same as the node order in the exported graph.
+    # We dispatch shared expert first so that we can easily fork the execution of the routed experts
+    # (using the custom op below) to an auxiliary stream.
+    shared_out = self.shared_experts(residuals)
+    # Check if this is a latent MOE (has fc1_latent_proj and fc2_latent_proj)
+    has_latent_proj = hasattr(self, "fc1_latent_proj") and hasattr(self, "fc2_latent_proj")
+
+    if has_latent_proj:
+        # Latent MOE: project to latent space before routing
+        x_flat = self.fc1_latent_proj(x_flat)
+
+    # Route through experts (operates in latent space if latent MOE, full space otherwise)
     out_flat = torch.ops.auto_deploy.torch_moe(
         x_flat,
         topk_indices,
@@ -111,8 +152,12 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
         mlp_style="mlp",
     )
 
-    out = out_flat.view(*orig_shape)
-    out = out + self.shared_experts(residuals)
+    if has_latent_proj:
+        # Latent MOE: project back from latent space
+        out_flat = self.fc2_latent_proj(out_flat)
+
+    routed_out = out_flat.view(*orig_shape)
+    out = shared_out + routed_out
     return out
 
 
@@ -126,6 +171,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
     ],
     "NemotronHBlock": [("forward", _nemotron_h_block_forward)],
     "NemotronHMOE": [("forward", _nemotron_h_moe_forward)],
+    "NemotronHTopkRouter": [("forward", _nemotron_h_topk_router_forward)],
 }
 
 

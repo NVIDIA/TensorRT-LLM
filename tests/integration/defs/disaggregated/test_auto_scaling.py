@@ -1,7 +1,9 @@
 import asyncio
 import os
+import shutil
 import subprocess
 import tempfile
+import uuid
 
 import openai
 import pytest
@@ -10,12 +12,12 @@ import yaml
 
 from tensorrt_llm.logger import logger
 
-TEST_PORT = 18000
+TEST_PORT = 8000
 HEARTBEAT_INTERVAL = 1
 INACTIVE_TIMEOUT = 2
+CHECK_STATUS_INTERVAL = 3  # check cluster status with a larger interval than inactive timeout to avoid flaky tests
 
-ROUTER_TYPES = ["round_robin",
-                "load_balancing"]  # kv_cache_aware doesn't support auto-scaling
+ROUTER_TYPES = ["round_robin", "load_balancing", "kv_cache_aware"]
 
 
 @pytest.fixture
@@ -23,11 +25,28 @@ def model_name():
     return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
+@pytest.fixture(scope="function")
+def service_discovery(request):
+    if request.param == "etcd":
+        data_dir = f"{tempfile.gettempdir()}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        yield etcd, f"etcd://localhost:2379"
+        try:
+            etcd.kill()
+            etcd.wait(timeout=10)
+            shutil.rmtree(data_dir)
+        except Exception:
+            pass
+    else:
+        yield None, f"http://localhost:{TEST_PORT}"
+
+
 @pytest.fixture
-def disagg_cluster_config():
+def disagg_cluster_config(service_discovery):
     # same cluster config for workers and proxy server
+    _, uri = service_discovery
     return {
-        "cluster_uri": f"http://localhost:{TEST_PORT}",
+        "cluster_uri": uri,
         "cluster_name": "test_cluster",
         "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
         "inactive_timeout_sec": INACTIVE_TIMEOUT,
@@ -95,7 +114,8 @@ def _run_worker(model_name, worker_config, role, port=8000, device=-1):
         env = os.environ.copy()
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        return subprocess.Popen(cmd, env=env)
+        f = open(f"output_{role}.log", "w+")
+        return subprocess.Popen(cmd, env=env, stdout=f, stderr=f)
 
 
 def run_ctx_worker(model_name,
@@ -173,13 +193,13 @@ def verify_cluster_info(ready,
 
 
 def terminate(*args):
-    try:
-        for arg in args:
-            if arg and isinstance(arg, subprocess.Popen):
-                arg.terminate()
+    for arg in args:
+        if arg and isinstance(arg, subprocess.Popen):
+            try:
+                arg.kill()
                 arg.wait(timeout=10)
-    except Exception:
-        pass
+            except Exception:
+                print(f"Failed to terminate process {arg.pid}")
 
 
 def request_completion(model_name, prompt, port=TEST_PORT):
@@ -195,8 +215,9 @@ def request_completion(model_name, prompt, port=TEST_PORT):
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 async def test_service_discovery(model_name, disagg_server_config,
-                                 worker_config, router):
+                                 worker_config, router, service_discovery):
     ctx_worker1 = None
     gen_worker1 = None
     disagg_server = None
@@ -219,10 +240,11 @@ async def test_service_discovery(model_name, disagg_server_config,
 @pytest.mark.parametrize(
     "router", ["round_robin"], indirect=True
 )  # use only round_robin to reduce the test time, this router type doesn't matter for this test
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
 async def test_minimal_instances(model_name, disagg_server_config,
-                                 worker_config, router):
+                                 worker_config, router, service_discovery):
     # the cluster should have at least 2 ctx and 2 gen workers
     minimal_instances = {
         "context_servers": 2,
@@ -266,10 +288,11 @@ async def test_minimal_instances(model_name, disagg_server_config,
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
 async def test_worker_restart(model_name, disagg_server_config, worker_config,
-                              router):
+                              router, service_discovery):
     ctx_worker1 = None
     ctx_worker2 = None
     gen_worker1 = None
@@ -295,7 +318,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         print(response)
         # kill gen1, the request should fail
         terminate(gen_worker1)
-        await asyncio.sleep(INACTIVE_TIMEOUT)
+        await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 1, 0)
         with pytest.raises(Exception):
             request_completion(model_name, "Hello, my name is", port=TEST_PORT)
@@ -308,7 +331,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      TEST_PORT + 201,
                                      device=2)
         await wait_for_worker_ready(TEST_PORT + 201)
-        await asyncio.sleep(INACTIVE_TIMEOUT)
+        await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1)
 
         response = request_completion(model_name, test_prompt, port=TEST_PORT)
@@ -318,7 +341,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 
         # kill ctx1, the request should fail
         terminate(ctx_worker1)
-        await asyncio.sleep(INACTIVE_TIMEOUT)
+        await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 0, 1)
         with pytest.raises(Exception):
             request_completion(model_name, test_prompt, port=TEST_PORT)
@@ -340,7 +363,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
         await wait_for_worker_ready(TEST_PORT + 100)
         await wait_for_worker_ready(TEST_PORT + 200)
-        await asyncio.sleep(INACTIVE_TIMEOUT)
+        await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 2, 2)
 
         # send 10 requests, the responses will be generated by the different ctx/gen workers (but we can't verify it now)
@@ -357,10 +380,11 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ["round_robin"], indirect=True)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(300)
 async def test_disagg_server_restart(model_name, disagg_server_config,
-                                     worker_config, router):
+                                     worker_config, router, service_discovery):
     ctx_worker1 = None
     gen_worker1 = None
     disagg_server = None
@@ -379,7 +403,7 @@ async def test_disagg_server_restart(model_name, disagg_server_config,
 
         # kill disagg server, the request should fail
         terminate(disagg_server)
-        await asyncio.sleep(INACTIVE_TIMEOUT)
+        await asyncio.sleep(CHECK_STATUS_INTERVAL)
         with pytest.raises(Exception):
             verify_cluster_info(False, 1, 1, expected_code=500)
 

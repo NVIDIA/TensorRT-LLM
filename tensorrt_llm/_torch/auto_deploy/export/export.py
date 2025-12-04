@@ -93,18 +93,31 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
 
 def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
     """Adds back the state dict load hooks stripped away during export."""
-    hooks = {
+    pre_hooks = {
         k: mod._load_state_dict_pre_hooks
         for k, mod in model.named_modules()
         if mod._load_state_dict_pre_hooks
     }
 
     for mod_name, mod in gm.named_modules():
-        if mod_name in hooks:
-            for hook in hooks.pop(mod_name).values():
+        if mod_name in pre_hooks:
+            for hook in pre_hooks.pop(mod_name).values():
                 mod._register_load_state_dict_pre_hook(hook.hook, with_module=hook.with_module)
-    assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
-        The following module names were not found in exported module {list(hooks.keys())}"""
+    assert not (bool(pre_hooks)), f"""Mismatch in names of exported and source modules with hooks.
+        The following module names were not found in exported module {list(pre_hooks.keys())}"""
+
+    post_hooks = {
+        k: mod._load_state_dict_post_hooks
+        for k, mod in model.named_modules()
+        if mod._load_state_dict_post_hooks
+    }
+
+    for mod_name, mod in gm.named_modules():
+        if mod_name in post_hooks:
+            for hook in post_hooks.pop(mod_name).values():
+                mod.register_load_state_dict_post_hook(hook)
+    assert not (bool(post_hooks)), f"""Mismatch in names of exported and source modules with hooks.
+        The following module names were not found in exported module {list(post_hooks.keys())}"""
 
 
 def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> None:
@@ -172,7 +185,7 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
     gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
-def _clean_up_assertions(gm: fx.GraphModule):
+def _clean_up_assertions_and_guards(gm: fx.GraphModule):
     """This transformations removes shape checks and assertions from the graph."""
     check_ops = {
         torch.ops.aten._assert_scalar,
@@ -183,11 +196,26 @@ def _clean_up_assertions(gm: fx.GraphModule):
         # torch.ops.aten._functional_sym_constrain_range_for_size
     }
     graph: fx.Graph = gm.graph
+    removed = False
     for node in reversed(graph.nodes):
         if len(node.users) > 0 or not is_op(node, check_ops):
             continue
         graph.erase_node(node)
-    canonicalize_graph(gm)
+        removed = True
+    for node in reversed(graph.nodes):
+        if node.op == "call_module" and (
+            str(node.target) == "_guards_fn" or str(node.target).startswith("_guards")
+        ):
+            # there's typically no users of the guards, but if there are, we route through the first arg
+            if len(node.users) > 0 and len(node.args) >= 1:
+                node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+            removed = True
+
+    if removed and hasattr(gm, "_guards_fn"):
+        delattr(gm, "_guards_fn")
+    if removed:
+        canonicalize_graph(gm)
 
 
 def run_forward_for_capture(
@@ -308,7 +336,7 @@ def torch_export_to_gm(
     _clean_up_device_info(egm)
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
-    _clean_up_assertions(egm)
+    _clean_up_assertions_and_guards(egm)
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))

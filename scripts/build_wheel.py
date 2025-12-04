@@ -364,7 +364,8 @@ def check_missing_libs(lib_name: str) -> list[str]:
 
 
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
-                                deep_ep: bool, binding_lib_name: str):
+                                deep_ep: bool, flash_mla: bool,
+                                binding_lib_name: str):
     is_nanobind = binding_type == "nanobind"
     if is_nanobind:
         build_run(f"\"{venv_python}\" -m pip install nanobind")
@@ -397,6 +398,10 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
         build_run(
             f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
+        if flash_mla:
+            build_run(
+                f"\"{venv_python}\" -m pybind11_stubgen -o . flash_mla_cpp_tllm --exit-code",
+                env=env_stub_gen)
         if deep_ep:
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
@@ -606,12 +611,16 @@ def main(*,
         build_pyt = "OFF"
         build_deep_ep = "OFF"
         build_deep_gemm = "OFF"
+        build_flash_mla = "OFF"
     else:
-        targets.extend(
-            ["th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils"])
+        targets.extend([
+            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
+            "flash_mla"
+        ])
         build_pyt = "ON"
         build_deep_ep = "ON"
         build_deep_gemm = "ON"
+        build_flash_mla = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -647,7 +656,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -897,6 +906,17 @@ def main(*,
                      deep_gemm_dir,
                      dirs_exist_ok=True)
 
+        with (build_dir / "tensorrt_llm" / "flash_mla" /
+              "cuda_architectures.txt").open() as f:
+            flash_mla_cuda_architectures = f.read().strip().strip(";")
+        if flash_mla_cuda_architectures:
+            install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
+                         pkg_dir)
+            install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
+                         "flash_mla",
+                         pkg_dir / "flash_mla",
+                         dirs_exist_ok=True)
+
         if not skip_stubs:
             with working_directory(pkg_dir):
                 if on_windows:
@@ -905,7 +925,9 @@ def main(*,
                 else:  # on linux
                     generate_python_stubs_linux(
                         binding_type, venv_python,
-                        bool(deep_ep_cuda_architectures), binding_lib_file_name)
+                        bool(deep_ep_cuda_architectures),
+                        bool(flash_mla_cuda_architectures),
+                        binding_lib_file_name)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -924,42 +946,9 @@ def main(*,
             # and validating python changes in the whl.
             clear_folder(dist_dir)
 
-        # Modify requirements.txt for wheel build based on CUDA version
-        def modify_requirements_for_cuda():
-            requirements_file = project_dir / "requirements.txt"
-            if os.environ.get("CUDA_VERSION", "").startswith("12."):
-                print(
-                    "Detected CUDA 12 environment, modifying requirements.txt for wheel build..."
-                )
-                with open(requirements_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                modified_lines = []
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
-                    if "<For CUDA 12.9>" in line and line.strip().startswith(
-                            "#"):
-                        new_line = line.replace("# ", "", 1)
-                        print(
-                            f"Enable CUDA 12.9 dependency: {new_line.strip()}")
-                        modified_lines.append(new_line)
-                        print(
-                            f"Disable CUDA 13 dependency: # {lines[i + 1].strip()}"
-                        )
-                        modified_lines.append("# " + lines[i + 1])
-                        i += 1
-                    else:
-                        modified_lines.append(line)
-                    i += 1
-                with open(requirements_file, 'w', encoding='utf-8') as f:
-                    f.writelines(modified_lines)
-                return True
-            return False
-
-        modify_requirements_for_cuda()
-
+        extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
 
     if install:

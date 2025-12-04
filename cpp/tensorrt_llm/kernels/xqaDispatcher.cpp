@@ -259,9 +259,9 @@ bool XqaDispatcher::isSupported()
             TLLM_LOG_WARNING("Unsupported data type combination.");
             return false;
         }
-        if (mFixedParams.isSpecDecoding)
+        if (mFixedParams.isSpecDecoding && mFixedParams.isMLA)
         {
-            TLLM_LOG_WARNING("TRTLLM-GEN does not support Speculative decoding.");
+            TLLM_LOG_WARNING("TRTLLM-GEN does not support tree-based speculative decoding with MLA.");
             return false;
         }
         if (mFixedParams.hasAlibi)
@@ -274,7 +274,9 @@ bool XqaDispatcher::isSupported()
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mMaskType
+            = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = true;
@@ -292,6 +294,7 @@ bool XqaDispatcher::isSupported()
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
+
         if (!isSupported)
         {
             TLLM_LOG_WARNING("TRTLLLM-Gen kernels are not selected: " + info);
@@ -398,7 +401,6 @@ void XqaDispatcher::runImpl(
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = params.multi_block_mode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
@@ -454,10 +456,11 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.attentionSinksPtr = params.attention_sinks;
         tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
+        // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
-        // TRTLLM-GEN kernels always use the Log2 scale
-        tllmRunnerParams.scaleSoftmaxLog2Ptr
-            = reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr);
+        tllmRunnerParams.scaleSoftmaxLog2Ptr = launchParams.bmm1_scale_ptr
+            ? reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr)
+            : nullptr;
         tllmRunnerParams.oSfScalePtr = params.fp4_out_sf_scale;
 
         tllmRunnerParams.oPtr = params.output;
@@ -486,7 +489,15 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
-
+        tllmRunnerParams.mIsSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
+        tllmRunnerParams.mMaskType
+            = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mLayerIdx = params.layer_idx;
+        tllmRunnerParams.seqlensQPtr = params.spec_decoding_generation_lengths;
+        tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
+        tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
+        tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
+        tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

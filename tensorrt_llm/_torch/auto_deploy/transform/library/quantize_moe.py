@@ -16,11 +16,6 @@ from .quantization import (
     Quantization,
 )
 
-quantized_moe_op_map = {
-    "FP8": torch.ops.auto_deploy.torch_quant_fp8_moe,
-    "NVFP4": torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-}
-
 
 def _quantize_moe_node(
     gm: GraphModule,
@@ -92,11 +87,33 @@ def _quantize_moe_node(
         s1, s2, s3 = collect_scales(idx)
         args.extend([s1, s2, s3])
 
+    # Extract mlp_style and act_fn from the original node
+    # These can be in args[6:] or in kwargs
+    mlp_style = "gated_mlp"  # default
+    act_fn = "silu"  # default
+
+    if len(node.args) > 6:
+        mlp_style = node.args[6]
+    elif "mlp_style" in node.kwargs:
+        mlp_style = node.kwargs["mlp_style"]
+
+    if len(node.args) > 7:
+        act_fn = node.args[7]
+    elif "act_fn" in node.kwargs:
+        act_fn = node.kwargs["act_fn"]
+
+    # Prepare kwargs for the quantized op
+    kwargs = {
+        "mlp_style": mlp_style,
+        "act_fn": act_fn,
+    }
+
     # Replace the current node with the quantized version
     with gm.graph.inserting_after(node):
         new_node = gm.graph.call_function(
             quantized_op,
             args=tuple(args),
+            kwargs=kwargs,
         )
         node.replace_all_uses_with(new_node)
         gm.graph.erase_node(node)

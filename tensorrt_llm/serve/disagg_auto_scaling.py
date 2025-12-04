@@ -94,18 +94,21 @@ class DisaggClusterManager:
 
     async def watch_workers(self, get_existing_first: bool = True):
         workers = []
+        self._watch_handle = await self._cluster_storage.watch(
+            self.worker_key_prefix)
         if get_existing_first:
             # There is a tiny gap between getting existing workers and watching the key,
             # which may cause we missing some workers registered in between.
             resp = await self._cluster_storage.get_prefix(
                 self.worker_key_prefix, keys_only=False)
+            events = []
             for worker_id, data in resp.items():
                 event = WatchEvent(storage_item=StorageItem(key=worker_id,
                                                             value=data),
                                    event_type=WatchEventType.SET)
                 workers.append(self._parse_worker_info(event))
-        self._watch_handle = await self._cluster_storage.watch(
-            self.worker_key_prefix)
+                events.append(event)
+            await self._watch_handle.add_events(events)
         return workers
 
     async def unwatch_workers(self) -> None:

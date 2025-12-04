@@ -23,16 +23,20 @@ from typing import Dict, List, NamedTuple
 
 import pytest
 import yaml
-from defs.common import convert_weights, get_cpp_benchmark, quantize_data
+from defs.common import get_cpp_benchmark
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
+from .open_search_db_utils import (add_id, get_history_data, get_job_info,
+                                   post_new_perf_data, prepare_baseline_data,
+                                   prepare_regressive_test_cases,
+                                   print_regressive_test_cases)
 from .pytorch_model_config import get_model_yaml_config
+from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfDisaggScriptTestCmds, PerfMetricType,
-                    PerfScriptTestCmds, PerfServerClientBenchmarkCmds,
-                    generate_test_nodes)
+                    PerfServerClientBenchmarkCmds, generate_test_nodes)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -57,7 +61,6 @@ MODEL_PATH_DICT = {
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
-    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "llama_v3.1_405b_instruct_fp8":
     "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
     "llama_v3.1_405b_instruct_fp4":
@@ -122,8 +125,6 @@ MODEL_PATH_DICT = {
     "mamba_2.8b": "mamba/mamba-2.8b-hf",
     "gpt_20b": "gpt-neox-20b",
     "gpt_350m_moe": "gpt2-medium",
-    "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
-    "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
     "phi_4_mini_instruct": "Phi-4-mini-instruct",
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
@@ -140,6 +141,9 @@ MODEL_PATH_DICT = {
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
+    "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
+    "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "starcoder2_7b": "starcoder2-7b",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -401,6 +405,33 @@ PERF_METRIC_THRESHOLD = {
                                         50),  # Ignore TTFT regression < 50ms
 }
 
+PERF_METRIC_STRING = {
+    PerfMetricType.BUILD_TIME: "build_time",
+    PerfMetricType.INFERENCE_TIME: "mean_e2el",
+    PerfMetricType.MEDIAN_INFERENCE_TIME: "median_e2el",
+    PerfMetricType.P99_INFERENCE_TIME: "p99_e2el",
+    PerfMetricType.FIRST_TOKEN_TIME: "mean_ttft",
+    PerfMetricType.MEDIAN_FIRST_TOKEN_TIME: "median_ttft",
+    PerfMetricType.P99_FIRST_TOKEN_TIME: "p99_ttft",
+    PerfMetricType.OUTPUT_TOKEN_TIME: "mean_tpot",
+    PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME: "median_tpot",
+    PerfMetricType.P99_OUTPUT_TOKEN_TIME: "p99_tpot",
+    PerfMetricType.INTER_TOKEN_TIME: "mean_itl",
+    PerfMetricType.MEDIAN_INTER_TOKEN_TIME: "median_itl",
+    PerfMetricType.P99_INTER_TOKEN_TIME: "p99_itl",
+    PerfMetricType.SEQ_LATENCY: "seq_latency",
+    PerfMetricType.TOKEN_THROUGHPUT: "token_throughput",
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT: "total_token_throughput",
+    PerfMetricType.USER_THROUGHPUT: "user_throughput",
+    PerfMetricType.SEQ_THROUGHPUT: "seq_throughput",
+    PerfMetricType.INFERENCE_PEAK_GPU_MEMORY: "inference_peak_gpu_memory",
+    PerfMetricType.BUILD_PEAK_CPU_MEMORY: "build_peak_cpu_memory",
+    PerfMetricType.BUILD_PEAK_GPU_MEMORY: "build_peak_gpu_memory",
+    PerfMetricType.ENGINE_SIZE: "engine_size",
+    PerfMetricType.CONTEXT_GPU_MEMORY: "context_gpu_memory",
+    PerfMetricType.KV_CACHE_SIZE: "kv_cache_size",
+}
+
 BUILDER_METRICS = [
     PerfMetricType.BUILD_TIME, PerfMetricType.BUILD_PEAK_CPU_MEMORY,
     PerfMetricType.BUILD_PEAK_GPU_MEMORY, PerfMetricType.ENGINE_SIZE
@@ -410,20 +441,6 @@ INFERENCE_METRICS = [
     PerfMetricType.INFERENCE_TIME,
     PerfMetricType.INFERENCE_PEAK_GPU_MEMORY,
     PerfMetricType.CONTEXT_GPU_MEMORY,
-]
-
-BERT_CPP_INFERENCE_METRICS = [
-    PerfMetricType.INFERENCE_TIME,
-    PerfMetricType.CONTEXT_GPU_MEMORY,
-]
-
-MANAGER_INFERENCE_METRICS = [
-    PerfMetricType.INFERENCE_TIME,
-    PerfMetricType.TOKEN_THROUGHPUT,
-    PerfMetricType.CONTEXT_GPU_MEMORY,
-    PerfMetricType.SEQ_THROUGHPUT,
-    PerfMetricType.SEQ_LATENCY,
-    PerfMetricType.KV_CACHE_SIZE,
 ]
 
 SERVER_BENCHMARK_METRICS = [
@@ -488,6 +505,7 @@ class ServerConfig:
         self,
         name: str,
         model_name: str,
+        gpus: int,
         tp: int,
         ep: int,
         max_num_tokens: int,
@@ -497,7 +515,7 @@ class ServerConfig:
         enable_chunked_prefill: bool = False,
         disable_overlap_scheduler: bool = False,
         moe_backend: str = "",
-        moe_max_num_tokens: str = "",
+        moe_max_num_tokens: int = 0,
         stream_interval: int = 10,
         enable_attention_dp: bool = False,
         attention_dp_balance: bool = False,
@@ -510,6 +528,7 @@ class ServerConfig:
     ):
         self.name = name
         self.model_name = model_name
+        self.gpus = gpus
         self.tp = tp
         self.ep = ep
         self.pp = pp
@@ -543,6 +562,33 @@ class ServerConfig:
             "8000", "--backend", "pytorch", "--extra_llm_api_options",
             config_path
         ]
+
+    def to_db_data(self) -> dict:
+        """Convert ServerConfig to Database data"""
+        return {
+            "s_model_name": self.model_name.lower(),
+            "l_gpus": self.gpus,
+            "l_tp": self.tp,
+            "l_ep": self.ep,
+            "l_pp": self.pp,
+            "l_max_num_tokens": self.max_num_tokens,
+            "b_enable_chunked_prefill": self.enable_chunked_prefill,
+            "b_disable_overlap_scheduler": self.disable_overlap_scheduler,
+            "s_attention_backend": self.attention_backend,
+            "s_moe_backend": self.moe_backend,
+            "l_moe_max_num_tokens": self.moe_max_num_tokens,
+            "l_stream_interval": self.stream_interval,
+            "b_enable_attention_dp": self.enable_attention_dp,
+            "b_attention_dp_balance": self.attention_dp_balance,
+            "l_batching_wait_iters": self.batching_wait_iters,
+            "l_timeout_iters": self.timeout_iters,
+            "s_kv_cache_dtype": self.kv_cache_dtype,
+            "b_enable_block_reuse": self.enable_block_reuse,
+            "d_free_gpu_memory_fraction": self.free_gpu_memory_fraction,
+            "l_max_batch_size": self.max_batch_size,
+            "b_enable_padding": self.enable_padding,
+            "s_server_log_link": "",
+        }
 
     def generate_extra_llm_api_config(self) -> str:
         """Generate extra-llm-api-config.yml content"""
@@ -623,6 +669,17 @@ class ClientConfig:
             str(self.concurrency)
         ]
 
+    def to_db_data(self) -> dict:
+        """Convert ClientConfig to Database data"""
+        return {
+            "l_concurrency": self.concurrency,
+            "l_iterations": self.iterations,
+            "l_isl": self.isl,
+            "l_osl": self.osl,
+            "d_random_range_ratio": self.random_range_ratio,
+            "s_client_log_link": "",
+        }
+
 
 def parse_select_pattern(select_pattern: str):
     """Parse select pattern like 'r1_fp4_dep4,r1_fp4_tep4:con1_iter1_1024_1024,r1_fp4_tep4:con8_iter1_1024_1024'
@@ -699,13 +756,14 @@ def parse_config_file(config_file_path: str, select_pattern: str = None):
         server_config = ServerConfig(
             name=server_config_data['name'],
             model_name=server_config_data['model_name'],
+            gpus=server_config_data['gpus'],
             tp=server_config_data['tp'],
             ep=server_config_data['ep'],
             pp=server_config_data.get('pp', 1),
             attention_backend=server_config_data.get('attention_backend',
                                                      'TRTLLM'),
             moe_backend=server_config_data.get('moe_backend', ''),
-            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', ''),
+            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', 0),
             stream_interval=server_config_data.get('stream_interval', 10),
             enable_attention_dp=server_config_data.get('enable_attention_dp',
                                                        False),
@@ -794,6 +852,8 @@ class PerfTestConfig:
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
+        # only for torch-backend currently
+        extra: bool = False,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-opt",
         free_mem_ratio: float = 0.9,
@@ -852,6 +912,8 @@ class PerfTestConfig:
         self.pp_size = pp_size
         # Number of GPUs.
         self.num_gpus = num_gpus
+        # Extra flag to enable pytorch_model_config reading for TRT backend
+        self.extra = extra
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
         self.free_mem_ratio = free_mem_ratio
@@ -868,7 +930,9 @@ class PerfTestConfig:
         # Used for perf sanity test
         # config_file: YAML path, select_pattern: server/client selection string
         # server_configs: list[ServerConfig], server_client_configs: dict[server_id -> list[ClientConfig]]
+        self.upload_to_db = False
         self.config_file = None
+        self.gpu_type = None
         self.config_path = None
         self.select_pattern = None
         self.server_configs = []
@@ -1027,6 +1091,10 @@ class PerfTestConfig:
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
 
+        # Add extra flag for llm-api-config.yml.
+        if self.extra:
+            entries.append("extra")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -1073,10 +1141,12 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         # Used for perf sanity test
-        if labels[0] == "perf_sanity":
+        if "perf_sanity" in labels[0]:
             assert len(labels) > 1, "perf_sanity test must have a config file!"
             self.runtime = "server-benchmark"
+            self.upload_to_db = "upload" in labels[0]
             self.config_file = labels[1]
+            self.gpu_type = labels[1].replace("l0_", "").lower()
             self.config_path = os.path.join(
                 "tests/scripts/perf-sanity", f"{labels[1]}.yaml"
                 if not labels[1].endswith(".yaml") else labels[1])
@@ -1191,6 +1261,11 @@ class PerfTestConfig:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
 
+        if len(labels) > 0:
+            self.extra = True if labels[0] == "extra" else False
+            if self.extra:
+                labels.pop(0)
+
         assert len(
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
@@ -1269,21 +1344,6 @@ class PerfTestConfig:
         if self.gpu_weights_percent != -1:
             assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
         if not self.build_only:
-            if self.runtime != "cppmanager" and self.runtime != "bench":
-                print(f"runtime: {self.runtime}")
-                # Validate max batch size.
-                if self.max_batch_size > 0:
-                    assert max(
-                        self.batch_sizes
-                    ) <= self.max_batch_size, f"Batch Size larger than Max Batch Size!"
-                    # Validate bs, seq lens, and num_beams.
-                    assert len(
-                        self.batch_sizes
-                    ) > 0 and self.batch_sizes[0] > 0, f"Empty batch sizes!"
-                assert self.static_batching == "", f"Static Batching only valid for gptManagerBenchmark!"
-                assert self.api == "", f"API Type only valid for gptManagerBenchmark!"
-                assert self.streaming == "", f"Streaming only valid for gptManagerBenchmark and trtllm-bench!"
-
             assert len(self.input_lens) > 0, f"Empty input_lens!"
             if self.is_bert_like():
                 assert len(
@@ -1395,6 +1455,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # This will store the currently running metric.
         self._current_metric = None
         self.lora_dirs = []
+        # This will store each test's result
+        self._test_results = {}
 
     def get_test_name(self) -> str:
         return str(self._config)
@@ -1443,54 +1505,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._perf_cache_fpath = perf_cache_fpath
         self._llm_root = llm_root
         self._gpu_clock_lock = gpu_clock_lock
-
-    def get_convert_weights_command(self, model_dir, engine_dir) -> str:
-        """
-        Get the convert checkpoint command.
-        """
-        if "phi" in self._config.model_name:
-            example_name = "phi"
-        else:
-            example_name = "llama"
-
-        if self._config.quantization != "":
-            command, checkpoint_dir = quantize_data(
-                llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples", "models",
-                                          "core", example_name),
-                model_dir=model_dir,
-                calib_dataset=os.path.join(llm_models_root(), "datasets",
-                                           "cnn_dailymail"),
-                dtype=self._config.data_type,
-                qformat=self._config.quantization,
-                tp_size=self._config.tp_size,
-                pp_size=self._config.pp_size,
-                quantize_dir=engine_dir)
-        else:
-            command, checkpoint_dir = convert_weights(
-                llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples", "models",
-                                          "core", example_name),
-                cmodel_dir=engine_dir,
-                model=self._config.model_name,
-                model_path=model_dir,
-                tp_size=self._config.tp_size,
-                pp_size=self._config.pp_size,
-                data_type=self._config.data_type)
-        command = [f"python3"] + command
-
-        return command, checkpoint_dir
-
-    def get_convert_lora_weights_command(self, model_dir, engine_dir) -> str:
-        script = os.path.join(self._llm_root, "examples", "hf_lora_convert.py")
-        checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-        command = [
-            script, f"-i={model_dir}", "--storage-type=float16",
-            f"-o={checkpoint_dir}"
-        ]
-        command = [f"python3"] + command
-
-        return command, checkpoint_dir
 
     def get_trtllm_server_client_commands(self):
         server_cmds = []
@@ -1598,44 +1612,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             build_cmd.append(f"--trust_remote_code=True")
         return build_cmd
 
-    def get_benchmark_build_command(self, engine_dir) -> list:
-        mode_flag = self._config.mode.replace("_", "-")
-        build_cmd = [
-            self._build_script, f"--model={self._config.model_name}",
-            "--log_level=info", f"--mode={mode_flag}",
-            f"--dtype={self._config.data_type}", f"--output_dir={engine_dir}",
-            "--monitor_memory"
-        ]
-        if self._config.quantization != "":
-            build_cmd.append(f"--quantization={self._config.quantization}")
-        num_beams = self._config.num_beams
-        if num_beams > 1:
-            build_cmd.append(f"--max_beam_width={num_beams}")
-        gpu_percent = self._config.gpu_weights_percent
-        if gpu_percent != -1:
-            build_cmd += [f"--weight_streaming"]
-        if self._config.max_batch_size > 0:
-            build_cmd.append(f"--max_batch_size={self._config.max_batch_size}")
-
-        # For performance data stability, set opt_num_token/opt_batch_size to 8 when max batch size is greater than 8.
-        # The script will use the settings from allow_configs.py if max_batch_size is set to 0,
-        # opt_num_token/opt_batch_size is also necessary for stability.
-        if self._config.max_batch_size > 8 or self._config.max_batch_size == 0:
-            if self._config.mode in ["plugin_ifb", "plugin", 'ootb_except_mha']:
-                build_cmd.append("--opt_num_tokens=8")
-            else:
-                build_cmd.append("--opt_batch_size=8")
-        # For Multiple Profiles
-        if self._config.multiple_profiles:
-            build_cmd.append("--multiple_profiles")
-        # For engine inspector
-        build_cmd.append("--profiling_verbosity=layer_names_only")
-        if TIMING_CACHE_DIR and not self._config.build_only:
-            timing_cache = os.path.join(TIMING_CACHE_DIR, "model.cache")
-            build_cmd.append(f"--input_timing_cache={timing_cache}")
-            build_cmd.append(f"--output_timing_cache={timing_cache}")
-        return build_cmd
-
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
         data_cmd = []
@@ -1686,28 +1662,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
                     f" > {dataset_path}"
                 ]
-            elif self._config.backend == "cppmanager":
-                data_cmd += [
-                    "python3", prepare_data_script, f"--stdout",
-                    f"--rand-task-id 0 {nloras-1}",
-                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
-                    f"--num-requests={self._config.num_reqs}",
-                    f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
-                ]
-                # generate LoRA weights for C++ runtime
-                # the lora_dir is $engine_dir/loras. This is populated by the convert_lora_cmd executed before this.
-                # The generate_rand_loras.py will create random lora weights to $engine_dir/lora_cpp.
-                generate_rand_lora_script = os.path.join(
-                    self._llm_root, "benchmarks", "cpp", "utils",
-                    "generate_rand_loras.py")
-                checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-                data_cmd += [
-                    "python3", generate_rand_lora_script, checkpoint_dir,
-                    lora_dir,
-                    str(nloras)
-                ]
 
             else:
                 pytest.skip(
@@ -1736,78 +1690,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 ]
 
         return data_cmd
-
-    def get_python_runtime_benchmark_command(self, engine_dir, bs, input_len,
-                                             output_len):
-        benchmark_cmd = [
-            self._benchmark_script,
-        ]
-        if self._config.is_bert_like():
-            model = "enc"
-            benchmark_cmd.append(f"--engine_dir={engine_dir}")
-        elif self._config.is_enc_dec():
-            model = "enc-dec"
-            benchmark_cmd.append(
-                f"--encoder_engine_dir={os.path.join(engine_dir, 'encoder')}")
-            benchmark_cmd.append(
-                f"--decoder_engine_dir={os.path.join(engine_dir, 'decoder')}")
-
-        else:
-            model = "dec"
-            benchmark_cmd.append(f"--engine_dir={engine_dir}")
-        benchmark_cmd.append(f"--model={model}")
-        benchmark_cmd += [f"--batch_size={bs}"]
-        # Use 3 warm-up runs and minimum of 10 actual runs and minimum of 10 seconds for now.
-        benchmark_cmd += [f"--warm_up=3", f"--num_runs=10", f"--duration=10"]
-        benchmark_cmd += [f"--dtype={self._config.data_type}"]
-        if self._config.is_bert_like():
-            benchmark_cmd.append(f"--input_len={input_len}")
-        else:
-            benchmark_cmd.append(f"--input_output_len={input_len},{output_len}")
-        # Weight streaming don't support CUDA Graph for now.
-        gpu_percent = self._config.gpu_weights_percent
-        if gpu_percent == -1:
-            benchmark_cmd.append(f"--enable_cuda_graph")
-        return benchmark_cmd
-
-    def get_gpt_session_runtime_benchmark_command(self, engine_dir, bs,
-                                                  input_len, output_len):
-        benchmark_cmd = [
-            self._benchmark_script,
-            # This is required to get context GPU info
-            f"--log_level=info",
-        ]
-        benchmark_cmd.append(f"--engine_dir={engine_dir}")
-        if self._config.is_bert_like():
-            benchmark_cmd.append(f"--model={self._config.model_name}")
-        num_beams = self._config.num_beams
-        if num_beams > 1:
-            benchmark_cmd.append(f"--beam_width={num_beams}")
-        gpu_percent = self._config.gpu_weights_percent
-        if gpu_percent != -1:
-            benchmark_cmd.append(f"--gpu_weights_percent={gpu_percent}")
-        benchmark_cmd += [f"--batch_size={bs}"]
-        # Use 3 warm-up runs and minimum of 10 actual runs and minimum of 10 seconds for now.
-        benchmark_cmd += [f"--warm_up=3", f"--num_runs=10", f"--duration=10"]
-        if not self._config.is_bert_like() and not self._config.is_enc_dec(
-        ) and not self._config.is_mamba_family() and self._config.num_gpus < 8:
-            # Dump layer information and per-layer profile
-            benchmark_cmd += ["--dump_layer_info", "--dump_profile"]
-
-        # For GPT Models and enc-dec Models
-        if not self._config.is_bert_like():
-            benchmark_cmd.append(f"--input_output_len={input_len},{output_len}")
-            # Weight streaming don't support CUDA Graph for now.
-            # MoE OOTB doesn't support CUDA Graph
-            gpu_percent = self._config.gpu_weights_percent
-            if gpu_percent == -1 and not (self._config.is_moe_family()
-                                          and self._config.mode
-                                          in ['ootb', 'ootb_except_mha']):
-                benchmark_cmd.append(f"--enable_cuda_graph")
-        # For BERT Models:
-        else:
-            benchmark_cmd.append(f"--input_len={input_len}")
-        return benchmark_cmd
 
     def get_trtllm_bench_command(self, engine_dir):
         model_dir = self.get_trtllm_bench_model()
@@ -1850,21 +1732,29 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
-        #use default yaml config
-        if self._config.backend == "pytorch":
-            import yaml
+        if self._config.num_gpus > 1:
+            benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
+
+        #Add extra-llm-api-config.yml for pytorch backend and tensorrt backend with extra flag
+        if self._config.backend == "pytorch" or (self._config.backend == ""
+                                                 and self._config.extra):
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
             config = get_model_yaml_config(self._config.to_string(),
                                            lora_dirs=self.lora_dirs)
-            print_info(f"pytorch model config: {config}")
-            with open(pytorch_config_path, 'w') as f:
-                yaml.dump(config, f, default_flow_style=False)
-            benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
+            if config:
+                print_info(f"pytorch/TRT model config: {config}")
+                with open(pytorch_config_path, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False)
+                benchmark_cmd += [
+                    f"--extra_llm_api_options={pytorch_config_path}"
+                ]
+                # If guided_decoding_backend is set, we need to initialize tokenizer
+                if config.get('guided_decoding_backend') is not None:
+                    benchmark_cmd += ["--no_skip_tokenizer_init"]
         elif self._config.backend == "_autodeploy":
-            import yaml
             autodeploy_config_path = os.path.join(engine_dir,
                                                   "extra_llm_api_options.yaml")
             if not os.path.exists(autodeploy_config_path):
@@ -1891,65 +1781,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [
                 f"--extra_llm_api_options={autodeploy_config_path}"
             ]
-        return benchmark_cmd
-
-    def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,
-                                                  input_len):
-        benchmark_cmd = [
-            self._benchmark_script,
-            # This is required to get context GPU info
-            f"--log_level=info",
-        ]
-        if self._config.is_enc_dec():
-            benchmark_cmd.append(
-                f"--encoder_engine_dir={os.path.join(engine_dir, 'encoder')}")
-            benchmark_cmd.append(
-                f"--decoder_engine_dir={os.path.join(engine_dir, 'decoder')}")
-        else:
-            benchmark_cmd.append(f"--engine_dir={engine_dir}")
-
-        num_beams = self._config.num_beams
-        if num_beams > 1:
-            benchmark_cmd.append(f"--beam_width={num_beams}")
-        gpu_percent = self._config.gpu_weights_percent
-        if gpu_percent != -1:
-            benchmark_cmd.append(f"--gpu_weights_percent={gpu_percent}")
-        if self._config.num_loras > 0:
-            nloras = self._config.num_loras
-            dataset_path = os.path.join(engine_dir,
-                                        f"token-norm-dist-lora-{nloras}.json")
-            lora_dir = os.path.join(engine_dir, f"loras")
-
-            eos_id = 2
-            num_layers = 32 if "mixtral" in self._config.model_name else 40
-            num_lora_mods = 8 if "mixtral" in self._config.model_name else 7
-            max_lora_rank = 64
-            benchmark_cmd += [f"--lora_host_cache_bytes=8589934592"]
-            benchmark_cmd += [
-                f"--lora_num_device_mod_layers={32 * num_layers * num_lora_mods * max_lora_rank}"
-            ]
-            benchmark_cmd += [f"--eos_id={eos_id}"]
-            benchmark_cmd += [f"--lora_dir={lora_dir}"]
-        else:
-            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
-        benchmark_cmd += [f"--dataset={dataset_path}"]
-        # API Type is executor
-        if self._config.api == "exe":
-            benchmark_cmd += [f"--api=executor"]
-        if self._config.mode == "plugin_ifb":
-            benchmark_cmd += [
-                f"--type=UIFB"
-            ] if self._config.is_mamba_family() else ["--type=IFB"]
-        else:
-            benchmark_cmd += [f"--type=V1"]
-        if self._config.streaming == "streaming":
-            benchmark_cmd += [f"--streaming"]
-            benchmark_cmd += [f"--scheduler_policy=max_utilization"]
-        if self._config.static_batching == "static_batching":
-            benchmark_cmd += [f"--static_emulated_batch_size={bs}"]
-        if self._config.concurrency != -1:
-            benchmark_cmd += [f"--concurrency={self._config.concurrency}"]
-
+        # for sampler options
+        sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
+        if not os.path.exists(sampler_options_path):
+            os.makedirs(os.path.dirname(sampler_options_path), exist_ok=True)
+        sampler_config = get_sampler_options_config(self._config.to_string())
+        print_info(f"sampler options config: {sampler_config}")
+        with open(sampler_options_path, 'w') as f:
+            yaml.dump(sampler_config, f, default_flow_style=False)
+        benchmark_cmd += [f"--sampler_options={sampler_options_path}"]
         return benchmark_cmd
 
     def get_commands(self):
@@ -1992,39 +1832,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         # Construct engine build command.
         engine_dir = self._get_engine_dir()
-        convert_cmd = []
         build_cmd = []
-        if self._build_script == "trtllm-build" and self._config.model_name in MODEL_PATH_DICT.keys(
-        ):
-            model_path = MODEL_PATH_DICT[self._config.model_name]
-            model_dir = os.path.join(llm_models_root(), model_path)
-            if not os.path.exists(engine_dir):
-                os.makedirs(engine_dir, exist_ok=True)
-            convert_cmd, checkpoint_dir = self.get_convert_weights_command(
-                model_dir, engine_dir)
-            if self._config.num_loras > 0:
-                if self._config.model_name in LORA_MODEL_PATH.keys():
-                    model_dir = os.path.join(
-                        llm_models_root(),
-                        LORA_MODEL_PATH[self._config.model_name])
-                    convert_lora_cmd, lora_checkpoint_dir = self.get_convert_lora_weights_command(
-                        model_dir, engine_dir)
-                    convert_cmd += [";"]
-                    convert_cmd += convert_lora_cmd
-                else:
-                    pytest.skip(
-                        f"There is no LoRA weights model for {self._config.model_name}"
-                    )
-            build_cmd = self.get_trtllm_build_command(engine_dir,
-                                                      checkpoint_dir)
-        elif self._config.runtime == "bench":
+        if self._config.runtime == "bench":
             if self._config.backend in ["pytorch", "_autodeploy"]:
                 # Skip building process as it is pytorch or _autodeploy backend")
                 pass
             else:
                 build_cmd = self.get_trtllm_bench_build_command(engine_dir)
         else:
-            build_cmd = self.get_benchmark_build_command(engine_dir)
+            pytest.skip("only support trtllm-bench runtime for now")
         # Construct prepare synthetic data command
         data_cmds = []
 
@@ -2034,22 +1850,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             for len_idx, input_len in enumerate(self._config.input_lens):
                 output_len = None if self._config.is_bert_like(
                 ) else self._config.output_lens[len_idx]
-                if is_python:
-                    benchmark_cmd = self.get_python_runtime_benchmark_command(
-                        engine_dir, bs, input_len, output_len)
-                elif self._config.runtime == "bench":
+                if self._config.runtime == "bench":
                     benchmark_cmd = self.get_trtllm_bench_command(engine_dir)
-                elif self._config.runtime == "cpp":
-                    benchmark_cmd = self.get_gpt_session_runtime_benchmark_command(
-                        engine_dir, bs, input_len, output_len)
                 else:
-                    benchmark_cmd = self.get_gpt_manager_runtime_benchmark_command(
-                        engine_dir, bs, input_len)
+                    pytest.skip("only support trtllm-bench runtime for now")
                 benchmark_cmds.append(benchmark_cmd)
-                if not self._config.runtime == "cpp" and not is_python:
-                    data_cmd = self.get_prepare_data_command(
-                        engine_dir, input_len, output_len)
-                    data_cmds.append(data_cmd)
+                data_cmd = self.get_prepare_data_command(
+                    engine_dir, input_len, output_len)
+                data_cmds.append(data_cmd)
 
         # Construct MPI command.
         mpi_cmd = []
@@ -2065,8 +1873,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
                                            mpi_cmd, is_python)
         else:
-            return PerfScriptTestCmds(convert_cmd, build_cmd, data_cmds,
-                                      benchmark_cmds, mpi_cmd, is_python)
+            pytest.skip("only support trtllm-bench runtime for now")
 
     def get_perf_result(self, outputs: Dict[int, str]) -> float:
         """
@@ -2089,7 +1896,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             metric.metric_regex.search(line)
             for line in outputs[cmd_idx].split("\n")
         ]
-        print_info(outputs[cmd_idx].split("\n"))
         metric_values = []
         for match in regex_matches:
             if match:
@@ -2103,9 +1909,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     metric_values.append(float(value))
 
         if len(metric_values) == 0:
-            if self._build_script == "trtllm-build" and metric.metric_type == PerfMetricType.ENGINE_SIZE:
-                metric_values = [0.0]
-            elif self._build_script == "trtllm-bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
+            if self._build_script == "trtllm-bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
                 print_info("skip building process for multi-gpu test"
                            )  #https://nvbugspro.nvidia.com/bug/5210111
                 metric_values = [0.0]
@@ -2191,6 +1995,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             #prepare dataset first for trtllm-bench
             print_info(f"Running command for generating dataset")
             outputs = self.run_ex("prepare_dataset",
+                                  None,
                                   llm_venv,
                                   gpu_clock_lock,
                                   session_data_writer,
@@ -2231,6 +2036,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 print_info(f"Running command for {metric.metric_name}")
                 outputs = self.run_ex(
                     metric.metric_name,
+                    metric.metric_type,
                     llm_venv,
                     gpu_clock_lock,
                     session_data_writer,
@@ -2244,6 +2050,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 result_states[self._current_cmd_idx] = result_state
                 if result_state != "valid":
                     errors.append(self.get_error())
+                    if self._current_cmd_idx in self._test_results:
+                        del self._test_results[self._current_cmd_idx]
+
+            self.upload_test_results_to_database()
+
         finally:
             # Clean up engine dir after use.
             shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
@@ -2263,6 +2074,69 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
             raise RuntimeError(msg)
 
+    def upload_test_results_to_database(self):
+        """
+        Upload the test results and baseline to database.
+        """
+        # Currently only server-benchmark need to store the test result.
+        if self._config.runtime == "server-benchmark":
+            job_config = get_job_info()
+            job_config["s_gpu_type"] = self._config.gpu_type
+            is_post_merge = job_config["b_is_post_merge"]
+            new_data_dict = {}
+            cmd_idx = 0
+            for server_idx, client_configs in self._config.server_client_configs.items(
+            ):
+                server_config = self._config.server_configs[server_idx]
+                server_config_dict = server_config.to_db_data()
+                for client_config in client_configs:
+                    client_config_dict = client_config.to_db_data()
+                    # If cmd_idx not in self._test_results or some metrics missing, skip this cmd_idx
+                    if cmd_idx not in self._test_results or not all(
+                            metric_type in self._test_results[cmd_idx]
+                            for metric_type in SERVER_BENCHMARK_METRICS):
+                        print_info(
+                            f"Skipped posting command {cmd_idx} 's test results since some metrics are missing in test results."
+                        )
+                        cmd_idx += 1
+                        continue
+                    new_data = {}
+                    new_data.update(job_config)
+                    new_data.update(server_config_dict)
+                    new_data.update(client_config_dict)
+                    for metric_type in SERVER_BENCHMARK_METRICS:
+                        new_data[
+                            f"d_{PERF_METRIC_STRING[metric_type]}"] = self._test_results[
+                                cmd_idx][metric_type]
+                    add_id(new_data)
+                    new_data_dict[cmd_idx] = new_data
+                    cmd_idx += 1
+
+            # Get history data for each cmd_idx
+            history_baseline_dict, history_data_dict = get_history_data(
+                new_data_dict)
+            # Prepare regressive test cases
+            regressive_data_list = prepare_regressive_test_cases(
+                history_baseline_dict, new_data_dict)
+
+            if is_post_merge:
+                # Prepare new baseline data for post-merge
+                new_baseline_data_dict = prepare_baseline_data(
+                    history_baseline_dict, history_data_dict, new_data_dict)
+            else:
+                # Pre-merge does not need to upload baseline data
+                new_baseline_data_dict = None
+
+            if self._config.upload_to_db:
+                # Upload the new perf data and baseline data to database
+                post_new_perf_data(new_baseline_data_dict, new_data_dict,
+                                   regressive_data_list)
+
+            # Print regressive test cases
+            print_regressive_test_cases(regressive_data_list)
+        else:
+            return
+
     def _get_engine_dir(self) -> str:
         """
         Get the engine directory to store the engine.
@@ -2275,7 +2149,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
         Generate all the metric configs for the current test.
         """
-
         metrics = []
         if self._config.runtime == "server-benchmark":
             cmd_idx = 0
@@ -2365,21 +2238,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         metric_types.append(PerfMetricType.OUTPUT_TOKEN_TIME)
                 else:
                     metric_types = INFERENCE_METRICS.copy()
-                if self._config.runtime == "cpp":
-                    metric_types.append(PerfMetricType.TOKEN_THROUGHPUT)
-
-                if self._config.runtime == "cppmanager":
-                    metric_types = MANAGER_INFERENCE_METRICS.copy()
-                    if self._config.streaming == "streaming":
-                        metric_types.append(PerfMetricType.FIRST_TOKEN_TIME)
-                    if self._config.mode != "plugin_ifb" or self._config.is_mamba_family(
-                    ):
-                        metric_types.remove(PerfMetricType.KV_CACHE_SIZE)
-                if self._config.is_bert_like(
-                ) and self._config.runtime == "cpp":
-                    # TODO: bertBenchmark does not report peak GPU memory yet.
-                    metric_types = BERT_CPP_INFERENCE_METRICS
-
                 for metric_type in metric_types:
                     metrics.append(
                         PerfTestMetric(
@@ -2450,9 +2308,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 raise ValueError(f"Unexpected metric_type: {metric_type}")
             return SERVER_BENCHMARK_PERF_METRIC_LOG_QUERIES[metric_type]
         else:
-            if metric_type not in PERF_METRIC_LOG_QUERIES:
-                raise ValueError(f"Unexpected metric_type: {metric_type}")
-            return PERF_METRIC_LOG_QUERIES[metric_type]
+            pytest.skip("only support trtllm-bench runtime for now")
 
     def _get_metric_threshold(self, metric_type: PerfMetricType) -> float:
         """

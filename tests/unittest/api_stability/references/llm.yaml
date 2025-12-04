@@ -18,6 +18,10 @@ methods:
         annotation: Optional[dict]
         default: null
         status: prototype
+      pp_partition:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
       # Stats
       iter_stats_max_iterations:
         annotation: Optional[int]
@@ -103,6 +107,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      disable_flashinfer_sampling:
+        annotation: bool
+        default: False
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -187,6 +195,22 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
         default: null
         status: prototype
+      otlp_traces_endpoint:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      ray_worker_extension_cls:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      enable_sleep:
+        annotation: bool
+        default: False
+        status: prototype
+      env_overrides:
+        annotation: Optional[Dict[str, str]]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -218,6 +242,10 @@ methods:
       cache_salt:
         annotation: Optional[str]
         default: null
+      trace_headers:
+        annotation: Optional[Mapping[str, str]]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:

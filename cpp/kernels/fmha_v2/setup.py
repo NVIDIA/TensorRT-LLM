@@ -1,12 +1,17 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 import subprocess
@@ -3063,7 +3068,9 @@ def get_kernel_traits_code(specs_names):
 # 2. Hopper sm89 with e4m3/e4m3_fp32 dtype uses cubins for accuracy regressions (will be fixed).
 # You should set the condition `use_cubin_header` to false if you have modified the source codes of those kernels that use cubins.
 # This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
-def use_cubin_header(sm, head_size, dtype):
+def use_cubin_header(sm, head_size, dtype, output_dtype=None):
+    if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
+        return False
     return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
 
 
@@ -3074,7 +3081,7 @@ def get_cubin_header(kernel_traits, specs_names):
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:
         if generate_cu_trtllm and not use_cubin_header(
-                kspec.sm, kspec.head_size, kspec.dtype):
+                kspec.sm, kspec.head_size, kspec.dtype, kspec.output_dtype):
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3229,7 +3236,8 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if use_cubin_header(int(sm), int(head_size), prec.lower()):
+                    if use_cubin_header(int(sm), int(head_size), prec.lower(),
+                                        output_prec.lower()):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3248,8 +3256,9 @@ def get_cubin_header(kernel_traits, specs_names):
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
-'''.format(**locals()) if use_cubin_header(int(sm), int(head_size),
-                                           prec.lower()) else '''\
+'''.format(**locals()) if use_cubin_header(int(sm),
+                                           int(head_size), prec.lower(),
+                                           output_prec.lower()) else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
@@ -3791,7 +3800,7 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
             continue
         # for normal attention, we do not need return softmax for ws fp8 kernels currently.
         # also fp8 input and bf16 output is only needed for MLA kernel.
-        skip_combination = return_softmax or (output_dtype is not None)
+        skip_combination = return_softmax
         # for context mla, we need separate qkv as input layout when returning softmax.
         skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
         if not skip_combination:
@@ -6383,6 +6392,16 @@ def enumerate_kernels():
                   or  (kspec.sm           == 100
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
                   and kspec.head_size     == 80
+                  and kspec.head_size_v   == 0
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == True
+                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
+                  # Gemma3 VL support.
+                  or  (kspec.sm           == 100
+                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
+                  and kspec.head_size     == 72
                   and kspec.head_size_v   == 0
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2

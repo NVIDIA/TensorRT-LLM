@@ -63,8 +63,8 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     x_ref = x.clone()
-    # Run CUDA cached op
-    y = torch.ops.auto_deploy.cuda_cached_causal_conv1d(
+    # Run CUDA cached op (modifies x in-place and returns None)
+    torch.ops.auto_deploy.cuda_cached_causal_conv1d(
         # INPUTS
         x,
         w,
@@ -82,7 +82,9 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
         d,
         g,
         pm,
+        None,
     )
+    y = x  # The op modifies x in-place
 
     assert y.shape == (batch, seq, c)
     assert torch.isfinite(y).all()
@@ -185,15 +187,9 @@ def test_prepare_metadata_cuda(conv_env):
     pages_per_seq = torch.ones(b, device=device, dtype=torch.int32)
     slot_idx = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32)
     page_size = 128
-
+    chunk_size = 128
     out = torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata(
-        position_ids,
-        seq_len,
-        input_pos,
-        cache_loc,
-        pages_per_seq,
-        slot_idx,
-        page_size,
+        position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
     )
     assert len(out) == 4
     seq_len_s, seq_start, slot_s, use_initial_states = out

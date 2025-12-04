@@ -3,6 +3,7 @@ import copy
 import inspect
 import os
 import pathlib
+from collections.abc import Mapping
 from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from pprint import pprint
 from types import MethodType, NoneType

@@ -8,6 +8,10 @@ import torch
 from tensorrt_llm.logger import logger
 
 
+def get_size_in_byte(target_shape: list[int], target_dtype: torch.dtype):
+    return math.prod(target_shape) * target_dtype.itemsize
+
+
 @dataclass
 class BufferBlock:
     """A container for a buffer tensor and its state."""
@@ -36,20 +40,26 @@ class Buffers:
                  target_dtype: torch.dtype) -> torch.Tensor:
         """Safely creates a view of a raw byte buffer with the desired shape and dtype."""
         # The buffer is stored as uint8, so its numel is its size in bytes.
-        required_size_in_bytes = math.prod(target_shape) * target_dtype.itemsize
-        if buffer.numel() < required_size_in_bytes:
+        required_memory_size = get_size_in_byte(target_shape, target_dtype)
+        if buffer.numel() < required_memory_size:
             raise ValueError(
                 "Buffer is too small for the requested shape and dtype.")
 
         # Slice the buffer to the exact required size, then view it with the correct type and shape.
-        return buffer[:required_size_in_bytes].view(target_dtype).view(
+        return buffer[:required_memory_size].view(target_dtype).view(
             target_shape)
 
     def get_buffer(self, tensor_shape: list[int], dtype: torch.dtype,
                    buffer_name: str, reserve_buffer: bool):
+        """Return a reusable buffer view for the requested shape/dtype.
+        The returned tensor is backed by an underlying `torch.uint8` buffer. When
+        no suitable buffer exists in the pool, a new tensor is created via
+        `torch.empty`, so its contents are uninitialized. Overwrite the data before use if needed.
+        """
 
         # all buffers are allocated with 1 byte element size
         required_memory_size = math.prod(tensor_shape) * dtype.itemsize
+
         candidate_blocks = self.buffers.get(buffer_name, [])
 
         # Find the best-fit available buffer.
@@ -86,7 +96,7 @@ class Buffers:
         new_buffer_tensor = None
         try:
             with torch.cuda.memory.use_mem_pool(get_shared_pool()):
-                new_buffer_tensor = torch.zeros((required_memory_size, ),
+                new_buffer_tensor = torch.empty((required_memory_size, ),
                                                 device='cuda',
                                                 dtype=torch.uint8)
         except Exception as ex:
@@ -96,7 +106,7 @@ class Buffers:
             )
             # if exception happens during allocating memory from shared pool, retry
             # to allocate from default pool
-            new_buffer_tensor = torch.zeros((required_memory_size, ),
+            new_buffer_tensor = torch.empty((required_memory_size, ),
                                             device='cuda',
                                             dtype=torch.uint8)
 

@@ -165,6 +165,7 @@ class SamplingParams:
         repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         presence_penalty (float, optional): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
         frequency_penalty (float, optional): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
+        prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have no effect. Values > input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.
         length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
         early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
         no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
@@ -232,6 +233,7 @@ class SamplingParams:
     repetition_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
+    prompt_ignore_length: Optional[int] = None
     length_penalty: Optional[float] = None
     early_stopping: Optional[int] = None
     no_repeat_ngram_size: Optional[int] = None
@@ -392,6 +394,25 @@ class SamplingParams:
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
             self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+
+        # add generation_config to stop word list, only in qwen3-next now
+        if (
+            hf_model_config is not None
+            and hf_model_config.model_type == "qwen3_next"
+            and generation_config is not None
+            and isinstance(generation_config.eos_token_id, List)
+            and all(isinstance(i, int) for i in generation_config.eos_token_id)
+        ):
+            if self._stop_word_ids:
+                all_stop_tokens_id = set(i for sublist in self._stop_word_ids for i in sublist)
+                from_generation_stop_tokens = [
+                    i for i in generation_config.eos_token_id if i not in all_stop_tokens_id
+                ]
+
+                if from_generation_stop_tokens:
+                    self._stop_word_ids.append(from_generation_stop_tokens)
+            else:
+                self._stop_word_ids = [generation_config.eos_token_id]
 
         return self
 

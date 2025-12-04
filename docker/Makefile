@@ -75,8 +75,16 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
+base_pull:
+	@echo "Pulling base image: $(BASE_IMAGE):$(BASE_TAG)"
+	docker pull $(BASE_IMAGE):$(BASE_TAG)
+
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
-%_build:
+%_build: SH_ENV      = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+				  	   | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: BASH_ENV    = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				   | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: base_pull
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
@@ -97,6 +105,8 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
+		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -192,16 +202,17 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 13.0.0-devel-rockylinux8
+# [TODO] Update to NVIDIA CUDA 13.0.2 when it's available
+jenkins-rockylinux8_%: BASE_TAG = 13.0.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-rockylinux8_%: BASE_TAG = 13.0.0-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 13.0.1-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu22_%: BASE_TAG = 13.0.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 13.0.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

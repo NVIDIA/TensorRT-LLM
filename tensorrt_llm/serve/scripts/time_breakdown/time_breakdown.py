@@ -109,6 +109,15 @@ class TimingMetricsConfig:
                 end_field='ctx_server_first_token_time',
                 server_type='ctx'),
             TimingMetric(
+                name='disagg_relay',
+                display_name='Disagg Relay',
+                color='#000000',  # Black
+                description=
+                'Time duration from context server sends the first token response to the generation server receives it',
+                start_field='ctx_server_first_token_time',
+                end_field='gen_server_arrival_time',
+                server_type='disagg'),
+            TimingMetric(
                 name='gen_preprocessing',
                 display_name='Generation Preprocessing',
                 color='#FFE66D',  # Bright yellow
@@ -181,27 +190,31 @@ class RequestDataParser:
             ctx_metrics = request_data.get('perf_metrics',
                                            {}).get('timing_metrics', {})
 
-        ctx_arrival_time = ctx_metrics.get('arrival_time', 0)
-        ctx_first_scheduled_time = ctx_metrics.get('first_scheduled_time', 0)
-        ctx_first_token_time = ctx_metrics.get('first_token_time', 0)
-        ctx_server_arrival_time = ctx_metrics.get('server_arrival_time', 0)
+        ctx_arrival_time = ctx_metrics.get('arrival_time', float('nan'))
+        ctx_first_scheduled_time = ctx_metrics.get('first_scheduled_time',
+                                                   float('nan'))
+        ctx_first_token_time = ctx_metrics.get('first_token_time', float('nan'))
+        ctx_server_arrival_time = ctx_metrics.get('server_arrival_time',
+                                                  float('nan'))
         ctx_server_first_token_time = ctx_metrics.get('server_first_token_time',
-                                                      0)
+                                                      float('nan'))
 
         gen_server_first_token_time = gen_metrics.get('server_first_token_time',
-                                                      0)
-        gen_server_arrival_time = gen_metrics.get('server_arrival_time', 0)
-        gen_arrival_time = gen_metrics.get('arrival_time', 0)
-        gen_first_token_time = gen_metrics.get('first_token_time', 0)
-        gen_first_scheduled_time = gen_metrics.get('first_scheduled_time', 0)
+                                                      float('nan'))
+        gen_server_arrival_time = gen_metrics.get('server_arrival_time',
+                                                  float('nan'))
+        gen_arrival_time = gen_metrics.get('arrival_time', float('nan'))
+        gen_first_token_time = gen_metrics.get('first_token_time', float('nan'))
+        gen_first_scheduled_time = gen_metrics.get('first_scheduled_time',
+                                                   float('nan'))
 
-        disagg_server_arrival_time = 0
-        disagg_server_first_token_time = 0
+        disagg_server_arrival_time = float('nan')
+        disagg_server_first_token_time = float('nan')
         if is_disaggregated:
             disagg_server_arrival_time = request_data.get(
-                'disagg_server_arrival_time', 0)
+                'disagg_server_arrival_time', float('nan'))
             disagg_server_first_token_time = request_data.get(
-                'disagg_server_first_token_time', 0)
+                'disagg_server_first_token_time', float('nan'))
 
         # Get request ID
         if is_disaggregated:

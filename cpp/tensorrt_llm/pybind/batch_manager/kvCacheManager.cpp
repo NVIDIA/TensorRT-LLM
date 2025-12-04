@@ -223,6 +223,12 @@ public:
             tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getPrimaryPool, poolIdx);
     }
 
+    tensorrt_llm::runtime::ITensor::SharedPtr getIndexerKCachePool() const override
+    {
+        PYBIND11_OVERLOAD_PURE(
+            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getIndexerKCachePool);
+    }
+
     tensorrt_llm::runtime::ITensor::SharedPtr getUniquePrimaryPool() const override
     {
         PYBIND11_OVERLOAD_PURE(
@@ -232,6 +238,11 @@ public:
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getPoolLayerIdx, layer_idx);
+    }
+
+    void syncTransferManagerWithBufferManager() override
+    {
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, syncTransferManagerWithBufferManager);
     }
 
     void refreshBlocks() override
@@ -412,6 +423,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             },
             py::call_guard<py::gil_scoped_release>())
         .def(
+            "get_indexer_k_cache_pool_data",
+            [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
+                return pool.index({torch::indexing::Slice(), layer_idx});
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             py::call_guard<py::gil_scoped_release>())
         .def(
@@ -471,8 +490,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::call_guard<py::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             py::call_guard<py::gil_scoped_release>())
+        .def("sync_transfer_manager_with_buffer_manager", &BaseKVCacheManager::syncTransferManagerWithBufferManager,
+            py::call_guard<py::gil_scoped_release>())
+        .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, py::call_guard<py::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, py::call_guard<py::gil_scoped_release>())
-        .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, py::call_guard<py::gil_scoped_release>());
+        .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, py::call_guard<py::gil_scoped_release>())
+        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)
@@ -485,7 +508,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_per_window"), py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window_vec"), py::arg("temp_attention_window_inputs"), py::arg("dtype"),
@@ -494,7 +517,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
             py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true,
-            py::arg("kv_connector_manager") = nullptr, py::call_guard<py::gil_scoped_release>());
+            py::arg("kv_connector_manager") = nullptr, py::arg("enable_indexer_k_cache") = false,
+            py::arg("indexer_k_cache_quant_block_size") = 128, py::arg("indexer_k_cache_index_head_dim") = 0,
+            py::call_guard<py::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)

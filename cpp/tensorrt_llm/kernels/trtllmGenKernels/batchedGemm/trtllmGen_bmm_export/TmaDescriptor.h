@@ -22,8 +22,6 @@
 
 #ifdef TLLM_ENABLE_CUDA
 #include <cuda.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/half.h>
 #endif
 
 namespace batchedGemm
@@ -64,7 +62,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
     }
-    else if (dtype == tg::Dtype::MxE2m1)
+    else if (dtype == tg::Dtype::MxE2m1 || dtype == tg::Dtype::MxInt4)
     {
         if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
         {
@@ -228,10 +226,14 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     std::vector<uint64_t> const& strides, std::vector<uint32_t> const& tileShapes, void* gmemAddr)
 {
     CUtensorMap desc{};
-    CUtensorMapDataType tmaDataFormat;
+    CUtensorMapDataType tmaDataFormat{};
     if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::UE8m0)
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    }
+    else if (dtype == tg::Dtype::Bfloat16)
+    {
+        tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     }
     else
     {

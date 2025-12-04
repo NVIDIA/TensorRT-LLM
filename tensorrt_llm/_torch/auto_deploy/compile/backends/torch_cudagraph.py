@@ -139,7 +139,7 @@ class CapturedGraph(nn.Module):
             args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
 
             # capture graph for truncated inputs
-            combined_shape = sum((input.shape for input in inputs_truncated), start=())
+            combined_shape = sum((tuple(input.shape) for input in inputs_truncated), start=())
             self.cudagraphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
 
     def forward(self, *args, **kwargs) -> Any:
@@ -157,7 +157,7 @@ class CapturedGraph(nn.Module):
 
         # Calculate rounded-up shapes for each input
         rounded_shapes = [
-            (self.round_to_cuda_batch_size(input.shape[0]),) + input.shape[1:]
+            (self.round_to_cuda_batch_size(input.shape[0]),) + tuple(input.shape[1:])
             for input in args_batched
         ]
         combined_shape = sum(rounded_shapes, start=())
@@ -175,7 +175,7 @@ class CapturedGraph(nn.Module):
 
         # retrieve output from buffer, cut to batch size, and unflatten
         bs = args_batched[0].shape[0]
-        out_flat = [o_b[:bs].detach().clone() for o_b in self._out_buffer_flat]
+        out_flat = [o_b[:bs] for o_b in self._out_buffer_flat]
         return self._out_spec.unflatten(out_flat)
 
 

@@ -111,6 +111,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
 
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
                                         total_num_kv_heads_per_layer, head_dim,
                                         tokens_per_block, world_config,
@@ -147,8 +148,10 @@ class CacheTransBufferManager:
                                                max_num_tokens)
 
     @staticmethod
-    def pre_alloc_buffer_size(tokens_per_block: int,
-                              kv_cache_size_per_token: int,
-                              cache_transceiver_config: CacheTransceiverConfig):
+    def pre_alloc_buffer_size(
+            kv_cache_size_bytes_per_token_per_window: dict[int, int],
+            tokens_per_block: int,
+            cache_transceiver_config: CacheTransceiverConfig):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            tokens_per_block, kv_cache_size_per_token, cache_transceiver_config)
+            kv_cache_size_bytes_per_token_per_window, tokens_per_block,
+            cache_transceiver_config)

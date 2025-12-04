@@ -12,10 +12,20 @@ from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
     ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
-from openai.types.responses import (ResponseFunctionToolCall,
-                                    ResponseInputItemParam, ResponseOutputItem,
-                                    ResponsePrompt, ResponseReasoningItem,
-                                    ResponseStatus, ResponseTextConfig)
+from openai.types.responses import (
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
+    ResponseCodeInterpreterCallInterpretingEvent, ResponseCompletedEvent,
+    ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
+    ResponseCreatedEvent, ResponseFormatTextConfig, ResponseFunctionToolCall,
+    ResponseInProgressEvent, ResponseInputItemParam, ResponseOutputItem,
+    ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponsePrompt,
+    ResponseReasoningItem, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
+    ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent)
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
@@ -92,10 +102,10 @@ class ModelList(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be one of "text", "json", "json_object", or "structural_tag"
-    type: Literal["text", "json", "json_object", "regex", "ebnf",
+    type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
     schema: Optional[dict] = None
+    json_schema: Optional[dict] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     format: Optional[xgrammar.structural_tag.Format] = None
@@ -193,6 +203,12 @@ def _response_format_to_guided_decoding_params(
                 "The 'schema' field is required when response_format.type is 'json'."
             )
         return GuidedDecodingParams(json=response_format.schema)
+    elif response_format.type == "json_schema":
+        if response_format.json_schema is None:
+            raise ValueError(
+                "The 'json_schema' field is required when response_format.type is 'json_schema'."
+            )
+        return GuidedDecodingParams(json=response_format.json_schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
@@ -205,6 +221,18 @@ def _response_format_to_guided_decoding_params(
                                                            exclude_none=True))
     else:
         raise ValueError(f"Unsupported response format: {response_format.type}")
+
+
+def _response_format_text_config_to_guided_decoding_params(
+    text_format: Optional[ResponseFormatTextConfig]
+) -> Optional[GuidedDecodingParams]:
+    if text_format is None:
+        return None
+
+    resp_format = ResponseFormat(type=text_format.type,
+                                 json_schema=getattr(text_format, "schema_",
+                                                     None))
+    return _response_format_to_guided_decoding_params(resp_format)
 
 
 class CompletionRequest(OpenAIBaseModel):
@@ -229,6 +257,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = None
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
+    prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -283,6 +312,7 @@ class CompletionRequest(OpenAIBaseModel):
             temperature=(self.temperature
                          if self.temperature is not None else 1.0),
             top_p=(self.top_p if self.top_p is not None else 1.0),
+            prompt_ignore_length=self.prompt_ignore_length,
 
             # completion-sampling-params
             use_beam_search=self.use_beam_search,
@@ -358,7 +388,7 @@ class ToolCall(OpenAIBaseModel):
 
 class DeltaToolCall(OpenAIBaseModel):
     id: Optional[str] = None
-    type: Optional[Literal["function"]] = None
+    type: Literal["function"] = "function"
     index: int
     function: Optional[DeltaFunctionCall] = None
 
@@ -394,6 +424,12 @@ ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam,
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
     """Enables custom roles in the Chat Completion API."""
+
+    # This is so custom fields not in any of the `ChatCompletionMessage<XYZ>Param` defined by OpenAI
+    # are still allowed.
+    # Examples include: assistant messages with `reasoning` / `reasoning_content`.
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
     role: Required[str]
     """The role of the message's author."""
 
@@ -530,6 +566,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "reasoning is shown in the model's response. Options: "
                 "'low', 'medium', 'high'."),
         )
+    prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -622,6 +659,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             temperature=(self.temperature
                          if self.temperature is not None else 1.0),
+            prompt_ignore_length=self.prompt_ignore_length,
 
             # chat-completion-sampling-params
             best_of=self.best_of,
@@ -770,13 +808,11 @@ class ResponsesRequest(OpenAIBaseModel):
 
     def to_sampling_params(
         self,
-        default_max_tokens: int,
         default_sampling_params: Optional[dict] = None,
     ) -> SamplingParams:
-        if self.max_output_tokens is None:
-            max_tokens = default_max_tokens
-        else:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+        max_tokens = None
+        if self.max_output_tokens is not None:
+            max_tokens = self.max_output_tokens
 
         default_sampling_params = default_sampling_params or {}
         if (temperature := self.temperature) is None:
@@ -785,17 +821,13 @@ class ResponsesRequest(OpenAIBaseModel):
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
                 "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
-        stop_token_ids = default_sampling_params.get("stop_token_ids")
+        stop_token_ids = default_sampling_params.get("stop_token_ids", None)
 
         # Structured output
         guided_decoding = None
         if self.text is not None and self.text.format is not None:
-            response_format = self.text.format
-            if response_format.type == "json_schema":
-                guided_decoding = GuidedDecodingParams(
-                    json=response_format.schema_)
-            elif response_format.type == "json_object":
-                raise NotImplementedError("json_object is not supported")
+            guided_decoding = _response_format_text_config_to_guided_decoding_params(
+                self.text.format)
 
         return SamplingParams(
             temperature=temperature,
@@ -839,6 +871,27 @@ class ResponseUsage(OpenAIBaseModel):
     total_tokens: int
 
 
+StreamingResponsesResponse: TypeAlias = Union[
+    ResponseCreatedEvent,
+    ResponseInProgressEvent,
+    ResponseCompletedEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent,
+    ResponseWebSearchCallCompletedEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallInterpretingEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+]
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
@@ -855,7 +908,7 @@ class ResponsesResponse(OpenAIBaseModel):
     tools: list[Tool]
     top_p: float
     background: bool
-    max_output_tokens: int
+    max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None

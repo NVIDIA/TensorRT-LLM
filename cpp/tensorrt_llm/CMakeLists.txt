@@ -189,6 +189,7 @@ set(TRTLLM_LINK_LIBS
     fb_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
+    cute_dsl_src
     layers_src
     runtime_src
     testing_src
@@ -296,6 +297,10 @@ endif()
 
 if(BUILD_DEEP_GEMM)
   add_subdirectory(deep_gemm)
+endif()
+
+if(BUILD_FLASH_MLA)
+  add_subdirectory(flash_mla)
 endif()
 
 add_subdirectory(plugins)

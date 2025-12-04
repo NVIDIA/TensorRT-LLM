@@ -11,12 +11,15 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     from ..speculative.utils import SpecDecodingTensor
+    from ..speculative.interface import SpecMetadata
+    from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
@@ -144,6 +147,8 @@ class AttentionMetadata:
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    # The number of heads per kv head.
+    num_heads_per_kv: Optional[int] = 1
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -335,14 +340,67 @@ class AttentionMetadata:
 
     def update_spec_dec_param(
             self,
+            batch_size,
             is_spec_decoding_enabled,
             is_spec_dec_tree,
             is_spec_dec_dynamic_tree,
-            max_draft_tokens,
+            max_draft_len,
+            max_total_draft_tokens,
+            model_is_wrapped: bool = False,
+            spec_metadata: Optional['SpecMetadata'] = None,
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
             spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
+
+    def update_for_spec_dec(self) -> None:
+        """
+        Hook to be called during forward when using spec-dec one-model mode.
+        """
+
+    @staticmethod
+    def get_empty(buffers: Buffers,
+                  tensor_shape: list[int],
+                  dtype: torch.dtype,
+                  cache_name: str,
+                  capture_graph: bool = False) -> torch.Tensor:
+        """
+        Finds a compatible, reusable buffer from a cache or creates a new one.
+
+        This function searches for a pre-allocated tensor (buffer) that can be
+        reused for an operation involving a tensor with the shape of `tensor_shape`.
+
+        The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
+
+        If a compatible buffer is found, it's returned immediately. Otherwise, a new
+        buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
+
+        Args:
+            tensor_shape: The required shape.
+            dtype: The required dtype.
+            cache_name: The key for the specific list of buffers to search in.
+        Returns:
+            An existing compatible buffer or a newly created one.
+        """
+        if buffers is None:
+            return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
+
+        return buffers.get_buffer(tensor_shape, dtype, cache_name,
+                                  capture_graph)
+
+    @staticmethod
+    def get_empty_like(buffers,
+                       like_tensor: torch.Tensor,
+                       cache_name: str,
+                       capture_graph: bool = False) -> torch.Tensor:
+        return AttentionMetadata.get_empty(
+            buffers,
+            like_tensor.shape,
+            dtype=like_tensor.dtype,
+            cache_name=cache_name,
+            capture_graph=capture_graph,
+        )
 
 
 class PositionalEmbedder(Protocol):
@@ -651,3 +709,4 @@ class MLAParams:
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
     chunked_prefill_buffer_batch_size: int = 1
+    hidden_size: int = 0

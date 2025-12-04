@@ -19,6 +19,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/thop/attentionOp.h>
+#include <tensorrt_llm/thop/moeAlltoAllMeta.h>
 #include <torch/extension.h>
 
 namespace nb = nanobind;
@@ -28,6 +29,12 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
+    // Export MoE A2A constants
+    for (auto const& kv : torch_ext::moe_comm::getMoeA2AMetaInfoIndexPairs())
+    {
+        m.attr(kv.first) = kv.second;
+    }
+
     m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         nb::arg("q"), nb::arg("k") = std::nullopt, nb::arg("v") = std::nullopt, nb::arg("output"),
@@ -55,7 +62,13 @@ void initBindings(nb::module_& m)
         nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
         nb::arg("mla_tensor_params"), nb::arg("attention_chunk_size") = std::nullopt,
         nb::arg("softmax_stats_tensor") = std::nullopt, nb::arg("spec_decoding_bool_params"),
-        nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_attention_params"), "Multi-head attention operation",
+        nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_kv_indices") = std::nullopt,
+        nb::arg("sparse_kv_offsets") = std::nullopt, nb::arg("sparse_attn_indices") = std::nullopt,
+        nb::arg("sparse_attn_offsets") = std::nullopt, nb::arg("sparse_attn_indices_block_size"),
+        nb::arg("sparse_mla_topk") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
+        nb::arg("cu_kv_seqlens") = std::nullopt, nb::arg("fmha_scheduler_counter") = std::nullopt,
+        nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
+        nb::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::thop

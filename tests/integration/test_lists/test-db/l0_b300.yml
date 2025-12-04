@@ -8,6 +8,7 @@ l0_b300:
     wildcards:
       gpu:
       - '*gb110*'
+      - '*b300*'
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
@@ -16,7 +17,8 @@ l0_b300:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention # 200s
-  # - unittest/_torch/thop
+  - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   - unittest/_torch/modules # 300s
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4

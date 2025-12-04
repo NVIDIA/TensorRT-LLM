@@ -261,6 +261,16 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml"
          ),
+        "deepseek_v3_lite_bf16_empty_batch":
+        (3,
+         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml"
+         ),
+        "llama4_kv_cache_overflow":
+        (8, f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml"),
+        "deepseek_v3_lite_bf16_tllm_gen_helix":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -853,10 +863,12 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
         lines = f.readlines()
         assert len(lines) > 1
         assert lines[0].startswith(
-            "RequestID,Delay(ms),Duration(ms),Bandwidth(Gbps)")
+            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
+        )
+        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
         # get a send sample and match the recv
         sample = lines[1].split(',')
-        assert len(sample) >= 4
+        assert len(sample) >= 9
     with open(recv_file, "r") as f:
         lines = f.readlines()
         assert len(lines) > 1
@@ -1528,18 +1540,23 @@ def run_disaggregated_benchmark(example_dir,
                                 benchmark_model_root,
                                 shared_gpt_path,
                                 env=None,
-                                cwd=None):
+                                cwd=None,
+                                num_ranks=2,
+                                random_input_len=16,
+                                random_output_len=64,
+                                num_prompts=100,
+                                max_concurrency=32,
+                                skip_warmup=False):
     """Run disaggregated test with given configuration."""
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
-    num_rank = 2
     workers_cmd = [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_rank), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
 
-    server_start_timeout = 900
+    server_start_timeout = 1200
     server_cmd = [
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
@@ -1587,15 +1604,15 @@ def run_disaggregated_benchmark(example_dir,
                 '--dataset-path',
                 shared_gpt_path,
                 '--random-input-len',
-                '256',
+                str(random_input_len),
                 '--random-output-len',
-                '64',
+                str(random_output_len),
                 '--random-prefix-len',
                 '0',
                 '--num-prompts',
-                '320',
+                str(num_prompts),
                 '--max-concurrency',
-                '32',
+                str(max_concurrency),
                 '--host',
                 'localhost',
                 '--port',
@@ -1606,7 +1623,8 @@ def run_disaggregated_benchmark(example_dir,
                 'e2el,ttft',
             ]
             # warm up
-            check_call(benchmark_cmd, env=env)
+            if not skip_warmup:
+                check_call(benchmark_cmd, env=env)
             output = check_output(benchmark_cmd, env=env)
             e2el_pattern = r"Median E2EL \(ms\):\s*(\d+\.?\d*)"
             ttft_pattern = r"Median TTFT \(ms\):\s*(\d+\.?\d*)"
@@ -1673,6 +1691,104 @@ def get_config_for_benchmark(model_root, backend):
     return serve_config
 
 
+def run_disaggregated_genai_perf(config_file,
+                                 model_path,
+                                 num_ranks,
+                                 server_start_timeout=1200,
+                                 input_tokens=128000,
+                                 output_tokens=100,
+                                 env=None,
+                                 cwd=None):
+    """Run disaggregated test with genai-perf for performance/stress testing."""
+    cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib"
+
+    workers_cmd = [
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        config_file
+    ]
+
+    server_cmd = [
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
+        str(server_start_timeout), '-c', config_file
+    ]
+
+    artifact_dir = os.path.join(cwd or ".", "benchmark-results")
+
+    try:
+        with (open('output_workers.log', 'w') as output_workers,
+              popen(workers_cmd,
+                    stdout=output_workers,
+                    stderr=subprocess.STDOUT,
+                    env=run_env,
+                    cwd=cwd) as workers_proc, open('output_disagg.log', 'w') as
+              output_disagg,
+              popen(server_cmd,
+                    stdout=output_disagg,
+                    stderr=subprocess.STDOUT,
+                    env=run_env,
+                    cwd=cwd) as server_proc):
+
+            # Wait for server to be ready
+            if not wait_for_server(
+                    "localhost", 8000, timeout_seconds=server_start_timeout):
+                raise RuntimeError(
+                    f"Disaggregated server did not become ready within {server_start_timeout} seconds"
+                )
+
+            # Run genai-perf
+            genai_perf_cmd = [
+                'genai-perf', 'profile', '--model', model_path, '--tokenizer',
+                model_path, '--endpoint-type', 'chat', '--endpoint',
+                '/v1/chat/completions', '--streaming', '--url',
+                'localhost:8000', '--synthetic-input-tokens-mean',
+                str(input_tokens), '--synthetic-input-tokens-stddev', '0',
+                '--output-tokens-mean',
+                str(output_tokens), '--output-tokens-stddev', '0',
+                '--extra-inputs', f'max_tokens:{output_tokens}',
+                '--extra-inputs', f'min_tokens:{output_tokens}',
+                '--extra-inputs', 'ignore_eos:true', '--concurrency', '1',
+                '--warmup-request-count', '8', '--num-dataset-entries', '64',
+                '--random-seed', '100', '--artifact-dir', artifact_dir, '--',
+                '-v', '-H', 'Authorization: Bearer NOT USED', '-H',
+                'Accept: text/event-stream', '-p', '200000'
+            ]
+
+            check_call(genai_perf_cmd,
+                       env=env,
+                       poll_procs=[workers_proc, server_proc])
+
+    except Exception:
+        # Print outputs on error
+        logger.error("-------- Workers output (last 30 lines) --------")
+        try:
+            with open('output_workers.log', 'r') as f:
+                lines = f.read().split('\n')
+                for line in lines[-30:]:
+                    if line.strip():
+                        logger.error(line)
+        except FileNotFoundError:
+            pass
+
+        logger.error("-------- Disagg server output (last 30 lines) --------")
+        try:
+            with open('output_disagg.log', 'r') as f:
+                lines = f.read().split('\n')
+                for line in lines[-30:]:
+                    if line.strip():
+                        logger.error(line)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        server_proc.terminate()
+        workers_proc.terminate()
+        server_proc.wait()
+        workers_proc.wait()
+
+
 @pytest.mark.parametrize("benchmark_model_root", [
     'DeepSeek-V3-Lite-fp8', 'DeepSeek-V3-Lite-bf16', 'llama-v3-8b-hf',
     'llama-3.1-8b-instruct-hf-fp8'
@@ -1716,3 +1832,103 @@ def test_disaggregated_benchmark_on_diff_backends(
 
     assert ucx_e2el > 0 and nixl_e2el > 0 and nixl_e2el < 1.05 * ucx_e2el
     assert ucx_ttft > 0 and nixl_ttft > 0 and nixl_ttft < 1.05 * ucx_ttft
+
+
+@pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
+        disaggregated_example_root, llm_venv, benchmark_model_root,
+        benchmark_root, shared_gpt_path):
+
+    src_dst_dict = {
+        benchmark_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    test_desc = "deepseek_v3_lite_bf16_empty_batch"
+    num_ranks, config_file = get_test_config(test_desc,
+                                             disaggregated_example_root,
+                                             os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        benchmark_model_root,
+        shared_gpt_path,
+        env=env,
+        cwd=llm_venv.get_working_directory(),
+        num_ranks=num_ranks,
+        num_prompts=10,
+        max_concurrency=10,
+        random_input_len=384,
+        random_output_len=1536,
+        skip_warmup=True)
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+    assert e2el > 0 and ttft > 0
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.parametrize(
+    "model_path",
+    ['llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8'])
+def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
+                                               disaggregated_example_root,
+                                               llm_venv, model_path):
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5555681
+    Test to reproduce KV cache buffer overflow bug with long context.
+    """
+    models_root = llm_models_root()
+    llama4_model_root = os.path.join(models_root, model_path)
+
+    # Create symlink to match config file path
+    src_dst_dict = {
+        llama4_model_root: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    num_ranks, config_file = get_test_config("llama4_kv_cache_overflow",
+                                             disaggregated_example_root,
+                                             os.path.dirname(__file__))
+
+    run_disaggregated_genai_perf(config_file=config_file,
+                                 model_path=llama4_model_root,
+                                 num_ranks=num_ranks,
+                                 server_start_timeout=1200,
+                                 input_tokens=128000,
+                                 output_tokens=100,
+                                 env=llm_venv._new_env,
+                                 cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_tllm_gen_helix",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="long_prompts.json")

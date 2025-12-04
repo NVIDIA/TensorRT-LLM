@@ -24,7 +24,7 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
-from ..utils.sharding_utils import ShardingConfig
+from ..utils.sharding_utils import ShardingTransformContainer
 
 
 class TransformError(Exception):
@@ -61,7 +61,9 @@ class Stages(Enum):
 class SharedConfig(BaseModel):
     """Global config shared between multiple transforms in the inference optimizer."""
 
-    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
+    sharding_transform_container: ShardingTransformContainer = Field(
+        default_factory=ShardingTransformContainer
+    )
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
 
@@ -172,6 +174,10 @@ class TransformInfo(BaseModel):
             is_clean=self.is_clean and other.is_clean,
             has_valid_shapes=self.has_valid_shapes and other.has_valid_shapes,
         )
+
+    # implement + addition operator for TransformInfo
+    def __add__(self, other: "TransformInfo") -> "TransformInfo":
+        return self.__and__(other)
 
 
 TransformHistory = Dict[str, TransformInfo]
@@ -406,14 +412,14 @@ class BaseTransform(ABC):
             return self._apply_to_full_model(mod, cm, factory, shared_config)
 
         # just run it on first graph module we are encountering for now...
-        info = TransformInfo()
+        info = None
         for k, graph_sub in named_graphmodules(mod):
             graph_sub, info_apply = self._apply(graph_sub, cm, factory, shared_config)
             if k == "":
                 mod = graph_sub
             else:
                 mod.set_submodule(k, graph_sub)
-            info = info & info_apply
+            info = info & info_apply if info is not None else info_apply
         return mod, info
 
     @final

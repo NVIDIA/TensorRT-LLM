@@ -34,9 +34,9 @@ SamplingConfig::SamplingConfig(SizeType32 beamWidth, OptSize32 const& topK, OptF
     OptFloat const& topPMin, std::optional<TokenIdType> const& topPResetIds, OptFloat const& topPDecay,
     std::optional<RandomSeedType> const& seed, OptFloat const& temperature, OptSize32 const& minTokens,
     OptFloat const& beamSearchDiversityRate, OptFloat const& repetitionPenalty, OptFloat const& presencePenalty,
-    OptFloat const& frequencyPenalty, OptFloat const& lengthPenalty, OptSize32 const& earlyStopping,
-    OptSize32 const& noRepeatNgramSize, OptSize32 const& numReturnSequences, OptFloat const& minP,
-    OptVec<SizeType32> const& beamWidthArray)
+    OptFloat const& frequencyPenalty, OptSize32 const& promptIgnoreLength, OptFloat const& lengthPenalty,
+    OptSize32 const& earlyStopping, OptSize32 const& noRepeatNgramSize, OptSize32 const& numReturnSequences,
+    OptFloat const& minP, OptVec<SizeType32> const& beamWidthArray)
     : mBeamWidth(checkBeamWidth(beamWidth))
     , mTopK(checkTopK(topK))
     , mTopP(checkTopP(topP))
@@ -50,6 +50,7 @@ SamplingConfig::SamplingConfig(SizeType32 beamWidth, OptSize32 const& topK, OptF
     , mRepetitionPenalty(checkRepetitionPenalty(repetitionPenalty))
     , mPresencePenalty(presencePenalty)
     , mFrequencyPenalty(frequencyPenalty)
+    , mPromptIgnoreLength(checkPromptIgnoreLength(promptIgnoreLength))
     , mLengthPenalty(checkLengthPenalty(lengthPenalty))
     , mEarlyStopping(checkEarlyStopping(earlyStopping))
     , mNoRepeatNgramSize(checkNoRepeatNgramSize(noRepeatNgramSize))
@@ -67,9 +68,10 @@ bool SamplingConfig::operator==(SamplingConfig const& other) const
         && mTemperature == other.mTemperature && mMinTokens == other.mMinTokens
         && mBeamSearchDiversityRate == other.mBeamSearchDiversityRate && mRepetitionPenalty == other.mRepetitionPenalty
         && mPresencePenalty == other.mPresencePenalty && mFrequencyPenalty == other.mFrequencyPenalty
-        && mLengthPenalty == other.mLengthPenalty && mEarlyStopping == other.mEarlyStopping
-        && mNoRepeatNgramSize == other.mNoRepeatNgramSize && mNumReturnSequences == other.mNumReturnSequences
-        && mMinP == other.mMinP && mBeamWidthArray == other.mBeamWidthArray;
+        && mPromptIgnoreLength == other.mPromptIgnoreLength && mLengthPenalty == other.mLengthPenalty
+        && mEarlyStopping == other.mEarlyStopping && mNoRepeatNgramSize == other.mNoRepeatNgramSize
+        && mNumReturnSequences == other.mNumReturnSequences && mMinP == other.mMinP
+        && mBeamWidthArray == other.mBeamWidthArray;
 }
 
 // Getters
@@ -141,6 +143,11 @@ OptFloat SamplingConfig::getPresencePenalty() const
 OptFloat SamplingConfig::getFrequencyPenalty() const
 {
     return mFrequencyPenalty;
+}
+
+OptSize32 SamplingConfig::getPromptIgnoreLength() const
+{
+    return mPromptIgnoreLength;
 }
 
 OptFloat SamplingConfig::getLengthPenalty() const
@@ -238,6 +245,11 @@ void SamplingConfig::setPresencePenalty(OptFloat const& presencePenalty)
 void SamplingConfig::setFrequencyPenalty(OptFloat const& frequencyPenalty)
 {
     mFrequencyPenalty = frequencyPenalty;
+}
+
+void SamplingConfig::setPromptIgnoreLength(OptSize32 const& promptIgnoreLength)
+{
+    mPromptIgnoreLength = checkPromptIgnoreLength(promptIgnoreLength);
 }
 
 void SamplingConfig::setLengthPenalty(OptFloat const& lengthPenalty)
@@ -360,6 +372,15 @@ OptFloat const& SamplingConfig::checkRepetitionPenalty(OptFloat const& repetitio
         TLLM_CHECK(repetitionpenalty.value() > 0.f);
     }
     return repetitionpenalty;
+}
+
+OptSize32 const& SamplingConfig::checkPromptIgnoreLength(OptSize32 const& promptIgnoreLength)
+{
+    if (promptIgnoreLength.has_value())
+    {
+        TLLM_CHECK(promptIgnoreLength.value() >= 0);
+    }
+    return promptIgnoreLength;
 }
 
 OptFloat const& SamplingConfig::checkLengthPenalty(OptFloat const& lengthPenalty)

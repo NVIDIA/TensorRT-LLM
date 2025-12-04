@@ -34,6 +34,7 @@ Before running the scripts, ensure you have:
 ### Run Benchmarks
 
 ```bash
-# Please find the `submit.py` script and an example `config.yaml` in the `examples/disaggregated/slurm/benchmark/` directory.
-python3 submit.py -c your_config.yaml
+# Please find the `submit.py` script in the `examples/disaggregated/slurm/benchmark/` directory.
+# An example `config.yaml` for wide EP: `examples/wide_ep/slurm_scripts/config.yaml`.
+python3 submit.py -c config.yaml
 ```

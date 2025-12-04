@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CUDA-backed cached causal conv1d custom ops and attention descriptor.
 
 This mirrors `torch_backend_causal_conv.py` but reuses existing TRT-LLM CUDA
@@ -61,6 +76,7 @@ def cuda_causal_conv_prepare_metadata(
     pages_per_seq: torch.Tensor,
     slot_idx: torch.Tensor,
     page_size: int,
+    chunk_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for cached causal conv (CUDA backend).
 
@@ -75,13 +91,13 @@ def cuda_causal_conv_prepare_metadata(
 
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # This is only used during prefill to determine if we should use the initial states from the cache.
-    use_initial_states = input_pos > 0
+    use_initial_states = input_pos[:num_seq] > 0
     return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @cuda_causal_conv_prepare_metadata.register_fake
 def cuda_causal_conv_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
 ):
     seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
@@ -93,7 +109,7 @@ def cuda_causal_conv_prepare_metadata_fake(
     )
 
 
-@torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={})
+@torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={"input"})
 def _cuda_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
@@ -112,13 +128,16 @@ def _cuda_cached_causal_conv1d(
     dilation: int,
     groups: int,
     padding_mode: str,
-) -> torch.Tensor:
+    activation: Optional[str],
+) -> None:
     """Flattened cached causal conv that respects slot-indexed state caches (CUDA backend).
 
     Supports two layouts from the attention interface:
     - Generate-only: input is [b, 1, c_in]. We'll gather caches using slot_idx[:b].
     - Flattened context/mixed: input is [1, total_s, c_in] and seq_len/seq_start
       describe per-sequence segments. We'll process each segment and scatter final states to caches.
+
+    NOTE: This op modifies `input` in-place.
     """
     b, s = input.shape[:2]
     num_seq = seq_len.shape[0]
@@ -135,8 +154,6 @@ def _cuda_cached_causal_conv1d(
     # Flatten tokens
     bs = b * s
     inp_flat = input.reshape(bs, *input.shape[2:])  # [total_s, C_in]
-    y = torch.empty(b, s, weight.shape[0], device=input.device, dtype=input.dtype)
-    y_flat = y.view(bs, *y.shape[2:])
 
     # Prepare weight as [dim, width] (depthwise)
     if weight.ndim == 3:
@@ -175,37 +192,30 @@ def _cuda_cached_causal_conv1d(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             conv_states=conv_state_cache,
-            activation=None,
+            activation=activation,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
-
-        # Scatter outputs back to y
-        y_prefill = y_varlen.transpose(0, 1)  # [total_prefill_tokens, C_out]
-        y_flat[:total_prefill_tokens].copy_(y_prefill.to(y_flat.dtype))
+        # Scatter outputs back to input buffer
+        inp_flat[:total_prefill_tokens] = y_varlen.transpose(0, 1)
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
-        # Use true start offsets for decode tokens (tail after prefills)
-        decode_idx = seq_start[num_prefill:].to(torch.long)
-        x_decode = inp_flat.index_select(0, decode_idx)  # [num_decode, C_in]
+        x_decode = inp_flat[
+            total_prefill_tokens : total_prefill_tokens + num_decode
+        ]  # [num_decode, C_in]
 
-        y_dec = causal_conv1d_update(
+        causal_conv1d_update(
             x_decode,  # [batch, dim]
             conv_state_cache,
             w2d,
             bias,
-            activation=None,
+            activation=activation,
             cache_seqlens=None,
             conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
         )
 
-        if y_dec.dim() == 3:
-            y_dec = y_dec.squeeze(-1)
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
-
-    # Custom op must not return an alias of any input; return a fresh tensor
-    return y.contiguous().clone()
+    return
 
 
 @_cuda_cached_causal_conv1d.register_fake
@@ -227,10 +237,14 @@ def _cuda_cached_causal_conv1d_fake(
     dilation: int,
     groups: int,
     padding_mode: str,
+    activation: Optional[str],
 ):
-    return torch.empty(
-        input.shape[0], input.shape[1], weight.shape[0], device=input.device, dtype=input.dtype
-    )
+    return
+
+
+def cuda_cached_causal_conv1d_wrapper(input, *args, **kwargs):
+    torch.ops.auto_deploy.cuda_cached_causal_conv1d(input, *args, **kwargs)
+    return input
 
 
 @AttentionRegistry.register("cuda_causal_conv")
@@ -256,7 +270,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.cuda_cached_causal_conv1d
+        return cuda_cached_causal_conv1d_wrapper
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
@@ -279,7 +293,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
                 in_channels,
                 max(1, kernel_size - 1),
                 device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
+                dtype=inp_fake.dtype,
             )
 
         return {"conv_state_cache": _get_conv_cache}
@@ -293,4 +307,5 @@ class CudaBackendCausalConv(AttentionDescriptor):
         stride, padding, dilation, groups, padding_mode = extract_op_args(
             source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
         )
-        return [stride, padding, dilation, groups, padding_mode]
+        # None is for activation parameter, which may not exist in the source node (added by fusion later)
+        return [stride, padding, dilation, groups, padding_mode, None]

@@ -9,7 +9,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
-from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -186,6 +185,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         ),
     )
 
+    draft_checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
+    )
+
     ### SEQUENCE INTERFACE CONFIG ##################################################################
     max_input_len: int = Field(default=1024, description="The maximum input length.")
     max_num_tokens: Optional[int] = Field(default=None, description="The maximum number of tokens.")
@@ -197,6 +201,16 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="Page size for attention (tokens_per_block). For triton and torch "
         "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
         "properly passed through.",
+    )
+    enable_iter_perf_stats: bool = Field(
+        default=False, description="Enable iteration performance statistics.", status="prototype"
+    )
+
+    enable_iter_req_stats: bool = Field(
+        default=False,
+        description="If true, enables per request stats per iteration. Must also set "
+        "enable_iter_perf_stats to true to get request stats.",
+        status="prototype",
     )
 
     ### VALIDATION #################################################################################
@@ -318,12 +332,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
-    build_config: Optional[object] = Field(
-        default_factory=lambda: BuildConfig(),
+    build_config: Optional[BuildConfig] = Field(
+        default_factory=BuildConfig,
         description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
         exclude_from_json=True,
         frozen=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
         repr=False,
     )
     backend: Literal["_autodeploy"] = Field(
@@ -404,13 +417,6 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     def validate_and_init_tokenizer(self):
         """Skip tokenizer initialization in config. We do this in the AutoDeploy LLM class."""
         return self
-
-    ### UTILITY METHODS ############################################################################
-    # TODO: Remove this after the PyTorch backend is fully migrated to LlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "LlmArgs":
-        """Return the LlmArgs (self) object."""
-        # TODO: can we just pass through self directly??
-        return type(self)(**self.to_llm_kwargs())
 
     def to_dict(self) -> Dict:
         """Convert model to a dictionary such that cls(**self.to_dict()) == self."""

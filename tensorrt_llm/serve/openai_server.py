@@ -17,7 +17,7 @@ from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
@@ -25,15 +25,16 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import MultimodalEncoder
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.serve.chat_utils import (check_multiple_response,
+from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
@@ -77,13 +78,19 @@ class OpenAIServer:
     def __init__(self,
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
+                 tool_parser: Optional[str],
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
-                 disagg_cluster_config: Optional[DisaggClusterConfig] = None):
+                 disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+                 multimodal_server_config: Optional[MultimodalServerConfig] = None,
+                 chat_template: Optional[str] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
+        self.multimodal_server_config = multimodal_server_config
+        self.chat_template = load_chat_template(chat_template)
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -96,8 +103,12 @@ class OpenAIServer:
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
+        # load model config
         try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            from tensorrt_llm._torch.pyexecutor.config_utils import \
+                load_pretrained_config
+            self.model_config = load_pretrained_config(hf_tokenizer_path,
+                                                       trust_remote_code=trust_remote_code)
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -225,6 +236,9 @@ class OpenAIServer:
             status_code=HTTPStatus.NOT_FOUND,
         )
 
+    def _check_health(self) -> bool:
+        return self.llm._check_health()
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
@@ -285,7 +299,10 @@ class OpenAIServer:
                                methods=["POST"])
 
     async def health(self) -> Response:
-        return Response(status_code=200)
+        if self._check_health():
+            return Response(status_code=200)
+        else:
+            return Response(status_code=503, content="LLM is unavailable. Please check the server logs for more details.")
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -475,7 +492,6 @@ class OpenAIServer:
             return chat_response
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -489,7 +505,7 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -503,7 +519,7 @@ class OpenAIServer:
                     mm_placeholder_counts=mm_placeholder_counts,
                     tools=tool_dicts,
                     documents=request.documents,
-                    chat_template=request.chat_template,
+                    chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
             prompt = prompt_inputs(prompt)
@@ -513,6 +529,7 @@ class OpenAIServer:
                 prompt["multi_modal_data"] = mm_data
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
+            postproc_args.tool_parser = self.tool_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
@@ -522,6 +539,8 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
+
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
@@ -530,6 +549,7 @@ class OpenAIServer:
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
+                trace_headers=trace_headers,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -582,7 +602,6 @@ class OpenAIServer:
             )
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -717,7 +736,6 @@ class OpenAIServer:
             yield "data: [DONE]\n\n"
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
@@ -744,6 +762,7 @@ class OpenAIServer:
                     if request.stream else completion_response_post_processor,
                     postproc_args=postproc_args,
                 )
+                trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
@@ -758,7 +777,8 @@ class OpenAIServer:
                     _postproc_params=postproc_params,
                     streaming=request.stream,
                     lora_request=request.lora_request,
-                    disaggregated_params=disaggregated_params
+                    disaggregated_params=disaggregated_params,
+                    trace_headers=trace_headers
                 )
                 asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -897,22 +917,16 @@ class OpenAIServer:
                 request=request,
                 sampling_params=sampling_params,
                 generator=generator,
-                harmony_adapter=self.harmony_adapter,
                 model_name=self.model,
                 conversation_store=self.conversation_store,
+                use_harmony=self.use_harmony,
+                reasoning_parser=self.llm.args.reasoning_parser,
+                tool_parser=self.tool_parser,
                 enable_store=self.enable_store
             ):
                 yield event_data
 
         try:
-            if not self.use_harmony:
-                raise NotImplementedError("Responses API only supports harmony format for now")
-
-            # Initialize HarmonyAdapter
-            # NOTE: WAR for Disagg failure, may affect perf if no warmup
-            if not self.harmony_adapter:
-                self.harmony_adapter = HarmonyAdapter()
-
             if request.background:
                 logger.warning("Request.background is not supported yet, will fallback to foreground processing.")
 
@@ -930,7 +944,15 @@ class OpenAIServer:
                         return self._create_response_id_not_found_error(prev_response_id)
 
             input_tokens, sampling_params = await responses_api_request_preprocess(
-                request, prev_response, self.harmony_adapter, self.conversation_store, self.enable_store)
+                request=request,
+                prev_response=prev_response,
+                conversation_store=self.conversation_store,
+                enable_store=self.enable_store,
+                use_harmony=self.use_harmony,
+                tokenizer=self.tokenizer if not self.use_harmony else None,
+                model_config=self.model_config if not self.use_harmony else None,
+                processor=self.processor if not self.use_harmony else None,
+            )
 
             promise = self.llm.generate_async(
                 inputs=input_tokens,
@@ -953,7 +975,10 @@ class OpenAIServer:
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store)
+                    enable_store=self.enable_store,
+                    use_harmony=self.use_harmony,
+                    reasoning_parser=self.llm.args.reasoning_parser,
+                    tool_parser=self.tool_parser)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

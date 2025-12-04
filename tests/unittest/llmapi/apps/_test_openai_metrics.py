@@ -1,11 +1,12 @@
 """Test the metrics endpoint when using OpenAI API to send requests"""
 
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
-from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 from ..test_llm import llama_model_path
@@ -14,26 +15,35 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 @pytest.fixture(scope="module")
-def client():
-    build_config = BuildConfig()
-    build_config.max_batch_size = 8
-    build_config.max_seq_len = 512
+def llm():
     llm = PyTorchLLM(model=llama_model_path,
-                     build_config=build_config,
                      kv_cache_config=KvCacheConfig(),
                      enable_iter_perf_stats=True)
-    hf_tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    yield llm
+    llm.shutdown()
 
+
+@pytest.fixture(scope="module")
+def client(llm):
     app_instance = OpenAIServer(llm,
                                 model=llama_model_path,
-                                hf_tokenizer=hf_tokenizer)
+                                tool_parser=None,
+                                server_role=None,
+                                metadata_server_cfg=None)
     client = TestClient(app_instance.app)
     yield client
 
 
-def test_health(client):
-    response = client.get("/health")
-    assert response.status_code == 200
+@pytest.mark.parametrize("is_healthy,response_code", [(True, 200),
+                                                      (False, 503)])
+def test_health(client, llm, is_healthy, response_code):
+    if not is_healthy:
+        with patch.object(llm._executor, 'is_shutdown', return_value=True):
+            response = client.get("/health")
+            assert response.status_code == response_code
+    else:
+        response = client.get("/health")
+        assert response.status_code == response_code
 
 
 def test_version(client):

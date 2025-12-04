@@ -15,6 +15,7 @@ from pydantic_settings import (
 )
 
 from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
     deep_merge_dicts,
@@ -139,9 +140,10 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     ### CORE ARGS ##################################################################################
     # The main AutoDeploy arguments - contains model, tokenizer, backend configs, etc.
-    args: AutoDeployConfig = Field(
+    args: LlmArgs = Field(
         description="The main AutoDeploy arguments containing model, tokenizer, backend configs, etc. "
-        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.AutoDeployConfig` for more details."
+        "Contains all the fields from `AutoDeployConfig` and `BaseLlmArgs`. "
+        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` for more details."
     )
 
     # Optional model field for convenience - if provided, will be used to initialize args.model
@@ -304,6 +306,7 @@ def main(config: Optional[ExperimentConfig] = None):
         store_benchmark_results(results, config.benchmark.results_path)
 
     llm.shutdown()
+    return results
 
 
 if __name__ == "__main__":

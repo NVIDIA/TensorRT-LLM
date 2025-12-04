@@ -5,19 +5,35 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm.executor.result import GenerationResult, TokenLogprobs
+from tensorrt_llm.executor.result import TokenLogprobs
+
+from .result import ScaffoldingOutput
 
 
 @dataclass
 class Task:
-    # Reserve for custom input params.
-    custom_input_params: Optional[dict] = None
-
     # Scaffolding delivers the task to the Worker by worker_tag.
     worker_tag: str = field(default=None)
 
+    # For streaming output.
+    streaming_output_flag: bool = field(default=False)
+    streaming_output_list: list[Any] = field(default_factory=list)
+
+    # Reserve for custom input params.
+    custom_input_params: Optional[dict] = None
+
     # Reserve for custom output params.
     custom_output_params: Optional[dict] = None
+
+    @staticmethod
+    def create_from_prompt(prompt: str) -> "Task":
+        pass
+
+    def create_scaffolding_output(self) -> ScaffoldingOutput:
+        pass
+
+    def create_scaffolding_output_stream(self) -> List[ScaffoldingOutput]:
+        pass
 
 
 class TaskStatus(Enum):
@@ -33,7 +49,7 @@ class GenerationTask(Task):
     input_str: Optional[str] = None
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
-    streaming: bool = False
+    #streaming: bool = False
 
     # sampling params for openai
     # Ordered by official OpenAI API documentation
@@ -63,47 +79,13 @@ class GenerationTask(Task):
     worker_tag: Union[str, "Controller.WorkerTag"] = None
 
     # result field
-    # link to TRTLLM's GenerationResult, for async update in streaming mode
-    _result: Optional[GenerationResult] = None
+    output_str: Optional[str] = None
+    output_tokens: Optional[List[int]] = None
+    # TODO: support openai API format context logits
+    context_logits: Optional[torch.Tensor] = None
+    # TODO: don't not use TokenLogprobs for general support
+    logprobs: Optional[TokenLogprobs] = None
     customized_result_fields: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def result(self) -> GenerationResult:
-        return self._result
-
-    @result.setter
-    def result(self, result: GenerationResult) -> None:
-        self._result = result
-
-    @property
-    def outputs(self) -> Optional[List[dict]]:
-        return self._result.outputs if self._result else None
-
-    @property
-    def output_tokens(self) -> List[int]:
-        return self._result.outputs[0].token_ids if self._result else None
-
-    @property
-    def output_str(self) -> Optional[str]:
-        return self._result.outputs[0].text if self._result else None
-
-    @output_str.setter
-    def output_str(self, output) -> Optional[str]:
-        assert self.result
-        self._result.outputs[0].text = output
-
-    @property
-    def cumulative_logprob(self) -> Optional[float]:
-        return self._result.outputs[
-            0].cumulative_logprob if self._result else None
-
-    @property
-    def logprobs(self) -> Optional[TokenLogprobs]:
-        return self._result.outputs[0].logprobs if self._result else None
-
-    @property
-    def context_logits(self) -> Optional[torch.Tensor]:
-        return self._result.context_logits if self._result else None
 
     @staticmethod
     def create_from_prompt(prompt: str) -> "GenerationTask":
@@ -113,8 +95,8 @@ class GenerationTask(Task):
         task.skip_detokenizer = False
         return task
 
-    def create_scaffolding_output(self) -> GenerationResult:
-        return self._result
+    def create_scaffolding_output(self) -> ScaffoldingOutput:
+        return ScaffoldingOutput(self.output_str, self.output_tokens)
 
 
 @dataclass
@@ -148,3 +130,21 @@ class RewardTask(Task):
     # input field
     input_tokens: Optional[List[int]] = field(default=None)
     input_str: Optional[str] = field(default=None)
+
+
+@dataclass
+class StreamGenerationTask(GenerationTask):
+    # input field
+    # if the flag is set to True, the worker will cancel the generation work
+    cancel_flag: Optional[bool] = field(default=False)
+    # the task will be returned to the controller with at least new streaming_step tokens
+    # if the streaming_step is set to 0,
+    # the task will be returned to the controller immediately with
+    # new tokens that have already been generated.
+    streaming_step: Optional[int] = field(default=1)
+
+    #result field
+    # worker set this field and identify the same task by this field
+    request_handle: Any = field(default=None)
+    # worker set this field to True when the generation is finished
+    end_flag: bool = field(default=False)

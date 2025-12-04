@@ -8,7 +8,6 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
@@ -26,6 +25,7 @@ class RuntimeConfig(BaseModel):
     model: str
     model_path: Optional[Path] = None
     engine_dir: Optional[Path] = None
+    revision: Optional[str] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
     # TODO: this is a dict corresponding to the Mapping class, the type should be
@@ -126,7 +126,7 @@ class PerformanceOptions:
 
         return config
 
-    def get_pytorch_perf_config(self) -> PyTorchConfig:
+    def get_pytorch_perf_config(self):
         return self.pytorch_config
 
     def get_autodeploy_perf_config(self) -> Dict:

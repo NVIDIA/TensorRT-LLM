@@ -118,9 +118,11 @@ else:
         'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
-        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
-        'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
-        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh'
+        'deep_ep/LICENSE', 'deep_ep/*.py', 'deep_ep_cpp_tllm.*.so',
+        "include/**/*", 'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
+        'deep_gemm/*.py', 'deep_gemm_cpp_tllm.*.so',
+        'scripts/install_tensorrt.sh', 'flash_mla/LICENSE', 'flash_mla/*.py',
+        'flash_mla_cpp_tllm.*.so'
     ]
 
 package_data += [
@@ -132,6 +134,7 @@ package_data += [
     "_torch/auto_deploy/config/*.yaml",
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
+    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*'
 ]
 
 
@@ -202,8 +205,19 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith((".py", ".yaml")):
+            # Skip yaml files
+            if file.filename.endswith(".yaml"):
                 continue
+
+            # Skip .py files EXCEPT for generated C++ extension wrappers
+            # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
+            if file.filename.endswith(".py"):
+                allowed_dirs = ("tensorrt_llm/deep_gemm/",
+                                "tensorrt_llm/deep_ep/",
+                                "tensorrt_llm/flash_mla/")
+                if not any(file.filename.startswith(d) for d in allowed_dirs):
+                    continue
+
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
                                        f"tensorrt_llm/{filename_pattern}"):
@@ -232,13 +246,19 @@ if use_precompiled:
 
 sanity_check()
 
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
-    description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
-    long_description=
-    'TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
+    description=
+    ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
+     'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
+     ),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",

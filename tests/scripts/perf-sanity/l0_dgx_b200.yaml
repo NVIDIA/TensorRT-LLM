@@ -1,6 +1,7 @@
 server_configs:
   - name: "r1_fp4_dep4"
     model_name: "deepseek_r1_0528_fp4"
+    gpus: 4
     tp: 4
     ep: 4
     pp: 1
@@ -29,6 +30,7 @@ server_configs:
 
   - name: "r1_fp4_tep4"
     model_name: "deepseek_r1_0528_fp4"
+    gpus: 4
     tp: 4
     ep: 4
     pp: 1

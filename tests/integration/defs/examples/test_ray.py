@@ -14,7 +14,8 @@ def ray_example_root(llm_root):
 
 def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
-    venv_check_call(llm_venv, [script_path])
+    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    venv_check_call(llm_venv, [script_path, "--model", model_path])
 
 
 @pytest.mark.skip_less_device(2)
@@ -45,6 +46,9 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
     if ep_size != -1:
         model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
         cmd.extend(["--model_dir", model_dir])
+    else:
+        model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+        cmd.extend(["--model_dir", model_dir])
 
     venv_check_call(llm_venv, cmd)
 
@@ -52,17 +56,23 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
+    if tp_size == 1:
+        pytest.skip("https://nvbugs/5682551")
+
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
 
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
-
+    model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     subprocess.run("ray stop --force", shell=True, check=False)
 
     proc = subprocess.Popen(
-        ["bash", script_path, "--executor", "ray", "--tp_size",
-         str(tp_size)],
+        [
+            "bash", script_path, "--executor", "ray", "--model", model_dir,
+            "--tp_size",
+            str(tp_size)
+        ],
         cwd=disagg_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -75,7 +85,7 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
             "curl", "-sS", "-w", "\n%{http_code}",
             "http://localhost:8000/v1/completions", "-H",
             "Content-Type: application/json", "-d",
-            '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"NVIDIA is a great company because","max_tokens":16,"temperature":0}'
+            '{"model":"TinyLlama-1.1B-Chat-v1.0","prompt":"NVIDIA is a great company because","max_tokens":16,"temperature":0}'
         ],
                                 capture_output=True,
                                 text=True,

@@ -23,13 +23,13 @@ import torch
 
 from .. import profiler
 from .._utils import mpi_broadcast
-from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
-                        WorldConfig)
+from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
 from ..bindings import executor as trtllm
 from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
                                  OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
 from ..layers import MropeParams
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from .generation import LogitsProcessor, LoraManager
@@ -248,7 +248,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             json_config = GptJsonConfig.parse_file(config_path)
             model_config = json_config.model_config
 
-        use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
+        use_kv_cache = KVCacheType.from_cpp(
+            model_config.kv_cache_type) != KVCacheType.DISABLED
         if not model_config.use_cross_attention:
             assert cross_kv_cache_fraction is None, "cross_kv_cache_fraction should only be used with enc-dec models."
 
@@ -648,6 +649,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 "repetition_penalty",
                 "presence_penalty",
                 "frequency_penalty",
+                "prompt_ignore_length",
                 "length_penalty",
                 "early_stopping",
                 "no_repeat_ngram_size",

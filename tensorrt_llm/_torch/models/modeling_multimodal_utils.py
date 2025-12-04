@@ -17,7 +17,7 @@
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -76,7 +76,7 @@ def _cache_multimodal_embeddings(
     embed_lengths = [
         param.multimodal_runtime.total_mm_tokens_in_request -
         param.multimodal_runtime.total_special_tokens_in_request
-        for param in multimodal_params
+        for param in multimodal_params if param.multimodal_runtime is not None
     ]
 
     # Validate total length matches
@@ -86,9 +86,15 @@ def _cache_multimodal_embeddings(
 
     # Use torch.split for efficient tensor splitting
     split_embeddings = torch.split(mm_embed, embed_lengths, dim=0)
+    valid_params = [
+        p for p in multimodal_params if p.multimodal_runtime is not None
+    ]
 
     # Cache split embeddings to each parameter
-    for param, embed_chunk in zip(multimodal_params, split_embeddings):
+    logger.debug(
+        f"Caching {len(split_embeddings)} multimodal embedding chunks in {len(multimodal_params)} params"
+    )
+    for param, embed_chunk in zip(valid_params, split_embeddings):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
 
     logger.debug(
@@ -157,9 +163,12 @@ def get_multimodal_embeddings(
             param.multimodal_data["multimodal_embedding"] = torch.cat(embeds,
                                                                       dim=0)
 
+    valid_params = [
+        param for param in multimodal_params
+        if param.multimodal_data.get("multimodal_embedding", None) is not None
+    ]
     all_embeddings = torch.cat([
-        param.multimodal_data["multimodal_embedding"]
-        for param in multimodal_params
+        param.multimodal_data["multimodal_embedding"] for param in valid_params
     ],
                                dim=0)
     return [all_embeddings]
@@ -204,7 +213,7 @@ def find_input_mm_embeds(
     total_mm_tokens = sum([
         param.multimodal_runtime.num_mm_tokens_in_chunk -
         param.multimodal_runtime.num_special_tokens_in_chunk
-        for param in multimodal_params
+        for param in multimodal_params if param.multimodal_runtime is not None
     ])
 
     if total_mm_tokens == 0:
@@ -221,6 +230,8 @@ def find_input_mm_embeds(
     slices = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
+        if runtime is None:
+            continue
         local_start_pos = runtime.num_unseen_mm_tokens - runtime.num_unseen_special_tokens
         local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk - runtime.num_special_tokens_in_chunk
         slices.append(
@@ -291,7 +302,7 @@ def fuse_input_embeds(
     text_token_indices: Optional[torch.IntTensor] = None,
     mm_token_indices: Optional[torch.IntTensor] = None,
     **kwargs,
-) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
+) -> Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor]]:
     """
     Fuse text and multimodal embeddings. input_ids is [text_total_length + mm_total_length] and mm_embed is [mm_total_length, hidden_dim]. We just need to fuse them into [text_total_length + mm_total_length, hidden_dim] by slice-and-assign to the corresponding entries.
 
@@ -337,7 +348,7 @@ def fuse_input_embeds(
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
 
-    return None, input_embeds
+    return None, cast(torch.FloatTensor, input_embeds)
 
 
 #region VILA utils
