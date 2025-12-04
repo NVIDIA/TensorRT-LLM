@@ -548,7 +548,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
                 to_userbuffers: bool,
-                allowed_backends,
+                allowed_backends: str,
             ):
                 return
 
@@ -560,7 +560,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
                 to_userbuffers: bool,
-                allowed_backends,
+                allowed_backends: str,
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
@@ -568,17 +568,20 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 return nvfp4_gemm_output
 
             def extra_check(match: Match) -> bool:
-                # Validate allowed_backends if present
+                # Validate allowed_backends if present (now a comma-separated string)
                 allowed_backends_value = match.kwargs.get('allowed_backends')
                 if allowed_backends_value is not None:
-                    # allowed_backends should be a list of strings
-                    if not isinstance(allowed_backends_value, list):
+                    # allowed_backends should be a comma-separated string
+                    if not isinstance(allowed_backends_value, str):
                         return False
+                    backends_list = [
+                        b.strip() for b in allowed_backends_value.split(',')
+                        if b.strip()
+                    ]
                     valid_individual = {
                         'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
                     }
-                    if not all(b in valid_individual
-                               for b in allowed_backends_value):
+                    if not all(b in valid_individual for b in backends_list):
                         return False
 
                 return True

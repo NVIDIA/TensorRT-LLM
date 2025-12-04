@@ -878,7 +878,7 @@ def nvfp4_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
-    allowed_backends: Optional[List[str]] = None,
+    allowed_backends: str = "cutlass,cublaslt,cuda_core",
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM with automatic backend selection.
 
@@ -900,8 +900,8 @@ def nvfp4_gemm(
         alpha: Scaling factor (as torch.Tensor for CUTLASS/cuBLASLt compatibility)
         output_dtype: Output data type
         to_userbuffers: Whether to use user buffers (CUTLASS/cuBLASLt only)
-        allowed_backends: List of backends to consider for auto-selection.
-            Default: ['cutlass', 'cublaslt', 'cuda_core'] (excludes cutedsl for faster build)
+        allowed_backends: Comma-separated list of backends to consider for auto-selection.
+            Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
             Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
 
@@ -914,24 +914,24 @@ def nvfp4_gemm(
 
     valid_individual_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
 
-    # Use default if not specified
-    if allowed_backends is None:
-        allowed_backends = ['cutlass', 'cublaslt', 'cuda_core']
+    # Parse comma-separated string to list
+    backends_list = [
+        b.strip() for b in allowed_backends.split(',') if b.strip()
+    ]
 
     # Validate allowed_backends
-    invalid_backends = set(allowed_backends) - valid_individual_backends
+    invalid_backends = set(backends_list) - valid_individual_backends
     if invalid_backends:
         raise ValueError(
             f"Invalid backends in allowed_backends: {invalid_backends}. "
             f"Valid backends are: {sorted(valid_individual_backends)}.")
-    if not allowed_backends:
+    if not backends_list:
         raise ValueError(
             f"allowed_backends cannot be empty. "
             f"Valid backends are: {sorted(valid_individual_backends)}.")
 
     # Build runner with allowed backends
-    runner = NVFP4GemmUnifiedRunner(to_userbuffers, output_dtype,
-                                    list(allowed_backends))
+    runner = NVFP4GemmUnifiedRunner(to_userbuffers, output_dtype, backends_list)
 
     # Use AutoTuner to select best runner and tactic
     # - For 'auto' mode: compare across all backends, find global optimum
@@ -971,7 +971,7 @@ def _(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
-    allowed_backends: Optional[List[str]] = None,
+    allowed_backends: str = "cutlass,cublaslt,cuda_core",
 ) -> torch.Tensor:
     """Fake implementation for torch.compile support."""
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
