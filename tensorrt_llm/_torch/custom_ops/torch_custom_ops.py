@@ -772,7 +772,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                         raise ValueError(
                             f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
                             f"CuteDSL NVFP4 is not supported on this GPU architecture. "
-                            f"Please add other backends to allowed_backends.")
+                            "Please add other backends to allowed_backends.")
                 else:
                     # SM version OK, check if CuteDSL supports the current shape
                     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
