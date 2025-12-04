@@ -38,10 +38,31 @@ add_gtest(ucxCommTest ucxCommTest.cpp)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
 target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 
-if(NIXL_ROOT)
-  add_gtest(transferAgentTest transferAgentTest.cpp)
+# Skip MOONCAKE related tests on Rocky8
+set(IS_ROCKY8 FALSE)
+if(EXISTS "/etc/redhat-release")
+  set(IS_ROCKY8 TRUE)
+endif()
+
+if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
   add_gtest(agentCommTest agentCommTest.cpp)
-  target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
-  target_link_libraries(agentCommTest PRIVATE tensorrt_llm_nixl_wrapper
-                                              ${Python3_LIBRARIES})
+  add_gtest(transferAgentTest transferAgentTest.cpp)
+
+  if(NIXL_ROOT)
+    target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
+    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_nixl_wrapper
+                                                ${Python3_LIBRARIES})
+    target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
+    target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
+  endif()
+
+  if(MOONCAKE_ROOT)
+    target_link_libraries(transferAgentTest
+                          PRIVATE tensorrt_llm_mooncake_wrapper)
+    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_mooncake_wrapper
+                                                ${Python3_LIBRARIES})
+    target_compile_definitions(transferAgentTest
+                               PRIVATE TEST_MOONCAKE_BACKEND=1)
+    target_compile_definitions(agentCommTest PRIVATE TEST_MOONCAKE_BACKEND=1)
+  endif()
 endif()
