@@ -125,7 +125,7 @@ class TuningConfig:
     inputs_pre_hook: Callable = None
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = True
-    distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.BROADCAST
+    distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
 
 
 @dataclass(unsafe_hash=True)
@@ -609,7 +609,7 @@ class AutoTuner:
 
         # Dsitributed tuning state
         self._distributed_comm = None
-        self.mapping = None
+        self.mapping = Mapping()
 
     @classmethod
     def get(cls):
