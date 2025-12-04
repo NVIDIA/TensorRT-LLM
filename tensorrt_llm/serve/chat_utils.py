@@ -17,7 +17,8 @@ from typing_extensions import Required
 from tensorrt_llm.inputs import (ConversationMessage, MultimodalData,
                                  MultimodalDataTracker,
                                  add_multimodal_placeholders, async_load_audio,
-                                 async_load_image, async_load_video)
+                                 async_load_image, async_load_video,
+                                 load_base64_image_embeds)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.logger import logger
 
@@ -33,24 +34,38 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
+class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
+    """Type definition for image embeddings passed in base64-encoded PyTorch tensor format."""
+    image_embeds: Required[str]
+    type: Required[Literal["image_embeds"]]
+
+
 # Type Aliases and Constants
 ChatCompletionContentPartParam: TypeAlias = Union[
-    OpenAIChatCompletionContentPartParam, ChatCompletionContentPartVideoParam,
-    str]
+    OpenAIChatCompletionContentPartParam,
+    ChatCompletionContentPartVideoParam,
+    ChatCompletionContentPartImageEmbedsParam,
+    str,
+]
 
 # TODO: Add "input_audio" to support byte_encoded audio input.
 VALID_MESSAGE_CONTENT_MM_PART_TYPES = [
-    "text", "image_url", "video_url", "audio_url"
+    "text",
+    "image_url",
+    "video_url",
+    "audio_url",
+    "image_embeds",
 ]
 
 # Parser Functions
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
 _ImageParser = partial(cast, ChatCompletionContentPartImageParam)
+_ImageEmbedsParser = partial(cast, ChatCompletionContentPartImageEmbedsParam)
 _VideoParser = partial(cast, ChatCompletionContentPartVideoParam)
 _AudioParser = partial(cast, ChatCompletionContentPartInputAudioParam)
 
 MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
-    str, dict[str, str]]]] = {
+    str, dict[str, str], None]]] = {
         "text":
         lambda part: _TextParser(part).get("text", None),
         "image_url":
@@ -59,12 +74,20 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         lambda part: _VideoParser(part).get("video_url", {}).get("url", None),
         "audio_url":
         lambda part: _AudioParser(part).get("audio_url", {}).get("url", None),
+        "image_embeds":
+        lambda part: _ImageEmbedsParser(part).get("image_embeds", None),
     }
+
+# Map from content part tags used to directly provide embeddings
+# to the corresponding data modality.
+MM_EMBEDDING_MAP: dict[str, str] = {
+    "image_embeds": "image",
+}
 
 
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
-) -> tuple[str, Union[str, dict[str, str]]]:
+) -> tuple[str, Union[str, dict[str, str], None]]:
     """Parse a single multimodal part of a chat message."""
     assert isinstance(part, dict)
     part_type = part.get("type", None)
@@ -78,7 +101,7 @@ def _parse_chat_message_content_mm_part(
 
 
 def parse_chat_message_content_part(
-    part: ChatCompletionMessageParam,
+    part: ChatCompletionContentPartParam,
     mm_data_tracker: MultimodalDataTracker,
 ) -> Optional[Any]:
     """Parse a single part of a chat message."""
@@ -111,6 +134,19 @@ def parse_chat_message_content_part(
                 return None
 
         return MultimodalData(modality="image", data=load_image_async())
+
+    if part_type == "image_embeds":
+        str_content = cast(str, content)
+
+        async def decode_image_embeds_async():
+            try:
+                return load_base64_image_embeds(str_content)
+            except Exception as e:
+                logger.error(f"Failed to decode image data: {str(e)}")
+                return None
+
+        return MultimodalData(modality="image_embeds",
+                              data=decode_image_embeds_async())
 
     if part_type == "video_url":
         str_content = cast(str, content)
@@ -147,7 +183,7 @@ def parse_chat_message_content_part(
 
 def parse_chat_message_content_parts(
     role: str,
-    parts: Iterable[ChatCompletionMessageParam],
+    parts: Iterable[ChatCompletionContentPartParam],
     mm_data_tracker: MultimodalDataTracker,
 ) -> ConversationMessage:
     """Parse multiple parts of a chat message."""
@@ -237,7 +273,10 @@ def parse_chat_messages_coroutines(
         conversation.append(parsed_msg)
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
-                mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+                mm_data_tracker.add_data(mdata["modality"],
+                                         mdata["data"],
+                                         modality=MM_EMBEDDING_MAP.get(
+                                             mdata["modality"], None))
         mm_placeholder_count = mm_data_tracker.placeholder_counts()
         if mm_placeholder_count:
             parsed_msg["content"] = add_multimodal_placeholders(

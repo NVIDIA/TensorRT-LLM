@@ -114,6 +114,15 @@ def load_base64_image(parsed_url: str) -> Image.Image:
     return image
 
 
+def load_base64_image_embeds(str_content: str) -> torch.Tensor:
+    content_bytes = base64.b64decode(str_content)
+    with BytesIO(content_bytes) as buf:
+        image_data: torch.Tensor = torch.load(buf,
+                                              weights_only=True,
+                                              map_location="cpu")
+    return image_data
+
+
 def load_image(image: Union[str, Image.Image],
                format: str = "pt",
                device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
@@ -468,10 +477,15 @@ class MultimodalDataTracker:
 
         return {modality: items for modality, items in self._data.items()}
 
-    def add_data(self, media_type: str, data: Union[Coroutine, Any]):
+    def add_data(self,
+                 media_type: str,
+                 data: Union[Coroutine, Any],
+                 *,
+                 modality: Optional[str] = None):
+        modality = modality or media_type
         current_count = len(self._data[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
-                                                      media_type, current_count)
+                                                      modality, current_count)
         self._data[media_type].append(data)
         if placeholder:
             self._placeholder_counts[placeholder] += 1
