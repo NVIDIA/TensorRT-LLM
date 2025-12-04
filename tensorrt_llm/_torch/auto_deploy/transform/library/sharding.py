@@ -1188,6 +1188,26 @@ def init_process_grid_from_config(
     return process_grid
 
 
+def _canonicalize_node_args(node: Node) -> None:
+    """
+    Canonicalize the node's arguments.
+    Actions performed:
+    - Flatten list arguments
+    """
+    new_args = list(node.args)
+    for i in range(len(new_args)):
+        # In FX graphs, the list might be a Node representing a list() call
+        if isinstance(new_args[i], Node):
+            # Check if this is a list() call node
+            if new_args[i].target is list and len(new_args[i].args) == 1:
+                new_args[i] = new_args[i].args[0]
+        if isinstance(new_args[i], (list, tuple)):
+            if len(new_args[i]) == 1:
+                new_args[i] = new_args[i][0]
+
+    node.args = tuple(new_args)
+
+
 ########################################################
 #  Sharding transform functions
 ########################################################
@@ -1690,53 +1710,18 @@ def _insert_sharded_moe(
         raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
-    # Detect format: check if w1_weight is a single-element list with a 3D tensor (stacked format)
-    w1_weight_arg = node.args[3]
-    is_stacked = False
-
-    # In FX graphs, the list might be a Node representing a list() call
-    if isinstance(w1_weight_arg, Node):
-        # Check if this is a list() call node
-        if w1_weight_arg.target is list and len(w1_weight_arg.args) > 0:
-            # Get the actual list content from the args
-            list_content = w1_weight_arg.args[0]
-            if isinstance(list_content, (list, tuple)) and len(list_content) == 1:
-                first_elem = list_content[0]
-                if isinstance(first_elem, Node) and first_elem.op == "get_attr":
-                    try:
-                        tensor = gm.get_parameter(first_elem.target)
-                        is_stacked = tensor.ndim == 3
-                    except (AttributeError, KeyError):
-                        pass
-                elif isinstance(first_elem, torch.Tensor):
-                    is_stacked = first_elem.ndim == 3
-    # Handle case where it's a direct Python list (not in FX graph context)
-    elif isinstance(w1_weight_arg, (list, tuple)) and len(w1_weight_arg) == 1:
-        first_elem = w1_weight_arg[0]
-        if isinstance(first_elem, Node) and first_elem.op == "get_attr":
-            try:
-                tensor = gm.get_parameter(first_elem.target)
-                is_stacked = tensor.ndim == 3
-            except (AttributeError, KeyError):
-                pass
-        elif isinstance(first_elem, torch.Tensor):
-            is_stacked = first_elem.ndim == 3
-
-    if is_stacked:
-        # Use stacked tensor sharding logic (similar to _insert_sharded_moe_bmm)
-        _insert_sharded_moe_stacked(gm, node, ep_rank, ep_size, allreduce_strategy, scale_names)
-        return
-
-    num_experts = len(node.args[3])
-    # Standard per-expert list sharding
-    # For FX graphs, get the list from the Node; for direct calls, use the list directly
-    if isinstance(w1_weight_arg, Node) and w1_weight_arg.target is list:
-        # Extract the list content from the list() call node
-        num_experts = len(w1_weight_arg.args[0]) if w1_weight_arg.args else 0
-    elif isinstance(w1_weight_arg, (list, tuple)):
-        num_experts = len(w1_weight_arg)
+    _canonicalize_node_args(node)
+    # we have two variants of MoE: stacked and listed:
+    # - stacked: w1, w2, w3 weight args are order-3 tensors, where the 1st dimension corresponds
+    #            to the stacked expert weigthts.
+    # - listed: w1, w2, w3 weight args are lists of order-2 tensors, where each expert weight
+    #            is a separate entry in the list.
+    if isinstance(node.args[3], Node):
+        is_stacked = True
+        num_experts = node.args[3].meta["val"].shape[0]
     else:
-        raise ValueError(f"Unexpected w1_weight format in node {node.name}: {type(w1_weight_arg)}")
+        is_stacked = False
+        num_experts = len(node.args[3])
     args = list(node.args)
 
     # -- Handle selected_experts and final_scales sharding --
@@ -1783,32 +1768,37 @@ def _insert_sharded_moe(
         )
         return lst[expert_start:expert_end]
 
-    w_up_list_sharded = get_partition(args[3], ep_size, ep_rank)
-    w_down_list_sharded = get_partition(args[4], ep_size, ep_rank)
-    w_gate_list_sharded = get_partition(args[5], ep_size, ep_rank)
+    if is_stacked:
+        # bmm-style stacked MoE: sharding is done by slicing the 1st dimension of the stacked weight tensor
+        pass
+    else:
+        # listed MoE: sharding is done by taking a range of the listed weight tensors
+        w_up_list_sharded = get_partition(args[3], ep_size, ep_rank)
+        w_down_list_sharded = get_partition(args[4], ep_size, ep_rank)
+        w_gate_list_sharded = get_partition(args[5], ep_size, ep_rank)
 
-    # if tp_size > 1, we do 2D EP+TP sharding.
-    # we add TP sharding of all expert weights.
-    for w_up in w_up_list_sharded + w_gate_list_sharded:
-        shard_weight_tensor(
-            gm=gm,
-            weight_tensor=gm.get_parameter(w_up.target),
-            param_key=w_up.target,
-            dim=SplitDimension.COLUMN,
-            rank=tp_rank,
-            world_size=tp_size,
-        )
-    # here we don't need to add all-reduce: it's enough to have
-    # just one all-reduce after the whole EP+TP sharded MoE node.
-    for w_down in w_down_list_sharded:
-        shard_weight_tensor(
-            gm=gm,
-            weight_tensor=gm.get_parameter(w_down.target),
-            param_key=w_down.target,
-            dim=SplitDimension.ROW,
-            rank=tp_rank,
-            world_size=tp_size,
-        )
+        # if tp_size > 1, we do 2D EP+TP sharding.
+        # we add TP sharding of all expert weights.
+        for w_up in w_up_list_sharded + w_gate_list_sharded:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=gm.get_parameter(w_up.target),
+                param_key=w_up.target,
+                dim=SplitDimension.COLUMN,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
+        # here we don't need to add all-reduce: it's enough to have
+        # just one all-reduce after the whole EP+TP sharded MoE node.
+        for w_down in w_down_list_sharded:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=gm.get_parameter(w_down.target),
+                param_key=w_down.target,
+                dim=SplitDimension.ROW,
+                rank=tp_rank,
+                world_size=tp_size,
+            )
 
     # -- Update args --
     args[1] = selected_experts_local
