@@ -35,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --container-mount) container_mount="$2"; shift 2 ;;
         --container-image) container_image="$2"; shift 2 ;;
         --build-wheel) build_wheel="$2"; shift 2 ;;
+        --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
         # Profiling
         --nsys-on) nsys_on="$2"; shift 2 ;;
@@ -153,6 +154,9 @@ elif [ -d "${trtllm_repo}" ]; then
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
         build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
+        if [ -n "${cuda_architectures:-}" ]; then
+            build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
+        fi
         if ! srun --container-name=${container_name} \
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
