@@ -380,20 +380,39 @@ class OpenAIDisaggServer:
                 if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
                     yield "data: [DONE]\n\n".encode('utf-8')
                 else:
-                    # Then yield the generation responses
+                    bytes_count = 0
                     await self._increment_metric("gen_total_requests")
-                    if isinstance(gen_req, CompletionRequest):
-                        gen_response = await self.send_completion_request(gen_server, gen_req, trace_headers)
-                    elif isinstance(gen_req, ChatCompletionRequest):
-                        gen_response = await self.send_chat_request(gen_server, gen_req, trace_headers)
-                    else:
-                        raise TypeError("Invalid request type: {type(gen_req).__name__}")
+                    for attempt in range(self.max_retries + 1):
+                        # Note that the retry here is needed as well as the retry in send_request function.
+                        # This is because we are using the `body_iterator` to stream the response, and it may raise an exception if the connection is lost.
+                        # The retry is needed so we send the request again to the same server.
+                        # Then yield the generation responses
+                        try:
+                            if isinstance(gen_req, CompletionRequest):
+                                gen_response = await self.send_completion_request(gen_server, gen_req, trace_headers)
+                            elif isinstance(gen_req, ChatCompletionRequest):
+                                gen_response = await self.send_chat_request(gen_server, gen_req, trace_headers)
+                            else:
+                                raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
-                    first_response = await anext(gen_response.body_iterator)
-                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
-                    yield first_response
-                    async for chunk in gen_response.body_iterator:
-                        yield chunk
+                            first_response = await anext(gen_response.body_iterator)
+                            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                            yield first_response
+                            async for chunk in gen_response.body_iterator:
+                                bytes_count += len(chunk)
+                                yield chunk
+                        except (aiohttp.ClientError, OSError) as e:
+                            # We will retry if no tokens have been yielded as otherwise we will need to discard the tokens
+                            # that have been yielded.
+                            if attempt == self.max_retries or bytes_count > 0:
+                                raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error after {token_count} tokens") from e
+                            logger.warning(f"Client error: {e} - retry {attempt} of {self.max_retries}")
+                            # TODO : add a configurable retry interval
+                            await asyncio.sleep(1)
+                        except Exception as e:
+                            logger.error(f"Error encountered while streaming generation response: {e}")
+                            raise
+
                     await self._increment_metric("gen_completed_requests")
                     if need_ctx and self.perf_metrics_keys is not None:
                         asyncio.create_task(self._add_perf_metrics_keys(
@@ -402,6 +421,7 @@ class OpenAIDisaggServer:
 
             finally:
                 await self.gen_router.finish_request(gen_req)
+            # end  _merge_streaming_responses
         try:
             # Determine if need context server
             condition = self.conditional_disagg_config
