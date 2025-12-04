@@ -2050,7 +2050,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             a_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
             c_ptr (cute.Pointer): Pointer to the C tensor.
-            alpha (cute.Tensor): Device tensor to alpha scaling factor.
+            alpha_tensor (cute.Tensor): Device tensor to alpha scaling factor.
             max_active_clusters (cutlass.Constexpr): Maximum number of active
                 clusters.
             current_stream (cuda.CUstream): CUDA stream for the operation.
