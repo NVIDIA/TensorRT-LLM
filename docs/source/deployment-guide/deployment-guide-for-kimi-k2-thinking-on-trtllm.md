@@ -221,6 +221,39 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 Example response:
 
 ```json
+{
+  "id": "chatcmpl-5907ed752eb44d11a12893b19f79f8ca",
+  "object": "chat.completion",
+  "created": 1764866686,
+  "model": "nvidia/Kimi-K2-Thinking-NVFP4",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "<think> The user is asking a very simple question: \"Where is New York?\" This could be interpreted in a few ways:\n\n1. Where is New York State located?\n2. Where is New York City located?\n3. Where is New York located in relation to something else?\n\nGiven the ambiguity, I should provide a comprehensive answer that covers the main interpretations. I should be clear and direct.\n\nLet me structure my answer:\n- First, clarify that \"New York\" can refer to either New York State or New York City\n- For New York State: It's located in the northeastern United States, bordered by New Jersey, Pennsylvania, Connecticut",
+        "reasoning_content": "",
+        "reasoning": null,
+        "tool_calls": []
+      },
+      "logprobs": null,
+      "finish_reason": "length",
+      "stop_reason": null,
+      "mm_embedding_handle": null,
+      "disaggregated_params": null,
+      "avg_decoded_tokens_per_iter": 1.0
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "total_tokens": 140,
+    "completion_tokens": 128,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "prompt_token_ids": null
+}
 ```
 
 ## Benchmark
