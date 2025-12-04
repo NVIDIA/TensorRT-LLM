@@ -49,6 +49,8 @@ from tensorrt_llm.logger import logger
 
 from ..modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
 
+from PIL import Image
+
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
 
@@ -226,12 +228,11 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
 
 
 class MistralCommonImageProcessor:
-
     def __init__(self, tokenizer: MistralTokenizer, dtype) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.dtype = dtype
-
+    
     @property
     def image_processor(self) -> ImageEncoder:
         image_encoder = self.tokenizer.instruct.mm_encoder
@@ -241,7 +242,7 @@ class MistralCommonImageProcessor:
     @property
     def image_break_id(self) -> int:
         return self.image_processor.special_ids.img_break
-
+    
     @property
     def image_break_token_id(self) -> int:
         return self.image_break_id
@@ -267,18 +268,16 @@ class MistralCommonImageProcessor:
         return self.image_processor.mm_config.image_patch_size
 
     def _get_num_multimodal_tokens(self, image_sizes):
-        return {
-            "num_image_tokens":
-            [self.get_num_tokens_per_image(size) for size in image_sizes]
-        }
-
+        return {"num_image_tokens": [self.get_num_tokens_per_image(size) for size in image_sizes]}
+    
     def get_num_tokens_per_image(self, image_sizes):
         # FIXME avoid double loading with custom loader
         h, w = image_sizes
         ncols, nrows = self.image_processor._image_to_num_tokens(
-            Image.new("RGB", (w, h)))
+            Image.new("RGB", (w, h))
+        )
         return ncols * nrows + nrows
-
+    
     def __call__(self, text, images, media, **kwargs):
         assert media is not None
         if isinstance(media, str):
@@ -288,24 +287,16 @@ class MistralCommonImageProcessor:
 
         print(f"text: {text}")
 
-        conversation = [{
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": text
-            }, *mm_items]
-        }]
+        conversation = [
+            {"role":"user", 
+             "content":[{"type": "text", "text": text}, 
+                        *mm_items]}]
+        
+        encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(conversation, tokenize=True, return_dict=True, return_tensors='pt')
 
-        encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
-            conversation, tokenize=True, return_dict=True, return_tensors='pt')
-
-        print(
-            f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}"
-        )
-        print(
-            f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}"
-        )
-
+        print(f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}")
+        print(f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}")
+        
         processed = {
             "input_ids": encoded.input_ids,
             "pixel_values": encoded.pixel_values.to(self.dtype),
@@ -344,8 +335,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
 
         self._model_path = model_path
         if isinstance(self._tokenizer, MistralTokenizer):
-            self._processor = MistralCommonImageProcessor(
-                tokenizer=self._tokenizer, dtype=self.dtype)
+            self._processor = MistralCommonImageProcessor(tokenizer=self._tokenizer, dtype=self.dtype)
         else:
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
@@ -388,10 +378,11 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
             do_rescale = False
 
-        processed = self.processor(text=inputs["prompt"],
-                                   images=images,
-                                   do_rescale=do_rescale,
-                                   **mm_processor_kwargs)
+        processed = self.processor(
+            text=inputs["prompt"],
+            images=images,
+            do_rescale=do_rescale,
+        )
         input_ids = processed.pop("input_ids").tolist()[0]
         # Remaining in `processed`:
         # * "attention_mask": [B, num_input_tokens]
@@ -588,7 +579,6 @@ class Mistral3VLM(PreTrainedModel):
                                                          "vision_config",
                                                          attn_backend="VANILLA",
                                                          quant_config=None)
-
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
 
@@ -951,3 +941,4 @@ class Mistral3MultiModalProjector(torch.nn.Module):
 
     def load_weights(self, weights, *args, **kwargs):
         _load_weights_impl(self, weights, *args, **kwargs)
+
