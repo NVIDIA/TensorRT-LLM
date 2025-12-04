@@ -1399,8 +1399,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 tolerations = """
                 tolerations:
                 - key: "node_for_blossom_trt"
-                    operator: "Exists"
-                    effect: "NoSchedule"
+                  operator: "Exists"
+                  effect: "NoSchedule"
                 """
             } else {
                 selectors = """
