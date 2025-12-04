@@ -1,7 +1,6 @@
 from typing import Any, Optional
 
 from ..llmapi.llm import LLM
-from .virtual_memory import ExecutorMemoryType
 
 
 class AsyncLLM(LLM):
@@ -14,8 +13,13 @@ class AsyncLLM(LLM):
     def __init__(self, *args, **kwargs):
         kwargs["orchestrator_type"] = "ray"
         kwargs["ray_defer_workers_init"] = True
-        if 'ray_worker_extension_cls' not in kwargs:
-            kwargs['ray_worker_extension_cls'] = 'tensorrt_llm.llmapi.rlhf_utils.WorkerExtension'
+        # WAR: RL integration needs to use NCCL AllReduce for TP>1 due to a bug in TRTLLM's AllReduce
+        # which will cause convergence issue when using multiple rollout instances.
+        kwargs["allreduce_strategy"] = "NCCL"
+
+        if "ray_worker_extension_cls" not in kwargs:
+            kwargs["ray_worker_extension_cls"] = "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension"
+
         super().__init__(*args, **kwargs)
         self._async_initialized = False
 

@@ -1,10 +1,10 @@
 import pytest
+from utils.llm_data import llm_models_root
+from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm._torch.virtual_memory import ExecutorMemoryType
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
-from utils.llm_data import llm_models_root
-from utils.util import get_current_process_gpu_memory
 
 
 @pytest.mark.ray
@@ -25,7 +25,7 @@ async def test_async_llm_awaitable():
 
     output = await llm.generate_async(prompt, sampling_params)
     assert output.outputs[0].text
-    print('Output text:', output.outputs[0].text)
+    print("Output text:", output.outputs[0].text)
 
     del llm
 
@@ -35,8 +35,8 @@ async def test_async_llm_awaitable():
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
     """Verifies that:
-        1. Memory is released/restored when calling release()/resume()
-        2. generation_async() works correctly before and after release/resume cycle(s)
+    1. Memory is released/restored when calling release()/resume()
+    2. generation_async() works correctly before and after release/resume cycle(s)
     """
     llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
@@ -51,7 +51,6 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
     ) as llm:
-
         # Generate baseline
         output_before = await llm.generate_async(prompt, sampling_params)
         baseline_text = output_before.outputs[0].text
@@ -64,7 +63,9 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
             memory_usage_released = get_current_process_gpu_memory(True) / 1024**3
 
             if process_gpu_memory_info_available:
-                print(f"[Cycle {cycle + 1}] Memory usage after release: {memory_usage_released:.2f} GB")
+                print(
+                    f"[Cycle {cycle + 1}] Memory usage after release: {memory_usage_released:.2f} GB"
+                )
                 assert memory_usage_released < memory_usage_active, (
                     f"Released memory ({memory_usage_released:.2f} GB) should be < active memory ({memory_usage_active:.2f} GB)"
                 )

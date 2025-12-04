@@ -83,14 +83,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor)
 
-            # WAR: RL integration needs to use NCCL AllReduce for TP>1 due to a bug in TRTLLM's AllReduce
-            # which will cause convergence issue when using multiple rollout instances.
-            if not self.has_start_local_cluser:
-                self.worker_kwargs['llm_args'].allreduce_strategy = 'NCCL'
-                logger.info(
-                    "Forcing allreduce_strategy to NCCL as a workaround for RL integration."
-                )
-
             self.init_rpc_executor()
             # Inject the generated HMAC key into worker_kwargs for workers
             self.worker_kwargs['hmac_key'] = self.hmac_key
@@ -101,9 +93,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             if defer_workers_init:
                 self.workers = [
                 ]  # Placeholder, will be initialized in setup_async
-                self._needs_async_setup = True
-                self._mainloop_started = False  # Track if mainloop has been started
-                # DO NOT start mainloop until after setup_engine_remote_async is called
+                self._mainloop_started = False  # DO NOT start mainloop until after setup_engine_remote_async is called
             else:
                 if not has_event_loop():
                     self.init_workers_sync()
@@ -122,12 +112,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
         num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
-        if llm_args:
-            # TODO: to remove
-            if getattr(llm_args, 'placement_share', None) is not None:
-                num_gpus = llm_args.placement_share
-            elif llm_args.per_worker_gpu_share is not None:
-                num_gpus = llm_args.per_worker_gpu_share
+        if llm_args and llm_args.per_worker_gpu_share is not None:
+            num_gpus = llm_args.per_worker_gpu_share
 
         logger.debug(f"{num_gpus=} for each worker.")
 
@@ -360,28 +346,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             - bundle_indices is always a List[int]
         """
         llm_args = worker_kwargs.get("llm_args") if worker_kwargs else None
-
-        # TODO: clean up
-        if llm_args and getattr(llm_args, 'placement_where', None) is not None:
-            total_workers = sum(
-                len(indices) for _, indices in llm_args.placement_where)
-            if total_workers != self.world_size:
-                raise ValueError(
-                    f"Total bundle indices ({total_workers}) must equal world_size ({self.world_size})"
-                )
-
-            logger.info(
-                f"Creating {self.world_size} workers with external placement_where"
-            )
-
-            flat_pgs = []
-            flat_indices = []
-            for pg, indices in llm_args.placement_where:
-                for idx in indices:
-                    flat_pgs.append(pg)
-                    flat_indices.append(idx)
-
-            return flat_pgs, flat_indices
 
         if llm_args and hasattr(
                 llm_args,

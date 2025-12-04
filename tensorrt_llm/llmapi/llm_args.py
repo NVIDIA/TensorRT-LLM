@@ -2775,19 +2775,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU).",
         status="prototype")
 
-    # TODO: to remove
-    placement_where: Optional[List[Tuple[Any, List[int]]]] = Field(
-        default=None,
-        description="List of (PlacementGroup, List[int]) tuples for each node.",
-        status="prototype")
-
-    # TODO: to remove
-    placement_share: Optional[float] = Field(
-        default=None,
-        description="GPU fraction per worker for colocation scenarios. "
-        "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU).",
-        status="prototype")
-
     enable_sleep: bool = Field(
         default=False,
         description=
