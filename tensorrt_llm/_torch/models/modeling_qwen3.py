@@ -122,6 +122,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[dict] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -152,6 +153,10 @@ class Qwen3DecoderLayer(DecoderLayer):
                 enable_allreduce=not self.disable_allreduce),
             cutlass_min_latency_mode=False,
         )
+
+        if deepstack_visual_embeds is not None and self.layer_idx in range(
+                len(deepstack_visual_embeds)):
+            residual = residual + deepstack_visual_embeds[self.layer_idx]
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -209,7 +214,7 @@ class Qwen3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for decoder_layer in self.layers:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -217,13 +222,7 @@ class Qwen3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 mrope_config=mrope_config,
-            )
-            # add visual features to the hidden states of first several layers
-            if deepstack_visual_embeds is not None and layer_idx in range(
-                    len(deepstack_visual_embeds)):
-                hidden_states = hidden_states + deepstack_visual_embeds[
-                    layer_idx]
-
+                deepstack_visual_embeds=deepstack_visual_embeds)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
