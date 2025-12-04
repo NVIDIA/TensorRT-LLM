@@ -25,7 +25,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+                                 RocketSparseAttentionConfig, SamplingParams,
+                                 TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -122,11 +123,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
                             torch_compile):
-        if torch_compile and pp_size > 1:
-            pytest.skip(
-                "Pipeline parallel with torch.compile is not supported yet.\n"
-                "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
-                "discarded at graph breaks.")
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
@@ -1351,9 +1347,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler,
                             torch_compile):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
-
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
             pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
@@ -1452,8 +1445,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         overlap_scheduler,
         torch_compile,
     ):
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = (TorchCompileConfig(
             enable_fullgraph=True,
@@ -1557,8 +1548,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1619,8 +1608,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         overlap_scheduler,
         torch_compile,
     ):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = (TorchCompileConfig(
             enable_fullgraph=True,
@@ -1846,8 +1833,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
                          torch_compile, mtp_nextn, moe_backend):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
@@ -2485,8 +2470,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
-    @pytest.mark.skipif(get_sm_version() >= 100,
-                        reason="https://nvbugs/5547584 WNF")
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -4393,7 +4376,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512) if cuda_graph else None)
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
 
         with LLM(
                 model_path,
@@ -4428,7 +4412,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512) if cuda_graph else None)
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
         moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(model_path,
@@ -4606,3 +4591,50 @@ class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
                  max_seq_len=4096) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestLlama3_1_8B_Instruct_LongBenchV2(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+
+    def test_auto_dtype(self):
+        model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        # Configure model settings
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=64)
+
+        sparse_attention_config = RocketSparseAttentionConfig(
+            kt_cache_dtype="float8_e5m2", )
+
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              sparse_attention_config=sparse_attention_config,
+                              enable_chunked_prefill=False)
+
+        MAX_LEN = 128000
+        MAX_NEW_TOKENS = 1024
+
+        with LLM(model_dir,
+                 max_seq_len=MAX_LEN,
+                 max_num_tokens=128000,
+                 max_batch_size=64,
+                 **pytorch_config) as llm:
+            task = LongBenchV2(self.MODEL_NAME)
+
+            sampling_params = SamplingParams(
+                max_tokens=MAX_NEW_TOKENS,
+                temperature=0.8,
+                top_p=0.95,
+            )
+
+            extra_evaluator_kwargs = dict(max_len=MAX_LEN,
+                                          max_output_length=MAX_NEW_TOKENS)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
