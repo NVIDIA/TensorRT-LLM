@@ -2015,6 +2015,11 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        if helix_is_inactive_rank is not None and len(
+                helix_is_inactive_rank) > 0:
+            helix_is_inactive_rank = torch.tensor(helix_is_inactive_rank,
+                                                  dtype=torch.bool,
+                                                  device='cuda')
         attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
