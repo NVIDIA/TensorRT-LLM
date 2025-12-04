@@ -113,7 +113,6 @@ class TRTLLMGenFusedMoE(MoE):
         # - self.expert_size_per_partition = self.num_experts // self.ep_size
         # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
-        # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
         # When without_comm=True, skip communication initialization (ConfigurableMoE will handle it)
         if not without_comm:
             self.alltoall_method_type = self.select_alltoall_method_type()
@@ -133,15 +132,22 @@ class TRTLLMGenFusedMoE(MoE):
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                         model_config.mapping)
                 elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
-                    workspace_mb = int(
-                        os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
+                    # Calculate required workspace size
+                    ep_size = self.mapping.moe_ep_size
+                    max_num_tokens = model_config.max_num_tokens
+                    hidden_size = self.hidden_size
+                    dtype = self.dtype or torch.bfloat16
+
+                    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+                        ep_size, self.routing_method.experts_per_token,
+                        max_num_tokens, hidden_size, dtype)
+
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
                         max_num_tokens=model_config.max_num_tokens,
                         top_k=self.routing_method.experts_per_token,
                         num_experts=self.num_slots,
-                        workspace_size_per_rank=workspace_mb * 1024 * 1024,
-                    )
+                        workspace_size_per_rank=workspace_size)
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
                         "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
@@ -186,7 +192,7 @@ class TRTLLMGenFusedMoE(MoE):
                 )
             return AlltoallMethodType[all2all_method_type]
 
-        # TODO: We found that NVLinkOneSided performs better than NCCL AllGather/ReduceScatter,
+        # We found that NVLinkOneSided performs better than NCCL AllGather/ReduceScatter,
         # regardless of the relationship between EP size and topK. We favor NVLinkOneSided for now.
         # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
         #     return AlltoallMethodType.NotEnabled
@@ -310,6 +316,13 @@ class TRTLLMGenFusedMoE(MoE):
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
+                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+                # fc31_act_scale shape: (1, hidden_size)
+                # x shape: (num_tokens, hidden_size)
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    x = x * self.fc31_act_scale
                 x_row = x.shape[0]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,

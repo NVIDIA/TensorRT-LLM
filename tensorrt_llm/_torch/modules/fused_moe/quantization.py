@@ -480,10 +480,12 @@ class FusedMoEMethodBase(ABC):
 
         dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
         if w1_weight is not None:
-            dst_w1_weight.copy_(w1_weight_shard.view(dst_w3_w1_weight.dtype),
+            dst_w1_weight.copy_(w1_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype),
                                 non_blocking=True)
         if w3_weight is not None:
-            dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_w1_weight.dtype),
+            dst_w3_weight.copy_(w3_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype),
                                 non_blocking=True)
 
     # Helper function
@@ -1714,6 +1716,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
 
+        # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
+        # This will be initialized in load_quant_scales if pre_quant_scale exists
+        module.register_parameter("fc31_act_scale", None)
+
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
                                w2_weight_shape)
 
@@ -1832,11 +1838,29 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                              dst_fc2_alpha[expert_idx])
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # Check if pre_quant_scale exists in the checkpoint (for NVFP4_AWQ)
+        has_pre_quant_scale = False
+        if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+            # Check if any expert has pre_quant_scale
+            has_pre_quant_scale = f"0.w1.pre_quant_scale" in weights
+
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
                                            dtype=torch.float32)
         tmp_fc2_input_scale = torch.empty(module.num_experts,
                                           dtype=torch.float32)
+
+        # If pre_quant_scale exists, we need a per-channel act scale for fc31
+        # All experts share the same input, so pre_quant_scale should be identical across experts
+        if has_pre_quant_scale:
+            # Create fc31_act_scale parameter (for gate_up_proj / w3_w1)
+            # Shape: (1, hidden_size) - single vector for all experts (they share the same input)
+            fc31_act_scale = nn.Parameter(torch.empty(1,
+                                                      module.hidden_size,
+                                                      dtype=module.dtype,
+                                                      device='cuda'),
+                                          requires_grad=False)
+            module.register_parameter("fc31_act_scale", fc31_act_scale)
 
         for expert_id in range(module.num_experts):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
@@ -1863,6 +1887,66 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
         module.fc2_input_scale.data.copy_(
             tmp_fc2_input_scale.max().reciprocal())
+
+        # Load pre_quant_scale if it exists (for NVFP4_AWQ)
+        if has_pre_quant_scale:
+            from ..linear import TensorParallelMode, load_weight_shard
+
+            device = module.fc31_act_scale.device
+            # Load fc31 (w3/w1) pre_quant_scales
+            # All experts should have identical pre_quant_scale since they share the same input
+            all_w3_pre_quant_scales = []
+            all_w1_pre_quant_scales = []
+            for expert_id in module.initial_local_expert_ids:
+                w3_pre_quant_scale = load_weight_shard(
+                    weights[f"{expert_id}.w3.pre_quant_scale"],
+                    module.tp_size,
+                    module.tp_rank,
+                    TensorParallelMode.ROW,
+                    device=device)
+                w1_pre_quant_scale = load_weight_shard(
+                    weights[f"{expert_id}.w1.pre_quant_scale"],
+                    module.tp_size,
+                    module.tp_rank,
+                    TensorParallelMode.ROW,
+                    device=device)
+                all_w3_pre_quant_scales.append(w3_pre_quant_scale)
+                all_w1_pre_quant_scales.append(w1_pre_quant_scale)
+
+            # Verify that all experts have identical pre_quant_scale
+            # (they should be the same since all experts share the same input)
+            w3_reference = all_w3_pre_quant_scales[0]
+            w1_reference = all_w1_pre_quant_scales[0]
+
+            def check_consistency(scale, ref_scale, scale_name, expert_id):
+                if not torch.allclose(scale, ref_scale, rtol=1e-5, atol=1e-8):
+                    max_diff = (scale - ref_scale).abs().max()
+                    msg = (
+                        f"MoE pre_quant_scale: expert {expert_id} {scale_name} "
+                        f"differs from expert {module.initial_local_expert_ids[0]}! Max diff: {max_diff:.6e}. "
+                        f"All experts should have identical pre_quant_scale since they share the same input."
+                    )
+                    logger.error(msg)
+                    raise ValueError(msg)
+
+            for i, (w3_scale, w1_scale) in enumerate(
+                    zip(all_w3_pre_quant_scales[1:],
+                        all_w1_pre_quant_scales[1:]), 1):
+                check_consistency(w3_scale, w3_reference, "w3.pre_quant_scale",
+                                  module.initial_local_expert_ids[i])
+                check_consistency(w1_scale, w1_reference, "w1.pre_quant_scale",
+                                  module.initial_local_expert_ids[i])
+
+            # Take the maximum pre_quant_scale between w3 and w1 from the first expert
+            # (all experts should have the same values)
+            # Shape: (hidden_size,)
+            # Keep on CUDA device (w3_reference and w1_reference are already on CUDA)
+            fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+                dtype=module.dtype, device='cuda')
+
+            # Store as a single vector since all experts share the same pre_quant_scale
+            # This will be broadcasted to all tokens in the forward pass
+            module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
         # Step2: Load weight block scales and alphas.
         self.load_all_fp4_weight_scales_and_alphas(

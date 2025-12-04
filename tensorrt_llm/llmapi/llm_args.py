@@ -977,7 +977,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend == "pytorch" or backend == "_autodeploy"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2719,7 +2719,7 @@ class TorchLlmArgs(BaseLlmArgs):
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
     disable_flashinfer_sampling: bool = Field(
-        default=True,
+        default=False,
         description=
         "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
         status="prototype",

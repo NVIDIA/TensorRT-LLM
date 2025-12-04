@@ -1,6 +1,5 @@
 import asyncio
 import json
-import threading
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -15,12 +14,11 @@ import torch.nn.functional as F
 from tensorrt_llm.llmapi import tracing
 
 try:
-    import ray
+    pass
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    pass
 
-from .._ray_utils import unwrap_ray_errors
-from .._utils import mpi_disabled, nvtx_range_debug, ray_use_rpc
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
@@ -160,104 +158,12 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
-def warmup_tensorrt_llm():
-    import tensorrt_llm
-    print("Warmup by importing tensorrt_llm with version",
-          tensorrt_llm.version.__version__)
-
-
-@ray.remote(max_concurrency=1000000, num_cpus=2)
-class RayAsyncQueue:
-    """Ray actor for async response handling."""
-
-    def __init__(self):
-        self.data = {}
-        self.event_map = {}
-        self.warmup_done = False
-
-    def register(self, key: int):
-        assert key not in self.event_map, f"Key {key} already registered"
-        self.event_map[key] = asyncio.Event()
-
-    def unregister(self, key: int):
-        if key in self.event_map:
-            del self.event_map[key]
-
-        if key in self.data:
-            del self.data[key]
-
-    def warmup(self):
-        if self.warmup_done:
-            return
-        warmup_tensorrt_llm()
-        self.warmup_done = True
-
-    def put_response(self, key: int, item: Any):
-        assert key in self.event_map, f"Key {key} not registered"
-        self.data[key] = item
-        self.event_map[key].set()
-
-    async def get_async(self, key: int):
-        assert key in self.event_map, f"Key {key} not registered"
-        await self.event_map[key].wait()
-        self.event_map[key].clear()
-        ret = self.data[key]
-        del self.data[key]
-        return ret
-
-
-SYNC_QUEUE_MAX_CONCURRENCY = 2
-
-
-@ray.remote(max_concurrency=SYNC_QUEUE_MAX_CONCURRENCY,
-            num_cpus=SYNC_QUEUE_MAX_CONCURRENCY)
-class RaySyncQueue:
-    """Ray actor for sync response handling."""
-
-    def __init__(self):
-        self.data = {}
-        self.event_map = {}
-        self.semaphore = threading.Semaphore(SYNC_QUEUE_MAX_CONCURRENCY - 1)
-        self.warmup_done = False
-
-    def register(self, key: int):
-        assert key not in self.event_map, f"Key {key} already registered"
-        self.event_map[key] = threading.Event()
-        self.event_map[key]
-
-    def unregister(self, key: int):
-        if key in self.event_map:
-            del self.event_map[key]
-
-        if key in self.data:
-            del self.data[key]
-
-    def warmup(self):
-        if self.warmup_done:
-            return
-        warmup_tensorrt_llm()
-        self.warmup_done = True
-
-    def put_response(self, key: int, item: Any):
-        self.data[key] = item
-        self.event_map[key].set()
-
-    def get(self, key: int):
-        with self.semaphore:
-            self.event_map[key].wait()
-            self.event_map[key].clear()
-            ret = self.data[key]
-            del self.data[key]
-            return ret
-
-
 class GenerationResultBase:
     ''' This holds the core logic of the GenerationResult class. '''
 
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
-                 ray_queue: Optional[RayAsyncQueue] = None,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
         self.id = id
@@ -275,22 +181,12 @@ class GenerationResultBase:
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
-        if ray_queue is not None and not ray_use_rpc():
-            if has_event_loop():
-                self.aqueue = ray_queue
-                self.queue = self.aqueue
-            else:
-                self.queue = ray_queue
-                self.aqueue = None
-            with unwrap_ray_errors():
-                ray.get(self.queue.register.remote(id))
+        if has_event_loop():
+            self.aqueue = AsyncQueue()
+            self.queue = self.aqueue.sync_q
         else:
-            if has_event_loop():
-                self.aqueue = AsyncQueue()
-                self.queue = self.aqueue.sync_q
-            else:
-                self.queue = Queue()
-                self.aqueue = None
+            self.queue = Queue()
+            self.aqueue = None
 
         # In Sampling mode, the Executor runtime will return best_of sequences
         # in total, which the LLM API will select the n-best sequences among
@@ -557,12 +453,6 @@ class GenerationResultBase:
         else:
             raise ValueError(f"Unknown response type: {response}")
 
-        if self._done and mpi_disabled() and not ray_use_rpc():
-            assert hasattr(
-                self.queue, "unregister"
-            ), "Ray path should be activated for unregistering the Ray queue."
-            self.queue.unregister.remote(self.id)
-
     def record_stats(self,
                      output: CompletionOutput,
                      stats: Optional[dict[str, float]] = None) -> None:
@@ -787,15 +677,9 @@ class GenerationResult(GenerationResultBase):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         logprob_params: Optional[LogprobParams] = None,
     ) -> None:
-        use_async_queue = has_event_loop()
-        shared_queue = None
-        if executor and executor.use_ray_queue() and not ray_use_rpc():
-            shared_queue = executor.async_response_queue_weakref if use_async_queue else executor.sync_response_queue_weakref
-
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
-            shared_queue,
             background_error_handler,
             postproc_params=generation_request.postproc_params,
         )
@@ -854,22 +738,12 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        if mpi_disabled() and not ray_use_rpc():
-            with unwrap_ray_errors():
-                response = ray.get(self.queue.get.remote(self.request_id))
-            response = self._handle_ray_response(response)
-        else:
-            response = self.queue.get()
-
+        response = self.queue.get()
         self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        if mpi_disabled() and not ray_use_rpc():
-            response = await self.aqueue.get_async.remote(self.request_id)
-            response = self._handle_ray_response(response)
-        else:
-            response = await self.aqueue.get()
+        response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
         self._handle_response(response)
 

@@ -70,11 +70,13 @@ def torch_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
         weight: Scaling weights for the normalized output.
         eps: Small constant for numerical stability.
     """
-    input_dtype = input.dtype
+    # pre-allocate output to ensure same dtype+stride as input
+    out = torch.empty_like(input)
     input = input.to(torch.float32)
     variance = input.pow(2).mean(-1, keepdim=True)
     input = input * torch.rsqrt(variance + eps)
-    return (weight * input.to(input_dtype)).contiguous()
+    out.copy_((weight * input.to(out.dtype)))
+    return out
 
 
 @torch_rmsnorm.register_fake

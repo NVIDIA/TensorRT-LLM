@@ -631,6 +631,15 @@ def deepseek_v3_model_root(request):
     return deepseek_v3_model_root
 
 
+@pytest.fixture(scope="function")
+def gpt_oss_model_root(request):
+    models_root = os.path.join(llm_models_root(), "gpt_oss")
+    if request.param == "gpt-oss-20b":
+        gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
+    assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"
+    return gpt_oss_model_root
+
+
 @pytest.fixture(scope="session")
 def trt_performance_cache_name():
     return "performance.cache"
@@ -1345,6 +1354,10 @@ def llm_lora_model_root(request):
                 os.path.join(
                     models_root, "nemotron-nas",
                     "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
+        elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
+            model_root_list.append(
+                os.path.join(models_root, "gpt_oss",
+                             "gpt-oss-20b-lora-adapter_NIM_r8"))
 
     return ",".join(model_root_list)
 
