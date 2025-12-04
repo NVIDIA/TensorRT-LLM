@@ -90,7 +90,8 @@ class LongBenchV2(Evaluator):
         """
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt, chat_template_kwargs=chat_template_kwargs)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
 
         self.dataset_path = dataset_path
         self.num_samples = num_samples
