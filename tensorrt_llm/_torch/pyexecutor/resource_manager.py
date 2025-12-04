@@ -353,7 +353,7 @@ class KVCacheManager(BaseResourceManager):
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
-        self._stream = torch.cuda.Stream()
+        self._stream = torch.cuda.current_stream()
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
