@@ -2017,20 +2017,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @cute.jit
     def wrapper(
         self,
-        m,
-        n,
-        k,
-        sf_m,
-        sf_n,
-        sf_k,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        sf_m: cutlass.Int32,
+        sf_n: cutlass.Int32,
+        sf_k: cutlass.Int32,
         l: cutlass.Constexpr,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        alpha: cute.
-        Pointer,  # Device pointer to alpha, will be converted to Tensor
+        alpha_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
@@ -2051,7 +2050,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             a_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for A.
             b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
             c_ptr (cute.Pointer): Pointer to the C tensor.
-            alpha (cute.Pointer): Device pointer to alpha scaling factor (converted to Tensor internally).
+            alpha (cute.Tensor): Device tensor to alpha scaling factor.
             max_active_clusters (cutlass.Constexpr): Maximum number of active
                 clusters.
             current_stream (cuda.CUstream): CUDA stream for the operation.
@@ -2096,9 +2095,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                           (32, 4, sf_n, 4, sf_k, l),
                                           order=(2, 1, 4, 0, 3, 5),
                                       ))
-        alpha_tensor = cute.make_tensor(alpha,
-                                        layout=cute.make_ordered_layout(
-                                            (1, ), order=(0, )))
 
         self(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha_tensor,
              max_active_clusters, current_stream, epilogue_op)
