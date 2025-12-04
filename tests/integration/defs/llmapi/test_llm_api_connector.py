@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -422,7 +423,7 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=True,
-                     kv_cache_config=KvCacheConfig(max_tokens=120))
+                     kv_cache_config=KvCacheConfig(max_tokens=144))
 
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
 
