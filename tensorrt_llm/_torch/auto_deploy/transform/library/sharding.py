@@ -109,6 +109,16 @@ class LayerType(Enum):
     MOE = "moe"
 
 
+class MLPType(Enum):
+    """Enum for MLP type."""
+
+    GATED_MLP = "gated_mlp"  # explicit three weights: up, down, gate (in this order)
+    MLP = "mlp"  # two weights: up, down
+    FUSED_GATED_MLP = (
+        "fused_gated_mlp"  # fused three weights (two inputs) up_gate, down (in this order)
+    )
+
+
 ########################################################
 #  Sharding classes
 ########################################################
@@ -590,6 +600,8 @@ class BMMShardingInfo(ShardingTransformInfo):
 class EPShardingInfo(ShardingTransformInfo):
     """Configuration for EP sharding transformations."""
 
+    mlp_type: MLPType
+
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
         """
@@ -607,7 +619,7 @@ class EPShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.config)
+        _insert_sharded_moe(gm, node, self.config, mlp_type=self.mlp_type)
 
 
 class MXFP4EPShardingInfo(EPShardingInfo):
@@ -1687,6 +1699,7 @@ def _insert_sharded_moe(
     gm: GraphModule,
     node: Node,
     config: ShardingTransformConfig,
+    mlp_type: MLPType,
     scale_names: Sequence[str] = (),
 ):
     """Update the torch_moe node with sharded weight lists or stacked tensors,
@@ -1770,6 +1783,7 @@ def _insert_sharded_moe(
 
     if is_stacked:
         # bmm-style stacked MoE: sharding is done by slicing the 1st dimension of the stacked weight tensor
+
         pass
     else:
         # listed MoE: sharding is done by taking a range of the listed weight tensors
