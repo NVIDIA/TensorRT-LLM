@@ -578,7 +578,9 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 if not isinstance(backend_value, str):
                     return False
 
-                valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
+                valid_backends = {
+                    'auto', 'auto_no_cutedsl', 'cutlass', 'cublaslt', 'cutedsl'
+                }
                 return backend_value in valid_backends
 
             register_replacement(

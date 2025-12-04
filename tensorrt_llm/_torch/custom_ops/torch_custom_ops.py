@@ -698,15 +698,18 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     def __init__(self,
                  to_userbuffers: bool,
                  output_dtype: torch.dtype,
-                 backend: str = "auto"):
+                 backend: str = "auto",
+                 exclude_cutedsl: bool = False):
         super().__init__()
         self.to_userbuffers = to_userbuffers
         self.output_dtype = output_dtype
         self.backend = backend
+        self.exclude_cutedsl = exclude_cutedsl
 
     def unique_id(self):
-        """Include backend in cache key to avoid sharing cache across backends."""
-        return (self.to_userbuffers, self.output_dtype, self.backend)
+        """Include backend and exclude_cutedsl in cache key to avoid sharing cache across backends."""
+        return (self.to_userbuffers, self.output_dtype, self.backend,
+                self.exclude_cutedsl)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -753,7 +756,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     "Please check cuBLASLt installation or use backend='auto'.")
 
         # Add CuteDSL runner if available
-        if backend in ["auto", "cutedsl"]:
+        # Note: "auto_no_cutedsl" explicitly excludes cutedsl from auto selection
+        if backend in ["auto", "cutedsl"] and not self.exclude_cutedsl:
             if IS_CUTLASS_DSL_AVAILABLE:
                 # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
                 sm_version = get_sm_version()
@@ -882,7 +886,7 @@ def nvfp4_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
-    backend: str = "auto",
+    backend: str = "auto_no_cutedsl",
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM with automatic or manual backend selection.
 
@@ -906,7 +910,8 @@ def nvfp4_gemm(
         output_dtype: Output data type
         to_userbuffers: Whether to use user buffers (CUTLASS/cuBLASLt only)
         backend: Backend selection, one of:
-            - 'auto': AutoTuner automatically selects best backend (default)
+            - 'auto_no_cutedsl': Auto-select from cutlass/cublaslt/cuda_core (default, faster build)
+            - 'auto': Auto-select from all backends including cutedsl (slower build, extreme perf)
             - 'cutlass': Force use CUTLASS (FP4GemmRunner)
             - 'cublaslt': Force use cuBLASLt (CublasLtFP4GemmRunner)
             - 'cutedsl': Force use CuteDSL (CuteDSLNVFP4Wrapper)
@@ -920,13 +925,22 @@ def nvfp4_gemm(
     """
 
     # Validate backend parameter
-    valid_backends = ['auto', 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
+    valid_backends = [
+        'auto', 'auto_no_cutedsl', 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
+    ]
     if backend not in valid_backends:
         raise ValueError(
             f"Invalid backend '{backend}'. Must be one of {valid_backends}")
 
+    # Normalize auto_no_cutedsl to auto for the runner (cutedsl exclusion is handled in get_valid_tactics)
+    effective_backend = 'auto' if backend == 'auto_no_cutedsl' else backend
+
     # Build list of runners based on backend parameter
-    runner = NVFP4GemmUnifiedRunner(to_userbuffers, output_dtype, backend)
+    runner = NVFP4GemmUnifiedRunner(
+        to_userbuffers,
+        output_dtype,
+        effective_backend,
+        exclude_cutedsl=(backend == 'auto_no_cutedsl'))
 
     # Use AutoTuner to select best runner and tactic
     # - For 'auto' mode: compare across all backends, find global optimum
@@ -966,7 +980,7 @@ def _(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
-    backend: str = "auto",
+    backend: str = "auto_no_cutedsl",
 ) -> torch.Tensor:
     """Fake implementation for torch.compile support."""
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),

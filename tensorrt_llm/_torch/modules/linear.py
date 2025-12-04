@@ -2054,13 +2054,17 @@ class Linear(nn.Module):
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
-        nvfp4_backend: str = "auto",
+        nvfp4_backend: str = "auto_no_cutedsl",
     ):
         """
         Args:
             nvfp4_backend: Backend selection for NVFP4 GEMM operations.
-                Supported values: "auto", "cutlass", "cublaslt", "cutedsl".
-                Default is "auto" which automatically selects the best backend.
+                Supported values: "auto", "auto_no_cutedsl", "cutlass", "cublaslt", "cutedsl".
+                - "auto": Automatically selects the best backend (may include cutedsl).
+                - "auto_no_cutedsl": Like auto, but excludes cutedsl from selection.
+                - "cutlass", "cublaslt", "cutedsl": Force specific backend.
+                Default is "auto_no_cutedsl" (excludes cutedsl to reduce build time).
+                Set to "auto" for extreme performance at the cost of longer build time.
                 Can be overridden via TRTLLM_NVFP4_GEMM_BACKEND environment variable.
         """
         from ..distributed import AllReduce
@@ -2087,7 +2091,9 @@ class Linear(nn.Module):
                                              nvfp4_backend)
 
         # Validate backend selection
-        valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
+        valid_backends = {
+            'auto', 'auto_no_cutedsl', 'cutlass', 'cublaslt', 'cutedsl'
+        }
         if nvfp4_backend_value not in valid_backends:
             raise ValueError(
                 f"Invalid nvfp4_backend: '{nvfp4_backend_value}'. "
