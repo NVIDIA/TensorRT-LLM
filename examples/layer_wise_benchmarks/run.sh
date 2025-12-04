@@ -17,15 +17,21 @@ PROFILE_DIR=${PROFILE_DIR:-profiles}
 mkdir -p ${PROFILE_DIR}
 
 PROFILE=${PROFILE:-1}
+BACKTRACE=${BACKTRACE:-0}
 GPU_METRICS=${GPU_METRICS:-0}
 if [ "$PROFILE" -eq 1 ]; then
     PROFILE_CMD="nsys profile
-        -t cuda,nvtx -s none
+        -t cuda,nvtx
         --cpuctxsw none --cuda-event-trace false
         --cuda-graph-trace node
         -c cudaProfilerApi --capture-range-end stop
         -o ${PROFILE_DIR}/report_np${WORLD_SIZE}_rank${RANK}.nsys-rep
         --force-overwrite true"
+    if [ "$BACKTRACE" -eq 1 ]; then
+        PROFILE_CMD+=" --python-backtrace=cuda --cudabacktrace all"
+    else
+        PROFILE_CMD+=" -s none"
+    fi
     if [ "$GPU_METRICS" -eq 1 ]; then
         PROFILE_CMD+=" --gpu-metrics-devices $LOCAL_RANK
             --gpu-metrics-frequency 10000"

@@ -437,6 +437,14 @@ class CutlassFusedMoE(MoE):
             elif self.has_int8_woq_per_channel:
                 use_int8_woq_per_channel = True
             elif self.has_nvfp4:
+                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    assert not isinstance(
+                        x, Fp4QuantizedTensor
+                    ), "Fp4QuantizedTensor is not expected for AWQ quantization."
+                    x = x * self.fc31_act_scale
                 if run_post_quant_allgather or self.enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"

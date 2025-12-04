@@ -11,6 +11,7 @@ from torch.fx import GraphModule
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm.mapping import Mapping
 
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .patterns.ar_residual_norm import register_ar_fusions
@@ -39,13 +40,16 @@ class Backend:
         enable_piecewise_cuda_graph: bool = False,
         capture_num_tokens: Optional[List[int]] = None,
         max_num_streams: int = 1,
+        mapping=None,
     ) -> None:
         super().__init__()
         self.elapsed_time = 0
         self.module_inference_event = []
         self.module_inference_time = 0
         self.call_count = 0
-        self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
+        self.mapping = mapping
+        self.custom_passes = Backend.get_custom_pass(enable_userbuffers,
+                                                     mapping)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
         self.capture_num_tokens = sorted(capture_num_tokens or [])
@@ -61,8 +65,7 @@ class Backend:
         self.match_count = []
 
     @classmethod
-    def get_custom_pass(cls, enable_userbuffers):
-        # TODO: add pp + tp support
+    def get_custom_pass(cls, enable_userbuffers, mapping: Mapping):
         world_size = tensorrt_llm.mpi_world_size()
         if not cls._custom_pass_instances:
             # Really naive pass manager here
@@ -73,7 +76,8 @@ class Backend:
                 os.environ["DISABLE_LAMPORT_REDUCE_NORM_FUSION"] = "1"
                 ub_enabled = enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
                 )
-                register_ar_fusions(cls._custom_pass_instances, ub_enabled)
+                register_ar_fusions(cls._custom_pass_instances, mapping,
+                                    ub_enabled)
             else:
                 register_add_norm(cls._custom_pass_instances[0])
         return cls._custom_pass_instances

@@ -18,6 +18,7 @@ import os
 import re
 from pathlib import Path
 
+import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, parse_mpi_cmd,
                          parse_output, quantize_data, run_and_check, similar,
@@ -27,6 +28,11 @@ from defs.common import (convert_weights, generate_summary_cmd, parse_mpi_cmd,
 from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
+
+from tensorrt_llm import LLM
+from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.sampling_params import SamplingParams
 
 # skip trt flow cases on post-Blackwell-Ultra
 if get_sm_version() >= 103:
@@ -1927,4 +1933,63 @@ def test_llm_minitron_fp8_with_pseudo_loras(gpt_example_root,
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
+    )
+
+
+@pytest.mark.skip_less_device_memory(
+    20000)  # Conservative 20GB requirement for GPT-OSS-20B
+@pytest.mark.parametrize("gpt_oss_model_root", [
+    "gpt-oss-20b",
+], indirect=True)
+@pytest.mark.parametrize("llm_lora_model_root",
+                         ['gpt-oss-20b-lora-adapter_NIM_r8'],
+                         indirect=True)
+def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
+                                llm_datasets_root, llm_rouge_root, engine_dir,
+                                cmodel_dir, llm_lora_model_root):
+    """Run GPT-OSS-20B with LoRA adapter using Torch backend."""
+
+    print(f"Using LoRA from: {llm_lora_model_root}")
+
+    defs.ci_profiler.start("test_gpt_oss_20b_lora_torch")
+
+    lora_config = LoraConfig(
+        lora_dir=[llm_lora_model_root],
+        max_lora_rank=8,  # Match adapter_config.json "r": 8
+        max_loras=1,
+        max_cpu_loras=1,
+    )
+
+    with LLM(model=gpt_oss_model_root, lora_config=lora_config) as llm:
+
+        prompts = [
+            "User: Message Mason saying that we should compete in next week's football tournament, and tell him that the winner will get $100.\n\nAssistant: "
+        ]
+
+        sampling_params = SamplingParams(max_tokens=50)
+
+        lora_request = [LoRARequest("gpt-oss-lora", 0, llm_lora_model_root)]
+
+        print("Running inference with real LoRA adapter...")
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_request)
+
+        expected_output = " Hey Mason! I hope you're doing well. I was thinking about the next week's football tournament and I wanted to give you a hint that we should compete in it. The winner will be a great opportunity for us to win $100.\n\nUser:"
+
+        for i, output in enumerate(outputs):
+            print(f"Prompt {i+1}: {prompts[i]}")
+            print(f"Response {i+1}: {output.outputs[0].text}")
+            print("-" * 50)
+
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs) > 0
+        generated_text = outputs[0].outputs[0].text
+        similarity = similarity_score(generated_text, expected_output)
+        assert similar(generated_text, expected_output, threshold=0.8), \
+            f"Output similarity too low (similarity={similarity:.2%})!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
+
+    defs.ci_profiler.stop("test_gpt_oss_20b_lora_torch")
+    print(
+        f"test_gpt_oss_20b_lora_torch: {defs.ci_profiler.elapsed_time_in_sec('test_gpt_oss_20b_lora_torch')} sec"
     )

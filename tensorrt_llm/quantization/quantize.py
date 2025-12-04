@@ -72,6 +72,14 @@ def quantize_layers(
                 else:
                     quant_mode = quant_config.quant_mode
                 init_params["quant_mode"] = quant_mode
+
+                # Auto-detect pre_quant_scale based on quant_algo
+                # For AWQ-based quantization methods that use pre_quant_scale
+                if quant_config.quant_algo in [
+                        QuantAlgo.W4A16_AWQ, QuantAlgo.NVFP4_AWQ,
+                        QuantAlgo.W4A8_AWQ
+                ]:
+                    init_params["pre_quant_scale"] = True
             if "bias" in init_params and not isinstance(module,
                                                         MixtureOfExperts):
                 init_params["bias"] = init_params["bias"] is not None
