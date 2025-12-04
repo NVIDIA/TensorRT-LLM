@@ -183,14 +183,14 @@ class CutlassFusedMoE(MoE):
                     raise NotImplementedError(
                         f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                     )
-            else:
-                # When without_comm=True, set minimal attributes
-                # Communication will be handled by parent wrapper (e.g., ConfigurableMoE)
-                self.alltoall_method_type = AlltoallMethodType.NotEnabled
-                self.alltoall_workspace = None
-                self.alltoall_prepare_workspace = None
-                self.use_low_precision_combine = False
-                self.moe_a2a = None
+        else:
+            # When without_comm=True, set minimal attributes
+            # Communication will be handled by parent wrapper (e.g., ConfigurableMoE)
+            self.alltoall_method_type = AlltoallMethodType.NotEnabled
+            self.alltoall_workspace = None
+            self.alltoall_prepare_workspace = None
+            self.use_low_precision_combine = False
+            self.moe_a2a = None
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
