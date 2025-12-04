@@ -420,7 +420,7 @@ class Nvfp4GemmConfig(StrictBaseModel):
         default=['cutlass', 'cublaslt', 'cuda_core'],
         description="List of backends to consider for auto-selection. "
         "Default excludes 'cutedsl' for faster build time. "
-        "Add 'cutedsl' for extreme performance at the cost of longer build time. "
+        "Add 'cutedsl' for extreme performance at the cost of longer server launch time. "
         "Valid values: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.")
 
     @model_validator(mode="after")
