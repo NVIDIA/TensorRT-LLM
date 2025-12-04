@@ -5,6 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
@@ -662,7 +663,7 @@ def fp8_block_scaling_bmm_out(
     mat2_dequant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     sm_version = get_sm_version()
-    if sm_version == 90 or sm_version == 89 or sm_version == 120:
+    if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
 
@@ -671,7 +672,12 @@ def fp8_block_scaling_bmm_out(
                                                    mat1_scale, mat2_scale,
                                                    output)
         out.copy_(output)
-
+    elif sm_version == 120:
+        mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(mat1)
+        torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
+                                                   mat1_scale, mat2_scale,
+                                                   output)
+        out.copy_(output)
     elif is_sm_100f(sm_version):
         torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
@@ -1802,6 +1808,15 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
+            if self.k_b_proj_trans_scale.dtype != torch.int32:
+                self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
+                    self.k_b_proj_trans, self.k_b_proj_trans_scale)
+                self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
+                    self.k_b_proj_trans_scale,
+                    mn=self.k_b_proj_trans.shape[0],
+                    k=self.k_b_proj_trans.shape[1],
+                    recipe=(1, 128, 128),
+                    is_sfa=False)
             maybe_execute_in_parallel(
                 lambda: fp8_block_scaling_bmm_out(
                     q_nope,
@@ -1936,6 +1951,15 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
+            if self.k_b_proj_trans_scale.dtype != torch.int32:
+                self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
+                    self.k_b_proj_trans, self.k_b_proj_trans_scale)
+                self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
+                    self.k_b_proj_trans_scale,
+                    mn=self.k_b_proj_trans.shape[0],
+                    k=self.k_b_proj_trans.shape[1],
+                    recipe=(1, 128, 128),
+                    is_sfa=False)
             fp8_block_scaling_bmm_out(
                 q_nope,
                 self.k_b_proj_trans,
@@ -2058,6 +2082,15 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = q_nope_out.transpose(0, 1)
 
+            if self.k_b_proj_trans_scale.dtype != torch.int32:
+                self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
+                    self.k_b_proj_trans, self.k_b_proj_trans_scale)
+                self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
+                    self.k_b_proj_trans_scale,
+                    mn=self.k_b_proj_trans.shape[0],
+                    k=self.k_b_proj_trans.shape[1],
+                    recipe=(1, 128, 128),
+                    is_sfa=False)
             fp8_block_scaling_bmm_out(
                 q_nope,
                 self.k_b_proj_trans,
