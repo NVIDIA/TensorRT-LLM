@@ -357,7 +357,13 @@ class ModelLoader:
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
-            use_low_precision_moe_combine)
+            use_low_precision_moe_combine,
+            nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
+            allowed_backends)
+
+        # Store nvfp4 config in extra_attrs for Linear layer access
+        config.extra_attrs[
+            'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
