@@ -18,7 +18,7 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
                                  create_moe, get_moe_cls)
-from ..modules.fused_moe.interface import MoE
+from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -114,6 +114,7 @@ class Qwen3MoE(nn.Module):
             moe_backend_cls=get_moe_cls(model_config),
         )
 
+        self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -124,6 +125,7 @@ class Qwen3MoE(nn.Module):
             reduce_results=False,
             model_config=model_config,
             layer_idx=layer_idx,
+            weight_loading_mode=self.weight_loading_mode,
         )
 
     def forward(
@@ -221,6 +223,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        mrope_config: Optional[dict[str, torch.Tensor]] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -236,6 +240,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            mrope_config=mrope_config,
             **kwargs,
         )
 
@@ -268,6 +273,10 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
         )
+
+        if deepstack_visual_embeds is not None and self.layer_idx in range(
+                len(deepstack_visual_embeds)):
+            residual = residual + deepstack_visual_embeds[self.layer_idx]
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -365,6 +374,8 @@ class Qwen3MoEModel(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        mrope_config: Optional[dict[str, torch.Tensor]] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -379,11 +390,14 @@ class Qwen3MoEModel(DecoderModel):
 
         residual = None
         for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual,
-                                                    spec_metadata=spec_metadata)
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
+                mrope_config=mrope_config,
+                deepstack_visual_embeds=deepstack_visual_embeds)
         return hidden_states
 
 

@@ -136,9 +136,22 @@ class MRotaryEmbedding(RotaryEmbedding):
         head_dim: int,
         mrope_section: List[int],
         is_neox: bool = True,
+        mrope_interleaved: bool = False,
     ):
         super().__init__(rope_params, head_dim=head_dim, is_neox=is_neox)
         self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
+
+    def apply_interleaved_rope(self, x: torch.Tensor) -> torch.Tensor:
+        # copied from vllm
+        x_t = x[0].clone()
+        x_t[...,
+            1:self.mrope_section[1] * 3:3] = x[1, ...,
+                                               1:self.mrope_section[1] * 3:3]
+        x_t[...,
+            2:self.mrope_section[2] * 3:3] = x[2, ...,
+                                               2:self.mrope_section[2] * 3:3]
+        return x_t
 
     def get_cos_sin(
             self,
@@ -146,16 +159,20 @@ class MRotaryEmbedding(RotaryEmbedding):
         if position_ids.ndim == 3:
             cos_sin = self.rotary_cos_sin[position_ids.view(3, -1)]
             cos, sin = cos_sin[:, :, 0, :], cos_sin[:, :, 1, :]
-            cos = torch.cat([
-                m[i]
-                for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
-            ],
-                            dim=-1)
-            sin = torch.cat([
-                m[i]
-                for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
-            ],
-                            dim=-1)
+            if self.mrope_interleaved:
+                cos = self.apply_interleaved_rope(cos)
+                sin = self.apply_interleaved_rope(sin)
+            else:
+                cos = torch.cat([
+                    m[i]
+                    for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
+                ],
+                                dim=-1)
+                sin = torch.cat([
+                    m[i]
+                    for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
+                ],
+                                dim=-1)
         else:
             # Fallback to the original RoPE where position_ids is 2D for dummy requests
             cos_sin = self.rotary_cos_sin[position_ids.view(-1)]
