@@ -5,6 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
 from tensorrt_llm.logger import logger
@@ -19,7 +20,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, alltoall_helix
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -115,6 +116,85 @@ def attn_custom_op_inplace(
                           enable_attn_nvfp4_output=False,
                           output=output,
                           attention_sinks=attention_sinks)
+
+
+class HelixAllToAll:
+    """
+    Manager for Helix All-to-All operations with MNNVL workspace management.
+
+    Exchanges data along the cp_size dimension:
+    - Field 0: [..., cp_size, kv_lora_rank] half-precision
+    - Field 1: [..., cp_size, 2] float32
+    """
+
+    workspace: MnnvlMemory = None
+    workspace_tensor: torch.Tensor = None
+    mapping: Mapping = None
+
+    @staticmethod
+    def initialize(mapping: Mapping, is_fused: bool = False):
+        """
+        Initialize the Helix All-to-All workspace using MNNVL memory.
+
+        Args:
+            mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
+            is_fused: Whether to use fused all-to-all operation
+        """
+        if MnnvlMemory.initialized and HelixAllToAll.workspace_tensor is not None:
+            return
+        logger.info(
+            f"Rank {mapping.cp_rank} initializing MnnvlMemory for Helix, is_fused={is_fused}"
+        )
+        MnnvlMemory.initialize()
+
+        HelixAllToAll.mapping = mapping
+
+        # Get workspace size (in bytes)
+        dummy = torch.empty(0, device="cuda")
+        if is_fused:
+            workspace_size_per_rank = torch.ops.trtllm.getHelixFusedWorkspaceSizePerRankNative(
+                dummy, mapping.cp_size)
+        else:
+            workspace_size_per_rank = torch.ops.trtllm.getHelixWorkspaceSizePerRankNative(
+                dummy, mapping.cp_size)
+
+        # Allocate MNNVL memory
+        HelixAllToAll.workspace = MnnvlMemory(mapping, workspace_size_per_rank)
+        HelixAllToAll.workspace_tensor = (
+            HelixAllToAll.workspace.as_torch_strided_tensor(torch.uint64))
+
+        torch.ops.trtllm.initializeHelixWorkspaceNative(
+            HelixAllToAll.workspace_tensor, mapping.cp_rank, mapping.cp_size)
+        torch.cuda.synchronize()
+        MnnvlMemory.get_comm(mapping).barrier()
+
+    @staticmethod
+    def alltoall(field0: torch.Tensor,
+                 field1: torch.Tensor,
+                 is_fused: bool = False):
+        """
+        Perform all-to-all data exchange.
+
+        Args:
+            field0: Field 0 tensor, shape [..., cp_size, kv_lora_rank], dtype half
+            field1: Field 1 tensor, shape [..., cp_size, 2], dtype float32
+            is_fused: Whether to use fused all-to-all operation
+
+        Returns:
+            Tuple of (field0_out, field1_out) with same shapes as inputs, or single tensor for fused
+        """
+        assert (HelixAllToAll.workspace_tensor
+                is not None), "Must call initialize() first"
+
+        field0_out, field1_out = torch.ops.trtllm.helixAllToAllNative(
+            field0,
+            field1,
+            HelixAllToAll.workspace_tensor,
+            HelixAllToAll.mapping.cp_rank,
+            HelixAllToAll.mapping.cp_size,
+        )
+
+        return field0_out, field1_out
 
 
 class Attention(nn.Module):
@@ -1081,6 +1161,9 @@ class MLA(nn.Module):
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.has_cp_helix():
+            # Initialize Helix All-to-All workspace if needed
+            HelixAllToAll.initialize(self.mapping)
+
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
@@ -1094,24 +1177,33 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 helix_position_offsets=position_ids,
                 **kwargs)
-            # this is the post-processing of helix parallel attention,
-            # similar to the post-processing of ring attention
+
+            # Get dimensions
+            num_tokens = partial_o.shape[0]
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            # transpose the tensors to make the split across cp_size contiguous
-            # for both tensors, we need to split across the second dimension
-            chunks = []
-            for t in [partial_o, softmax_stats]:
-                t = t.transpose(1, 0).contiguous()
-                chunks.extend(torch.split(t,
-                                          t.shape[0] // self.mapping.cp_size))
-            gathered = alltoall_helix(chunks, self.mapping.cp_group)
-            # transpose the tensors back to ensure dimensions are ordered correctly
-            # note: an additional dimension was added at the first index for all-to-all,
-            # so the transpose dimensions are shifted by 1
-            gathered = [t.transpose(1, 2).contiguous() for t in gathered]
-            return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
-                                                       1.0)
+            cp_size = self.mapping.cp_size
+
+            # Reshape for native all-to-all:
+            # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, heads_per_rank, kv_lora_rank]
+            # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, heads_per_rank, 2]
+            assert num_heads % cp_size == 0, f"num_heads ({num_heads}) must be divisible by cp_size ({cp_size})"
+            heads_per_rank = num_heads // cp_size
+
+            field0 = partial_o.view(num_tokens, cp_size, heads_per_rank,
+                                    kv_lora_rank)
+            field1 = softmax_stats.view(num_tokens, cp_size, heads_per_rank, 2)
+
+            # Call native helixAllToAll
+            field0_out, field1_out = HelixAllToAll.alltoall(field0, field1)
+
+            # field0_out: [num_tokens, heads_per_rank, cp_size, kv_lora_rank]
+            # field1_out: [num_tokens, heads_per_rank, cp_size, 2]
+            # cp_dim = 2 (the dimension where cp_size is located)
+
+            # Call helixPostProcess2 with cp_dim=2
+            return torch.ops.helix.helixPostProcess2(field0_out, field1_out,
+                                                     1.0, 2)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output

@@ -37,10 +37,14 @@ struct HelixPostProcParams
     int num_tokens;
     int num_heads;
     int kv_lora_rank;
+    int cp_dim;
 };
 
 template <typename T>
 void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream);
+
+template <typename T>
+void helixPostProcessNative(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm
