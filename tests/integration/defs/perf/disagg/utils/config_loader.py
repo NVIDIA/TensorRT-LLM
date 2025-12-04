@@ -93,7 +93,7 @@ DEFAULT_METRICS_CONFIG = {
             ^.*?(?:\n|.)*?$\n
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
-        metric_names=["DISAGG_SERVER_TTFT", "DISAGG_SERVER_E2EL"],
+        metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
     ),
     ("wideep", "perf"): MetricsConfig(
         log_file="bench.log",
@@ -117,18 +117,18 @@ DEFAULT_METRICS_CONFIG = {
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
         metric_names=[
-            "WIDEEP_SERVER_MEAN_TTFT",
-            "WIDEEP_SERVER_TTFT",  # Median TTFT (keep the same name as disagg)
-            "WIDEEP_SERVER_P99_TTFT",
-            "WIDEEP_SERVER_MEAN_TPOT",
-            "WIDEEP_SERVER_MEDIAN_TPOT",
-            "WIDEEP_SERVER_P99_TPOT",
-            "WIDEEP_SERVER_MEAN_ITL",
-            "WIDEEP_SERVER_MEDIAN_ITL",
-            "WIDEEP_SERVER_P99_ITL",
-            "WIDEEP_SERVER_MEAN_E2EL",
-            "WIDEEP_SERVER_E2EL",  # Median E2EL (keep the same name as disagg)
-            "WIDEEP_SERVER_P99_E2EL",
+            "SERVER_MEAN_TTFT",
+            "SERVER_MEDIAN_TTFT",  # Median TTFT (keep the same name as disagg)
+            "SERVER_P99_TTFT",
+            "SERVER_MEAN_TPOT",
+            "SERVER_MEDIAN_TPOT",
+            "SERVER_P99_TPOT",
+            "SERVER_MEAN_ITL",
+            "SERVER_MEDIAN_ITL",
+            "SERVER_P99_ITL",
+            "SERVER_MEAN_E2EL",
+            "SERVER_E2EL",  # Median E2EL (keep the same name as disagg)
+            "SERVER_P99_E2EL",
         ],
     ),
     # Accuracy test configuration
