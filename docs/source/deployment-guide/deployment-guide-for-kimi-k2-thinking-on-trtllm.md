@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This is a quick-start guide for running the Kimi K2 Thinking model on TensorRT LLM. It focuses on a working setup with recommended defaults.
+This is a quickstart guide for running the Kimi K2 Thinking model on TensorRT LLM. It focuses on a working setup with recommended defaults.
 
 ## Prerequisites
 
@@ -32,7 +32,7 @@ make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=kimi-k2-thinking-lo
 
 ### Launch the TensorRT LLM Server
 
-Prepare a `EXTRA_OPTIONS_YAML_FILE` that specify LLM API arguments when deploying the model, an example YAML file is as follows:
+Prepare an `EXTRA_OPTIONS_YAML_FILE` that specifies LLM API arguments when deploying the model. An example YAML file is as follows:
 
 ```yaml
 max_batch_size: 128
@@ -52,7 +52,7 @@ cache_transceiver_config:
 trust_remote_code: true
 ```
 
-This YAML file specifies configurations that deploy the model with 8-way expert parallelism for the MoE part, and 8-way attention data parallelism. It also enables `trust_remote_code`, so that it works with the Kimi K2 Thinking customize [tokenizer](https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4/blob/main/tokenization_kimi.py).
+This YAML file specifies configurations that deploy the model with 8-way expert parallelism for the MoE part and 8-way attention data parallelism. It also enables `trust_remote_code`, so that it works with the Kimi K2 Thinking customized [tokenizer](https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4/blob/main/tokenization_kimi.py).
 
 
 With the `EXTRA_OPTIONS_YAML_FILE`, use the following example command to launch the TensorRT LLM server with the Kimi-K2-Thinking-NVFP4 model from within the container.
@@ -63,7 +63,7 @@ trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
     --extra_llm_api_options ${EXTRA_OPTIONS_YAML_FILE}
 ```
 
-TensorRT LLM will load weights and select the best kernels during starting, and the server is successfully launched when the following log is shown:
+TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:
 
 ```
 INFO:     Started server process [xxxxx]
@@ -82,9 +82,9 @@ When the `Status: 200` code is returned, the server is ready for queries.
 
 ## Deploy Kimi K2 Thinking on GB200 NVL72 through SLURM with wide EP and disaggregated serving
 
-TensorRT LLM provides a set of SLURM scripts that could be easily configured through YAML files, and automatically launch SLURM jobs on the GB200 NVL72 clusters for deploying, benchmarking and accuracy testing purposes. The scripts are located at `examples/disaggregated/slurm/benchmark`, and refer to [this page](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) for more details and example wide EP config file.
+TensorRT LLM provides a set of SLURM scripts that can be easily configured through YAML files and automatically launch SLURM jobs on GB200 NVL72 clusters for deployment, benchmarking, and accuracy testing purposes. The scripts are located at `examples/disaggregated/slurm/benchmark`. Refer to [this page](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) for more details and example wide EP config files.
 
-For Kimi K2 Thinking, an example to configure SLURM arguments and the scripts is as the following:
+For Kimi K2 Thinking, an example configuration for SLURM arguments and the scripts is as follows:
 
 ```yaml
 # SLURM Configuration
@@ -154,7 +154,6 @@ worker_config:
       - 768
       - 1024
       - 2048
-      - 128
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
@@ -193,7 +192,7 @@ worker_config:
     trust_remote_code: true
 ```
 
-It includes SLURM specific configurations, benchmark and hardware details, and environment settings. The `worker_config` field includes detailed settings for context and generation servers when deploying a disaggregated server, and each performs as a list of LLM API arguments.
+It includes SLURM-specific configurations, benchmark and hardware details, and environment settings. The `worker_config` field includes detailed settings for context and generation servers when deploying a disaggregated server, with each specified as a list of LLM API arguments.
 
 To launch SLURM jobs with the YAML config file, execute the following command:
 ```shell
@@ -203,7 +202,7 @@ python3 submit.py -c config.yaml
 
 ## Query the OpenAI-compatible API Endpoint
 
-After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.
+After the TensorRT LLM server is set up and shows `Application startup complete`, you can send requests to the server.
 
 ```shell
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json"  -d '{
@@ -221,13 +220,12 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 
 Example response:
 
-```
-
+```json
 ```
 
 ## Benchmark
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server, you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<'EOF' > bench.sh
@@ -260,7 +258,7 @@ EOF
 chmod +x bench.sh
 ```
 
-If you want to save the results to a file add the following options.
+If you want to save the results to a file, add the following options:
 
 ```shell
 --save-result \
@@ -268,7 +266,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
+For more benchmarking options, see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py).
 
 Run `bench.sh` to begin a serving benchmark.
 
