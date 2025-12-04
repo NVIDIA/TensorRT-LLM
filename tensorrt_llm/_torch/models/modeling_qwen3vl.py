@@ -369,7 +369,7 @@ class Qwen3VLVisionMLP(MLP):
             intermediate_size=config.intermediate_size,
             bias=True,
             activation=HF_ACT2FN[config.hidden_act],
-            # dtype=model_config.pretrained_config.text_config.dtype,
+            dtype=model_config.pretrained_config.text_config.dtype,
             config=model_config,
             layer_idx=layer_idx,
         )
@@ -663,7 +663,6 @@ class Qwen3VisionModelBase(nn.Module):
         self.model_config.quant_config = QuantConfig(
             kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
         )
-
         self.visual = model_class(self.model_config).to(self.model_dtype)
 
         self.post_config()
@@ -1022,9 +1021,7 @@ class Qwen3VLModel(Qwen3VLModelBase):
     def multimodal_data_device_paths(self) -> List[str]:
         return [
             "image.pixel_values",
-            "image.image_grid_thw",
             "video.pixel_values_videos",
-            "video.video_grid_thw",
             "multimodal_embedding",
             "deepstack_feature",
         ]
