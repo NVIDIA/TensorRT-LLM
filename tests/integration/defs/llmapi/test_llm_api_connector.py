@@ -165,10 +165,9 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
     worker.get_finished.side_effect = lambda finished_gen, load_async: (
         finished_gen, load_async)
 
-    outputs = generate_and_sleep(
-        model, [
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-        ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
+    generate_and_sleep(model, [
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+    ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
     # Once for the initial poll, then once for each token. One extra token when using the overlap scheduler.
     assert worker.get_finished.call_count == NUM_TOKENS + 1 + int(
@@ -398,9 +397,9 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
     gen_disagg_params = result.disaggregated_params
     gen_disagg_params.request_type = "generation_only"
 
-    result = generate_and_sleep(decode_worker, [0] * 48,
-                                sampling_params=sampling_params,
-                                disaggregated_params=gen_disagg_params)
+    generate_and_sleep(decode_worker, [0] * 48,
+                       sampling_params=sampling_params,
+                       disaggregated_params=gen_disagg_params)
 
     assert scheduler.build_connector_meta.call_count == 1
 
