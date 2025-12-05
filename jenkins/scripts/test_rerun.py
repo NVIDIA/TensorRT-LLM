@@ -24,7 +24,6 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
     #    - If test duration > 5 min and <= 10 min: add to rerun_1.txt (will rerun 1 time)
     #    - If test duration > 10 min but contains fail signatures in error message: add to rerun_1.txt
     #    - If test duration > 10 min and no known failure signatures: add to rerun_0.txt (will not rerun)
-    print(failSignaturesList)
 
     rerun_0_filename = os.path.join(outdir, 'rerun_0.txt')
     rerun_1_filename = os.path.join(outdir, 'rerun_1.txt')
