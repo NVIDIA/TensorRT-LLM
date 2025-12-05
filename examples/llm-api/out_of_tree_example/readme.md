@@ -44,7 +44,7 @@ Prepare the dataset:
 ```
 trtllm-bench \
   --model ./model_ckpt  \
-  dataset \
+  prepare-dataset \
   --output mm_data.jsonl
   real-dataset
   --dataset-name lmms-lab/MMMU \
