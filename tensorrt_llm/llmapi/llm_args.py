@@ -667,6 +667,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Eagle": EagleDecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
+            "Suffix": SuffixDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
@@ -959,6 +960,45 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "NGram"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
+class SuffixDecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for Suffix Decoding drafter speculative decoding.
+
+    Arguments:
+        max_draft_len: int
+            The maximum number of speculative tokens to generate per step.
+
+        max_tree_depth: int
+            Maximum depth of the suffix tree.
+
+        max_spec_factor: float
+            Maximum speculation factor for dynamic draft length.
+
+        min_token_prob: float
+            Minimum token probability threshold for speculation.
+
+        max_cached_requests: int
+            Maximum number of cached requests in the suffix cache.
+    """
+    max_tree_depth: int = 24
+    max_spec_factor: float = 1.0
+    min_token_prob: float = 0.1
+    max_cached_requests: int = 10000
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Suffix Decoding uses dynamic draft lengths
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "Suffix"
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
