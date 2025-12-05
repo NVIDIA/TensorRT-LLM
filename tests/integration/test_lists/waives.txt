@@ -323,8 +323,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequan
 accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_auto_dtype[tp8ep4-cuda_graph=True] SKIP (https://nvbugs/5640697)
 accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_reasoning_fp8_prequantized[tp8ep8-cuda_graph=True] SKIP (https://nvbugs/5640697)
 accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4 SKIP (https://nvbugs/5640697)
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5644632)
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5644632)
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-True] SKIP (https://nvbugs/5648560)
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-False] SKIP (https://nvbugs/5648560)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_trtllmgen_adp_lmtp] SKIP (https://nvbugs/5629136)

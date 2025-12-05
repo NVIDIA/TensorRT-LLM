@@ -1085,11 +1085,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 4
         }
         ctx_server_config["kv_cache_config"] = {
+            "free_gpu_memory_fraction": 0.5,
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
         }
         gen_server_config["kv_cache_config"] = {
+            "free_gpu_memory_fraction": 0.5,
             "max_attention_window": [128, 32768],
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": False,
