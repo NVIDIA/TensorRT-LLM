@@ -49,6 +49,7 @@ from tensorrt_llm.logger import logger
 
 from ..modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
 
+from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
@@ -522,6 +523,15 @@ class Mistral3Gate(nn.Module):
         #      src/mistral_common/tokens/tokenizers/base.py#L326
         # However, accuracy tests show that the model generates higher quality output when the image
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
+@register_input_processor(
+    Mistral3InputProcessor, 
+    model_type="mistral3",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "[IMG]",
+        },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ))
 class Mistral3VLM(PreTrainedModel):
