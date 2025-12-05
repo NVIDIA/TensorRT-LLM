@@ -5,8 +5,7 @@ slurm:
   account: "blackwell"
   job_time: "04:00:00"
   job_name: "coreai_comparch_trtllm"
-  numa_bind: true # Only enable for GB200 NVL72
-  timeout: 7200
+  numa_bind: true
 
 # Hardware Configuration
 hardware:
@@ -18,13 +17,13 @@ environment:
   container_mount: "/home/chenfeiz/:/home/chenfeiz/,/home/chenfeiz/.cache:/root/.cache,/home/scratch.chenfeiz_gpu:/home/scratch.chenfeiz_gpu,/home/scratch.trt_llm_data:/home/scratch.trt_llm_data"
   container_image: "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-aarch64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202511200955-9055"
   container_workdir: "/home/scratch.chenfeiz_gpu/another_repo/tekit-2"
-  job_workspace: "/home/scratch.chenfeiz_gpu/another_repo/tekit-2/pytest_aggr_workspace-6"
+  job_workspace: "/home/scratch.chenfeiz_gpu/another_repo/tekit-2/pytest_aggr_workspace"
   model_path: ""
   model_name: "deepseek_r1_0528_fp4_v2"
   llm_models_root: "/home/scratch.trt_llm_data/llm-models"
   trtllm_repo: "/home/scratch.chenfeiz_gpu/another_repo/tekit-2"
-  build_wheel: false  # Don't build the wheel when launching multiple jobs
-  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  build_wheel: false
+  trtllm_wheel_path: ""
   server_env_var: ""
 
 # Server Configuration
@@ -54,6 +53,38 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.5
+    client_configs:
+      - name: "con32_iter12_1k1k"
+        concurrency: 32
+        iterations: 12
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
+
+  - name: "r1_fp4_v2_tep8_mtp3"
+    model_name: "deepseek_r1_0528_fp4_v2"
+    gpus: 8
+    gpus_per_node: 4
+    trust_remote_code: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 3136
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: "TRTLLM"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      free_gpu_memory_fraction: 0.5
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 3
     client_configs:
       - name: "con32_iter12_1k1k"
         concurrency: 32

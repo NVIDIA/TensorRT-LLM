@@ -174,8 +174,6 @@ def main():
             "$(($(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))"
         ),
         "export OPEN_SEARCH_DB_BASE_URL='http://gpuwa.nvidia.com'",
-        # f"export WORKER_ENV_VAR='{env_config['worker_env_var']}'",
-        # f"export SERVER_ENV_VAR='{env_config['server_env_var']}'",
         f"export TRTLLM_CONFIG_FOLDER='{trtllm_config_folder}'",
         f"export runScript={args.run_sh}",
         f"export gpusPerNode={hardware_config['gpus_per_node']}",
@@ -195,9 +193,7 @@ def main():
         f"--container-mounts={env_config['mounts']}",
         "--container-env=NVIDIA_IMEX_CHANNELS",
         "--container-env=OPEN_SEARCH_DB_BASE_URL",
-        # "--container-env=WORKER_ENV_VAR",
-        # "--container-env=SERVER_ENV_VAR",
-        "--mpi=pmix",
+        "--mpi=pmi2",
     ]
 
     remove_whitespace_lines(srun_args_lines)

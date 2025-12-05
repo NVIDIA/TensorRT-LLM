@@ -24,3 +24,14 @@ python3 submit.py \
   --stage-name GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1 \
   --build-wheel  # Uncomment to build wheel before running tests
 ```
+
+```bash
+# For oci
+python3 submit.py \
+  --config-yaml /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/aggregated/l0_gb200_multi_nodes.yaml \
+  --draft-launch-sh /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/aggregated/slurm_launch_draft.sh \
+  --launch-sh /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/aggregated/slurm_launch.sh \
+  --run-sh /lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/jenkins/scripts/perf/aggregated/slurm_run.sh \
+  --stage-name GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1 \
+  --build-wheel  # Uncomment to build wheel before running tests
+```

@@ -2,9 +2,12 @@
 
 set -Eeuo pipefail
 
-install_lock_file="install_lock.lock.${SLURM_JOB_ID}"
-
-if [ $SLURM_PROCID -eq 0 ]; then
+if [ -n "${DISAGG_SERVING_TYPE:-}" ]; then
+    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname).${DISAGG_SERVING_TYPE}"
+else
+    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname)"
+fi
+if [ $SLURM_LOCALID -eq 0 ]; then
     echo "Installing dependencies on $(hostname) for process $SLURM_PROCID"
     cd $llmSrcNode
     pip install -e .
@@ -24,12 +27,6 @@ else
     total_elapsed=$(($(date +%s) - start_time))
     echo "Dependencies installation complete. Total wait time: ${total_elapsed}s"
 fi
-
-
-for env_var in $WORKER_ENV_VAR; do
-    export "${env_var}"
-    echo "Exported: ${env_var}"
-done
 
 # Change to test directory
 llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
