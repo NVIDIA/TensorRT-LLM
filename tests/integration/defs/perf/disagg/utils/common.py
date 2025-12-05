@@ -107,6 +107,7 @@ class EnvManager:
         work_dir = EnvManager.get_work_dir()
         script_dir = EnvManager.get_script_dir()
         model_dir = EnvManager.get_model_dir()
+        dataset_dir = EnvManager.get_dataset_dir()
         output_path = EnvManager.get_output_path()
         repo_dir = EnvManager.get_repo_dir()
         trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
@@ -118,10 +119,12 @@ class EnvManager:
             f"{output_path}:{output_path}",
         ]
 
+        if dataset_dir and not dataset_dir.startswith("<"):
+            mounts.append(f"{dataset_dir}:{dataset_dir}")
         # Add repo_dir if available
-        if repo_dir:
+        if repo_dir and not repo_dir.startswith("<"):
             mounts.append(f"{repo_dir}:{repo_dir}")
-        if trtllm_wheel_path:
+        if trtllm_wheel_path and not trtllm_wheel_path.startswith("<"):
             trtllm_wheel_dir = os.path.dirname(trtllm_wheel_path)
             mounts.append(f"{trtllm_wheel_dir}:{trtllm_wheel_dir}")
         return ",".join(mounts)
