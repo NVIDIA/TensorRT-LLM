@@ -173,6 +173,9 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: false
+  gather_logits_before_lm_head:
+    stage: compile
+    enabled: true
   compile_model:
     stage: compile
     run_per_gm: false

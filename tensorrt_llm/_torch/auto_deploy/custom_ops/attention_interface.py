@@ -210,6 +210,7 @@ class SequenceInfo:
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
         self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        self._registered_args: Dict[str, List[Number]] = {}
         # page_size is the size of attentionkv-cache pages.
         # chunk_size is used in mamba prefill kernels to split the context into chunks.
         self._cached_constants = ("page_size", "chunk_size")
@@ -249,7 +250,10 @@ class SequenceInfo:
         return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
     def _named_args(
-        self, include_extra_args: bool = True, include_cached_args: bool = True
+        self,
+        include_extra_args: bool = True,
+        include_cached_args: bool = True,
+        include_registered_args: bool = True,
     ) -> Dict[str, torch.Tensor]:
         # start with uncached args and shape them along the way
         args = {k: self._shape_for_forward(self._args_device[k]) for k in self._uncached_arg_names}
@@ -260,6 +264,9 @@ class SequenceInfo:
 
         if include_cached_args:
             args.update({k: self._args_device[k] for k in self._cached_arg_names})
+
+        if include_registered_args:
+            args.update({k: self._args_device[k] for k in self._registered_args})
 
         return args
 
@@ -273,19 +280,7 @@ class SequenceInfo:
         Cached arguments are only included if the attention mode is cached to reflect that after
         switching to cached attention, the cached arguments are required for a forward pass.
         """
-        return self._named_args(include_extra_args=True, include_cached_args=self._is_cached_attn)
-
-    @property
-    def named_standard_args(self) -> Dict[str, torch.Tensor]:
-        """Return a dictionary of named standard arguments.
-
-        We define standard arguments as the arguments that are part of the model's forward function
-        by default (i.e., without the extra arguments).
-
-        Just liked ``named_args``, this property includes cached attention arguments if the
-        attention mode is cached.
-        """
-        return self._named_args(include_extra_args=False, include_cached_args=self._is_cached_attn)
+        return self._named_args(include_cached_args=self._is_cached_attn)
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -558,6 +553,11 @@ class SequenceInfo:
         """
         self.set_generate_only_batch()
 
+    def register_arg(self, name: str, tnsr_default: torch.Tensor) -> None:
+        self._args_device[name] = tnsr_default.to(self.device)
+        self._args_host[name] = tnsr_default.tolist()
+        self._registered_args[name] = self._args_host[name]
+
     @staticmethod
     def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
         return [
@@ -687,7 +687,12 @@ class SequenceInfo:
             ]
         self._store_arg("position_ids", self._flatten(position_ids))
 
-        ### UPDATE EXTRA INPUTS ####################################################################
+        ### UPDATE REGISTERED ARGS #################################################################
+        for name, val_default in self._registered_args.items():
+            arg_value = extra_args.pop(name, val_default)
+            self._store_arg(name, arg_value, reset_val=val_default[0])
+
+        ### UPDATE UNREGISTERED EXTRA INPUTS #######################################################
         self._extra_args = {}
         for key, value in extra_args.items():
             self._store_extra_arg(key, value)

@@ -320,7 +320,8 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
-    ) -> List[bool]:
+        gather_context_logits: bool = False,
+    ):
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -339,7 +340,7 @@ class ADEngine(ModelEngine):
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
-        last_logit_only: List[bool] = []
+        logits_gather_mask: List[bool] = []
         page_assignments: List[List[int]] = []
         slot_idx: List[int] = []
 
@@ -367,7 +368,8 @@ class ADEngine(ModelEngine):
             input_pos.append(begin_compute)
 
             request.py_batch_idx = request.seq_slot
-            last_logit_only.append(True)
+            logits_gather_mask.extend([gather_context_logits] * len(prompt_tokens))
+            logits_gather_mask[-1] = True
 
             # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -447,6 +449,8 @@ class ADEngine(ModelEngine):
             num_tokens_seen = _compute_num_tokens_seen(request)
             input_ids_for_request, gather_indices_to_append = _build_input_ids(request)
 
+            # return all logits
+            logits_gather_mask.append(True)
             input_ids.append(input_ids_for_request)
             input_pos.append(num_tokens_seen)
             flat_gather_indices.extend(gather_indices_to_append)
@@ -466,6 +470,7 @@ class ADEngine(ModelEngine):
             input_pos=input_pos,
             page_assignments=page_assignments,
             slot_idx=slot_idx,
+            logits_gather_mask=logits_gather_mask,
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
@@ -480,15 +485,12 @@ class ADEngine(ModelEngine):
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_generation_tokens
-        return last_logit_only
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
-
-        # return a list of tensors
-        return self.cache_seq_interface.info.unnest_sequences(logits)
+        return logits
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -506,19 +508,12 @@ class ADEngine(ModelEngine):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
-        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
+        self._prepare_inputs(
+            scheduled_requests, resource_manager, new_tokens, gather_context_logits
+        )
         self.iter_counter += 1
 
-        # compute all logits
-        logits = self._compute_logits()
-
-        # gather+cat logits
-        logits_flat = torch.cat(
-            [ls_one_seq[-last_only:] for ls_one_seq, last_only in zip(logits, last_logit_only)],
-            dim=0,
-        )
-
-        return {"logits": logits_flat}
+        return {"logits": self._compute_logits()}
 
 
 def create_draft_model_engine_maybe(
