@@ -307,7 +307,7 @@ Llama 3.3
 
 `llm_options.yml`
 ```yaml
-cuda_graph_config
+cuda_graph_config:
   enable_padding: true
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
 ```
@@ -322,14 +322,14 @@ GPT-OSS:
 
 `llm_options.yml`
 ```yaml
-cuda_graph_config
+cuda_graph_config:
   enable_padding: true
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
 enable_attention_dp: true
-kv_cache_config
+kv_cache_config:
   dtype: fp8
   # Hopper: use auto
-moe_config
+moe_config:
   backend: CUTLASS
   # Hopper: use TRITON
 ```
@@ -338,21 +338,18 @@ DeepSeek R1:
 
 `llm_options.yml`
 ```yaml
-attention_dp_config
+attention_dp_config:
   batching_wait_iters: 0
   enable_balance: true
   timeout_iters: 60
 enable_attention_dp: true
-cuda_graph_config
+cuda_graph_config:
   enable_padding: true
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
-moe_config
+moe_config:
   backend: CUTLASS
-kv_cache_config
+kv_cache_config:
   dtype: fp8
-speculative_config (only if MTP)
-  decoding_type: MTP
-  num_nextn_predict_layers: 1
 ```
 
 Qwen3 MoE, Llama4 Maverick:
@@ -360,7 +357,7 @@ Qwen3 MoE, Llama4 Maverick:
 `llm_options.yml`
 ```yaml
 enable_attention_dp: true
-cuda_graph_config
+cuda_graph_config:
   enable_padding: true
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
 ```
