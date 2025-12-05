@@ -1933,11 +1933,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                          "llama-7b-hf")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
-        if self._config.num_loras > 0:
-            istdev = 16
-            ostdev = 24
-            nloras = self._config.num_loras
-            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
 
         if self._config.num_loras > 0:
             istdev = 16
