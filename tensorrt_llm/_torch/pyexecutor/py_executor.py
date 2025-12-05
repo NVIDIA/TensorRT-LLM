@@ -237,8 +237,8 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
         # schedule handle for PP to propagate the first PP rank's schedule result
         self.send_schedule_handler = None
-        self.pp_scheduler_max_retry_count = getattr(
-            self.llm_args, 'pp_scheduler_max_retry_count', 10)
+        self.pp_scheduler_max_retry_count = int(
+            os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
 
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
@@ -861,7 +861,7 @@ class PyExecutor:
             self._terminate_disagg_ctx_finished_requests()
         else:
             raise RuntimeError(
-                f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `pp_scheduler_max_retry_count` to a larger value to allow more retries."
+                f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
             )
 
     def _executor_loop_pp(self):
