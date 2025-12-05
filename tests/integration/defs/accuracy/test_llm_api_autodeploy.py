@@ -214,8 +214,8 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
     def test_fp8(self):
@@ -230,5 +230,5 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)

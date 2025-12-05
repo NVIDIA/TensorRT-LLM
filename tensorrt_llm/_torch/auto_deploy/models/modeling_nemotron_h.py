@@ -332,12 +332,8 @@ class NemotronHTopkRouter(nn.Module):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
 
-        self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
-        )
-        self.register_buffer(
-            "e_score_correction_bias", torch.zeros(self.n_routed_experts, dtype=torch.float32)
-        )
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
+        self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
 
     forward = _nemotron_h_topk_router_forward
 
@@ -369,8 +365,23 @@ class NemotronHAttention(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        if config.head_dim is not None:
-            self.head_dim = config.head_dim
+
+        # At some point during NemotronH development, what used to be called `attention_head_dim`
+        # was renamed to `head_dim`. Since no configuration class's code (nor the modeling code,
+        # for that matter) was ever upstreamed into `transformers`, we have to resort to the below
+        # hack in order to support multiple iterations of NemotronH models.
+        if hasattr(config, "head_dim"):
+            head_dim = config.head_dim
+        elif hasattr(config, "attention_head_dim"):
+            head_dim = config.attention_head_dim
+        else:
+            raise AttributeError(
+                "Expected either `head_dim` or `attention_head_dim` to be present in the config "
+                "class, found neither."
+            )
+
+        if head_dim is not None:
+            self.head_dim = head_dim
         else:
             self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -401,6 +412,29 @@ class NemotronHAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(
+        #     1, 2
+        # )
+        # value_states = value_states.view(
+        #     bsz, q_len, self.num_key_value_heads, self.head_dim
+        # ).transpose(1, 2)
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # query_states = query_states.contiguous()
+        # key_states = key_states.contiguous()
+        # value_states = value_states.contiguous()
+        # attn_output = torch.nn.functional.scaled_dot_product_attention(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attn_mask=None,
+        #     # Hardcoding to 0.0 since we should always be in eval mode.
+        #     dropout_p=0.0,
+        #     is_causal=True,
+        # )
+        # attn_output = attn_output.transpose(1, 2).contiguous()
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
@@ -415,6 +449,7 @@ class NemotronHAttention(nn.Module):
             is_causal=True,
             layout="bsnd",
         )
+
         attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)
 
         attn_output = self.o_proj(attn_output)
@@ -595,6 +630,6 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
 
 
 # TODO: uncomment after removing patches (and make sure it is imported in `__init__.py`).
-# from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-#
-# AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory  # noqa: E402
+
+AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)
