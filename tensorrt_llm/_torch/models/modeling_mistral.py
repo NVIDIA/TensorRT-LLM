@@ -533,15 +533,6 @@ class Mistral3Gate(nn.Module):
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ))
-@register_input_processor(
-    Mistral3InputProcessor,
-    model_type="mistral3",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "[IMG]",
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    ))
 class Mistral3VLM(PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.
 

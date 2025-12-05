@@ -9,8 +9,7 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
 import torch
 from PIL import Image
 from torch import Tensor, nn
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedTokenizerBase)
+from transformers import (AutoProcessor, PretrainedConfig, PreTrainedTokenizerBase)
 
 import tensorrt_llm
 
