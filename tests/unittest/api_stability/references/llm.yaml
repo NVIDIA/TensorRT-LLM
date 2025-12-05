@@ -215,10 +215,6 @@ methods:
         annotation: Optional[Dict[str, str]]
         default: null
         status: prototype
-      pp_scheduler_max_retry_count:
-        annotation: int
-        default: 10
-        status: prototype
     return_annotation: None
   generate:
     parameters:

@@ -2758,12 +2758,6 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    pp_scheduler_max_retry_count: int = Field(
-        default=10,
-        description=
-        "Maximum number of times a PP rank retries when it cannot run first PP's schedule result due to limited KV cache resources.",
-        status="prototype")
-
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
@@ -3053,14 +3047,6 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
-            )
-        return self
-
-    @model_validator(mode='after')
-    def validate_pp_scheduler_max_retry_count(self) -> 'TorchLlmArgs':
-        if self.pp_scheduler_max_retry_count < 0:
-            raise ValueError(
-                f"pp_scheduler_max_retry_count must be non-negative, got {self.pp_scheduler_max_retry_count}"
             )
         return self
 
