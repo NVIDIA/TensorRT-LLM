@@ -245,7 +245,7 @@ class TestQwen3VLMoe(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # # ==== Chunked Prefill Scenarios ====
+            # ==== Chunked Prefill Scenarios ====
             TestQwen3VLMoeScenario(
                 modality="image",
                 use_cuda_graph=False,
