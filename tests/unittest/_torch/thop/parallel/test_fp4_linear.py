@@ -311,15 +311,17 @@ def nvfp4_gemm_perf_test(
         x_sf_block_list = [x_sf_block]
         w_sf_block_list = [w_sf_block]
 
+    alpha_tensor = torch.tensor([1.0]).cuda()
     with torch.inference_mode(), autotune():
         with nvtx.annotate(
                 f"cute_dsl tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
                 color="orange",
         ):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                x_fp4, w_fp4, x_sf_block, w_sf_block, 1.0, dtype)
+                x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_tensor, dtype)
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    AutoTuner.get().print_statistics()
 
-    alpha_tensor = torch.tensor(1.0).cuda()
     if test_ref:
         with nvtx.annotate(
                 f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
@@ -340,7 +342,7 @@ def nvfp4_gemm_perf_test(
                 w_fp4_list[buffer_idx % workspace_count],
                 x_sf_block_list[buffer_idx % workspace_count],
                 w_sf_block_list[buffer_idx % workspace_count],
-                1.0,
+                alpha_tensor,
                 dtype,
             )
             buffer_idx = buffer_idx + 1
@@ -354,7 +356,7 @@ def nvfp4_gemm_perf_test(
                 w_fp4_list[buffer_idx % workspace_count],
                 x_sf_block_list[buffer_idx % workspace_count],
                 w_sf_block_list[buffer_idx % workspace_count],
-                1.0,
+                alpha_tensor,
                 dtype,
             )
             buffer_idx = buffer_idx + 1
@@ -744,23 +746,19 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 if __name__ == "__main__":
     # m, n, k
-    fp4_linear_perf_test(torch.bfloat16, 128, 7168, 16384)
-    fp4_linear_perf_test(torch.bfloat16, 128, 24576, 1536)
-    fp4_linear_perf_test(torch.bfloat16, 128, 2112, 7168)
-    fp4_linear_perf_test(torch.bfloat16, 128, 4096, 7168)
-    fp4_linear_perf_test(torch.bfloat16, 128, 7168, 2048)
+    nvfp4_gemm_perf_test(torch.bfloat16, 128, 7168, 16384)
 
-    # group-1 test cases
-    for tokens in [128, 8192]:
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
+    # # group-1 test cases
+    # for tokens in [128, 8192]:
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
 
-    # group-2 test cases
-    for m in [128, 256, 512]:
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
+    # # group-2 test cases
+    # for m in [128, 256, 512]:
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
