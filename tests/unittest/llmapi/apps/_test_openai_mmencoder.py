@@ -24,10 +24,10 @@ class RemoteMMEncoderServer(RemoteOpenAIServer):
         import subprocess
         import sys
 
-        from tensorrt_llm.llmapi.mpi_session import find_free_port
+        from tensorrt_llm._utils import get_free_port
 
         self.host = "localhost"
-        self.port = port if port is not None else find_free_port()
+        self.port = port if port is not None else get_free_port()
         self.rank = os.environ.get("SLURM_PROCID", 0)
 
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]

@@ -56,11 +56,12 @@ class RawRequestResponseHooks(ResponseHooks):
         self.raw_req = raw_req
         self.ctx_server = ""
         self.gen_server = ""
+        self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
-        ...
+        self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -132,6 +133,7 @@ class OpenAIDisaggServer:
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            self._perf_metrics_collector.validation_exceptions.inc()
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
@@ -157,8 +159,14 @@ class OpenAIDisaggServer:
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
             try:
+                self._perf_metrics_collector.total_requests.inc()
+                if req.stream:
+                    self._perf_metrics_collector.stream_requests.inc()
+                else:
+                    self._perf_metrics_collector.nonstream_requests.inc()
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)
+                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
                 else:
@@ -172,9 +180,11 @@ class OpenAIDisaggServer:
             logger.error("CppExecutorError: ", traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
+            self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
         else:
+            self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
@@ -196,6 +206,7 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        logger.info(f"Starting server on host: {host}, port: {port}")
         await uvicorn.Server(config).serve()
 
     # TODO: rework this for service discovery, now it's only for static server list
