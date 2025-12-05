@@ -795,6 +795,11 @@ def run_concurrently(func,
     reduce_func: an optional function to reduce the results.
     pbar: an optional tqdm progress bar.
     """
+    if num_workers is None:
+        tp_size = int(os.getenv('TP_SIZE', '1'))
+        # default: 1 worker per TP rank, max 8
+        num_workers = min(8, max(1, os.cpu_count() // tp_size))
+
     from concurrent import futures
     with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         # Submit all tasks
