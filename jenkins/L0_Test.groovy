@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@emma/add_spark_for_slurm', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -100,7 +100,7 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
@@ -664,7 +664,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                     if (cluster.host.contains("dlcluster")) {
                         dockerArgs += " " + sh(script: 'echo " -e NVIDIA_IMEX_CHANNELS=${NVIDIA_IMEX_CHANNELS:-0}"', returnStdout: true).trim()
-                        dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                        if (fileExists('/dev/gdrdrv')) {
+                            dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                        }
                     }
                 }
 
@@ -1317,7 +1319,7 @@ EOF_TIMEOUT_XML
 
 def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false)
 {
-    def targetCould = "kubernetes-cpu"
+    def targetCloud = "kubernetes-cpu"
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/arch: ${arch}
@@ -1326,9 +1328,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def nodeLabelPrefix = ""
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
+    def tolerations = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    if ( type == "gb10x" ) {
+        println "Using type: ${type} to create Kubernetes Pod config"
+    }
 
     switch(type)
     {
@@ -1408,14 +1414,30 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def gpuType = KubernetesManager.selectGPU(type)
         nodeLabelPrefix = type
 
-        targetCould = "kubernetes"
+        targetCloud = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
-            selectors = """
+            if (type == "gb10x") {
+                targetCloud = "nvks-sparks-cloud"
+                selectors = """
+                    kubernetes.io/arch: ${arch}
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu.machine: NVIDIA_DGX_Spark
+                    nvidia.com/tenant: blossom_trt"""
+                memorySize = "64Gi"
+                tolerations = """
+                tolerations:
+                - key: "node_for_blossom_trt"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+                """
+            } else {
+                selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
+            }
         } else if (perfMode && !hasMultipleGPUs) {
         // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
         // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
@@ -1499,7 +1521,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     }
 
     def podConfig = [
-        cloud: targetCould,
+        cloud: targetCloud,
         namespace: "sw-tensorrt",
         label: nodeLabel,
         yaml: """
@@ -1522,6 +1544,10 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 containers:
                   ${containerConfig}
                     env:
+                    - name: NVIDIA_VISIBLE_DEVICES
+                      value: "all"
+                    - name: NVIDIA_DRIVER_CAPABILITIES
+                      value: "compute,utility"
                     - name: HOST_NODE_NAME
                       valueFrom:
                         fieldRef:
@@ -1545,8 +1571,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     medium: Memory
                 ${llmModelVolume}
                 ${pvcVolume}
+                ${tolerations}
         """.stripIndent(),
     ]
+    if (type.contains("gb10x")) {
+        print(podConfig)
+    }
 
     return podConfig
 }
@@ -2929,12 +2959,14 @@ def launchTestJobs(pipeline, testFilter)
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
+        "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB10-PyTorch-Post-Merge-1": ["gb10x", "l0_gb10", 1, 1],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
