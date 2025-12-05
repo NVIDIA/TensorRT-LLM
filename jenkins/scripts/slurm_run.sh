@@ -35,6 +35,11 @@ if [ $SLURM_PROCID -eq 0 ]; then
     echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
 fi
 
+if [ -n "${DISAGG_SERVING_TYPE:-}" ]; then
+    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname).${DISAGG_SERVING_TYPE}"
+else
+    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname)"
+fi
 if [ $SLURM_LOCALID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
@@ -51,9 +56,9 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
     hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
     echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
-    touch install_lock.lock
+    touch $install_lock_file
 else
-    while [ ! -f install_lock.lock ]; do
+    while [ ! -f $install_lock_file ]; do
         sleep 5
     done
 fi
@@ -106,7 +111,7 @@ echo "Full Command: $pytestCommand"
 eval $pytestCommand
 echo "Rank${SLURM_PROCID} Pytest finished execution"
 
-if [ "$perfMode" = "true" ]; then
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
     if [[ "$stageName" == *PyTorch* ]]; then
         basePerfFilename="base_perf_pytorch.csv"
     else
