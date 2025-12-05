@@ -308,7 +308,7 @@ class ConfigLoader:
         supported_gpus = metadata.get("supported_gpus", ["GB200", "GB300", "H100", "B200", "B300"])
 
         # Override config with environment variables (in memory only, do not write back)
-        config_data = self._apply_env_overrides(config_data)
+        config_data = self._apply_env_overrides(config_data, model_name)
 
         # Generate benchmark_type from sequence configuration
         benchmark_type = self._generate_benchmark_type(config_data)
@@ -440,7 +440,7 @@ class ConfigLoader:
             logger.debug(f"Using default metrics config for {test_category}")
             return default_config
 
-    def _apply_env_overrides(self, config_data: dict) -> dict:
+    def _apply_env_overrides(self, config_data: dict, model_name: str) -> dict:
         """Apply environment variable overrides to configuration.
 
         Intelligently replaces empty or None values based on field path.
@@ -461,7 +461,7 @@ class ConfigLoader:
             ("slurm", "partition"): lambda: EnvManager.get_slurm_partition(),
             ("slurm", "account"): lambda: EnvManager.get_slurm_account(),
             ("slurm", "job_name"): lambda: EnvManager.get_slurm_job_name(),
-            ("environment", "container_mount"): lambda: EnvManager.get_container_mount(),
+            ("environment", "container_mount"): lambda: EnvManager.get_container_mount(model_name),
             ("environment", "container_image"): lambda: EnvManager.get_container_image(),
             ("environment", "trtllm_repo"): lambda: EnvManager.get_repo_dir(),
             ("environment", "trtllm_wheel_path"): lambda: EnvManager.get_trtllm_wheel_path(),
