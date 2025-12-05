@@ -2207,6 +2207,8 @@ ${reusedTestsContent}
 REUSED_TESTS_EOF
 """)
             echo "Appended ${reusedTests.size()} reused tests to ${waivesTxt}"
+        } else {
+            echo "No reused tests found"
         }
     } catch (InterruptedException e) {
         throw e
