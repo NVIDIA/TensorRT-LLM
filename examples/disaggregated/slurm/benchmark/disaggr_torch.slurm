@@ -35,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --container-mount) container_mount="$2"; shift 2 ;;
         --container-image) container_image="$2"; shift 2 ;;
         --build-wheel) build_wheel="$2"; shift 2 ;;
+        --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
         # Profiling
         --nsys-on) nsys_on="$2"; shift 2 ;;
@@ -153,6 +154,9 @@ elif [ -d "${trtllm_repo}" ]; then
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
         build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
+        if [ -n "${cuda_architectures:-}" ]; then
+            build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
+        fi
         if ! srun --container-name=${container_name} \
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
@@ -209,20 +213,24 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
-# start the ctx workers
-echo "Starting ctx workers..."
-for i in $(seq 0 $((num_ctx_servers - 1))); do
-    srun -l -N ${ctx_nodes_num_in_single_server} \
-        --ntasks=$((ctx_world_size)) \
-        --ntasks-per-node=${gpus_per_node} \
-        --container-image=${container_image} \
-        --container-name=${container_name} \
-        --container-mounts=${container_mount} \
-        --mpi=pmix \
-        bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_profile_range}" "${ctx_config_path}" "${worker_env_var}" \
-        &> ${full_logdir}/output_ctx_${i}.log &
-done
+# start the ctx workers (skip if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
+if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
+    echo "Starting ctx workers..."
+    for i in $(seq 0 $((num_ctx_servers - 1))); do
+        srun -l -N ${ctx_nodes_num_in_single_server} \
+            --ntasks=$((ctx_world_size)) \
+            --ntasks-per-node=${gpus_per_node} \
+            --container-image=${container_image} \
+            --container-name=${container_name} \
+            --container-mounts=${container_mount} \
+            --mpi=pmix \
+            bash ${work_dir}/start_worker.sh \
+            "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_profile_range}" "${ctx_config_path}" "${worker_env_var}" \
+            &> ${full_logdir}/output_ctx_${i}.log &
+    done
+else
+    echo "Skipping context workers startup (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set)"
+fi
 
 # start the server (in background)
 echo "Starting server..."
