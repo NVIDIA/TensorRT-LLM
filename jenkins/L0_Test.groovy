@@ -459,7 +459,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         def cleanupCommands = [
-            "rm -rf /lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
             "rm -rf ${jobWorkspace} || true",
         ].join(" && ")
         Utils.exec(
@@ -510,7 +510,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
         def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
-            "rm -rf /lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
         ].join(" && ")
         Utils.exec(
             pipeline,
@@ -565,12 +565,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
-                // Specific for OCI machines
-                def mounts = [
-                    "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                    "/home/svc_tensorrt:/home/svc_tensorrt",
-                    "/home/svc_tensorrt/.cache:/root/.cache"
-                ].join(",")
+                def mounts = getMountListForSlurmTest(cluster).join(",")
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
@@ -822,6 +817,27 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
+def getMountListForSlurmTest(SlurmCluster cluster)
+{
+    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+        return [
+            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
+            "/home/svc_tensorrt:/home/svc_tensorrt",
+        ]
+    }
+
+    if (!cluster.scratchPath) {
+        throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
+    }
+
+    return [
+        "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
+        "/home/svc_tensorrt:/home/svc_tensorrt",
+        "/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts",
+        "/home/svc_tensorrt/.cache:/root/.cache"
+    ]
+}
+
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
@@ -959,7 +975,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
-                def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
+                def mounts = getMountListForSlurmTest(cluster).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -971,13 +987,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
-                    mounts = [
-                        "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                        "/home/svc_tensorrt/bloom/scripts",
-                        "/home/svc_tensorrt/.cache:/root/.cache",
-                    ].join(",")
-
-                    def enrootImagePath = "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
+                    def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
                     containerImageArg = enrootImagePath
 
                     srunPrologue = """
