@@ -1502,7 +1502,9 @@ class PyExecutor:
                 self._kv_connector_terminate_requests()
 
                 self.iter_counter += 1
-
+    
+    @nvtx_range("_accept_draft_tokens")
+    @torch.compile(options={"max-autotune": True})
     def _accept_draft_tokens(
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
@@ -1540,15 +1542,16 @@ class PyExecutor:
 
         batch_size = target_tokens.shape[1]
         device = target_tokens.device
-        # Compute number of accepted tokens per request
-        num_accepted_tokens = torch.zeros(batch_size,
-                                          dtype=torch.int32,
-                                          device=device)
+        batch_indices = torch.arange(batch_size, device=device)
 
         if has_draft_tokens:
             # Draft tokens exist, compute acceptance
             draft_tokens = target_inputs.next_draft_tokens  # [batch_size, max_draft_len]
             max_draft_len = draft_tokens.shape[1]
+            
+            num_accepted_tokens = torch.zeros(batch_size,
+                                            dtype=torch.int32,
+                                            device=device)
 
             # Compute number of accepted tokens per request
             # Generation requests: compare with draft tokens to find acceptance
@@ -1569,12 +1572,9 @@ class PyExecutor:
 
             # Vectorized extraction using advanced indexing (no GPU-CPU sync)
             # Use num_accepted_tokens as indices to gather the right tokens
-            batch_indices = torch.arange(batch_size, device=device)
-            new_tokens[0, :, 0] = target_tokens[num_accepted_tokens,
-                                                batch_indices]
+            new_tokens[0, :, 0] = target_tokens[num_accepted_tokens, batch_indices]
         else:
             # No draft tokens to accept, just use the first (and only) sampled token
-            batch_indices = torch.arange(batch_size, device=device)
             new_tokens[0, :, 0] = target_tokens[0, batch_indices]
 
         # Create the updated SampleStateTensorsMTP
