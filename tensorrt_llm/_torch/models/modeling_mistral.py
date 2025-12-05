@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torchvision
+from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
+from PIL import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
@@ -227,11 +229,12 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
 
 
 class MistralCommonImageProcessor:
+
     def __init__(self, tokenizer: MistralTokenizer, dtype) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.dtype = dtype
-    
+
     @property
     def image_processor(self) -> ImageEncoder:
         image_encoder = self.tokenizer.instruct.mm_encoder
@@ -241,7 +244,7 @@ class MistralCommonImageProcessor:
     @property
     def image_break_id(self) -> int:
         return self.image_processor.special_ids.img_break
-    
+
     @property
     def image_break_token_id(self) -> int:
         return self.image_break_id
@@ -267,16 +270,18 @@ class MistralCommonImageProcessor:
         return self.image_processor.mm_config.image_patch_size
 
     def _get_num_multimodal_tokens(self, image_sizes):
-        return {"num_image_tokens": [self.get_num_tokens_per_image(size) for size in image_sizes]}
-    
+        return {
+            "num_image_tokens":
+            [self.get_num_tokens_per_image(size) for size in image_sizes]
+        }
+
     def get_num_tokens_per_image(self, image_sizes):
         # FIXME avoid double loading with custom loader
         h, w = image_sizes
         ncols, nrows = self.image_processor._image_to_num_tokens(
-            Image.new("RGB", (w, h))
-        )
+            Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
-    
+
     def __call__(self, text, images, media, **kwargs):
         assert media is not None
         if isinstance(media, str):
@@ -286,16 +291,24 @@ class MistralCommonImageProcessor:
 
         print(f"text: {text}")
 
-        conversation = [
-            {"role":"user", 
-             "content":[{"type": "text", "text": text}, 
-                        *mm_items]}]
-        
-        encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(conversation, tokenize=True, return_dict=True, return_tensors='pt')
+        conversation = [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": text
+            }, *mm_items]
+        }]
 
-        print(f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}")
-        print(f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}")
-        
+        encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
+            conversation, tokenize=True, return_dict=True, return_tensors='pt')
+
+        print(
+            f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}"
+        )
+        print(
+            f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}"
+        )
+
         processed = {
             "input_ids": encoded.input_ids,
             "pixel_values": encoded.pixel_values.to(self.dtype),
@@ -336,7 +349,8 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
                 self._tokenizer = MistralTokenizer.from_pretrained(model_path)
         self._model_path = model_path
         if isinstance(self._tokenizer, MistralTokenizer):
-            self._processor = MistralCommonImageProcessor(tokenizer=self._tokenizer, dtype=self.dtype)
+            self._processor = MistralCommonImageProcessor(
+                tokenizer=self._tokenizer, dtype=self.dtype)
         else:
             self._processor = AutoProcessor.from_pretrained(
                 model_path,
@@ -376,12 +390,10 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
             do_rescale = False
 
-        processed = self.processor(
-            text=inputs["prompt"],
-            images=images,
-            do_rescale=do_rescale,
-            **mm_processor_kwargs
-        )
+        processed = self.processor(text=inputs["prompt"],
+                                   images=images,
+                                   do_rescale=do_rescale,
+                                   **mm_processor_kwargs)
         input_ids = processed.pop("input_ids").tolist()[0]
         # Remaining in `processed`:
         # * "attention_mask": [B, num_input_tokens]
@@ -483,7 +495,7 @@ class Mistral3Gate(nn.Module):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ))
 @register_input_processor(
-    Mistral3InputProcessor, 
+    Mistral3InputProcessor,
     model_type="mistral3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
@@ -548,10 +560,10 @@ class Mistral3VLM(PreTrainedModel):
                                                          "vision_config",
                                                          attn_backend="VANILLA",
                                                          quant_config=None)
-        
+
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
-        
+
         self._multi_modal_projector = Mistral3MultiModalProjector(
             model_config).eval().to(self._device)
 
@@ -857,7 +869,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
         self.config = config
 
         dtype = config.torch_dtype or model_config.torch_dtype
-        
+
         self.norm = RMSNorm(
             hidden_size=config.vision_config.hidden_size,
             # NOTE: the original implementation actually does not look at the config for this value.
@@ -898,4 +910,3 @@ class Mistral3MultiModalProjector(torch.nn.Module):
 
     def load_weights(self, weights, *args, **kwargs):
         _load_weights_impl(self, weights, *args, **kwargs)
-

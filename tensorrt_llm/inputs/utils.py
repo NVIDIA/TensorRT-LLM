@@ -767,8 +767,8 @@ def default_multimodal_input_loader(
             add_generation_prompt=True,
             mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
-        
-        if keep_source_media: # WAR for mistral-common processors
+
+        if keep_source_media:  # WAR for mistral-common processors
             input["mm_processor_kwargs"] = {"media": media}
 
         if mm_placeholder_counts:

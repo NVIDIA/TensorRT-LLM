@@ -2,15 +2,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import torch
-from mistral_common.protocol.instruct.chunk import ImageChunk
 from mistral_common.tokens.tokenizers.base import (SpecialTokenPolicy,
                                                    SpecialTokens)
-from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from mistral_common.tokens.tokenizers.sentencepiece import \
     SentencePieceTokenizer
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
-from transformers import (AutoTokenizer, BatchFeature, PreTrainedTokenizerBase,
+from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 from transformers.tokenization_mistral_common import \
     MistralCommonTokenizer as TransformersMistralTokenizer
