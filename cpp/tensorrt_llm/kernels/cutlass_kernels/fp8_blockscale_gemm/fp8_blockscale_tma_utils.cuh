@@ -89,12 +89,8 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled()
     // Get pointer to cuTensorMapEncodeTiled
     cudaDriverEntryPointQueryResult driver_status;
     void* cuTensorMapEncodeTiled_ptr = nullptr;
-#if (__CUDACC_VER_MAJOR__ >= 12 && __CUDACC_VER_MINOR__ >= 5)
     cudaGetDriverEntryPointByVersion(
         "cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, 12000, cudaEnableDefault, &driver_status);
-#else
-    cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, cudaEnableDefault, &driver_status);
-#endif
 
     if (driver_status != cudaDriverEntryPointSuccess)
     {
