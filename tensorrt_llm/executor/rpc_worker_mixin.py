@@ -25,10 +25,11 @@ class RpcWorkerMixin:
     # This can be overridden by setting num_workers in the inheriting class
     NUM_WORKERS = 6
 
-    def init_rpc_worker(self, rank: int, rpc_addr: Optional[str]):
+    def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: Optional[bytes] = None):
         if rpc_addr is None:
             raise RuntimeError("RPC mode enabled but no rpc_addr provided to worker")
 
+        self.hmac_key = hmac_key
         self.rank = rank
         self.shutdown_event = Event()
         self._response_queue = Queue()
@@ -41,7 +42,7 @@ class RpcWorkerMixin:
         if self.rank == 0:
             # Use num_workers if set on the instance, otherwise use class default
             num_workers = getattr(self, "num_workers", RpcWorkerMixin.NUM_WORKERS)
-            self.rpc_server = RPCServer(self, num_workers=num_workers)
+            self.rpc_server = RPCServer(self, num_workers=num_workers, hmac_key=self.hmac_key)
             self.rpc_server.bind(self.rpc_addr)
             self.rpc_server.start()
 
