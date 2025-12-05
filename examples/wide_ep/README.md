@@ -4,7 +4,7 @@ TensorRT-LLM's Wide Expert Parallelism (Wide-EP) feature enables efficient infer
 
 ## Overview
 
-Large-scale MoE models like DeepSeek-V3/R1, LLaMA4, and Qwen3 use fine-grained expert designs that introduce new challenges for inference systems:
+Large-scale MoE models like DeepSeek-V3/R1, Kimi K2 Thinking, LLaMA4, and Qwen3 use fine-grained expert designs that introduce new challenges for inference systems:
 
 - **High memory demands** for expert weights
 - **Inherent expert-level workload imbalance** due to sparse execution patterns

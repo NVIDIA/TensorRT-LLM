@@ -2,17 +2,6 @@
 
 This directory contains scripts for benchmarking TensorRT LLM wide-ep performance using SLURM job scheduler.
 
-## ⚠️ DISCLAIMER
-
-**These scripts are currently not QA'ed and are provided for demonstration purposes only.**
-
-Please note that:
-
-- These scripts have not undergone formal quality assurance testing
-- They are intended for demonstration and educational purposes
-- Use at your own risk in production environments
-- Always review and test scripts thoroughly before running in your specific environment
-
 ## Scripts Overview
 
 ### Core Scripts
