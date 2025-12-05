@@ -1,0 +1,95 @@
+# SLURM Configuration
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "batch"
+  account: "coreai_comparch_trtllm"
+  job_time: "04:00:00"
+  job_name: "trtllm.disagg_perf"
+  numa_bind: true
+
+# Hardware Configuration
+hardware:
+  gpus_per_node: 4
+  gpus_per_server: 8
+
+# Environment Configuration
+environment:
+  container_mount: "/home/chenfeiz/:/home/chenfeiz/,/home/chenfeiz/.cache:/root/.cache,/lustre/fsw/portfolios/coreai/:/lustre/fsw/portfolios/coreai/,/lustre/fs1/portfolios/coreai/:/lustre/fs1/portfolios/coreai/,/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/"
+  container_image: "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-aarch64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202511200955-9055"
+  container_workdir: "/lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1"
+  job_workspace: "/lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1/pytest_aggr_workspacse-1"
+  model_path: ""
+  model_name: "deepseek_r1_0528_fp4_v2"
+  llm_models_root: "/lustre/fsw/portfolios/coreai/users/chenfeiz/models"
+  trtllm_repo: "/lustre/fsw/portfolios/coreai/users/chenfeiz/repo/trtllm-1"
+  build_wheel: false
+  trtllm_wheel_path: ""
+  worker_env_var: ""
+  server_env_var: ""
+
+# Server Configuration
+server_configs:
+  - name: "r1_fp4_v2_dep8_mtp1"
+    model_name: "deepseek_r1_0528_fp4_v2"
+    gpus: 8
+    gpus_per_node: 4
+    trust_remote_code: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 2112
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+    client_configs:
+      - name: "con32_iter12_1k1k"
+        concurrency: 32
+        iterations: 12
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
+  - name: "r1_fp4_v2_tep8_mtp3"
+    model_name: "deepseek_r1_0528_fp4_v2"
+    gpus: 8
+    gpus_per_node: 4
+    trust_remote_code: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 3136
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: "TRTLLM"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      free_gpu_memory_fraction: 0.5
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 3
+    client_configs:
+      - name: "con32_iter12_1k1k"
+        concurrency: 32
+        iterations: 12
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
