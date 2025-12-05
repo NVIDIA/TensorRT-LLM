@@ -7,8 +7,6 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 import torch
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
-    from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_sm_version
@@ -1189,10 +1187,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
+        is_target_model: bool = True,
         model_is_wrapped: bool = False,
-        spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
-        spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ) -> None:
         '''
         Update the spec-dec parameters for the TRTLLM attention layer.
@@ -1203,34 +1200,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
+            is_target_model: bool = True, whether the model is the target model.
             model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
-            spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None, the spec_decoding_tensor for draft token tree.
         '''
-        if spec_decoding_tensor is not None:
-            spec_decoding_position_offsets = spec_decoding_tensor.position_offsets
-            spec_decoding_packed_mask = spec_decoding_tensor.packed_mask
-            spec_decoding_generation_lengths = spec_decoding_tensor.generation_lengths
-        else:
-            spec_decoding_position_offsets = None
-            spec_decoding_packed_mask = None
-            spec_decoding_generation_lengths = None
 
         # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
             get_sm_version() < 100 or get_sm_version() == 120)
 
-        self.is_spec_dec_tree = spec_tree_manager is not None
-        self.is_spec_dec_dynamic_tree = spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree
-
-        if get_sm_version() >= 100 and get_sm_version() != 120:
-            if self.is_spec_dec_tree or self.is_spec_dec_dynamic_tree:
-                assert not self.is_spec_dec_tree, "Spec-dec tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec tree."
-
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
-
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
 
@@ -1267,43 +1247,42 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
 
-            # Case 1: dynamic tree
-            if self.is_spec_dec_dynamic_tree:
-                assert spec_decoding_position_offsets is not None, "spec_decoding_position_offsets is required for dynamic tree"
-                assert spec_decoding_packed_mask is not None, "spec_decoding_packed_mask is required for dynamic tree"
-                self.spec_decoding_position_offsets.copy_(
-                    spec_decoding_position_offsets, non_blocking=True)
-                self.spec_decoding_packed_mask.copy_(spec_decoding_packed_mask,
-                                                     non_blocking=True)
-                if spec_decoding_generation_lengths is not None:
-                    self.spec_decoding_generation_lengths.copy_(
-                        spec_decoding_generation_lengths, non_blocking=True)
-                else:
-                    self.generate_spec_decoding_generation_length(
-                        max_draft_len=max_total_draft_tokens)
-
-            # Case 2/3: static tree
-            elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert spec_metadata.spec_dec_mode.is_eagle3(
-                ), "Tree decoding is only supported for Eagle3 now"
-
-                is_target_model = not getattr(spec_metadata, 'is_draft_model',
-                                              False)
-
-                # Case 2: static tree and target model
+            # Case 1: draft token tree
+            if self.is_spec_dec_tree:
+                assert spec_tree_manager is not None, "spec_tree_manager is required for tree"
+                # Case 1.1: target model
                 if is_target_model:
-                    # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                    self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                        spec_tree_manager.spec_dec_position_offsets[0, :],
-                        non_blocking=True)
-                    self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                        non_blocking=True)
-                    self.spec_decoding_generation_lengths[:batch_size].fill_(
-                        spec_tree_manager.max_total_draft_tokens + 1)
+                    # Case 1.1.1: dynamic tree
+                    if self.is_spec_dec_dynamic_tree:
+                        # For the dynamic tree, we just copy batch_size's spec_tree_manager.spec_dec_position_offsets, spec_dec_packed_mask.
+                        # - For the context requests, we do not need to prepare these spec-dec parameters.
+                        # - For the generation requests, their relative spec-dec parameters are update in 'model_drafter.py::reconstruct_dynamic_tree()'
+                        #   And the XQA kernel will only handle the generation requests.
+                        self.spec_decoding_position_offsets[:batch_size, :].copy_(
+                            spec_tree_manager.
+                            spec_dec_position_offsets[:batch_size, :],
+                            non_blocking=True)
+                        self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
+                            spec_tree_manager.
+                            spec_dec_packed_mask[:batch_size, :, :],
+                            non_blocking=True)
+                        self.spec_decoding_generation_lengths[:batch_size].fill_(
+                            spec_tree_manager.max_total_draft_tokens + 1)
+                    # Case 1.1.2: static tree
+                    else:
+                        # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
+                        self.spec_decoding_position_offsets[:batch_size, :].copy_(
+                            spec_tree_manager.spec_dec_position_offsets[0, :],
+                            non_blocking=True)
+                        self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
+                            spec_tree_manager.spec_dec_packed_mask[0, :, :],
+                            non_blocking=True)
+                        self.spec_decoding_generation_lengths[:batch_size].fill_(
+                            spec_tree_manager.max_total_draft_tokens + 1)
 
-                # Case 3: static tree and the first drafter layer
+                # Case 1.2: the first drafter layer
                 else:
+                    # Dynamic tree and static tree can use the same code path.
                     assert model_is_wrapped == True, "The drafter model should be wrapped"
                     # The first drafter layer will take the padded tokens as input (padding to the max_draft_len + 1)
                     # But the spec-dec parameters are still in the shape of max_total_draft_tokens + 1.
@@ -1332,7 +1311,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.generate_spec_decoding_generation_length(
                         max_draft_len=max_draft_len)
 
-            # Case 4: linear tree
+            # Case 2: linear tree
             else:
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
                 # Prepare for the linear-tree.

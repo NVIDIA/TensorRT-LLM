@@ -10,8 +10,6 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
-    from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -346,10 +344,9 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
+            is_target_model: bool = True,
             model_is_wrapped: bool = False,
-            spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None,
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """

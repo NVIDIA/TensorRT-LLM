@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
+from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -492,20 +492,19 @@ class TestLlama(unittest.TestCase):
         ],
                                        dtype=torch.int,
                                        device=device)
-        spec_decoding_position_offsets = torch.tensor([
+        spec_decoding_position_offsets = torch.tensor([[
             0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
             2, 3
-        ],
+        ]],
                                                       dtype=torch.int,
                                                       device=device)
-        spec_decoding_packed_mask = torch.tensor(
-            [
-                1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2051, 4099, 8195,
-                16387, 32771, 65541, 131077, 262153, 524297, 1048593, 2097169,
-                4194321, 8388641, 16842757
-            ],
-            dtype=torch.int,
-            device=device).unsqueeze(0).unsqueeze(2)
+        spec_decoding_packed_mask = torch.tensor([[
+            1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2051, 4099, 8195,
+            16387, 32771, 65541, 131077, 262153, 524297, 1048593, 2097169,
+            4194321, 8388641, 16842757
+        ]],
+                                                 dtype=torch.int,
+                                                 device=device).unsqueeze(-1)
 
         num_cached_tokens_per_seq = [input_ids.size(-1)]
         is_spec_decoding_enabled = True
@@ -532,9 +531,17 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
             num_heads_per_kv=num_heads_per_kv,
         )
-        spec_decoding_tensor = SpecDecodingTensor(
-            position_offsets=spec_decoding_position_offsets,
-            packed_mask=spec_decoding_packed_mask)
+        # Use the spec_tree_manager to save spec_decoding_tensor for testing
+        spec_tree_manager = SpecTreeManager(
+            max_num_requests=batch_size,
+            use_dynamic_tree=True,
+            max_draft_len=3,
+            max_total_draft_tokens=max_total_draft_tokens,
+            eagle_choices=None,
+            dynamic_tree_max_topK=3,
+        )
+        spec_tree_manager.spec_dec_position_offsets = spec_decoding_position_offsets
+        spec_tree_manager.spec_dec_packed_mask = spec_decoding_packed_mask
 
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
@@ -544,8 +551,9 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_tree=is_spec_dec_tree,
             max_draft_len=max_total_draft_tokens,
             max_total_draft_tokens=max_total_draft_tokens,
+            is_target_model=True,
             model_is_wrapped=False,
-            spec_decoding_tensor=spec_decoding_tensor,
+            spec_tree_manager=spec_tree_manager,
         )
 
         gen_position_ids_0 = [
@@ -587,10 +595,19 @@ class TestLlama(unittest.TestCase):
             [gen_input_ids_1.size(-1)], dtype=torch.int)
         attn_metadata_gen_phase_0.kv_cache_params.num_cached_tokens_per_seq = num_cached_tokens_per_seq_1
 
+        spec_tree_manager.spec_dec_position_offsets = torch.tensor(
+            [[0, 1]], dtype=torch.int, device=device)
+        spec_tree_manager.spec_dec_packed_mask = torch.tensor([[[1], [3]]],
+                                                              dtype=torch.int,
+                                                              device=device)
+        spec_tree_manager.spec_dec_generation_lengths = torch.tensor(
+            [2], dtype=torch.int, device=device)
+
         attn_metadata_gen_phase_0.spec_decoding_position_offsets = None
         attn_metadata_gen_phase_0.spec_decoding_packed_mask = None
         attn_metadata_gen_phase_0.spec_decoding_generation_lengths = None
         attn_metadata_gen_phase_0.prepare()
+
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
@@ -599,7 +616,11 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
-            model_is_wrapped=False)
+            model_is_wrapped=False,
+            is_target_model=True,
+            spec_tree_manager=spec_tree_manager,
+        )
+        attn_metadata_gen_phase_0.spec_decoding_generation_lengths = spec_tree_manager.spec_dec_generation_lengths
 
         gen_position_ids_1 = [
             torch.full(
@@ -646,6 +667,14 @@ class TestLlama(unittest.TestCase):
         attn_metadata_ref.spec_decoding_packed_mask = None
         attn_metadata_ref.spec_decoding_generation_lengths = None
         attn_metadata_ref.prepare()
+
+        spec_tree_manager.spec_dec_position_offsets = torch.tensor(
+            [[0, 1, 2, 3]], dtype=torch.int, device=device)
+        spec_tree_manager.spec_dec_packed_mask = torch.tensor(
+            [[[1], [3], [7], [15]]], dtype=torch.int, device=device)
+        spec_tree_manager.spec_dec_generation_lengths = torch.tensor(
+            [4], dtype=torch.int, device=device)
+
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,
             is_spec_decoding_enabled=is_spec_decoding_enabled,
@@ -654,7 +683,11 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=False,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
-            model_is_wrapped=False)
+            model_is_wrapped=False,
+            is_target_model=True,
+            spec_tree_manager=spec_tree_manager,
+        )
+        attn_metadata_ref.spec_decoding_generation_lengths = spec_tree_manager.spec_dec_generation_lengths
 
         gen_position_ids_ref = [
             torch.full((gen_input_ids_ref.size(-1), ),
