@@ -276,6 +276,9 @@ def flashinfer_mha_with_cache(
         sm_scale=scale,
     )
 
+    # Assuming k_scale = v_scale = 1.0
+    k_scale, v_scale = 1.0, 1.0
+    # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
     if k_cache.dtype == torch.float8_e4m3fn:
         k = k.to(torch.float8_e4m3fn)
         v = v.to(torch.float8_e4m3fn)
@@ -299,8 +302,7 @@ def flashinfer_mha_with_cache(
         paged_kv_last_page_len,
         pp,
     )
-    # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
-    k_scale, v_scale = 1.0, 1.0
+
     y = wrapper.run(
         q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, enable_pdl=get_env_enable_pdl()
     )
