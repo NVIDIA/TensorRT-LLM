@@ -14,3 +14,4 @@ l0_gb200_multi_nodes_perf_sanity:
       backend: pytorch
   tests:
   - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes-r1_fp4_v2_dep8_mtp1]
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes-r1_fp4_v2_tep8_mtp3]

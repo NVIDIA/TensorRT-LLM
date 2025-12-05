@@ -13,4 +13,4 @@ l0_gb200_multi_nodes_disagg_perf_sanity:
       stage: post_merge
       backend: pytorch
   tests:
-  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes_disagg_dsr1_fp4_1k1k_ctx1_gen1_dep32_bs32_eplb0_mtp0_ccb_NIXL] TIMEOUT (180)
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_nodes_disagg_NIXL] TIMEOUT (180)
