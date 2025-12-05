@@ -7,6 +7,8 @@ This document summarizes performance measurements of TensorRT-LLM on a number of
 The data in the following tables is provided as a reference point to help users validate observed performance.
 It should *not* be considered as the peak performance that can be delivered by TensorRT-LLM.
 
+Not all configurations were tested for all GPUs. 
+
 We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
 Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situaiton.
 
@@ -22,8 +24,6 @@ and shows the throughput scenario under maximum load. The reported metric is `To
 The performance numbers below were collected using the steps described in this document.
 
 Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/TensorRT-Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
-
-*(NEW for v1.0) RTX 6000 Pro Blackwell Server Edition Benchmarks:*
 
 RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network. 
 
@@ -41,201 +41,216 @@ Other hardware variants may have different TDP, memory bandwidth, core count, or
 ### FP4 Models
 
 ```text
-nvidia/Llama-3.3-70B-Instruct-FP4
-nvidia/Llama-3.1-405B-Instruct-FP4
+nvidia/DeepSeek-R1-0528-NVFP4-v2
 nvidia/Qwen3-235B-A22B-FP4
 nvidia/Qwen3-30B-A3B-FP4
-nvidia/DeepSeek-R1-0528-FP4
+nvidia/Llama-3.3-70B-Instruct-FP4
+nvidia/Llama-4-Maverick-17B-128E-Instruct-NVFP4
 ```
 
 ### FP8 Models
 
 ```text
-nvidia/Llama-3.1-8B-Instruct-FP8
-nvidia/Llama-3.3-70B-Instruct-FP8
-nvidia/Llama-3.1-405B-Instruct-FP8
-nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
+deepseek-ai/DeepSeek-R1-0528
 nvidia/Qwen3-235B-A22B-FP8
+nvidia/Llama-3.3-70B-Instruct-FP8
+nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 ```
 
-#### Llama 4 Scout
+# Performance Summary - All Networks
 
-| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP4 (FP8) | H100<br/>TP4 (FP8) |
-|---------------------------|---------------------|---------------------|-------------------|-------------------|
-| 128/2048                 | 14,699              | 15,238             | 34,316           | 15,130           |
-| 128/4096                 | 8,932               | 9,556              | 21,332           | 8,603            |
-| 500/2000                 | 11,977              | 11,795             | 24,630           | 12,399           |
-| 1000/1000                | 10,591              | 7,738              | 21,636           | 12,129           |
-| 1000/2000                | 9,356               | 8,581              | 18,499           | 9,838            |
-| 2048/128                 | 3,137               | 3,295              | 3,699            | 3,253            |
-| 2048/2048                | 7,152               | 7,464              | 14,949           | 7,972            |
-| 5000/500                 | 2,937               | 3,107              | 4,605            | 3,342            |
-| 20000/2000               | 1,644               | 1,767              | 2,105            |                  |
+*This document contains performance data for all tested networks, organized alphabetically.*
+*Total networks: 8*
 
-RTX 6000 Pro Blackwell Server Edition
-| Sequence Length (ISL/OSL) | **4 GPUs**<br/>TP2,PP2 (FP4) | **8 GPUs**<br/>TP4,PP2 (FP4) |
-|---|---|---|
-| 128/2048 | 12,321 | 21,035 |
-| 128/4096 | 7,643 | 13,421 |
-| 1000/1000 | 9,476 | 15,781 |
-| 1000/2000 | 8,919 | 16,434 |
-| 2048/128 | 2,615 | 2,941 |
-| 2048/2048 | 6,208 | 10,410 |
-| 5000/500 | 2,662 | |
+## Units
 
-#### Llama 3.3 70B
+All performance values are measured in **output tokens per second per GPU**.
+
+## Table of Contents
+
+- [Deepseek R1 0528](#Deepseek_R1_0528)
+- [GPT-OSS 120B](#GPT-OSS_120B)
+- [GPT-OSS 20B](#GPT-OSS_20B)
+- [LLaMA v3.3 70B](#LLaMA_v3.3_70B)
+  - [LLaMA v3.3 70B - RTX Configurations](#LLaMA_v3.3_70B_rtx)
+- [LLaMA v4 Maverick](#LLaMA_v4_Maverick)
+  - [LLaMA v4 Maverick - RTX Configurations](#LLaMA_v4_Maverick_rtx)
+- [Qwen3 235B A22B](#Qwen3_235B_A22B)
+  - [Qwen3 235B A22B - RTX Configurations](#Qwen3_235B_A22B_rtx)
+- [Qwen3 30B A3B](#Qwen3_30B_A3B)
+  - [Qwen3 30B A3B - RTX Configurations](#Qwen3_30B_A3B_rtx)
+
+---
+
+<a id="Deepseek_R1_0528"></a>
+
+# Deepseek R1 0528
+
+| Sequence Length (ISL/OSL) | B200<br/>DEP4 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP8 (FP8) |
+|---|---|---|---|
+| 1000/1000 | 5,715 | 5,884 | 1,627 |
+| 1024/1024 | 5,610 | 6,169 | 1,620 |
+| 1024/8192 | 3,841 | 4,201 | 1,218 |
+| 1024/32768 | 1,409 | 1,465 | 438 |
+| 8192/1024 | 1,100 | 1,182 | |
+
+---
+
+<a id="GPT-OSS_120B"></a>
+
+# GPT-OSS 120B
+
+| Sequence Length (ISL/OSL) | B200<br/>DEP2 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) | H100<br/>DEP4 (FP8) |
+|---|---|---|---|---|
+| 1000/1000 | 25,926 | 27,198 | 6,602 | 4,685 |
+| 1024/1024 | 25,833 | 26,609 | 6,798 | 4,715 |
+| 1024/8192 | 17,277 | 14,800 | 3,543 | |
+| 1024/32768 | 6,272 | 5,556 | | 1,177 |
+| 8192/1024 | 6,094 | 6,835 | 1,828 | 1,169 |
+| 32768/1024 | 1,388 | 1,645 | 519 | 333 |
+
+---
+
+<a id="GPT-OSS_20B"></a>
+
+# GPT-OSS 20B
+
+| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) | H100<br/>TP1 (FP8) |
+|---|---|---|---|---|
+| 1000/1000 | 53,761 | 55,823 | 13,858 | 11,557 |
+| 1024/1024 | 53,112 | 56,528 | 13,248 | 11,403 |
+| 1024/8192 | 34,665 | 38,100 | 12,743 | 8,617 |
+| 1024/32768 | 14,560 | 16,463 | | |
+| 8192/1024 | 11,898 | 12,941 | 3,848 | 3,366 |
+| 32768/1024 | 2,641 | 2,905 | 875 | 785 |
+
+---
+
+
+<a id="LLaMA_v3.3_70B"></a>
+
+# LLaMA v3.3 70B
 
 | Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) | H100<br/>TP2 (FP8) |
 |---|---|---|---|---|
-| 128/2048 | 9,922 | 11,309 | 4,336 | 6,651 |
-| 128/4096 | 6,831 | 7,849 | 2,872 | 4,199 |
-| 500/2000 | 7,762 | 9,028 | 3,666 | 5,222 |
-| 1000/1000 | 7,007 | 7,326 | 2,909 | 4,205 |
-| 1000/2000 | 6,271 | 6,513 | 2,994 | 4,146 |
-| 2048/128 | 1,339 | 1,450 | 442 | 762 |
-| 2048/2048 | 4,783 | 5,646 | 2,003 | 3,082 |
-| 5000/500 | 1,459 | 1,602 | 566 | 898 |
-| 20000/2000 | 665 | 755 | 283 | 437 |
+| 1000/1000 | 6,897 | 7,769 | 2,646 | 2,209 |
+| 1024/1024 | 6,841 | 7,751 | 2,785 | |
+| 1024/8192 | 3,240 | 3,805 | | |
+| 8192/1024 | 1,362 | 1,491 | 521 | 398 |
+| 32768/1024 | 274 | 302 | | |
 
-RTX 6000 Pro Blackwell Server Edition
-| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) | **4 GPUs**<br/>TP1,PP4 (FP4) | **8 GPUs**<br/>TP1,PP8 (FP4) |
-|---|---|---|---|---|
-| 128/2048 | 2,422 | 4,993 | 7,922 | 9,833 |
-| 128/4096 | 1,349 | 2,893 | 4,978 | 7,352 |
-| 500/2000 | 1,856 | 4,114 | 6,939 | 9,435 |
-| 1000/1000 | 1,787 | 3,707 | 5,961 | 8,166 |
-| 1000/2000 | 1,594 | 2,993 | 5,274 | 6,943 |
-| 2048/128 | 393 | 813 | 1,511 | 2,495 |
-| 2048/2048 | 1,074 | 2,336 | 3,870 | 6,078 |
-| 5000/500 | 401 | 812 | 1,511 | 2,491 |
-| 20000/2000 | 142 | 319 | 630 | 1,148 |
+---
 
-#### Qwen3-235B-A22B
+<a id="LLaMA_v3.3_70B_rtx"></a>
 
-| Sequence Length (ISL/OSL) | B200<br/>TP8 (FP4) | H200<br/>TP8 (FP8) | H100<br/>TP8 (FP8) |
-|---|---|---|---|
-| 128/2048 | 66,057 | 42,821 | 19,658 |
-| 128/4096 | 39,496 | 26,852 | 12,447 |
-| 500/2000 | 57,117 | 28,026 | 18,351 |
-| 1000/1000 | 42,391 | 23,789 | 14,898 |
-| 1000/2000 | 34,105 | 22,061 | 15,136 |
-| 2048/128 | 7,329 | 3,331 | |
-| 2048/2048 | 26,854 | 16,672 | 9,924 |
-| 5000/500 | 8,190 | 3,623 | 3,225 |
-| 20000/2000 | 4,453 | 1,876 | |
+# LLaMA v3.3 70B - RTX Configurations (TP/PP)
 
-RTX 6000 Pro Blackwell Server Edition
-| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP2,PP4 (FP4) |
-|---|---|
-| 128/2048 | 12,494 |
-| 128/4096 | 7,715 |
-| 500/2000 | 11,157 |
-| 1000/1000 | 10,697 |
-| 1000/2000 | 10,109 |
-| 2048/128 | 3,181 |
-| 2048/2048 | 6,712 |
-| 5000/500 | 3,173 |
+*Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
+*Shows only the best configuration per GPU count based on throughput per GPU*
 
-#### Qwen3-30B-A3B
-
-| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) |
-|---|---|
-| 128/2048 | 37,844 |
-| 128/4096 | 24,953 |
-| 500/2000 | 27,817 |
-| 1000/1000 | 25,828 |
-| 1000/2000 | 22,051 |
-| 2048/128 | 6,251 |
-| 2048/2048 | 17,554 |
-| 5000/500 | 6,142 |
-| 20000/2000 | 2,944 |
-
-RTX 6000 Pro Blackwell Server Edition
-| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP2,PP1 (FP4) | **4 GPUs**<br/>TP4,PP1 (FP4) | **8 GPUs**<br/>TP8,PP1 (FP4) |
-|---|---|---|---|---|
-| 128/2048 | 12,540 | 22,744 | 35,715 | 52,676 |
-| 128/4096 | 7,491 | 15,049 | 28,139 | 33,895 |
-| 500/2000 | 10,695 | 17,266 | 26,175 | 44,088 |
-| 1000/1000 | 9,910 | 16,431 | 24,046 | 31,785 |
-| 1000/2000 | 8,378 | 13,323 | 25,131 | 28,881 |
-| 2048/128 | 3,257 | 3,785 | 4,311 | 4,798 |
-| 2048/2048 | 5,908 | 10,679 | 18,134 | 22,391 |
-| 5000/500 | 2,530 | 3,799 | 5,212 | 5,965 |
-| 20000/2000 | 871 | 1,558 | 2,551 | |
-
-#### DeepSeek R1
-
-| Sequence Length (ISL/OSL) | B200<br/>TP8 (FP4) |
-|---|---|
-| 128/2048 | 62,599 |
-| 128/4096 | 44,046 |
-| 1000/1000 | 37,634 |
-| 1000/2000 | 40,538 |
-| 2048/128 | 5,026 |
-| 2048/2048 | 28,852 |
-
-#### Llama 4 Maverick
-
-| Sequence Length (ISL/OSL) | B200<br/>TP8 (FP4) | H200<br/>TP8 (FP8) | H100<br/>TP8 (FP8) |
-|---|---|---|---|
-| 128/2048 | 112,676 | 40,572 | 10,829 |
-| 128/4096 | 68,170 | 24,616 | 6,744 |
-| 500/2000 | | 37,835 | 10,108 |
-| 1000/1000 | 79,617 | 31,782 | 9,677 |
-| 1000/2000 | 63,766 | 34,734 | 9,151 |
-| 2048/128 | 18,088 | 7,307 | |
-| 2048/2048 | 52,195 | 20,957 | 6,916 |
-| 5000/500 | | 8,456 | 3,457 |
-| 20000/2000 | 12,678 | 4,106 | |
-
-RTX 6000 Pro Blackwell Server Edition
-| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP4,PP2 (FP4) |
-|---|---|
-| 128/2048 | 19,146 |
-| 128/4096 | 12,165 |
-| 500/2000 | 17,870 |
-| 1000/1000 | 15,954 |
-| 1000/2000 | 12,456 |
-| 2048/128 | 4,463 |
-| 2048/2048 | 10,727 |
-| 5000/500 | 4,613 |
-
-#### Llama 3.1 405B
-
-| Sequence Length (ISL/OSL) | B200<br/>TP4 (FP4) | GB200<br/>TP4 (FP4) | H200<br/>TP8 (FP8) | H100<br/>TP8 (FP8) |
-|---|---|---|---|---|
-| 128/2048 | 8,020 | 8,151 | 5,348 | 4,340 |
-| 128/4096 | 6,345 | 6,608 | 4,741 | 3,116 |
-| 500/2000 | 6,244 | 6,540 | 4,724 | 3,994 |
-| 1000/1000 | 5,209 | 5,389 | 3,330 | 2,919 |
-| 1000/2000 | 4,933 | 5,135 | 3,722 | 2,895 |
-| 2048/128 | 749 | 797 | 456 | 453 |
-| 2048/2048 | 4,212 | 4,407 | 2,948 | 2,296 |
-| 5000/500 | 1,048 | 1,112 | 650 | 610 |
-| 20000/2000 | 672 | 739 | 505 | 345 |
-
-RTX 6000 Pro Blackwell Server Edition
-| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP1,PP8 (FP4) |
-|---|---|
-| 128/2048 | 2,981 |
-| 1000/1000 | 2,369 |
-| 1000/2000 | 1,931 |
-| 2048/128 | 579 |
-| 2048/2048 | 1,442 |
-
-#### Llama 3.1 8B
-
-| Sequence Length (ISL/OSL) | H200<br/>TP1 (FP8) | H100<br/>TP1 (FP8) |
+| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) |
 |---|---|---|
-| 128/2048 | 26,221 | 22,714 |
-| 128/4096 | 18,027 | 14,325 |
-| 500/2000 | 20,770 | 17,660 |
-| 1000/1000 | 17,744 | 15,220 |
-| 1000/2000 | 16,828 | 13,899 |
-| 2048/128 | 3,538 | 3,450 |
-| 2048/2048 | 12,194 | 9,305 |
-| 5000/500 | 3,902 | 3,459 |
-| 20000/2000 | 1,804 | 1,351 |
+| 1000/1000 | 1,454 | 1,524 |
+| 1024/1024 | 1,708 | 1,887 |
+| 8192/1024 | 296 | 327 |
+| 32768/1024 | | 67 |
+
+---
+
+<a id="LLaMA_v4_Maverick"></a>
+
+# LLaMA v4 Maverick
+
+| Sequence Length (ISL/OSL) | B200<br/>DEP4 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP8 (FP8) |
+|---|---|---|---|
+| 1000/1000 | 11,328 | 11,828 | 4,146 |
+| 1024/1024 | 11,227 | 11,905 | 4,180 |
+| 1024/8192 | 5,164 | 5,508 | 1,157 |
+| 1024/32768 | 2,187 | 2,300 | 679 |
+| 8192/1024 | 3,277 | 3,444 | 1,276 |
+| 32768/1024 | 858 | 963 | |
+
+---
+
+<a id="LLaMA_v4_Maverick_rtx"></a>
+
+# LLaMA v4 Maverick - RTX Configurations (TP/PP)
+
+*Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
+*Shows only the best configuration per GPU count based on throughput per GPU*
+
+| Sequence Length (ISL/OSL) | **4 GPUs**<br/>DEP4,PP1 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) |
+|---|---|---|
+| 1000/1000 | | 1,582 |
+| 1024/1024 | 1,734 | |
+| 1024/8192 | 620 | 638 |
+
+---
+
+<a id="Qwen3_235B_A22B"></a>
+
+# Qwen3 235B A22B
+
+| Sequence Length (ISL/OSL) | B200<br/>DEP4 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP4 (FP8) | H100<br/>DEP8 (FP8) |
+|---|---|---|---|---|
+| 1000/1000 | 5,758 | 6,172 | 3,165 | 1,932 |
+| 1024/1024 | 5,752 | 5,862 | 3,268 | 1,935 |
+| 1024/8192 | 3,388 | 3,423 | 1,417 | 873 |
+| 1024/32768 | 1,255 | | | |
+| 8192/1024 | 1,409 | 1,464 | 627 | |
+| 32768/1024 | 318 | 333 | 134 | |
+
+---
+
+<a id="Qwen3_235B_A22B_rtx"></a>
+
+# Qwen3 235B A22B - RTX Configurations (TP/PP)
+
+*Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
+*Shows only the best configuration per GPU count based on throughput per GPU*
+
+| Sequence Length (ISL/OSL) | **4 GPUs**<br/>DEP4,PP1 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) |
+|---|---|---|
+| 1000/1000 | 1,378 | 946 |
+| 1024/1024 | 1,377 | 941 |
+| 1024/8192 | 656 | 669 |
+| 8192/1024 | 246 | 177 |
+| 32768/1024 | 57 | |
+
+---
+
+<a id="Qwen3_30B_A3B"></a>
+
+# Qwen3 30B A3B
+
+| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) |
+|---|---|---|
+| 1000/1000 | 26,941 | 22,856 |
+| 1024/1024 | 26,587 | 22,201 |
+| 1024/8192 | 13,492 | 14,272 |
+| 1024/32768 | 4,494 | 4,925 |
+| 8192/1024 | 5,730 | 6,201 |
+| 32768/1024 | 1,263 | 1,380 |
+
+---
+
+<a id="Qwen3_30B_A3B_rtx"></a>
+
+# Qwen3 30B A3B - RTX Configurations (TP/PP)
+
+*Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
+*Shows only the best configuration per GPU count based on throughput per GPU*
+
+| Sequence Length (ISL/OSL) | **2 GPUs**<br/>DEP2,PP1 (FP4) | **4 GPUs**<br/>DEP2,PP2 (FP4) | **8 GPUs**<br/>DEP4,PP2 (FP4) | **1 GPUs**<br/>TP1,PP1 (FP4) |
+|---|---|---|---|---|
+| 1000/1000 | 7,844 | 6,423 | 5,034 | 9,142 |
+| 1024/1024 | 7,203 | 6,350 | 4,856 | 8,999 |
+| 1024/8192 | 3,289 | 2,708 | 2,300 | 3,335 |
+| 1024/32768 | | | 1,083 | |
+| 8192/1024 | 1,447 | 1,384 | 973 | 1,758 |
+| 32768/1024 | 251 | 242 | 220 | 324 |
+
+---
 
 
 ## Reproducing Benchmarked Results
@@ -248,7 +263,7 @@ The following tables are references for commands that are used as part of the be
 
 ### Command Overview
 
-Starting with v0.19, testing was performed using the PyTorch backend - this workflow does not require an engine to be built.
+Testing was performed using the PyTorch backend - this workflow does not require an engine to be built.
 
 | Stage | Description | Command |
 | :- | - | - |
@@ -291,18 +306,14 @@ because requests enter and exit the system at a much faster rate. For longer inp
 remain in the system longer and therefore require less requests to achieve steady state.
 
 
-| Input Length | Output Length |  $seq_len  | $num_requests      |
-| ------------ | ------------- | ---------- | ------------------ |
-| 128          | 128           | 256        | 30000              |
-| 128          | 2048          | 2176       | 3000               |
-| 128          | 4096          | 4224       | 1500               |
-| 1000         | 2000          | 3000       | 1500               |
-| 2048         | 128           | 2176       | 3000               |
-| 2048         | 2048          | 4096       | 1500               |
-| 5000         | 500           | 5500       | 1500               |
-| 1000         | 1000          | 2000       | 3000               |
-| 500          | 2000          | 2500       | 3000               |
-| 20000        | 2000          | 22000      | 1000               |
+| Input Length | Output Length | Number of Requests |
+|--------------|---------------|---------------------|
+| 1024         | 1024          | 3000                |
+| 8192         | 1024          | 1500                |
+| 1024         | 8192          | 1500                |
+| 32768        | 1024          | 1000                |
+| 1024         | 32768         | 1000                |
+| 100000       | 1024          | 300                 |
 
 ### Running the Benchmark
 
