@@ -17,15 +17,15 @@
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.export import Dim
 from torch.fx import GraphModule
 
+# Import to register custom op
+import tensorrt_llm._torch.auto_deploy.transform.library.gather_logits_before_lm_head  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.library.gather_logits_before_lm_head import (
-    gather_logits_before_lm_head,
-    gather_logits_before_lm_head_fake,
-)
+from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -57,13 +57,15 @@ class TestGatherLogitsBeforeLmHeadOp:
         max_batch_size = 8
         logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
 
-        output = gather_logits_before_lm_head(hidden_states, logit_gather_ids)
+        output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
+            hidden_states, logit_gather_ids
+        )
 
-        # Should return [batch, 1, hidden] unchanged for generate format
-        assert output.shape == (batch_size, 1, hidden_size)
+        # Should return [batch, hidden] (squeezed) for generate format
+        assert output.shape == (batch_size, hidden_size)
         assert output.dtype == hidden_states.dtype
         assert output.device == hidden_states.device
-        torch.testing.assert_close(output, hidden_states)
+        torch.testing.assert_close(output, hidden_states.squeeze(1))
 
     @pytest.mark.parametrize("total_tokens", [10, 50, 100])
     def test_packed_format(self, total_tokens):
@@ -83,16 +85,20 @@ class TestGatherLogitsBeforeLmHeadOp:
         logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
         logit_gather_ids[: len(gather_indices)] = gather_indices
 
-        output = gather_logits_before_lm_head(hidden_states, logit_gather_ids)
+        output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
+            hidden_states, logit_gather_ids
+        )
 
-        # Should return [1, max_batch_size, hidden] for packed format
-        assert output.shape == (1, max_batch_size, hidden_size)
+        # Should return [max_batch_size, hidden] for packed format
+        assert output.shape == (max_batch_size, hidden_size)
         assert output.dtype == hidden_states.dtype
         assert output.device == hidden_states.device
 
         # Verify gathered values match expected indices
         expected = hidden_states[:, gather_indices, :]
-        torch.testing.assert_close(output[:, : len(gather_indices), :], expected)
+        # Expected shape [1, gathered, hidden] -> squeeze -> [gathered, hidden]
+        expected = expected.squeeze(0)
+        torch.testing.assert_close(output[: len(gather_indices)], expected)
 
     def test_fake_implementation_generate_format(self):
         """Test fake implementation for generate format."""
@@ -103,10 +109,15 @@ class TestGatherLogitsBeforeLmHeadOp:
         logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
 
         # Use fake implementation directly
-        output = gather_logits_before_lm_head_fake(hidden_states, logit_gather_ids)
+        with FakeTensorMode() as mode:
+            hidden_states_fake = mode.from_tensor(hidden_states)
+            logit_gather_ids_fake = mode.from_tensor(logit_gather_ids)
+            output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
+                hidden_states_fake, logit_gather_ids_fake
+            )
 
-        # Should return [batch, 1, hidden_size]
-        assert output.shape == (batch_size, 1, hidden_size)
+        # Should return [batch, hidden_size]
+        assert output.shape == (batch_size, hidden_size)
         assert output.dtype == hidden_states.dtype
         assert output.device == hidden_states.device
 
@@ -121,10 +132,16 @@ class TestGatherLogitsBeforeLmHeadOp:
         logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
 
         # Use fake implementation directly
-        output = gather_logits_before_lm_head_fake(hidden_states, logit_gather_ids)
+        with FakeTensorMode() as mode:
+            hidden_states_fake = mode.from_tensor(hidden_states)
+            logit_gather_ids_fake = mode.from_tensor(logit_gather_ids)
+            output = torch.ops.auto_deploy.gather_logits_before_lm_head.default(
+                hidden_states_fake, logit_gather_ids_fake
+            )
 
-        # Should return [1, max_batch_size, hidden_size]
-        assert output.shape == (1, max_batch_size, hidden_size)
+        # Should return [total_tokens, hidden_size] for fake implementation (it returns empty_like(squeezed))
+        # The real implementation returns [num_gathered, hidden_size], but fake impl just keeps shape
+        assert output.shape == (total_tokens, hidden_size)
         assert output.dtype == hidden_states.dtype
         assert output.device == hidden_states.device
 
@@ -132,15 +149,15 @@ class TestGatherLogitsBeforeLmHeadOp:
 class TestGatherLogitsBeforeLmHeadTransform:
     """Test the transform application."""
 
-    def _create_sequence_info(self, max_batch_size: int = 8, device: str = "cuda"):
-        """Create a mock SequenceInfo for testing."""
+    def _create_cached_sequence_interface(self, max_batch_size: int = 8, device: str = "cuda"):
+        """Create a mock CachedSequenceInterface for testing."""
         seq_info = SequenceInfo(
             max_seq_len=64,
             max_batch_size=max_batch_size,
             max_num_tokens=1024,
         )
         seq_info.to(device)
-        return seq_info
+        return CachedSequenceInterface(seq_info, device=device)
 
     def _check_gather_op_in_graph(self, gm: GraphModule) -> bool:
         """Check if gather_logits_before_lm_head op is in the graph."""
@@ -181,7 +198,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
         )
 
         # Apply transform
-        seq_info = self._create_sequence_info(max_batch_size)
+        cm = self._create_cached_sequence_interface(max_batch_size)
         transform_config = {
             "gather_logits_before_lm_head": {
                 "stage": "compile",
@@ -189,14 +206,18 @@ class TestGatherLogitsBeforeLmHeadTransform:
             }
         }
         optimizer = InferenceOptimizer(None, transform_config)
-        gm_transformed = optimizer(seq_info, gm)
+        gm_transformed = optimizer(cm, gm)
 
         # Check that gather op was inserted
         assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
 
         # Test forward pass
-        output = gm_transformed(hidden_states, logit_gather_ids, seq_len)
-        assert output.shape == (batch_size, 1, vocab_size)
+        # We must pass the new graph input logits_gather_mask manually since we are running the graph directly
+        logits_gather_mask = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        output = gm_transformed(
+            hidden_states, logit_gather_ids, seq_len, logits_gather_mask=logits_gather_mask
+        )
+        assert output.shape == (batch_size, vocab_size)
 
     @pytest.mark.parametrize("total_tokens", [10, 50])
     def test_transform_packed_format(self, total_tokens):
@@ -231,7 +252,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
         )
 
         # Apply transform
-        seq_info = self._create_sequence_info(max_batch_size)
+        cm = self._create_cached_sequence_interface(max_batch_size)
         transform_config = {
             "gather_logits_before_lm_head": {
                 "stage": "compile",
@@ -239,14 +260,21 @@ class TestGatherLogitsBeforeLmHeadTransform:
             }
         }
         optimizer = InferenceOptimizer(None, transform_config)
-        gm_transformed = optimizer(seq_info, gm)
+        gm_transformed = optimizer(cm, gm)
 
         # Check that gather op was inserted
         assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
 
         # Test forward pass
-        output = gm_transformed(hidden_states, logit_gather_ids_padded, seq_len)
-        assert output.shape == (1, max_batch_size, vocab_size)
+        # We must pass the new graph input logits_gather_mask manually since we are running the graph directly
+        logits_gather_mask = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        output = gm_transformed(
+            hidden_states,
+            logit_gather_ids_padded,
+            seq_len,
+            logits_gather_mask=logits_gather_mask,
+        )
+        assert output.shape == (max_batch_size, vocab_size)
 
     def test_transform_skips_when_disabled(self):
         """Test that transform skips when disabled."""
@@ -268,7 +296,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
         )
 
         # Apply transform with disabled config
-        seq_info = self._create_sequence_info(max_batch_size)
+        cm = self._create_cached_sequence_interface(max_batch_size)
         transform_config = {
             "gather_logits_before_lm_head": {
                 "stage": "compile",
@@ -277,7 +305,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
             }
         }
         optimizer = InferenceOptimizer(None, transform_config)
-        gm_transformed = optimizer(seq_info, gm)
+        gm_transformed = optimizer(cm, gm)
 
         # Check that gather op was NOT inserted
         assert not self._check_gather_op_in_graph(gm_transformed), (
@@ -291,12 +319,9 @@ class TestGatherLogitsBeforeLmHeadTransform:
         class ModelWithoutLMHead(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.linear = torch.nn.Linear(
-                    hidden_size, hidden_size, device="cuda", dtype=torch.float16
-                )
 
             def forward(self, x):
-                return self.linear(x)
+                return x * 2
 
         model = ModelWithoutLMHead().cuda()
         hidden_states = torch.randn(4, 1, hidden_size, device="cuda", dtype=torch.float16)
@@ -305,7 +330,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
         gm = torch_export_to_gm(model, args=(hidden_states,), dynamic_shapes=None, clone=True)
 
         # Apply transform - should skip gracefully
-        seq_info = self._create_sequence_info()
+        cm = self._create_cached_sequence_interface()
         transform_config = {
             "gather_logits_before_lm_head": {
                 "stage": "compile",
@@ -313,7 +338,7 @@ class TestGatherLogitsBeforeLmHeadTransform:
             }
         }
         optimizer = InferenceOptimizer(None, transform_config)
-        gm_transformed = optimizer(seq_info, gm)
+        gm_transformed = optimizer(cm, gm)
 
         # Transform should have skipped (no LM head found)
         assert not self._check_gather_op_in_graph(gm_transformed), (

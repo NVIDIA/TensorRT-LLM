@@ -27,7 +27,7 @@ from torch.fx import GraphModule
 
 from ...utils._graph import add_graph_input
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_linear_op
+from ...utils.node_utils import is_linear_op, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -90,20 +90,21 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
 
         # assume lm head node is the input to the output node
         lm_head_node = gm.graph.find_nodes(op="output")[0].all_input_nodes[0]
+        if is_op(lm_head_node, torch.ops.aten.to):
+            lm_head_node = lm_head_node.all_input_nodes[0]
+
         if is_linear_op(lm_head_node):
             node_to_gather = lm_head_node.all_input_nodes[0]
             ad_logger.info(f"Found LM head node: {lm_head_node.name}")
         else:
             node_to_gather = lm_head_node
-            ad_logger.warning(f"lm_head node not found, logits gathered at {node_to_gather.name}")
+            ad_logger.warning("lm_head node is not linear, using it as the node to gather")
 
         # Add logits_gather_mask as input in the graph and the sequence info interface
         logits_gather_mask_node = add_graph_input(gm, "logits_gather_mask")
         cm.info.register_arg(
-            "logits_gather_mask", torch.ones(cm.info.max_num_tokens, dtype=torch.bool)
+            "logits_gather_mask", torch.zeros(cm.info.max_num_tokens, dtype=torch.bool)
         )
-
-        # now insert gather node right after the node to gather
         with gm.graph.inserting_after(node_to_gather):
             gathered_node = gm.graph.call_function(
                 torch.ops.auto_deploy.gather_logits_before_lm_head.default,

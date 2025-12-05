@@ -71,7 +71,6 @@ def test_engine(engine_cls: Type[ADEngine], attn_page_size: int):
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
         logits = engine._compute_logits()
-        logits = torch.stack(logits)
         assert logits is not None, "Logits are None"
 
         mock_input = None
@@ -105,7 +104,6 @@ def test_demo_engine_sampling(attn_page_size: int):
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
         logits = engine._compute_logits()
-        logits = torch.stack(logits)
 
         vocab_size = logits.size(-1)
         sampling_params = SamplingParams(top_k=5, temperature=1.0)
@@ -213,5 +211,7 @@ def test_ad_engine_chunked_prefill_equivalence(attn_page_size: int):
     _ = engine.forward(scheduled_part1, resource_manager)
     logits_chunked_last = engine.forward(scheduled_part2, resource_manager)["logits"]
 
-    assert logits_full.shape == logits_chunked_last.shape
-    assert torch.allclose(logits_full, logits_chunked_last, atol=1e-5)
+    full_last_logits = logits_full[:, -1, :]
+    chunked_last_logits = logits_chunked_last[:, -1, :]
+    assert full_last_logits.shape == chunked_last_logits.shape
+    assert torch.allclose(full_last_logits, chunked_last_logits, atol=1e-5)

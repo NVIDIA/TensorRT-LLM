@@ -458,11 +458,14 @@ class ADEngine(ModelEngine):
             num_generation_tokens += 1 + get_draft_token_length(request)
             request.py_batch_idx = request.seq_slot
             slot_idx.append(request.seq_slot)
-            last_logit_only.append(False)
 
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
+
+        # Only pass logits_gather_mask if it's a registered arg (i.e., transform was applied)
+        if "logits_gather_mask" in self.cache_seq_interface.info._registered_args:
+            extra_args["logits_gather_mask"] = logits_gather_mask
 
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
@@ -470,7 +473,6 @@ class ADEngine(ModelEngine):
             input_pos=input_pos,
             page_assignments=page_assignments,
             slot_idx=slot_idx,
-            logits_gather_mask=logits_gather_mask,
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
