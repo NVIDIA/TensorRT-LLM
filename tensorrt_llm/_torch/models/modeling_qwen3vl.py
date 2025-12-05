@@ -379,7 +379,6 @@ class Qwen3VLVisionBlock(torch.nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config.vision_config
-
         self.norm1 = LayerNorm(
             hidden_size=config.hidden_size,
             eps=model_config.pretrained_config.text_config.rms_norm_eps,
@@ -433,6 +432,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
             in_features=self.hidden_size,
             out_features=self.hidden_size,
             bias=True,
+            dtype=model_config.pretrained_config.text_config.dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             allreduce_strategy=model_config.allreduce_strategy,
@@ -442,6 +442,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
             in_features=self.hidden_size,
             out_features=config.out_hidden_size,
             bias=True,
+            dtype=model_config.pretrained_config.text_config.dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             allreduce_strategy=model_config.allreduce_strategy,
@@ -471,7 +472,7 @@ class Qwen3VisionModel(torch.nn.Module):
 
         self.patch_embed = HFQwen3VLVisionPatchEmbed(
             config=self.config,
-        )
+        ).to(self.model_config.pretrained_config.text_config.dtype)
 
         self.pos_embed = nn.Embedding(self.config.num_position_embeddings, self.config.hidden_size)
         self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
@@ -663,7 +664,7 @@ class Qwen3VisionModelBase(nn.Module):
         self.model_config.quant_config = QuantConfig(
             kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
         )
-        self.visual = model_class(self.model_config).to(self.model_dtype)
+        self.visual = model_class(self.model_config)
 
         self.post_config()
 
