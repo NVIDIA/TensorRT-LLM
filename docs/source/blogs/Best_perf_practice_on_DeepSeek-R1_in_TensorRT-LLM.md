@@ -249,7 +249,7 @@ To do the benchmark, run the following command:
 ```bash
 # generate synthetic dataset
 trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
-        dataset \
+        prepare-dataset \
         --output dataset.txt \
         token-norm-dist \
         --input-mean 1024 --output-mean 2048 \
@@ -351,7 +351,7 @@ To do the benchmark, run the following command:
 ```bash
 # generate synthetic dataset
 trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
-        dataset \
+        prepare-dataset \
         --output dataset.txt \
         token-norm-dist \
         --input-mean 1024 --output-mean 2048 \
