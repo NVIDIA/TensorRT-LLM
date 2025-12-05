@@ -168,6 +168,7 @@ def server_patched(model_name: str, temp_extra_llm_api_options_file: str):
         yield remote_server
 
 
+@pytest.mark.needs_l40s
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_image_embeds(
     server_patched: RemoteOpenAIServer,
