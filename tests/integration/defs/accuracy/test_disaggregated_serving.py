@@ -990,6 +990,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("block_reuse", [False, True])
+    @skip_pre_hopper
     def test_auto_dtype(self, block_reuse):
 
         ctx_server_config = {
