@@ -163,7 +163,7 @@ def submit_job(config, log_dir):
     ]
     
     # Add --segment parameter only for GB200
-    if hw_config.get('gpu_type') == 'GB200':
+    if hw_config.get('gpu_type', "GB200") == 'GB200':
         cmd.append(f'--segment={total_nodes}')
     
     cmd.extend([
