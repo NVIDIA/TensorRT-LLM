@@ -824,7 +824,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
     )
     for i in range(num_valid_permuted_tokens):
-        token_id = token_id_mapping[i].item()
+        token_id = token_id_mapping[i].item() // top_k
         if token_id >= 0:
             a_gathered[i] = a[token_id]
             a_sf_gathered[i] = a_sf_unswizzled[token_id]

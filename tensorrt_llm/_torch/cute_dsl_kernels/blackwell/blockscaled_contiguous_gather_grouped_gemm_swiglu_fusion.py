@@ -274,6 +274,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
+        topk: int,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and SwiGLU fusion.
@@ -295,6 +296,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         4.  Performance Optimization:
             - vectorized_f32: Enable vectorized f32x2 operations.
 
+        5.  MoE Configuration:
+            - topk: Number of experts selected per token (used for token ID mapping).
+
         :param sf_vec_size: Vector size for scale factors (16 for NVF4, 32 for MXF4/MXF8).
         :type sf_vec_size: int
         :param acc_dtype: Data type of the accumulator.
@@ -306,9 +310,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param vectorized_f32: Enable vectorized f32x2 operations for better performance.
         :type vectorized_f32: bool
+        :param topk: Number of experts selected per token (used for token ID mapping).
+        :type topk: int
         """
 
         self.sf_vec_size = sf_vec_size
+        self.topk = topk
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -1315,7 +1322,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         else cutlass.Boolean(0)
                     )
                     a_token_offset_tensor[i] = (
-                        a_token_offset_tensor[i]
+                        a_token_offset_tensor[i] // self.topk
                         if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
                         < tile_info[4]
                         else 0
@@ -1326,7 +1333,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     + 32 * ((tidx_in_warpgroup % 32) // 8)
                     + (tidx_in_warpgroup % 8)
                 )
-                sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset]
+                sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset] // self.topk
                 sfa_predicate_tensor[0] = (
                     cutlass.Boolean(1)
                     if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset

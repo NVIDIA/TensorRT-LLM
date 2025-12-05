@@ -129,14 +129,15 @@ class GroupedGemmInputsHelper:
             self, num_tokens: int,
             num_tokens_per_expert: List[int]) -> List[int]:
         """Generate token_id_mapping for gather operation.
-        Maps permuted index to original token index.
+        Maps permuted index to expanded index (token_idx * top_k + topk_idx).
         Args:
             num_tokens: Total number of input tokens
             num_tokens_per_expert: List of token counts per expert
         Returns:
-            List of token IDs with length = max_num_permuted_tokens,
-            where token_id_mapping[permuted_idx] = original_token_idx
+            List of expanded IDs with length = max_num_permuted_tokens,
+            where token_id_mapping[permuted_idx] = expanded_idx
             Padding tokens are marked with -1
+            Note: In kernel, use expanded_idx // top_k to get original token_idx
         """
         max_num_permuted_tokens = self.get_max_num_permuted_tokens(num_tokens)
         token_id_mapping = []
@@ -147,7 +148,9 @@ class GroupedGemmInputsHelper:
             for j in range(curr_num_tiles * self.tile_size):
                 if j < curr_num_tokens:
                     token_idx = colmajor_expanded_idx % num_tokens
-                    token_id_mapping.append(token_idx)
+                    topk_idx = colmajor_expanded_idx // num_tokens
+                    expanded_idx = token_idx * self.top_k + topk_idx
+                    token_id_mapping.append(expanded_idx)
                     colmajor_expanded_idx += 1
                 else:
                     token_id_mapping.append(-1)  # Padding token
@@ -1898,8 +1901,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                   128), (self.tile_size // 128,
                                                          1)
 
-            cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+            cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
+                         mma_tiler_mn, cluster_shape_mn)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -1907,6 +1910,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
+                    topk=self.top_k,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
