@@ -14,7 +14,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm._utils import is_device_integrated
+from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
 from tensorrt_llm.logger import logger
@@ -305,6 +305,11 @@ class LinearMethodBase(ABC):
     @abstractmethod
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor], *args, **kwargs):
+        raise NotImplementedError
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
         raise NotImplementedError
 
     def load_weights(self,
@@ -908,8 +913,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def _input_prepare(self, module: Linear, input: torch.Tensor):
         if isinstance(input, Fp4QuantizedTensor):
             # Input is already quantized - this should not happen if pre_quant_scale exists
             # because we disable FP4 output for attention output when pre_quant_scale is present
@@ -935,7 +939,11 @@ class NVFP4LinearMethod(LinearMethodBase):
 
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
+        return act_fp4, act_sf
 
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        act_fp4, act_sf = self._input_prepare(module, input)
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
@@ -948,6 +956,21 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.dtype,
             to_userbuffers=False,
             allowed_backends=allowed_backends_str)
+        # Take the dim of out_features if padded. Make sure the output is contiguous
+        if output.shape[-1] > module.out_features:
+            output = output[..., :module.out_features].contiguous()
+
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int]):
+        act_fp4, act_sf = self._input_prepare(module, input)
+        output = torch.ops.trtllm.nvfp4_gemm_allreduce(
+            act_fp4, module.weight, act_sf, module.weight_scale, module.alpha,
+            module.dtype, tp_rank, tp_group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -2133,6 +2156,20 @@ class Linear(nn.Module):
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
 
+        use_fused_gemm_allreduce = True
+        use_fused_gemm_allreduce &= (not mpi_disabled())
+        use_fused_gemm_allreduce &= self.dtype in (torch.float16,
+                                                   torch.bfloat16)
+        use_fused_gemm_allreduce &= (self.in_features % 128 == 0)
+        use_fused_gemm_allreduce &= (self.tp_mode is not None
+                                     and self.tp_mode == TensorParallelMode.ROW)
+        use_fused_gemm_allreduce &= (self.tp_size > 1 and self.reduce_output)
+        use_fused_gemm_allreduce &= (self.out_features % 64 == 0)
+        use_fused_gemm_allreduce &= (
+            self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_nvfp4())
+        self.use_fused_gemm_allreduce = use_fused_gemm_allreduce
+
         self.enable_cuda_core = False
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
@@ -2224,11 +2261,18 @@ class Linear(nn.Module):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         output = self.quant_method.apply(self, input, bias)
-
         if self.lora is not None and bool(lora_params):
             lora_result = self.lora(input, lora_params, layer_idx)
             if lora_result is not None:
                 output = output + lora_result
+        return output
+
+    def apply_linear_allreduce(self,
+                               input,
+                               bias,
+                               layer_idx: Optional[int] | None = None):
+        output = self.quant_method.apply_linear_allreduce(
+            self, input, bias, self.tp_rank, self.mapping.tp_group)
         return output
 
     def _maybe_fuse_bias_into_allreduce(
@@ -2257,16 +2301,23 @@ class Linear(nn.Module):
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         if self.tp_mode == TensorParallelMode.ROW:
+            use_fused_gemm_allreduce = self.use_fused_gemm_allreduce and lora_params is None
+            if use_fused_gemm_allreduce and all_reduce_params is not None:
+                use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
+
             bias = None if (self.tp_rank > 0) else self.bias
             if self.reduce_output:
-                fuse_bias = self._maybe_fuse_bias_into_allreduce(
-                    bias, all_reduce_params)
-                bias = None if fuse_bias else bias
-                output = self.apply_linear(input, bias, lora_params, layer_idx)
-                output = self.all_reduce(
-                    output,
-                    all_reduce_params=all_reduce_params,
-                )
+                if use_fused_gemm_allreduce:
+                    output = self.apply_linear_allreduce(
+                        input, self.bias, layer_idx)
+                else:
+                    fuse_bias = self._maybe_fuse_bias_into_allreduce(
+                        bias, all_reduce_params)
+                    bias = None if fuse_bias else bias
+                    output = self.apply_linear(input, bias, lora_params,
+                                               layer_idx)
+                    output = self.all_reduce(
+                        output, all_reduce_params=all_reduce_params)
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:

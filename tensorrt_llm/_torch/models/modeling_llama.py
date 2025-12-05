@@ -14,7 +14,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -673,9 +673,38 @@ class LlamaDecoderLayer(DecoderLayer):
         # Disable fusion for small models due to accuracy issues
         self.enable_fusion &= config.hidden_size > 4096
 
-        self.PRE_MLP_FUSION = self.mapping.has_tp(
+        use_fused_gemm_allreduce = True
+        use_fused_gemm_allreduce &= (not mpi_disabled())
+        use_fused_gemm_allreduce &= (self.mapping.tp_size > 1)
+        use_fused_gemm_allreduce &= (config.torch_dtype
+                                     in (torch.float16, torch.bfloat16))
+        use_fused_gemm_allreduce &= (self.is_nvfp4 is not None
+                                     and self.is_nvfp4)
+
+        num_heads = config.num_attention_heads
+        head_dim = getattr(config, 'head_dim', None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // num_heads
+
+        in_features = num_heads * head_dim
+        out_features = config.hidden_size
+        in_features_div_by = 128
+        attn_fused_gemm_allreduce = use_fused_gemm_allreduce and in_features % in_features_div_by == 0 and in_features >= 1024
+        attn_fused_gemm_allreduce &= (out_features % 64 == 0
+                                      and out_features >= 1024)
+
+        self.PRE_MLP_FUSION = not attn_fused_gemm_allreduce and self.mapping.has_tp(
         ) and not self.enable_attention_dp and self.enable_fusion
-        self.POST_MLP_FUSION = self.mapping.has_tp() and self.enable_fusion
+
+        in_features = config.intermediate_size
+        out_features = config.hidden_size
+        in_features_div_by = 128 * self.mapping.tp_size
+        mlp_fused_gemm_allreduce = use_fused_gemm_allreduce and in_features % in_features_div_by == 0 and in_features >= 1024
+        mlp_fused_gemm_allreduce &= (out_features % 64 == 0
+                                     and out_features >= 1024)
+
+        self.POST_MLP_FUSION = not mlp_fused_gemm_allreduce and self.mapping.has_tp(
+        ) and self.enable_fusion
 
         if self.is_nvfp4:
             self.pre_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
