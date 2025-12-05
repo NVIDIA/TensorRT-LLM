@@ -113,13 +113,16 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
          )), f"gen server_first_token_time is not numeric in {request_context}"
     assert gen_server_arrival <= gen_server_first_token, f"gen server_arrival_time > server_first_token_time in {request_context}"
 
+    # Network Time Protocol can ensure ms-level accuracy in LAN
+    ntp_tolerance = 1e-3
+
     # Validate timing relationships between different levels
     # Disaggregated server should receive request before individual servers
-    assert disagg_arrival <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
-    assert disagg_arrival <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
+    assert disagg_arrival - ntp_tolerance <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
+    assert disagg_arrival - ntp_tolerance <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
 
     # Context should complete before generation starts
-    assert ctx_server_first_token <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
+    assert ctx_server_first_token - ntp_tolerance <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
 
     # Validate internal timing consistency
     ctx_arrival_time = ctx_metrics["arrival_time"]
