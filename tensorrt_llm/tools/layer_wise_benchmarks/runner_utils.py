@@ -41,22 +41,14 @@ def round_up(a, b):
 def get_balanced_selection_no_cache(
     num_tokens, top_k, num_experts, dtype, device, dp_size, dp_rank, ep_size
 ):
-    # First, each sender selects target rank
-    target_rank_before_mod = torch.arange(num_tokens * dp_size * top_k).view(
-        num_tokens, dp_size, top_k
+    token_id = torch.arange(dp_rank * num_tokens * top_k, (dp_rank + 1) * num_tokens * top_k).view(
+        num_tokens, top_k
     )
-    # Shift `top_k` ranks for each loop, to balance network traffic
-    assert ep_size % dp_size == 0
-    target_rank_before_mod += top_k * (target_rank_before_mod // (ep_size * top_k))
-    target_rank = target_rank_before_mod % ep_size
-    # Second, each receiver selects target expert
-    target_expert = torch.empty_like(target_rank)
-    for reciever_rank in range(ep_size):
-        mask = target_rank == reciever_rank
-        experts_per_rank = num_experts // ep_size
-        local_expert = torch.arange(mask.sum()) % experts_per_rank
-        target_expert[mask] = (reciever_rank * experts_per_rank) + local_expert
-    token_selected_experts = target_expert[:, dp_rank].sort(dim=-1).values
+    experts_per_rank = num_experts // ep_size
+    token_selected_experts = (token_id % ep_size) * experts_per_rank + (
+        token_id // ep_size
+    ) % experts_per_rank
+    token_selected_experts = token_selected_experts.sort(dim=-1).values
     return token_selected_experts.contiguous().to(dtype=dtype, device=device)
 
 
