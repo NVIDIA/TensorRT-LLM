@@ -1169,7 +1169,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_m = cur_tile_coord[0] // self.cluster_shape_mn[0]
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
                 if mma_tile_coord_m < num_non_exiting_tiles[0]:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
                     cur_tile_coord = work_tile.tile_idx

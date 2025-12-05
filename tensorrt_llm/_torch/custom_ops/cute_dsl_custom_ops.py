@@ -10,7 +10,7 @@ from ...math_utils import pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (fp4_scale_infer_shape,
+from ..utils import (fp4_scale_infer_shape, fp4_unswizzled_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -22,13 +22,22 @@ except ImportError:
 
 class GroupedGemmInputsHelper:
 
-    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                 local_expert_offset: int, tile_size: int):
+    def __init__(self,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 tile_size: int,
+                 fuse_gather: bool = False):
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
         self.tile_size = tile_size
+        self.fuse_gather = fuse_gather
+        # For gather fusion, use token_id_mapping (index 7) to infer shapes
+        # For non-gather fusion, use a (index 0)
+        self.shape_infer_tensor_idx = 7 if fuse_gather else 0
         # Padding values should never be accessed.
         # Intentionally use a large padding value to expose issues early.
         self.pad_val = int(2e9)
@@ -63,10 +72,16 @@ class GroupedGemmInputsHelper:
             last_positive_power_of_2(self.infer_num_tokens(x)))
 
     def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
-        return self.infer_num_tokens(input_shapes[0][0])
+        return self.infer_num_tokens(
+            input_shapes[self.shape_infer_tensor_idx][0])
 
     def infer_shape_max_num_tiles(self, input_shapes: List[torch.Size]) -> int:
-        return input_shapes[0][0] // self.tile_size
+        """Infer max_num_tiles from the appropriate tensor based on fuse_gather.
+
+        For gather fusion: uses token_id_mapping (index 7)
+        For non-gather fusion: uses a tensor (index 0)
+        """
+        return input_shapes[self.shape_infer_tensor_idx][0] // self.tile_size
 
     def infer_shape_max_num_permuted_tokens(
             self, input_shapes: List[torch.Size]) -> int:
@@ -244,8 +259,8 @@ class GroupedGemmInputsHelper:
         assert num_non_exiting_tiles_val > 0
         assert num_padding_tiles_val >= 0
         assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-        assert len(
-            token_id_mapping_list) == num_non_exiting_tiles_val * self.tile_size
+        assert len(token_id_mapping_list
+                   ) == tile_idx_to_group_idx.size(0) * self.tile_size
 
         tile_idx_to_group_idx = torch.tensor(
             tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
@@ -1746,12 +1761,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             k = a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
+            # TODO: add more tactics
             if self.tile_size == 128:
-                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+                mma_tiler_mn_candidates = [(128, 128)]
+                cluster_shape_mn_candidates = [(1, 1)]
             elif self.tile_size == 256:
-                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
-                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+                mma_tiler_mn_candidates = [(256, 128)]
+                cluster_shape_mn_candidates = [(2, 1)]
             else:
                 raise ValueError(f"Tile size {self.tile_size} is not supported")
 
@@ -1782,20 +1798,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def get_tuning_config(self) -> TuningConfig:
             key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
-                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
+                # fuse_gather=True: use token_id_mapping (index 7) to infer shapes
+                helper = GroupedGemmInputsHelper(self.num_experts,
+                                                 self.top_k,
                                                  self.num_local_experts,
                                                  self.local_expert_offset,
-                                                 self.tile_size)
+                                                 self.tile_size,
+                                                 fuse_gather=True)
                 self.__class__.tuning_config_cache[key] = TuningConfig(
+                    # For gather fusion, use token_id_mapping (index 7) to determine
+                    # the max_num_permuted_tokens, not a (index 0) which is orig_m
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        0, 0, helper.gen_tuning_buckets,
+                        7, 0, helper.gen_tuning_buckets,
                         helper.map_to_tuning_buckets), ),
-                    constraint_specs=(
-                        ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                        ConstraintSpec(5, 0, helper.infer_shape_max_num_tiles),
-                        ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
-                        ConstraintSpec(
-                            7, 0, helper.infer_shape_max_num_permuted_tokens)),
+                    constraint_specs=(ConstraintSpec(
+                        0, 0, helper.infer_shape_num_tokens),
+                                      ConstraintSpec(
+                                          2, 0,
+                                          fp4_unswizzled_scale_infer_shape),
+                                      ConstraintSpec(
+                                          5, 0,
+                                          helper.infer_shape_max_num_tiles),
+                                      ConstraintSpec(
+                                          6, 0,
+                                          helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook_gather_fusion,
                     use_cuda_graph=True,
                 )
@@ -1809,7 +1835,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b.dtype == torch.float4_e2m1fn_x2
             assert b.dim() == 3
             assert a_sf.dtype == torch.uint8
-            assert a_sf.dim() == 2
             assert b_sf.dtype == torch.uint8
             assert b_sf.dim() == 3
             assert alpha.dtype == torch.float32
@@ -1826,8 +1851,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert k % (self.scaling_vector_size * 4) == 0
             assert n % (self.scaling_vector_size * 4 * 2) == 0
             assert b.size(2) * 2 == k
-            assert a_sf.size(0) == orig_m
-            assert a_sf.size(1) == scale_k
+            assert a_sf.numel() == orig_m * scale_k
             assert b_sf.size(0) == l
             assert b_sf.size(1) == n
             assert b_sf.size(2) == scale_k
