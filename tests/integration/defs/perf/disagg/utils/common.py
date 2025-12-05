@@ -103,7 +103,7 @@ class EnvManager:
         return os.getenv("INSTALL_MODE", "none")
 
     @staticmethod
-    def get_container_mount(model_name: str) -> str:
+    def get_container_mount(model_name: str = "") -> str:
         work_dir = EnvManager.get_work_dir()
         script_dir = EnvManager.get_script_dir()
         model_dir = EnvManager.get_model_dir()
