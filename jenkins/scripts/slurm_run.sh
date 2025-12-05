@@ -35,7 +35,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
     echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
 fi
 
-install_lock_file="install_lock.lock.${SLURM_JOB_ID}${DISAGG_SERVING_TYPE}"
+install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname)${DISAGG_SERVING_TYPE}"
 if [ $SLURM_PROCID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
