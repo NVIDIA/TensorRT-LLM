@@ -56,7 +56,7 @@ Follow this step-by-step guide to quantize a model:
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
 cd TensorRT-Model-Optimizer/examples/llm_ptq
-scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --export_fmt hf
+scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8
 ```
 
 ## Model Supported Matrix
