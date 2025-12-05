@@ -457,7 +457,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
             x, x_sf_global, scaling_vector_size, False)
         alpha_ref = 1.0 / (w_sf_global * x_sf_global)
-        alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
+        alpha_tensor = torch.tensor([alpha_ref], dtype=torch.float32).cuda()
 
     # Reference: Use CUTLASS backend explicitly for reference output
     with torch.inference_mode():
