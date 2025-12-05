@@ -38,12 +38,12 @@ class MistralCheckpointLoader(HfCheckpointLoader):
             modules = key.split(".")
 
             if modules[0] not in self.mm_module_mapping.keys():
-                    hf_weights["language_model." + key] = value
+                hf_weights["language_model." + key] = value
 
             else:
                 modules[0] = self.mm_module_mapping[modules[0]]
                 hf_weights[".".join(modules)] = value
-                    
+
         return hf_weights
 
     def broadcast_per_tensor_scales(self, weights):

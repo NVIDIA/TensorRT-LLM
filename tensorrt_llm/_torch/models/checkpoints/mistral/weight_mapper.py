@@ -78,7 +78,7 @@ class MistralWeightMapper(HfWeightMapper):
         processed_weights = {}
         config = self.config.pretrained_config
 
-        def permute(w: torch.Tensor, n_heads: int, attn_out: int):
+        def permute(w, n_heads: int, attn_out: int):
             attn_in = config.head_dim * n_heads
 
             return (
@@ -86,7 +86,6 @@ class MistralWeightMapper(HfWeightMapper):
                 .transpose(1, 2)
                 .reshape(attn_in, attn_out)
             )
-
 
         # rotary embeds should be sliced
         # If using quantized model in mistral format,
@@ -97,14 +96,10 @@ class MistralWeightMapper(HfWeightMapper):
                 config.num_key_value_heads if new_name == "k_proj" else config.num_attention_heads
             )
 
-            processed_weights["weight"] = permute(
-                weights["weight"], n_heads, config.hidden_size
-            )
+            processed_weights["weight"] = permute(weights["weight"], n_heads, config.hidden_size)
 
             if "qscale_weight" in weights and weights["qscale_weight"].numel() > 1:
-                processed_weights["qscale_weight"] = permute(
-                    weights["qscale_weight"], n_heads, 1
-                )
+                processed_weights["qscale_weight"] = permute(weights["qscale_weight"], n_heads, 1)
 
             return processed_weights
 
