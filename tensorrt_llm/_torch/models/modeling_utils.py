@@ -559,8 +559,8 @@ class DecoderModelForCausalLM(nn.Module,
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     params_map: Optional[Dict] = None,
                      skip_modules: List[str] = [],
+                     params_map: Optional[Dict] = None,
                      allow_partial_loading: bool = False):
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
@@ -839,6 +839,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         raise ValueError("model must have a config attribute")
 
     if params_map is not None:
+        print(f"Params map is not None")
         weights = rename_weights_with_regex(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
 
