@@ -67,7 +67,7 @@ Say we want to profile iterations 100 to 150 on a trtllm-bench/trtllm-serve run,
 
 # Prepare dataset for the benchmark
 trtllm-bench \
-    --model=${MODEL_PATH} dataset \
+    --model=${MODEL_PATH} prepare-dataset \
     --output /tmp/dataset.txt token-norm-dist --num-requests=${NUM_SAMPLES} \
     --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0
 
