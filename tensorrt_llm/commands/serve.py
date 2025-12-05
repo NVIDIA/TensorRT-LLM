@@ -178,7 +178,10 @@ def launch_server(
     backend = llm_args["backend"]
     model = llm_args["model"]
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, port))
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
