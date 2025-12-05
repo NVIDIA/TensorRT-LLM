@@ -20,10 +20,12 @@ import socket
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
 from packaging import version
 
 from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1147,3 +1149,20 @@ def wait_for_server(host, port, timeout_seconds=180):
         except (socket.error, ConnectionRefusedError, OSError):
             time.sleep(2)
     return False
+
+
+def revise_disaggregated_server_config_urls_with_free_ports(
+        disaggregated_server_config: dict[str, Any]) -> dict[str, Any]:
+    num_ctx_ports = len(disaggregated_server_config["context_servers"]["urls"])
+    num_gen_ports = len(
+        disaggregated_server_config["generation_servers"]["urls"])
+
+    disaggregated_server_config['port'] = get_free_port()
+    disaggregated_server_config["context_servers"]["urls"] = [
+        f"localhost:{get_free_port()}" for _ in range(num_ctx_ports)
+    ]
+    disaggregated_server_config["generation_servers"]["urls"] = [
+        f"localhost:{get_free_port()}" for _ in range(num_gen_ports)
+    ]
+
+    return disaggregated_server_config

@@ -991,7 +991,7 @@ class OpenAIServer:
         return JSONResponse(content={"detail": "None"})
 
 
-    async def __call__(self, host, port, sockets: list[socket.socket] = None):
+    async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
