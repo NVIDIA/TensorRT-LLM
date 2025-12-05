@@ -144,6 +144,21 @@ rm -f /dev/shm/moe_shared_l0_lr0_all
 
 **Warning:** Be careful when removing shared memory manually, as this may affect running processes that depend on these shared memory segments.
 
+### Host OOM
+
+Since EPLB requires all experts to be loaded on host memory, when some models (such as Kimi K2 Thinking) have larger weights size, it's possible seeing host OOM issues, as the following:
+
+```log
+Loading weights: 100%|█████████████████████| 1408/1408 [03:43<00:00,  6.30it/s]
+ 0: [12/04/2025-18:38:28] [TRT-LLM] [RANK 0] [I] moe_load_balancer finalizing model...
+ 1: [nvl72136-T14:452151:0:452151] Caught signal 7 (Bus error: nonexistent physical address)
+ 1: ==== backtrace (tid: 452151) ====
+ 1:  0  /usr/local/ucx//lib/libucs.so.0(ucs_handle_error+0x2cc) [0xffff9638274c]
+ 1:  1  /usr/local/ucx//lib/libucs.so.0(+0x328fc) [0xffff963828fc]
+ 1:  2  /usr/local/ucx//lib/libucs.so.0(+0x32c78) [0xffff96382c78]
+```
+This can be addressed by mounting `tmpfs:/dev/shm:size=640G` when launching the Docker container, to increase the shm size that the container can access.
+
 ### Disaggregated serving related issues
 
 Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md#troubleshooting-and-faq) section of Disaggregated-Service.
