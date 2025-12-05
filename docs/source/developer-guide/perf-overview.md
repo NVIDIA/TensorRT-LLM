@@ -10,7 +10,8 @@ It should *not* be considered as the peak performance that can be delivered by T
 Not all configurations were tested for all GPUs. 
 
 We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
-Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situaiton.
+Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situation.
+
 
 For DeepSeek R1 performance, please check out our [performance guide](../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
 
@@ -68,21 +69,22 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ## Table of Contents
 
-- [Deepseek R1 0528](#Deepseek_R1_0528)
-- [GPT-OSS 120B](#GPT-OSS_120B)
-- [GPT-OSS 20B](#GPT-OSS_20B)
-- [LLaMA v3.3 70B](#LLaMA_v3.3_70B)
-  - [LLaMA v3.3 70B - RTX Configurations](#LLaMA_v3.3_70B_rtx)
-- [LLaMA v4 Maverick](#LLaMA_v4_Maverick)
-  - [LLaMA v4 Maverick - RTX Configurations](#LLaMA_v4_Maverick_rtx)
-- [Qwen3 235B A22B](#Qwen3_235B_A22B)
-  - [Qwen3 235B A22B - RTX Configurations](#Qwen3_235B_A22B_rtx)
-- [Qwen3 30B A3B](#Qwen3_30B_A3B)
-  - [Qwen3 30B A3B - RTX Configurations](#Qwen3_30B_A3B_rtx)
+- [Deepseek R1 0528](#deepseek-r1-0528)
+- [GPT-OSS 120B](#gpt-oss-120b)
+- [GPT-OSS 20B](#gpt-oss-20b)
+- [Kimi-K2-Instruct-0905](#kimi-k2-instruct-0905)
+- [LLaMA v3.3 70B](#llama-v33-70b)
+  - [LLaMA v3.3 70B - RTX Configurations](#llama-v33-70b-rtx-configurations)
+- [LLaMA v4 Maverick](#llama-v4-maverick)
+  - [LLaMA v4 Maverick - RTX Configurations](#llama-v4-maverick-rtx-configurations)
+- [Qwen3 235B A22B](#qwen3-235b-a22b)
+  - [Qwen3 235B A22B - RTX Configurations](#qwen3-235b-a22b-rtx-configurations)
+- [Qwen3 30B A3B](#qwen3-30b-a3b)
+  - [Qwen3 30B A3B - RTX Configurations](#qwen3-30b-a3b-rtx-configurations)
 
 ---
 
-<a id="Deepseek_R1_0528"></a>
+<a id="deepseek-r1-0528"></a>
 
 # Deepseek R1 0528
 
@@ -96,7 +98,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="GPT-OSS_120B"></a>
+<a id="gpt-oss-120b"></a>
 
 # GPT-OSS 120B
 
@@ -111,7 +113,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="GPT-OSS_20B"></a>
+<a id="gpt-oss-20b"></a>
 
 # GPT-OSS 20B
 
@@ -126,8 +128,20 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
+<a id="kimi-k2-instruct-0905"></a>
 
-<a id="LLaMA_v3.3_70B"></a>
+# Kimi-K2-Instruct-0905
+
+| Sequence Length (ISL/OSL) | B200<br/>TEP8 (FP8) | H200<br/>TEP8 (FP8) |
+|---|---|---|
+| 1000/1000 | 439 | 240 |
+| 1024/1024 | 440 | 239 |
+| 1024/8192 | 309 | 98 |
+| 8192/1024 | | 60 |
+
+---
+
+<a id="llama-v33-70b"></a>
 
 # LLaMA v3.3 70B
 
@@ -141,7 +155,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="LLaMA_v3.3_70B_rtx"></a>
+<a id="llama-v33-70b-rtx-configurations"></a>
 
 # LLaMA v3.3 70B - RTX Configurations (TP/PP)
 
@@ -157,7 +171,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="LLaMA_v4_Maverick"></a>
+<a id="llama-v4-maverick"></a>
 
 # LLaMA v4 Maverick
 
@@ -172,7 +186,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="LLaMA_v4_Maverick_rtx"></a>
+<a id="llama-v4-maverick-rtx-configurations"></a>
 
 # LLaMA v4 Maverick - RTX Configurations (TP/PP)
 
@@ -187,7 +201,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="Qwen3_235B_A22B"></a>
+<a id="qwen3-235b-a22b"></a>
 
 # Qwen3 235B A22B
 
@@ -202,7 +216,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="Qwen3_235B_A22B_rtx"></a>
+<a id="qwen3-235b-a22b-rtx-configurations"></a>
 
 # Qwen3 235B A22B - RTX Configurations (TP/PP)
 
@@ -219,7 +233,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="Qwen3_30B_A3B"></a>
+<a id="qwen3-30b-a3b"></a>
 
 # Qwen3 30B A3B
 
@@ -234,7 +248,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="Qwen3_30B_A3B_rtx"></a>
+<a id="qwen3-30b-a3b-rtx-configurations"></a>
 
 # Qwen3 30B A3B - RTX Configurations (TP/PP)
 
