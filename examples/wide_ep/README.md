@@ -33,18 +33,18 @@ For more information on NVIDIA IMEX service for NVLink networks, refer to https:
 
 #### Coherent Driver-Based Memory Management (CDMM)
 
-Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-65-06/index.html#hardware-software-support) for GB200 platforms is introduced. With CDMM, the driver manages GPU memory instead of the OS. CDMM avoids OS onlining of the GPU memory and the exposing of the GPU memory as a NUMA node to the OS. In Wide-EP, online EPLB need host threads be able to access the GPU memory to do the weights update.
+Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-65-06/index.html#hardware-software-support) for GB200 platforms is introduced. With CDMM, the driver manages GPU memory instead of the OS. CDMM avoids OS onlining of the GPU memory and the exposing of the GPU memory as a NUMA node to the OS. In Wide-EP, online EPLB needs host threads to be able to access the GPU memory to do the weights update.
 
-When CDMM mode is off, GPU memory are exposed as NUMA nodes, so no additional prerequisites is required.
+When CDMM mode is off, GPU memory is exposed as NUMA nodes, so no additional prerequisites are required.
 
-When CDMM mode is on, GPU memory doesn't exist in NUMA nodes, in that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed.
+When CDMM mode is on, GPU memory doesn't exist in NUMA nodes. In that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed.
 
 When GDRCopy is installed and the kernel module is loaded, you should be able to see the device file `/dev/gdrdrv` and kernel module `gdrdrv` by `lsmod`. The device file needs to be mapped into the container.
 
 * For docker, this can be done by adding a device mapping like `--device=/dev/gdrdrv:/dev/gdrdrv`.
 * For slurm with enroot, `--container-mounts="/dev/gdrdrv:/dev/gdrdrv"` needs to be added when starting containers and environment variable `export ENROOT_ALLOW_DEV=yes` needs to be set.
 
-### Online Load Balancer  Configurations
+### Online Load Balancer Configurations
 
 An example yaml file to enable wide EP:
 ```yaml
@@ -59,7 +59,7 @@ moe_config:
 #### `backend`
 
  - MoE backend type, defaults to `CUTLASS`.
- - Currently, TensorRT LLM has multiple MoE backends that support wide EP, includes `WIDEEP`, `CUTLASS`, `TRTLLM` and `CUTEDSL`. There are on-going efforts to refactor the backends so that we don't necessary need a specific `WIDEEP` backend, and each other backend will support wide EP functionality.
+ - Currently, TensorRT LLM has multiple MoE backends that support wide EP, including `WIDEEP`, `CUTLASS`, `TRTLLM` and `CUTEDSL`. There are on-going efforts to refactor the backends so that we don't necessarily need a specific `WIDEEP` backend, and each other backend will support wide EP functionality.
 
 #### `max_num_tokens`
 
@@ -86,13 +86,13 @@ Number of layers updated per iteration, defaults to `0`. `0` means offline, whil
 
 Refer to the [Offline EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer) documentation.
 
-*Online EP Load Balancer is more suitable for production deployment needs to react timely to the online traffic changes.*
+*Note: Online EP Load Balancer is more suitable for production deployments that need to react timely to online traffic changes.*
 
 ### Execute Wide-EP on SLURM Clusters
 
-Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) for submiting jobs to SLURM clusters.
+Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) for submitting jobs to SLURM clusters.
 
-## Trouble shooting
+## Troubleshooting
 
 ### Transparent HugePages failure
 
@@ -110,7 +110,7 @@ echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
 
 ### GB200 NUMA binding
 
-GPU memory are also on NUMA nodes on GB200 and system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
+GPU memory is also on NUMA nodes on GB200 and the system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
 ```bash
 numactl -m 0,1 <command>
 ```

@@ -77,7 +77,6 @@ worker_config:
       - 768
       - 1024
       - 2048
-      - 128
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
