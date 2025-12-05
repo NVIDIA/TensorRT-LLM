@@ -103,7 +103,7 @@ class EnvManager:
         return os.getenv("INSTALL_MODE", "none")
 
     @staticmethod
-    def get_container_mount() -> str:
+    def get_container_mount(model_name: str) -> str:
         work_dir = EnvManager.get_work_dir()
         script_dir = EnvManager.get_script_dir()
         model_dir = EnvManager.get_model_dir()
@@ -118,6 +118,10 @@ class EnvManager:
             f"{model_dir}:{model_dir}",
             f"{output_path}:{output_path}",
         ]
+
+        # Kimi-K2 needs 640G of shared memory, otherwise will cause host memory OOM.
+        if model_name.find("kimi-k2") != -1:
+            mounts.append(f"tmpfs:/dev/shm:size=640G")
 
         if dataset_dir and not dataset_dir.startswith("<"):
             mounts.append(f"{dataset_dir}:{dataset_dir}")
