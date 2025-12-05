@@ -75,6 +75,8 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
+  detect_hidden_states_for_capture:
+    stage: pattern_matcher
   detect_sharding:
     stage: sharding
     simple_shard_only: false
@@ -158,6 +160,9 @@ transforms:
   insert_cached_delta_rule:
     stage: cache_init
     backend: fla_delta
+  insert_cached_residual_add:
+    stage: cache_init
+    backend: cached_residual_add
   initialize_cache:
     stage: cache_init
     run_per_gm: false
