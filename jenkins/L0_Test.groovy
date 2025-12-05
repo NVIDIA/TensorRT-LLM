@@ -1084,6 +1084,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         exit \$EXIT_CODE
                     fi
                 """.replaceAll("(?m)^\\s*", "").trim()
+
                 pipeline.writeFile(file: scriptExecPathLocal, text: scriptExec)
                 Utils.exec(pipeline, script: "echo \"Script to trigger Slurm submission job: \" && cat ${scriptExecPathLocal}")
                 Utils.copyFileToRemoteHost(
