@@ -93,6 +93,18 @@ enum class BiasType : uint32_t
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType
+{
+    None = 0,
+    // Relu2 (also known as squared Relu) is defined as the following operation:
+    // act = relu(x0) ^ 2
+    // where x0 is the output of the Gemm.
+    Relu2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class TileScheduler
 {
     // Static scheduler (Non-persistent).
