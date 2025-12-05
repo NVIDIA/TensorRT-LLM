@@ -335,7 +335,6 @@ accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5644632)
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-True] SKIP (https://nvbugs/5648560)
 test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-False] SKIP (https://nvbugs/5648560)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_trtllmgen_adp_lmtp] SKIP (https://nvbugs/5629136)
 perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b200] SKIP (https://nvbugs/5643646)
 perf/test_perf.py::test_perf[perf_sanity_upload-l0_dgx_b300] SKIP (https://nvbugs/5643646)
 unittest/bindings/test_hostfunc.py::test_hostfunc SKIP (https://nvbugs/5643631)
