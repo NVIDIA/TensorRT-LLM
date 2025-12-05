@@ -315,12 +315,13 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        static_tensors["input_ids"][:seqlen].copy_(input_ids, non_blocking=True)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope and current_inputs.get(
                 'multimodal_params') is not None:
-            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+            static_tensors["position_ids"][:, :, :seqlen].copy_(
+                position_ids, non_blocking=True)
             for i, multimodal_param in enumerate(
                     current_inputs['multimodal_params']):
                 # NOTE: Currently, we only need 'mrope_position_deltas' on generation phase for multimodal models.
@@ -330,7 +331,8 @@ class CUDAGraphRunner:
                         ['mrope_position_deltas'],
                         non_blocking=True)
         else:
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            static_tensors["position_ids"][:, :seqlen].copy_(position_ids,
+                                                             non_blocking=True)
 
         self.graphs[key].replay()
         output_ref = self.graph_outputs[key]
