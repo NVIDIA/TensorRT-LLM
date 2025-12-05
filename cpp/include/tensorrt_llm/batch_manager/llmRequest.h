@@ -1064,6 +1064,16 @@ public:
         return mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
     }
 
+    [[nodiscard]] SizeType32 getNumConnectorMatchedTokens() const
+    {
+        return mNumConnectorMatchedTokens;
+    }
+
+    void setNumConnectorMatchedTokens(SizeType32 numConnectorMatchedTokens)
+    {
+        mNumConnectorMatchedTokens = numConnectorMatchedTokens;
+    }
+
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         // Add debug log for prepopulatedPromptLen
@@ -1667,6 +1677,15 @@ public:
             [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
     }
 
+    [[nodiscard]] bool isFinishedNormal() const noexcept
+    {
+        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+            [](auto reason) { 
+                return  reason == executor::FinishReason::kEND_ID || \
+                        reason == executor::FinishReason::kSTOP_WORDS || \
+                        reason == executor::FinishReason::kLENGTH; });
+    }
+
     [[nodiscard]] bool isTimedOut() const
     {
         if (!mAllottedTimeMs.has_value())
@@ -1919,6 +1938,9 @@ protected:
     // Up to inputLen - 1 tokens can be reused.
     SizeType32 mPrepopulatedPromptLenTarget{0};
     SizeType32 mPrepopulatedPromptLenDraft{0};
+
+    // Number of tokens matched by KV cache connector for block reuse.
+    SizeType32 mNumConnectorMatchedTokens{0};
 
     SizeType32 mMaxSentTokenLen;
 

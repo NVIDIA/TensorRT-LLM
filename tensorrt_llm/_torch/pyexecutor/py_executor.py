@@ -296,12 +296,14 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
 
+        self.use_flexkv = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0") == "1"
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
 
         if start_worker:
             self.start_worker()
+
 
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
@@ -330,6 +332,15 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
+            
+            if self.use_flexkv:
+                self._wait_for_flexkv_manager()
+    
+    def _wait_for_flexkv_manager(self):
+        if self.kv_connector_manager is not None and self.dist.rank == 0:
+            while not self.kv_connector_manager.scheduler.is_ready():
+                time.sleep(0.1)
+            logger.info("FlexKV manager is ready")
 
     def _event_loop_wrapper(self):
         try:
@@ -575,7 +586,7 @@ class PyExecutor:
                 if prev_device_step_time is None:
                     prev_device_step_time = "N/A"  # Handle first iteration
                 else:
-                    prev_device_step_time = f"{prev_device_step_time}ms"
+                    prev_device_step_time = f"{prev_device_step_time:.3f} ms"
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
@@ -585,7 +596,7 @@ class PyExecutor:
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "
-                    f"host_step_time = {host_step_time}ms, "
+                    f"host_step_time = {host_step_time:.3f} ms, "
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
@@ -1126,6 +1137,17 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    def _kv_connector_refresh_unfinished_tasks(self):
+        if not self.use_flexkv:
+            return
+        if len(self.active_requests) == 0:
+            return
+        if not self.kv_connector_manager:
+            return
+        logger.warning(f"No scheduled requests, but flexkv have pending put requests")
+        self.kv_connector_manager.handle_metadata()
+        time.sleep(0.01)
+
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
@@ -1162,6 +1184,9 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
+                
+                if scheduled_batch.batch_size == 0:
+                    self._kv_connector_refresh_unfinished_tasks()
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
@@ -1387,6 +1412,9 @@ class PyExecutor:
                             can_forward = True
 
                 self._pause_requests(scheduled_batch.paused_requests)
+                
+                if scheduled_batch.batch_size == 0:
+                    self._kv_connector_refresh_unfinished_tasks()
 
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
@@ -2390,6 +2418,8 @@ class PyExecutor:
                                  self.ctx_in_transmission_counter))
                     else:
                         requests_to_terminate.append(request)
+                if self.use_flexkv and (request.is_finished or request.state == LlmRequestState.GENERATION_COMPLETE):
+                    self.resource_manager.free_slot_only(request)
             else:
                 new_active_requests.append(request)
 
