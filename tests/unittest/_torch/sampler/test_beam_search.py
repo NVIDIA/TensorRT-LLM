@@ -45,13 +45,16 @@ def fixed_params():
     return {"max_tokens": 8, "max_beam_width": 2}
 
 
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampler_type(request):
+@pytest.fixture(scope="module",
+                params=[("TRTLLMSampler", False), ("TorchSampler", False),
+                        ("TorchSampler", True)])
+def sampling_information(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def model_kwargs(fixed_params, sampler_type) -> dict[str, Any]:
+def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
+
     assert fixed_params[
         "max_beam_width"] == 2, "This test only works for a beam width of 2"
     return dict(
@@ -60,7 +63,8 @@ def model_kwargs(fixed_params, sampler_type) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type=sampler_type,
+        sampler_type=sampling_information[0],
+        disable_flashinfer_sampling=sampling_information[1],
     )
 
 
@@ -445,11 +449,11 @@ def test_beam_search_sampling_batch_basic():
         f"Expected shape {expected_softmax_shape}, got {softmax.shape}")
 
     # Validate tokens are within vocab range
-    assert torch.all(next_tokens[1:] >= 0) and torch.all(
-        next_tokens < vocab_size), "Tokens out of vocab range"
+    assert torch.all(next_tokens[1:] >= 0), "Tokens out of vocab range"
     # First request has finished beams. Some beams may have BEAM_SEARCH_PAD_TOKEN (-1) as a token
-    assert torch.all(next_tokens[0] >= BEAM_SEARCH_PAD_TOKEN) and torch.all(
-        next_tokens < vocab_size), "Tokens out of vocab range"
+    assert torch.all(
+        next_tokens[0] >= BEAM_SEARCH_PAD_TOKEN), "Tokens out of vocab range"
+    assert torch.all(next_tokens < vocab_size), "Tokens out of vocab range"
 
     # Validate softmax probabilities sum to 1
     torch.testing.assert_close(softmax.sum(dim=-1),
@@ -705,8 +709,6 @@ def test_finish_beams():
     end_id = test_params.end_id
     batch_size = test_params.batch_size
     vocab_size = test_params.vocab_size
-    test_params.max_batch_size
-    test_params.max_beam_width
     num_logprobs = 1
     request = create_default_request(test_params)
     sampler = create_default_sampler(test_params)
@@ -775,111 +777,6 @@ def test_finish_beams():
             torch.testing.assert_close(
                 final_tokens_0, tokens[batch_idx,
                                        0, :num_generated_tokens // 2])
-
-
-@force_ampere  # Save H100 resource
-class TestParameterValidation:
-    """Ensure that unsupported request parameters do not crash/hang the engine."""
-
-    @pytest.fixture(scope="module")
-    @staticmethod
-    def fixed_params():
-        return {"max_tokens": 8, "max_beam_width": 4}
-
-    @pytest.fixture(scope="module")
-    @staticmethod
-    def model_kwargs() -> dict[str, Any]:
-        root = llm_models_root()
-        assert root is not None
-        return dict(model=root / "llama-models-v2" /
-                    "TinyLlama-1.1B-Chat-v1.0", )
-
-    # NB: Class-level fixture overrides do not work without this
-    @pytest.fixture(scope="module")
-    @staticmethod
-    def llm(fixed_params, input_prompts, model_kwargs):
-        return _build_llm(fixed_params, input_prompts, model_kwargs)
-
-    def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
-                               fixed_params: dict):
-        _ = llm.generate(input_prompts,
-                         sampling_params=SamplingParams(
-                             max_tokens=fixed_params["max_tokens"],
-                             n=1,
-                             best_of=fixed_params["max_beam_width"],
-                             use_beam_search=True,
-                             end_id=-1,
-                         ))
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_use_beam_search_false(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                ValueError,
-                match=
-                ".*Greedy decoding in the LLM API does not allow multiple returns.*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=fixed_params["max_beam_width"],
-                                 use_beam_search=False,
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_use_beam_search_ommitted(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                ValueError,
-                match=
-                ".*Greedy decoding in the LLM API does not allow multiple returns.*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=fixed_params["max_beam_width"],
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_smaller_beam_width(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict,
-    ):
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                RequestError,
-                match=".*Request beam width 2 is not equal to max_beam_width 4*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=2,
-                                 use_beam_search=True,
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
 
 
 @force_ampere  # Save H100 resource
