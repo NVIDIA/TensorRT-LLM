@@ -4,6 +4,103 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.1
+
+### Key Features and Enhancements
+
+- **Model Support**  
+  - Add GPT-OSS model support  
+  - Add Hunyuan-Dense model support  
+  - Add Hunyuan-MoE model support  
+  - Add Nemotron Nano VL V2 model support  
+  - Add Seed-OSS model support  
+- **Features**  
+  - **KV Cache & Context:**  
+    - **Connector API:** Introduced a new KV Cache Connector API for state transfer in disaggregated serving.  
+    - **Reuse & Offloading:** Enabled KV cache reuse for MLA (Multi-Head Latent Attention) and added examples for host offloading.  
+    - **Salting:** Implemented KV cache salting for secure cache reuse.  
+  - **Speculative Decoding:**  
+    - **Guided Decoding Integration:** Enabled guided decoding to work in conjunction with speculative decoding (including 2-model and draft model chunked prefill).  
+    - **Eagle:** Added multi-layer Eagle support and optimizations.  
+  - **Disaggregated Serving:**  
+    - Added support for Guided Decoding in disaggregated mode.  
+    - Optimized KV cache transfer for uneven pipeline parallelism.  
+  - **Performance:**  
+    - **DeepEP:** Optimized low-precision (FP4) combined kernels and all-to-all communication.  
+    - **AutoTuner:** Refactored tuning config and generalized tactic selection for better kernel performance.  
+    - **CuteDSL:** Integrated CuteDSL NVFP4 grouped GEMM for Blackwell.  
+- **Benchmark**  
+  - **New Benchmarks:**  
+    - **Disaggregated Serving:** Added dedicated performance tests for disaggregated serving scenarios (`test_perf.py`).  
+    - **Multimodal:** Enabled `benchmark_serving` support for multimodal models.  
+    - **NIM:** Added specific performance test cases for NIM (NVIDIA Inference Microservices) integration.  
+  - **Tooling Improvements:**  
+    - **trtllm-bench:** Added support for sampler options, accurate device iteration timing, and improved data loading for benchmark datasets.  
+    - **Metrics:** Enhanced reporting to include KV cache size metrics in benchmark results.  
+    - **Scaffolding:** Added benchmark support for scaffolding examples.  
+- **Documentation**  
+  - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.  
+  - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.  
+  - **Tech Blogs:** Published blogs on "Combining Guided Decoding and Speculative Decoding" and "ADP Balance Strategy".  
+  - **Hardware:** Updated documentation to reflect B300/GB300 support.  
+  - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).  
+  - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.  
+  - **Performance:** Updated online benchmarking documentation and performance overview pages.  
+  - **Examples:** Refined Slurm examples and added K2 tool calling examples.
+
+### Infrastructure Changes
+
+- The base Docker image for TensorRT-LLM is updated to \`nvcr.io/nvidia/pytorch:25.10-py3\`.  
+- The base Docker image for TensorRT-LLM Backend is updated to \`nvcr.io/nvidia/tritonserver:25.10-py3\`.  
+- The dependent public PyTorch version is updated to 2.9.0.  
+- The dependent NVIDIA ModelOpt version is updated to 0.37.  
+- The dependent xgrammar version is updated to 0.1.25.  
+- The dependent transformers version is updated to 4.56.0.
+
+### API Changes
+
+- **[Breaking Change**: The C++ TRTLLM sampler is now enabled by default, replacing the legacy implementation. A new `sampler_type` argument has been introduced to `SamplingConfig` to explicitly control sampler selection.  
+- **KV Cache Connector API:** Introduced a new KV Cache Connector API to facilitate state transfer between Disaggregated Serving workers (Context and Generation phases).  
+- **LLM API Enhancements:**  
+  - Added support for `prompt_logprobs` in the PyTorch backend.  
+  - Standardized `topk` logprob returns across TRT and PyTorch backends.  
+  - Added stable labels to arguments in the `LLM` class to better indicate API stability.
+- **Response API:** Added basic functionality for the Responses API to better handle streaming and non-streaming responses.  
+- **Multimodal Inputs:** Updated the `MultimodalParams` API to support `SharedTensor`, improving memory management for visual language models.  
+- **Wait and Cancel API:** Added tests and support for handling non-existent and completed request cancellations in the executor.
+
+### Fixed Issues
+
+- **DeepSeek-V3/R1:**  
+  - Fixed potential hangs in DeepSeek-V3 pipelines by adjusting MNNVL configurations.  
+  - Resolved illegal memory access errors in FP8 Scout and DeepSeek models.  
+  - Fixed weight loading issues for DeepSeek-R1 W4A8 checkpoints (TP16 scenarios).  
+- **Llama 4:** Fixed FP4 generation issues and corrected all-reduce operations in the last decoder layer.  
+- **Mistral/Pixtral:** Fixed a batching bug in Mistral 3.1 where processing multiple requests with images in the same batch caused failures.  
+- **Qwen:** Fixed Qwen2.5-VL failures related to CUDA graph padding and transformers version compatibility.  
+- **Gemma:** Fixed out-of-bounds vector access for models with multiple layer types and resolved accuracy issues in Gemma 2\.  
+- **Speculative Decoding:**  
+  - Fixed race conditions in one-model speculative decoding.  
+  - Resolved CUDA graph warmup issues that caused failures when using speculative decoding.  
+  - Fixed KV cache recompute logic in `draft_target` speculative decoding.  
+- **MoE (Mixture of Experts):**  
+  - Fixed OOM issues in fused MoE kernels by optimizing workspace pre-allocation.  
+  - Corrected Cutlass MoE integration to fix accuracy issues on Blackwell hardware.  
+  - Fixed W4A8 MoE kernel issues on Hopper architecture.  
+- **General:**  
+  - Fixed a potential hang caused by Python multiprocessing when prefetching weights.  
+  - Resolved an issue where `torch.onnx.export` would fail with newer PyTorch versions by correctly falling back to non-dynamo modes.  
+  - Fixed numerical stability issues for XQA kernels when using speculative decoding.  
+  - Fixed a memory leak in the `cacheTransceiver` that could lead to hangs in disaggregated serving.
+
+### Know Issues
+
+- **Llama Pipeline Parallelism:** There are known stability issues when running Llama models with Pipeline Parallelism (PP) enabled in specific configurations.  
+- **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release.  
+- **Context Chunking:** In certain disaggregated serving configurations with specific chunk sizes, context chunking may exhibit performance degradation or instability.  
+- **Triton Backend:** There are known limitations when building Triton Docker images with specific combinations of dependencies; users should adhere strictly to the support matrix versions.
+
+
 ## TensorRT-LLM Release 1.0
 
 TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now stable and the default experience, and the LLM API is now stable. For more details on new developments in 1.0, please see below.
