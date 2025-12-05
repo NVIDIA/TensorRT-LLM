@@ -56,7 +56,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
         "trtllm-bench",
         "--model",
         model_path_or_name,
-        "dataset",
+        "prepare-dataset",
         "--output",
         f"{dataset_path}",
         "token-norm-dist",

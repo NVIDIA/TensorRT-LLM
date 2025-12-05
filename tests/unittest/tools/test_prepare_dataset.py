@@ -72,7 +72,7 @@ class TestPrepareDatasetLora:
         cmd.extend(["--model", str(tokenizer_dir)])
 
         # Always add --stdout flag since we parse stdout output
-        cmd.extend(["dataset", "--output", f"{output_path}"])
+        cmd.extend(["prepare-dataset", "--output", f"{output_path}"])
 
         return cmd
 

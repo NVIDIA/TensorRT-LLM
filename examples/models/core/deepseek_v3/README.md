@@ -141,7 +141,7 @@ To avoid OOM (out of memory) error, you need to adjust the values of "--max_batc
 ```bash
 DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
 trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
-        dataset \
+        prepare-dataset \
         --output /tmp/benchmarking_64k.txt \
         token-norm-dist \
         --input-mean 65536 --output-mean 1024 \
@@ -168,7 +168,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
 ```bash
 DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
 trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
-        dataset \
+        prepare-dataset \
         --output /tmp/benchmarking_128k.txt \
         token-norm-dist \
         --input-mean 131072 --output-mean 1024 \
