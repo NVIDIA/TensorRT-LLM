@@ -639,6 +639,7 @@ class CutlassFusedMoE(MoE):
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
             activation_type=self.activation_type,
+            routing_method_type=self.routing_method.routing_method_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
         )

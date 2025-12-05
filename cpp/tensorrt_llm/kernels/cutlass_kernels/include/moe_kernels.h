@@ -960,7 +960,8 @@ public:
         }
     }
 
-    void prepare(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream);
+    void prepare(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream,
+        void const* token_selected_experts_customized = nullptr, bool use_customized_router = false);
 
     std::map<std::string, std::pair<size_t, size_t>> getProfilerWorkspaces(int maxM, bool is_tma_ws);
     size_t getWorkspaceSize(int maxM);
@@ -990,7 +991,7 @@ public:
     nvinfer1::DataType mOType{};
 
     // This will be a unique value for every iteration of warmup and actual bench
-    constexpr static int64_t NUM_ROUTING_SAMPLES = 16;
+    constexpr static int64_t NUM_ROUTING_SAMPLES = 1;
 
     constexpr static int64_t NUM_FUSION_TYPES = 2;
     constexpr static int64_t NUM_SWAP_AB_TYPES = 2;
@@ -1006,8 +1007,9 @@ public:
     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
 private:
-    void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream);
     void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
+    void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream,
+        void const* token_selected_experts_customized = nullptr, bool use_customized_router = false);
     void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
         TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, bool swap_ab, cudaStream_t stream);
 };
