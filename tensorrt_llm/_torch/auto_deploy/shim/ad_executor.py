@@ -20,7 +20,11 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor._util import (
+    _create_kv_cache_manager,
+    get_decoding_mode,
+    get_kv_cache_manager_cls,
+)
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
@@ -30,6 +34,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     LoadFormat,
+    SamplerType,
     SpeculativeConfig,
     TorchLlmArgs,
 )
@@ -42,7 +47,7 @@ from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
-from ...pyexecutor.sampler import TorchSampler
+from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -283,9 +288,9 @@ class ADEngine(ModelEngine):
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = seq_info.max_num_tokens
+        self.llm_args.max_seq_len = seq_info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
-        self.llm_args.max_seq_len = seq_info.max_seq_len
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.max_beam_width = max_beam_width
@@ -487,6 +492,9 @@ class ADEngine(ModelEngine):
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
+        # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
+        logits = logits.float()
+
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)
 
@@ -572,6 +580,59 @@ def create_draft_model_engine_maybe(
     draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
 
     return draft_model_engine
+
+
+class TRTLLMSamplerModelConfig:
+    def __init__(self, vocab_size_padded: int):
+        self.config = SimpleNamespace()
+        self.config.vocab_size = vocab_size_padded
+
+        # Initialized to dummy values as they are not used in the C++ code underlying TRTLLMSampler.
+        self.config.num_hidden_layers = 42
+        self.config.hidden_size = 42
+        self.config.num_attention_heads = 42
+
+
+def instantiate_sampler(
+    ad_config: LlmArgs,
+    max_num_sequences: int,
+    max_draft_len: int,
+    max_total_draft_tokens: int,
+    dist_mapping: Mapping,
+    engine: ADEngine,
+):
+    if ad_config.sampler_type == SamplerType.TorchSampler:
+        # search sampler with speculative decoding
+        sampler_args = TorchSampler.Args(
+            max_seq_len=ad_config.max_seq_len,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_num_sequences=max_num_sequences,
+            max_beam_width=ad_config.max_beam_width,
+            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        )
+        sampler = TorchSampler(sampler_args)
+
+    elif ad_config.sampler_type == SamplerType.TRTLLMSampler:
+        vocab_size_padded: int = engine.cache_seq_interface.info.vocab_size_padded
+        sampler_model_config = TRTLLMSamplerModelConfig(vocab_size_padded)
+        decoding_mode = get_decoding_mode(ad_config.decoding_config, ad_config.max_beam_width)
+        sampler = TRTLLMSampler(
+            model=sampler_model_config,
+            model_dtype=torch.bfloat16,  # hardcoded as bfloat16; does not seem necessary in C++ code.
+            mapping=dist_mapping,
+            decoding_mode=decoding_mode,
+            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+            max_seq_len=ad_config.max_seq_len,
+            max_batch_size=ad_config.max_batch_size,
+            max_beam_width=ad_config.max_beam_width,
+            decoding_config=ad_config.decoding_config,
+            kv_cache_config=ad_config.kv_cache_config,
+        )
+    else:
+        raise ValueError(f"Sampler type {ad_config.sampler_type} is not supported.")
+
+    return sampler
 
 
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
@@ -695,23 +756,21 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
-    # search sampler with speculative decoding
-    sampler_args = TorchSampler.Args(
-        max_seq_len=ad_config.max_seq_len,
+    vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
+    sampler = instantiate_sampler(
+        ad_config=ad_config,
+        max_num_sequences=max_num_sequences,
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
-        max_num_sequences=max_num_sequences,
-        max_beam_width=ad_config.max_beam_width,
-        disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        dist_mapping=dist_mapping,
+        engine=engine,
     )
-    sampler = TorchSampler(sampler_args)
 
     # Guided (structured) decoding.
     guided_decoder = None
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
     ) and dist_mapping.is_last_pp_rank():
-        vocab_size_padded = engine.cache_seq_interface.info.vocab_size_padded
         if vocab_size_padded is None:
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
