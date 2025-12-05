@@ -50,7 +50,7 @@ class RootArgs(BaseModel):
         return self
 
 
-@click.group(name="dataset")
+@click.group(name="prepare-dataset")
 @click.option(
     "--output", type=str, help="Output json filename.", default="preprocessed_dataset.json"
 )

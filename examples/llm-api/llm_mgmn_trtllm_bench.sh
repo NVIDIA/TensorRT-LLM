@@ -85,7 +85,7 @@ srun -l \
     --mpi=pmix \
     bash -c "
         $PROLOGUE
-        trtllm-bench --model=$LOCAL_MODEL dataset \
+        trtllm-bench --model=$LOCAL_MODEL prepare-dataset \
             --output $data_path \
             token-norm-dist \
             --num-requests=100 \

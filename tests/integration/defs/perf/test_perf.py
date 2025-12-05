@@ -1964,8 +1964,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "trtllm-bench", f"--model={tokenizer_dir}", "dataset",
-                    "--output", f"{dataset_path}",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
                     f"--rand-task-id 0 {nloras-1}", f"--lora-dir={lora_dir}",
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
@@ -1983,8 +1983,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             if self._build_script == 'trtllm-bench':
                 data_cmd += [
-                    "trtllm-bench", f"--model={tokenizer_dir}", "dataset",
-                    "--output", f"{dataset_path}", "token-norm-dist",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    "token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
                     f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
