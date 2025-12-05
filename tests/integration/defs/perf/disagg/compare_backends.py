@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Compare performance test results between different backends (UCX vs NIXL)."""
-
+import os
 import argparse
 import re
 import sys
@@ -44,6 +44,10 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
     Returns:
         DataFrame: Comparison results
     """
+    if not os.path.exists(csv_path):
+        print(f"CSV file not found: {csv_path}")
+        sys.exit(0)
+
     # Read CSV file
     df = pd.read_csv(csv_path)
 
