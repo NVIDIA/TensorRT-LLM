@@ -2934,7 +2934,11 @@ class TRTLLMSampler(Sampler):
                         )
                     }
                 ]
-                cum_log_probs = [cum_log_probs_host[seq_slot]]
+                cum_log_probs = [
+                    cum_log_probs_host[seq_slot][0]
+                    if isinstance(cum_log_probs_host[seq_slot], list)
+                    else cum_log_probs_host[seq_slot]
+                ]
                 request.py_result.append_log_probs([log_probs], cum_log_probs)
 
         for request in reqs:

@@ -146,3 +146,54 @@ def test_torch_sampler_with_multi_token_stop_words(model_path):
 
     assert len(text) > 0, "Should generate some text"
     assert stop_string not in text, f"Stop string '{repr(stop_string)}' should not appear in the output"
+
+
+@pytest.mark.high_cuda_memory
+def test_trtllm_sampler_best_of_with_logprobs(model_path):
+    """Test TRTLLMSampler with best_of > n and logprobs."""
+
+    llm = create_llm(model_path)
+
+    prompt = "The capital of France is"
+
+    sampling_config = SamplingParams(
+        max_tokens=10,
+        temperature=1.0,
+        top_k=2,
+        n=2,  # Return 2 sequences
+        best_of=3,  # Generate 3 candidates, pick best 2
+        logprobs=1  # Return log probabilities
+    )
+
+    outputs = llm.generate([prompt], sampling_params=sampling_config)
+
+    llm.shutdown()
+
+    assert len(outputs) == 1, "Should return one request output"
+
+    request_output = outputs[0]
+    completion_outputs = request_output.outputs
+
+    assert len(
+        completion_outputs
+    ) == 2, f"Expected 2 outputs (n=2), got {len(completion_outputs)}"
+
+    for i, output in enumerate(completion_outputs):
+        assert len(output.text) > 0, f"Output {i} should have generated text"
+
+        assert output.finish_reason is not None, \
+            f"Output {i} must have a finish_reason"
+
+        assert output.cumulative_logprob is not None, \
+            f"Output {i} should have cumulative_logprob when logprobs is requested"
+        assert isinstance(output.cumulative_logprob, (float, int)), \
+            f"Output {i} cumulative_logprob should be a number, got {type(output.cumulative_logprob)}"
+
+        assert output.logprobs is not None, \
+            f"Output {i} should have logprobs when logprobs=1"
+        assert len(output.logprobs) == len(output.token_ids), \
+            f"Output {i} should have logprobs for each token"
+
+    if len(completion_outputs) >= 2:
+        assert completion_outputs[0].cumulative_logprob >= completion_outputs[1].cumulative_logprob, \
+            "Outputs should be sorted by cumulative log probability (best first)"
