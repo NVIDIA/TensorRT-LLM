@@ -814,10 +814,13 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
+        override_tp_rank_for_o_proj = None
         if mapping_with_cp is not None:
             logger.warning(
                 "[MLA::__init__] Overriding mapping with CP detected.")
             self.mapping = mapping_with_cp
+            override_tp_rank_for_o_proj = mapping_with_cp.get_helix_overridden_tp_rank(
+            )
         else:
             self.mapping = config.mapping
         tp_size = self.mapping.tp_size
@@ -952,7 +955,10 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            # override_tp_rank is only used for helix parallelism.
+            override_tp_rank=override_tp_rank_for_o_proj,
+        )
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:

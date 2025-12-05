@@ -246,6 +246,26 @@ class MappingBase:
         return self.cp_size > 1 and self.cp_config.get(
             "cp_type") == CpType.HELIX
 
+    def get_helix_overridden_tp_rank(self) -> int:
+        """Get the overridden TP rank when repurposing helix CP to TP.
+
+        In helix parallelism, CP groups are structured differently than TP groups.
+        For example, with tp_size=2, cp_size=2:
+        - CP groups: [0, 2], [1, 3] (accumulated order: [0, 2, 1, 3])
+        - When repurposed to TP: [0, 1, 2, 3]
+
+        The helix accumulated order iterates through TP ranks, and for each TP rank
+        iterates through CP ranks. So the position in helix order is:
+            helix_position = tp_rank * cp_size + cp_rank
+
+        This function computes the TP rank in the repurposed mapping, accounting
+        for the reordering from helix accumulated order to standard TP order.
+
+        Returns:
+            The TP rank in the repurposed (tp_size * cp_size, cp_size=1) mapping.
+        """
+        return self.tp_rank * self.cp_size + self.cp_rank
+
     def get_node_rank(self, rank: int):
         return rank // self.gpus_per_node
 

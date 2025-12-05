@@ -148,8 +148,11 @@ def load_weights_vanilla_helper(module: Linear,
             assert "bias" in weights[0]
     device = torch.device('cuda')
 
+    # Use override_tp_rank if set, otherwise fall back to tp_rank. Currently, this is only used
+    # for o_proj in MLA when using helix parallelism.
+    effective_tp_rank = module.override_tp_rank if module.override_tp_rank is not None else module.tp_rank
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                               module.tp_rank, module.tp_mode,
+                               effective_tp_rank, module.tp_mode,
                                device) if "weight" in weights[0] else None
 
     if weight is not None:
@@ -166,7 +169,7 @@ def load_weights_vanilla_helper(module: Linear,
 
     if module.bias is not None:
         bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
+                                 effective_tp_rank, module.tp_mode,
                                  device) if "bias" in weights[0] else None
         if bias is not None:
             copy_weight(module.bias, bias_transform(bias))
@@ -2065,6 +2068,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
+        override_tp_rank: Optional[int] = None,
     ):
         """
         Args:
@@ -2105,6 +2109,7 @@ class Linear(nn.Module):
             'cutlass', 'cublaslt', 'cuda_core'
         ]
 
+        self.override_tp_rank = override_tp_rank
         local_in_features = in_features
         local_out_features = out_features
 
