@@ -268,8 +268,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
-            sm_version = get_sm_version()
-            if sm_version not in [100, 103]:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
                     f"CuteDSL: SM version {sm_version} is not supported. "
                     f"CuteDSL NVFP4 only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
@@ -597,8 +596,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             for automatic backend selection with better performance.
         """
         # Validate SM version before attempting to use CuteDSL
-        sm_version = get_sm_version()
-        if sm_version not in [100, 103]:
+        if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
                 f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
@@ -660,9 +658,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -947,9 +945,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -1326,9 +1324,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
