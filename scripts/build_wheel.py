@@ -290,6 +290,11 @@ def generate_fmha_cu(project_dir, venv_python):
     move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
                     cubin_dir / "fmha_cubin.h")
 
+    # Copy generated source file (fmha_cubin.cpp) to the same directory as header
+    cpp_src = fmha_v2_dir / "generated/fmha_cubin.cpp"
+    if cpp_src.exists():
+        move_if_updated(cpp_src, cubin_dir / "fmha_cubin.cpp")
+
     generated_files = set()
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
         dst_file = fmha_v2_cu_dir / os.path.basename(cu_file)

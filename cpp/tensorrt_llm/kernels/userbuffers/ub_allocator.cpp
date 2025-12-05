@@ -34,7 +34,7 @@ UserBufferAllocator& UserBufferAllocator::Instance()
     }
 }
 
-void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
+void UserBufferAllocator::initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
     if (!isInitialized())
     {
@@ -83,7 +83,7 @@ communicator* UserBufferAllocator::comm()
     return mUbComm;
 }
 
-void NCCLUserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
+void NCCLUserBufferAllocator::initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
     if (!isInitialized())
     {

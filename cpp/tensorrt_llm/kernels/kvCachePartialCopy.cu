@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace
@@ -133,4 +134,5 @@ void kvCacheBlockPartialCopy(IBuffer& dst, IBuffer const& src, unsigned int numL
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

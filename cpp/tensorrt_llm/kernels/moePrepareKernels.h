@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <map>
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -23,7 +24,9 @@
 
 #define DEBUG_PIPELINE 0
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace moe_prepare
@@ -87,4 +90,6 @@ size_t getMoePrepareWorkspaceSize(int epSize);
 
 } // namespace moe_prepare
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

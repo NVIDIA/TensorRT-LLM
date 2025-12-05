@@ -33,7 +33,7 @@ void UserBuffersManager::initialize(int64_t tp_size, int64_t pp_size, int64_t cp
     int64_t gpus_per_node, int64_t buffer_size, bool use_nccl_symmetric)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    tensorrt_llm::runtime::WorldConfig world_config(tp_size, pp_size, cp_size, rank, gpus_per_node);
+    ::tensorrt_llm::runtime::WorldConfig world_config(tp_size, pp_size, cp_size, rank, gpus_per_node);
 #if ENABLE_MULTI_DEVICE
     UserBufferAllocator::Instance().use_nccl_symmetric = use_nccl_symmetric;
 #endif

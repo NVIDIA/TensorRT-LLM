@@ -86,8 +86,10 @@ cpp_file_prefix_text = R"""/*
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
-namespace tensorrt_llm
-{
+
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 // clang-format off
@@ -96,7 +98,7 @@ namespace kernels
 cpp_file_suffex_text = R"""
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 """
 
 cubin_meta_info_struct_prefix_text = R"""

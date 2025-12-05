@@ -16,7 +16,11 @@
 
 #pragma once
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 
 // IMPORTANT: Keep the same order of activation functions in this enum and the activation functions in
@@ -34,4 +38,6 @@ enum class ActivationType
     Relu2 = 8,
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

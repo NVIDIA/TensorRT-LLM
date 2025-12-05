@@ -15,13 +15,17 @@
  */
 
 #include "fused_multihead_attention_v2.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cmath>
+#include <cuda_runtime_api.h>
 #include <iomanip>
 #include <sstream>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -556,7 +560,9 @@ FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType,
     {
         sm = kSM_120;
     }
-    return FusedMHAKernelFactoryV2::Get().getXMMAKernels(sMhaKernelMetaInfosV2,
-        sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), inputType, outputType, sm);
+    return FusedMHAKernelFactoryV2::Get().getXMMAKernels(
+        sMhaKernelMetaInfosV2, sMhaKernelMetaInfosV2Size, inputType, outputType, sm);
 }
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

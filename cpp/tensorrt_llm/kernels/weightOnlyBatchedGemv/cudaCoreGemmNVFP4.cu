@@ -15,12 +15,13 @@
  */
 
 #include "cutlass/numeric_conversion.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemmNVFP4.h"
 #include <cub/cub.cuh>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cuda_core_gemm_nvfp4
@@ -290,4 +291,5 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
 
 } // namespace cuda_core_gemm_nvfp4
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

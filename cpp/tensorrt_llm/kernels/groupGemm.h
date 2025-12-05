@@ -16,10 +16,11 @@
 #pragma once
 
 #include "cutlass/gemm_coord.h"
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -32,4 +33,4 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
 
 } // namespace kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
