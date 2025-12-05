@@ -114,6 +114,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
+@Field
+def BUILD_DOCKER_IMAGE = "build_docker_image"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -132,6 +134,7 @@ def testFilter = [
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (BUILD_DOCKER_IMAGE): gitlabParamsFromBot.get(BUILD_DOCKER_IMAGE, false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -1305,7 +1308,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages.remove("SBSA-Linux")
         echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
     }
-    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
+    if (testFilter[(BUILD_DOCKER_IMAGE)]) {
         stages = stages.findAll { key, value -> key.contains("Release Check") } + dockerBuildJob
         echo "Only execute Build-Docker-Images and Release Check stages, build and update docker images and tags"
     }
