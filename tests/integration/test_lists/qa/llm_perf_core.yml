@@ -65,7 +65,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-streaming-bfloat16-input_output_len:128,128]
 
   - perf/test_perf.py::test_perf[qwen2_7b_instruct-bench-pytorch-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-float16-input_output_len:512,200]
+  - perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-bfloat16-input_output_len:512,200]
+  - perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-bfloat16-input_output_len:500,2000-con:50]
+  - perf/test_perf.py::test_perf[starcoder2_7b-bench-pytorch-bfloat16-input_output_len:500,2000-con:50]
+  - perf/test_perf.py::test_perf[starcoder2_15b-bench-pytorch-bfloat16-input_output_len:500,2000-con:100]
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-pytorch-float16-input_output_len:128,128]
 
   # Ministral-8B

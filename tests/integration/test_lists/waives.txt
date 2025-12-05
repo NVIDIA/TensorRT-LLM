@@ -172,7 +172,6 @@ perf/test_perf.py::test_perf[flan_t5_xxl-cppmanager-exe-plugin_ifb-float16-input
 perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-gpus:4] SKIP (https://nvbugspro.nvidia.com/bug/5295390)
 perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:1024,1024-tp:2-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
-perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-float16-input_output_len:512,200] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[bart_large_cnn-bench-float16-input_output_len:128,20] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[mamba_130m-bench-float16-input_output_len:128,128] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[bert_large-bench-float16-maxbs:32-input_len:128+512] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
