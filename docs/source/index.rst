@@ -76,6 +76,7 @@ Welcome to TensorRT LLM's Documentation!
    features/auto_deploy/auto-deploy.md
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
+   features/helix.md
 
 
 .. toctree::
