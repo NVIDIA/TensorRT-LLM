@@ -256,9 +256,9 @@ def flashinfer_mha_with_cache(
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
 
-    q = q.contiguous().view(b * s, -1, head_dim)
-    k = k.contiguous().view(b * s, -1, head_dim)
-    v = v.contiguous().view(b * s, -1, head_dim)
+    q = q.reshape(b * s, -1, head_dim)
+    k = k.reshape(b * s, -1, head_dim)
+    v = v.reshape(b * s, -1, head_dim)
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -274,12 +274,6 @@ def flashinfer_mha_with_cache(
         kv_dtype=k_cache.dtype,
         sm_scale=scale,
     )
-
-    # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
-    k_scale, v_scale = 1.0, 1.0
-    if k_cache.dtype == torch.float8_e4m3fn:
-        k = (k / k_scale).to(torch.float8_e4m3fn)
-        v = (v / v_scale).to(torch.float8_e4m3fn)
 
     flashinfer.page.append_paged_kv_cache(
         k,
