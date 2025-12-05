@@ -152,7 +152,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
 ```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000
+trtllm-bench --model meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000
 ```
 
 ### Running with the PyTorch Workflow
@@ -233,12 +233,12 @@ The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapt
 
 **Preparing LoRA Dataset**
 
-Use `trtllm-bench dataset` with LoRA-specific options to generate requests with LoRA metadata:
+Use `trtllm-bench prepare-dataset` with LoRA-specific options to generate requests with LoRA metadata:
 
 ```shell
 trtllm-bench \
   --model /path/to/tokenizer \
-  dataset \
+  prepare-dataset \
   --rand-task-id 0 1 \
   --lora-dir /path/to/loras \
   token-norm-dist \
@@ -313,7 +313,7 @@ First, prepare the dataset:
 ```bash
 trtllm-bench \
   --model Qwen/Qwen2-VL-2B-Instruct \
-  dataset \
+  prepare-dataset \
   --output mm_data.jsonl
   real-dataset
   --dataset-name lmms-lab/MMMU \

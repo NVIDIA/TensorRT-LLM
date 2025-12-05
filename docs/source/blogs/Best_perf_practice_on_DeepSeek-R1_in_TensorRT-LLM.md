@@ -402,7 +402,7 @@ Average request latency (ms):                     181540.5739
 
 ## Exploring more ISL/OSL combinations
 
-To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the `trtllm-bench dataset` subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
+To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the `trtllm-bench prepare-dataset` subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
 ### WIP: Enable more features by default
 
 Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, overlap scheduler and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
