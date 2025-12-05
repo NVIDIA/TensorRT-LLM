@@ -278,8 +278,17 @@ def get_test_config(test_desc, example_dir, test_root):
         raise ValueError(f"Invalid test description: {test_desc}, "
                          f"valid descriptions are: {config_map.keys()}")
 
-    return revise_disaggregated_server_config_urls_with_free_ports(
-        config_map[test_desc])
+    # Revise the config file to use free ports
+    new_config = None
+    with open(config_map[test_desc][1], 'r') as f:
+        config = yaml.safe_load(f)
+        new_config = revise_disaggregated_server_config_urls_with_free_ports(
+            config)
+
+    with open(config_map[test_desc][1], 'w') as f:
+        yaml.dump(new_config, f)
+
+    return config_map[test_desc]
 
 
 def get_extra_llm_config(config, suffix, cwd):
