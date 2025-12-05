@@ -8,7 +8,7 @@ metadata:
   script_file: disaggr_torch.slurm
   benchmark_type: 8k1k
   config_index: 6
-  dataset_file: datasets/kimi-k2-8192-1024-20000-ratio-1_for_serve.json
+  dataset_file: disagg_datasets/kimi-k2-8192-1024-20000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
