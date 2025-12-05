@@ -731,7 +731,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
         tmpDir = temp_wd(self.get_working_dir())
 
         cmd_str = commands.get_cmd_str(cmd_idx)
-        is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "dataset --output" in cmd_str
+        is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
 
         is_perf_sanity_test = "perf_sanity" in full_test_name
 
