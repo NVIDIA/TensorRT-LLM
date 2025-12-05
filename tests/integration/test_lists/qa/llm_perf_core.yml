@@ -4,18 +4,18 @@ llm_perf_core:
 # Test Conditions Index
 # ===============================================================================
 # 1: All GPUs common tests
-# 2: L20, L40S, H100, H20, H200, GB200, B200, RTX-6000D, RTX-6000-Server test cases
+# 2: L20, L40S, H100, H20, H200, GB200, B200, B300, GB300, RTX-6000D, RTX-6000-Server test cases
 # 3: A100, L20, L40S, H100, H20, H200
 # 4: A100, L40S, H100, H20, H200
 # 5: A100, H100, H20, H200 test cases
 # 6: L40S, H100, H200, H20 test cases
 # 7: H100, H200, H20 test cases
 # 8: L20, L40S, H100, H200, H20 test cases
-# 9: H100, H20, H200, GB200, B200, RTX6000-D, RTX6000-Server test cases
-# 10: GB200, B200, RTX6000-Server test cases
-# 11: B200, GB200 test cases
-# 12: H100, H20, H200, B200 test cases
-# 13: H100, H20, H200, B200, RTX-6000 Server test cases
+# 9: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
+# 10: GB200, B200, B300, GB300, RTX6000-Server test cases
+# 11: B200, GB200, B300, GB300 test cases
+# 12: H100, H20, H200, B200, B300 test cases
+# 13: H100, H20, H200, B200, B300, RTX-6000 Server test cases
 # 14: RTX-6000D, RTX-6000 Server test cases
 # 15: RTX6000-Server test cases
 # ===============================================================================
@@ -39,7 +39,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:512,32]
 
 
-# 2: L20, L40S, H100, H20, H200, GB200, B200, RTX-6000D, RTX-6000-Server test cases
+# 2: L20, L40S, H100, H20, H200, GB200, B200, B300, GB300, RTX-6000D, RTX-6000-Server test cases
 - condition:
     terms:
       supports_fp8: true
@@ -205,7 +205,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-gpus:2]
 
-# 9: H100, H20, H200, GB200, B200, RTX6000-D, RTX6000-Server test cases
+# 9: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -221,7 +221,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8]
 
 
-# 10: GB200, B200, RTX6000-Server test cases
+# 10: GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -271,14 +271,14 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:4-gpus:4]
 
 
-# 11: B200, GB200 test cases
+# 11: B200, GB200 B300, GB300 test cases
 - condition:
     ranges:
       system_gpu_count:
         gte: 4
       compute_capability:
         gte: 10.0
-        lte: 10.0
+        lte: 10.3
   tests:
   # for chunked prefill cases
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:3000,500-reqs:200]
@@ -287,7 +287,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
 
 
-# 12: H100, H20, H200, B200 test cases
+# 12: H100, H20, H200, B200, B300 test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -354,7 +354,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8] TIMEOUT(60)
 
 
-# 13: H100, H20, H200, B200, RTX-6000 Server test cases
+# 13: H100, H20, H200, B200, B300, RTX-6000 Server test cases
 - condition:
     ranges:
       system_gpu_count:
