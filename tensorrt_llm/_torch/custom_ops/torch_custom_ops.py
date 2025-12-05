@@ -820,7 +820,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             valid_tactics = self.get_valid_tactics(inputs,
                                                    OptimizationProfile())
             if valid_tactics:
-                tactic = valid_tactics[0]
+                # Prefer cutlass as fallback if available, otherwise use first valid tactic
+                tactic = "cutlass" if "cutlass" in valid_tactics else valid_tactics[
+                    0]
             else:
                 m, n, k = inputs[0].shape[0], inputs[1].shape[
                     0], inputs[0].shape[1] * 2
