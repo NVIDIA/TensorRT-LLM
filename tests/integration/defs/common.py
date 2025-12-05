@@ -1153,16 +1153,22 @@ def wait_for_server(host, port, timeout_seconds=180):
 
 def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: dict[str, Any]) -> dict[str, Any]:
-    num_ctx_ports = len(disaggregated_server_config["context_servers"]["urls"])
-    num_gen_ports = len(
-        disaggregated_server_config["generation_servers"]["urls"])
-
+    # Revise serve port
     disaggregated_server_config['port'] = get_free_port()
-    disaggregated_server_config["context_servers"]["urls"] = [
-        f"localhost:{get_free_port()}" for _ in range(num_ctx_ports)
-    ]
-    disaggregated_server_config["generation_servers"]["urls"] = [
-        f"localhost:{get_free_port()}" for _ in range(num_gen_ports)
-    ]
+
+    # Revise context and generation server urls
+    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
+    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
+    url_map = dict()
+    for url in set(ctx_urls + gen_urls):
+        url_map[url] = (url.split(':')[0], get_free_port())
+
+    for i, url in enumerate(ctx_urls):
+        disaggregated_server_config["context_servers"]["urls"][
+            i] = f"{url_map[url][0]}:{url_map[url][1]}"
+
+    for i, url in enumerate(gen_urls):
+        disaggregated_server_config["generation_servers"]["urls"][
+            i] = f"{url_map[url][0]}:{url_map[url][1]}"
 
     return disaggregated_server_config
