@@ -152,7 +152,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
 ```shell
-python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
+trtllm-bench --model meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000
 ```
 
 ### Running with the PyTorch Workflow
@@ -233,13 +233,13 @@ The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapt
 
 **Preparing LoRA Dataset**
 
-Use `prepare_dataset.py` with LoRA-specific options to generate requests with LoRA metadata:
+Use `trtllm-bench prepare-dataset` with LoRA-specific options to generate requests with LoRA metadata:
 
 ```shell
-python3 benchmarks/cpp/prepare_dataset.py \
-  --stdout \
+trtllm-bench \
+  --model /path/to/tokenizer \
+  prepare-dataset \
   --rand-task-id 0 1 \
-  --tokenizer /path/to/tokenizer \
   --lora-dir /path/to/loras \
   token-norm-dist \
   --num-requests 100 \
@@ -310,17 +310,18 @@ Each subdirectory should contain the LoRA adapter files for that specific task.
 To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.
 
 First, prepare the dataset:
-```python
-python ./benchmarks/cpp/prepare_dataset.py \
-  --tokenizer Qwen/Qwen2-VL-2B-Instruct \
-  --stdout \
-  dataset \
+```bash
+trtllm-bench \
+  --model Qwen/Qwen2-VL-2B-Instruct \
+  prepare-dataset \
+  --output mm_data.jsonl
+  real-dataset
   --dataset-name lmms-lab/MMMU \
   --dataset-split test \
   --dataset-image-key image \
   --dataset-prompt-key question \
   --num-requests 10 \
-  --output-len-dist 128,5 > mm_data.jsonl
+  --output-len-dist 128,5
 ```
 It will download the media files to `/tmp` directory and prepare the dataset with their paths. Note that the `prompt` fields are texts and not tokenized ids. This is due to the fact that
 the `prompt` and the media (image/video) are processed by a preprocessor for multimodal files.
