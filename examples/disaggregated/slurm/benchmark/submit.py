@@ -160,7 +160,13 @@ def submit_job(config, log_dir):
         f'--nodes={total_nodes}',
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
-        f'--segment={total_nodes}',
+    ]
+    
+    # Add --segment parameter only for GB200
+    if hw_config.get('gpu_type') == 'GB200':
+        cmd.append(f'--segment={total_nodes}')
+    
+    cmd.extend([
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
         # Hardware configuration
@@ -216,7 +222,7 @@ def submit_job(config, log_dir):
 
         # Server environment variables
         '--server-env-var', env_config['server_env_var']
-    ]
+    ])
     # yapf: enable
 
     # Submit the job
