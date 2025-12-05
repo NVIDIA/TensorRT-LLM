@@ -22,7 +22,7 @@ This is a quickstart guide for running the Kimi K2 Thinking model on TensorRT LL
 ### Prepare Docker image
 
 Build and run the docker container. See the [Docker guide](../../../docker/README.md) for details.
-```
+```bash
 cd TensorRT-LLM
 
 make -C docker release_build IMAGE_TAG=kimi-k2-thinking-local
@@ -57,7 +57,7 @@ This YAML file specifies configurations that deploy the model with 8-way expert 
 
 With the `EXTRA_OPTIONS_YAML_FILE`, use the following example command to launch the TensorRT LLM server with the Kimi-K2-Thinking-NVFP4 model from within the container.
 
-```shell
+```bash
 trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
     --host 0.0.0.0 --port 8000 \
     --extra_llm_api_options ${EXTRA_OPTIONS_YAML_FILE}
@@ -65,7 +65,7 @@ trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
 
 TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:
 
-```
+```log
 INFO:     Started server process [xxxxx]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
