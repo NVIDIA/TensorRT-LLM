@@ -19,8 +19,8 @@ For more information on benchmarking with `trtllm-bench` see this NVIDIA [blog p
 
 ## Throughput Measurements
 
-The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
-and shows the throughput scenario under maximum load. The reported metric is `Total Output Throughput (tokens/sec)`.
+The below table shows performance data where a local inference client is fed requests at an high rate / no delay between messages,
+and shows the throughput scenario under maximum load. The reported metric is `Output Throughput per GPU (tokens/sec/GPU)`.
 
 The performance numbers below were collected using the steps described in this document.
 
@@ -58,10 +58,7 @@ nvidia/Llama-3.3-70B-Instruct-FP8
 nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 ```
 
-# Performance Summary - All Networks
-
-*This document contains performance data for all tested networks, organized alphabetically.*
-*Total networks: 8*
+# Performance Summary
 
 ## Units
 
@@ -72,7 +69,6 @@ All performance values are measured in **output tokens per second per GPU**.
 - [Deepseek R1 0528](#deepseek-r1-0528)
 - [GPT-OSS 120B](#gpt-oss-120b)
 - [GPT-OSS 20B](#gpt-oss-20b)
-- [Kimi-K2-Instruct-0905](#kimi-k2-instruct-0905)
 - [LLaMA v3.3 70B](#llama-v33-70b)
   - [LLaMA v3.3 70B - RTX Configurations](#llama-v33-70b-rtx-configurations)
 - [LLaMA v4 Maverick](#llama-v4-maverick)
@@ -128,19 +124,6 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="kimi-k2-instruct-0905"></a>
-
-# Kimi-K2-Instruct-0905
-
-| Sequence Length (ISL/OSL) | B200<br/>TEP8 (FP8) | H200<br/>TEP8 (FP8) |
-|---|---|---|
-| 1000/1000 | 439 | 240 |
-| 1024/1024 | 440 | 239 |
-| 1024/8192 | 309 | 98 |
-| 8192/1024 | | 60 |
-
----
-
 <a id="llama-v33-70b"></a>
 
 # LLaMA v3.3 70B
@@ -160,7 +143,6 @@ All performance values are measured in **output tokens per second per GPU**.
 # LLaMA v3.3 70B - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
-*Shows only the best configuration per GPU count based on throughput per GPU*
 
 | Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) |
 |---|---|---|
@@ -191,7 +173,6 @@ All performance values are measured in **output tokens per second per GPU**.
 # LLaMA v4 Maverick - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
-*Shows only the best configuration per GPU count based on throughput per GPU*
 
 | Sequence Length (ISL/OSL) | **4 GPUs**<br/>DEP4,PP1 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) |
 |---|---|---|
@@ -221,7 +202,6 @@ All performance values are measured in **output tokens per second per GPU**.
 # Qwen3 235B A22B - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
-*Shows only the best configuration per GPU count based on throughput per GPU*
 
 | Sequence Length (ISL/OSL) | **4 GPUs**<br/>DEP4,PP1 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) |
 |---|---|---|
@@ -253,7 +233,6 @@ All performance values are measured in **output tokens per second per GPU**.
 # Qwen3 30B A3B - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
-*Shows only the best configuration per GPU count based on throughput per GPU*
 
 | Sequence Length (ISL/OSL) | **2 GPUs**<br/>DEP2,PP1 (FP4) | **4 GPUs**<br/>DEP2,PP2 (FP4) | **8 GPUs**<br/>DEP4,PP2 (FP4) | **1 GPUs**<br/>TP1,PP1 (FP4) |
 |---|---|---|---|---|
@@ -327,7 +306,6 @@ remain in the system longer and therefore require less requests to achieve stead
 | 1024         | 8192          | 1500                |
 | 32768        | 1024          | 1000                |
 | 1024         | 32768         | 1000                |
-| 100000       | 1024          | 300                 |
 
 ### Running the Benchmark
 
@@ -337,30 +315,16 @@ a model name (HuggingFace reference or path to a local model), a [generated data
 
 For dense / non-MoE models:
 
+Llama 3.3
 ```shell
 trtllm-bench --tp $tp_size --pp $pp_size --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
 ```
 
 `llm_options.yml`
 ```yaml
-cuda_graph_config:
+cuda_graph_config
   enable_padding: true
-  batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    - 512
-    - 1024
-    - 2048
-    - 4096
-    - 8192
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
 ```
 
 For MoE models:
@@ -369,27 +333,46 @@ For MoE models:
 trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
 ```
 
+GPT-OSS:
 `llm_options.yml`
 ```yaml
-enable_attention_dp: true
-cuda_graph_config:
+cuda_graph_config
   enable_padding: true
-  batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    - 512
-    - 1024
-    - 2048
-    - 4096
-    - 8192
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
+enable_attention_dp: true
+kv_cache_config
+  dtype: fp8
+  # Hopper: use auto
+moe_config
+  backend: CUTLASS
+  # Hopper: use TRITON
+```
+
+DeepSeek R1
+```yaml
+attention_dp_config
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
+enable_attention_dp: true
+cuda_graph_config
+  enable_padding: true
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
+moe_config
+  backend: CUTLASS
+kv_cache_config
+  dtype: fp8
+speculative_config (only if MTP)
+  decoding_type: MTP
+  num_nextn_predict_layers: 1
+```
+
+Qwen3 MoE, Llama4 Maverick:
+```yaml
+enable_attention_dp: true
+cuda_graph_config
+  enable_padding: true
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 4096, 8192]
 ```
 
 In many cases, we also use a higher KV cache percentage by setting `--kv_cache_free_gpu_mem_fraction 0.95` in the benchmark command. This allows us to obtain better performance than the default setting of `0.90`. We fall back to `0.90` or lower if out-of-memory errors are encountered.
