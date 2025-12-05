@@ -93,3 +93,4 @@ The deployment guides below provide more detailed instructions for serving speci
    deployment-guide-for-gpt-oss-on-trtllm.md
    deployment-guide-for-qwen3-on-trtllm.md
    deployment-guide-for-qwen3-next-on-trtllm.md
+   deployment-guide-for-kimi-k2-thinking-on-trtllm.md
