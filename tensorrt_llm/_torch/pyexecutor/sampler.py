@@ -996,7 +996,7 @@ class TorchSampler(Sampler):
                     assert beam_idx == 0, (
                         "beam search does not need to explicitly handle sampled log probs"
                     )
-                    if sampled_log_probs_indices[step_idx] not in logprobs:
+                    if sampled_log_probs_indices[step_idx].item() not in logprobs:
                         logprobs[sampled_log_probs_indices[step_idx].item()] = Logprob(
                             logprob=sampled_log_probs_vals[step_idx].item(),
                             rank=max(
@@ -1249,7 +1249,7 @@ class TorchSampler(Sampler):
             else _request_strategy(request, vocab_size=2**31)
         )
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(
+        _, draft_probs, _ = sample(
             draft_sampling_strategy,
             request.py_draft_logits,
             generator=generator,
@@ -2050,7 +2050,7 @@ class TorchSampler(Sampler):
                 for _ in range(steps)
             ]
 
-            group_next_tokens_cuda, group_softmax_cuda = (
+            group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
                 self._grouped_sampler_cls.sample_grouped_strategies(
                     strategy_key,
                     group_strategies_per_step,
@@ -2072,18 +2072,29 @@ class TorchSampler(Sampler):
             ].copy_(group_next_tokens_cuda, non_blocking=True)
 
             if return_log_probs:
+                # select the logits for the current group
+                current_group_logits_cuda = (
+                    group_logits_cuda
+                    if logit_indices_for_sampler is None
+                    else group_logits_cuda[logit_indices_for_sampler]
+                )
                 if need_processed_logprobs:
                     # if softmax is 0, then the logit was masked out => set to -inf
-                    group_tgt_logits_cuda = torch.where(
-                        group_softmax_cuda != 0, group_logits_cuda, float("-inf")
-                    )
+                    # apply masking to the logits and store in batch_logits_cuda
                     batch_logits_cuda[
                         batch_next_tokens_offset_start:batch_next_tokens_offset_end
-                    ].copy_(group_tgt_logits_cuda, non_blocking=True)
+                    ] = torch.where(
+                        group_softmax_cuda > 0, current_group_logits_cuda, float("-inf")
+                    )
+                    # apply temperature to the logits
+                    if group_temperature_cuda is not None:
+                        batch_logits_cuda[
+                            batch_next_tokens_offset_start:batch_next_tokens_offset_end
+                        ] /= group_temperature_cuda
                 else:
                     batch_logits_cuda[
                         batch_next_tokens_offset_start:batch_next_tokens_offset_end
-                    ].copy_(group_logits_cuda, non_blocking=True)
+                    ].copy_(current_group_logits_cuda, non_blocking=True)
 
             # Set LlmRequest.py_target_probs
             if speculation_needs_probs:
@@ -2582,7 +2593,7 @@ class TorchSampler(Sampler):
         # NB: we do not need group logprobs anymore, we can reuse the storage
         # We only provide 0 based rank, it will be corrected to 1-indexed in handle logprobs
         group_logprobs_cuda.greater_(sampled_vals_cuda)
-        sampled_rank_cuda = group_logprobs_cuda.sum(dim=-1)
+        sampled_rank_cuda = group_logprobs_cuda.sum(dim=-1).to(torch.int32)
 
         # Use a single D2H copy to reduce overheads
         topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=False)
@@ -2653,12 +2664,7 @@ class TorchSampler(Sampler):
             req_offsets=sampling_requests_metadata.req_offsets,
         )
 
-        self._handle_log_probs(
-            requests,
-            logits_cuda,
-            logits_cuda_indexer=logits_cuda_indexer,
-            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
-        )
+        return_log_probs = self._return_log_probs(requests)
 
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
@@ -2676,7 +2682,9 @@ class TorchSampler(Sampler):
         )
 
         if return_log_probs:
-            self._process_logprobs(batched_sampling_result, requests, req_num_steps)
+            self._process_logprobs(
+                batched_sampling_result, requests, sampling_requests_metadata.req_num_steps
+            )
 
         # Fill results into output buffers
         new_tokens_host = self._unbatch_sampling_results(
