@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_completion.py
 
+import itertools
 from typing import List
 
 import openai
@@ -210,6 +211,17 @@ async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
 @pytest.mark.parametrize("prompts", [["Hello, my name is"] * 2])
 async def test_batch_completions_with_option_n_streaming(
         async_client: openai.AsyncOpenAI, model_name, prompts):
+    # Use non-stream single generation as reference
+    completion_ref = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts[0],
+        max_tokens=5,
+        temperature=0.0001,
+    )
+
+    text_ref = completion_ref.choices[0].text
+    # .choices[0].text
+
     # test beam search with streaming
     batch = await async_client.completions.create(
         model=model_name,
@@ -227,8 +239,17 @@ async def test_batch_completions_with_option_n_streaming(
 
     assert "" not in texts  # Assert all the generations are not empty
 
-    for i, j in zip(texts[:3], texts[3:]):
+    # Check all pairs within first request are consistent
+    for i, j in itertools.combinations(texts[:3], 2):
         assert similar(i, j, threshold=0.8)
+
+    # Check all pairs within second request are consistent
+    for i, j in itertools.combinations(texts[3:], 2):
+        assert similar(i, j, threshold=0.8)
+
+    # Check all generations are consistent with the reference
+    for text in texts:
+        assert similar(text, text_ref, threshold=0.8)
 
 
 @pytest.mark.asyncio(loop_scope="module")

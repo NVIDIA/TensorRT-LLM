@@ -481,7 +481,12 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
-
+                # Update _last_token_ids_len after detokenization to prevent
+                # re-decoding the same tokens in subsequent responses when n > 1.
+                # Without this, outputs not updated in _handle_sequence would have
+                # stale _last_token_ids_len, causing token_ids_diff to return old tokens.
+                beam_output._last_token_ids_len = len(beam_output.token_ids)
+                
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
                     beam_output.finish_reason == 'stop'
