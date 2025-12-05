@@ -278,15 +278,16 @@ class FuseFP8Linear(BaseTransform):
         if self.config.backend.lower() not in ["torch", "trtllm"]:
             raise ValueError(f"Unsupported FP8 backend: {self.config.backend}")
 
-        patterns = ADPatternMatcherPass()
         op = (
             torch.ops.auto_deploy.trtllm_quant_fp8_linear
             if self.config.backend.lower() == "trtllm"
             else torch.ops.auto_deploy.torch_quant_fp8_linear
         )
 
-        _register_quant_fp8_linear_patterns(patterns, op)
-        cnt = patterns.apply(gm.graph)
+        # Use direct node replacement instead of pattern matcher
+        # Pattern matcher has issues with extracting arguments from list structures
+        # under certain graph configurations
+        cnt = self._manual_replace_fp8_linear(gm, op)
 
         info = TransformInfo(
             skipped=(cnt == 0),
@@ -295,6 +296,53 @@ class FuseFP8Linear(BaseTransform):
             has_valid_shapes=cnt == 0,
         )
         return gm, info
+
+    def _manual_replace_fp8_linear(self, gm: GraphModule, target_op) -> int:
+        """Manually replace torch_fake_quant_fp8_linear nodes that pattern matcher missed."""
+        count = 0
+        for node in list(gm.graph.nodes):
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default
+            ):
+                # Extract arguments
+                if len(node.args) < 7:
+                    continue
+
+                input_tensor = node.args[0]
+                weight = node.args[1]
+                bias = node.args[2]
+                input_scale_list = node.args[3]
+                weight_scale_list = node.args[4]
+
+                # Extract scale nodes from lists
+                if isinstance(input_scale_list, (list, tuple)) and len(input_scale_list) > 0:
+                    input_scale = input_scale_list[0]
+                else:
+                    continue
+
+                if isinstance(weight_scale_list, (list, tuple)) and len(weight_scale_list) > 0:
+                    weight_scale = weight_scale_list[0]
+                else:
+                    continue
+
+                # Create replacement node
+                with gm.graph.inserting_before(node):
+                    new_node = gm.graph.call_function(
+                        target_op,
+                        args=(input_tensor, weight, bias),
+                        kwargs={"input_scale": input_scale, "weight_scale": weight_scale},
+                    )
+
+                # Replace all uses
+                node.replace_all_uses_with(new_node)
+                gm.graph.erase_node(node)
+                count += 1
+
+        if count > 0:
+            gm.recompile()
+
+        return count
 
 
 class FuseNVFP4LinearConfig(TransformConfig):
