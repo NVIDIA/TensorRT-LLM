@@ -177,8 +177,10 @@ class CUDAGraphRunner:
                     total_seq_len = request.max_beam_num_tokens + num_draft_tokens + 1
                 total_seq_lens.append(total_seq_len)
             # Determine the sequence length mode.
+            from ..speculative import get_num_extra_kv_tokens
+            num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
             max_seq_len = max(total_seq_lens)
-            if max_seq_len <= self.sparse_config.seq_len_threshold:
+            if max_seq_len <= self.sparse_config.seq_len_threshold - num_extra_kv_tokens:
                 seq_len_mode = "short"
             else:
                 seq_len_mode = "default"
