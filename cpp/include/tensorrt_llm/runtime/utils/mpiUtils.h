@@ -361,6 +361,8 @@ public:
     void sendRawTag(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
     void send(void const* buffer, std::size_t size, MpiType dtype, int dest, MpiTag tag) const;
     void send(runtime::IBuffer const& buf, int dest, MpiTag tag) const;
+    void sendRecv(
+        void const* sendbuf, void* recvbuf, int sendCount, int recvCount, MpiType dtype, int dest, MpiTag tag) const;
 
     template <typename T>
     void sendValue(T const& value, int dest, MpiTag tag) const
