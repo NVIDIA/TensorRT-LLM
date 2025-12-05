@@ -132,10 +132,6 @@ def add_multimodal_args(parser):
         type=int,
         default=2,
         help="Number of conversation turns for automated testing.")
-    parser.add_argument("--log_kv_cache_events",
-                        action="store_true",
-                        default=False,
-                        help="Log the KV cache events.")
     return parser
 
 
