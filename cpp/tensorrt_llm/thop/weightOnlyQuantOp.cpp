@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
@@ -398,6 +399,31 @@ Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_si
     return dequant_weight;
 }
 
+Tensor fp4_interleave_for_Hopper_mixed_gemm(Tensor weight)
+{
+    // weight (n, k / 2)
+    int const n = weight.size(0);
+    int const k = weight.size(1) * 2;
+
+    CHECK_TH_CUDA(weight);
+    CHECK_CONTIGUOUS(weight);
+
+    TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
+    TORCH_CHECK(weight.dtype() == torch::kUInt8, "Weight must be a packed uint8 tensor");
+    TORCH_CHECK(n % 16 == 0)
+    TORCH_CHECK(k % 16 == 0)
+
+    Tensor weight_interleaved
+        = torch::empty({n, k / 2}, torch::dtype(torch::kUInt8).device(torch::kCUDA).requires_grad(false));
+
+    uint8_t* weight_ptr = get_ptr<uint8_t>(weight);
+    uint8_t* weight_interleaved_ptr = get_ptr<uint8_t>(weight_interleaved);
+
+    interleave_fp4_for_Hopper_mixed_gemm(weight_ptr, weight_interleaved_ptr, n, k);
+
+    return weight_interleaved;
+}
+
 } // namespace torch_ext
 
 // Utility methods that may be useful for preprocessing weights in torch.
@@ -432,3 +458,6 @@ static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_trans
 
 static auto mxfp4_dequantize_unswizzled
     = torch::RegisterOperators("trtllm::mxfp4_dequantize_unswizzled", &torch_ext::mxfp4_dequantize_unswizzled);
+
+static auto fp4_interleave_for_Hopper_mixed_gemm = torch::RegisterOperators(
+    "trtllm::fp4_interleave_for_Hopper_mixed_gemm", &torch_ext::fp4_interleave_for_Hopper_mixed_gemm);
