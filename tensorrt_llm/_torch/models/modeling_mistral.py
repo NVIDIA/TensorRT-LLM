@@ -49,9 +49,6 @@ from tensorrt_llm.logger import logger
 
 from ..modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
 
-from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
-from PIL import Image
-
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
 
