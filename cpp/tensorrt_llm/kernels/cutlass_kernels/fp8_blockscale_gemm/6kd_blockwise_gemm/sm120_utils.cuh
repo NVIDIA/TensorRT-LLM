@@ -26,7 +26,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/device_kernel.h" // cutlass::device_kernel
-#include <cutlass/arch/reg_reconfig.h>
+#include "cutlass/numeric_conversion.h"
 
 using namespace cute;
 using namespace cutlass;
@@ -60,8 +60,7 @@ struct SM120BlockScaledBuilder
     // ====== mma ======
     using PermMmaTileM = Int<32>;
     using PermMmaTileN = Int<32>;
-    // using PermMmaTileN = Layout<Shape<_8,_2,_2>, Stride<_1, _16, _8>>;
-    using PermMmaTileK = Int<kTileK>;
+    using PermMmaTileK = Int<32>;
     using MMA_Atom = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<float_e4m3_t, float_e4m3_t, float, float_ue8m0_t,
         32>>; // sm120 16x8x32 fp8 mma
     using TiledMma = TiledMMA<MMA_Atom, Layout<Shape<_2, _2, _1>>, Tile<PermMmaTileM, PermMmaTileN, PermMmaTileK>>;
@@ -124,7 +123,7 @@ struct SM120BlockScaledBuilder
         auto tv_atom_sfa = tiled_atom_sfa.compose(AtomLayoutSFA_TV{}, _); // ((ThrV,FrgV),(RestM,RestK))
 
         // Tile the tensor for the Thread
-        auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
+        auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
         auto thr_tile
             = make_tile(_, make_tile(make_layout(size<1>(thr_layout_vmnk)), make_layout(size<3>(thr_layout_vmnk))));
         auto thr_tensor = zipped_divide(tv_atom_sfa, thr_tile); // ((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK)))
@@ -134,7 +133,6 @@ struct SM120BlockScaledBuilder
     template <class SFATensor, class ThrMma>
     CUTE_HOST_DEVICE static constexpr auto partition_fragment_SFA(SFATensor&& sfatensor, ThrMma& thread_mma)
     {
-        // using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSF;
         auto thr_tensor
             = make_tensor(static_cast<SFATensor&&>(sfatensor).data(), thrfrg_SFA(sfatensor.layout(), thread_mma));
         auto thr_vmnk = thread_mma.thr_vmnk_;
@@ -150,13 +148,13 @@ struct SM120BlockScaledBuilder
         auto tile_shape_mnk = tile_shape(mma);
         auto ref_A = make_layout(make_shape(size<0>(tile_shape_mnk), _1{}));
         auto thr_tensor = thrfrg_SFA(ref_A, mma);
-        auto thr_layout_vmnk = mma.get_thr_layout_vmnk(); // (_32,_4,_1,_1):(_1,_32,_0,_0)
+        auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
         auto atile = make_tile(_,
             make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                           make_stride(Int<1>{}, Int<0>{})),
-                _));                                          // (_,((_1,_4):(_1,_0),_))
-        auto tv_sfa = thr_tensor.compose(atile, _);           // mma_sfa_tv_layout
-        auto thridx_2_thrid = right_inverse(thr_layout_vmnk); // (_128:_1)
+                _));
+        auto tv_sfa = thr_tensor.compose(atile, _);
+        auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
         auto tv_layout = tv_sfa.compose(thridx_2_thrid, _);
         return tv_layout;
     }
@@ -194,8 +192,8 @@ struct SM120BlockScaledBuilder
         auto thr_tensor
             = make_tensor(static_cast<SFBTensor&&>(sfbtensor).data(), thrfrg_SFB(sfbtensor.layout(), thread_mma));
         auto thr_vmnk = thread_mma.thr_vmnk_;
-        auto thr_vmk = make_coord(get<0>(thr_vmnk), make_coord(get<1>(thr_vmnk), get<3>(thr_vmnk)));
-        auto partition_SFB = thr_tensor(thr_vmk, make_coord(_, repeat<rank<1, 1>(thr_tensor)>(_)));
+        auto thr_vnk = make_coord(get<0>(thr_vmnk), make_coord(get<1>(thr_vmnk), get<3>(thr_vmnk)));
+        auto partition_SFB = thr_tensor(thr_vnk, make_coord(_, repeat<rank<1, 1>(thr_tensor)>(_)));
         auto frg_SFB = make_fragment_like<ElementSFLoad>(partition_SFB);
         return frg_SFB;
     }
@@ -246,8 +244,8 @@ struct SM120BlockScaledBuilder
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<AB_Stages>{}), Step<_1, _2, _3>{}));
 
     // ====== TMA config ======
-    using StrideA = Stride<int64_t, Int<1>, int64_t>;
-    using StrideB = Stride<int64_t, Int<1>, int64_t>;
+    using StrideA = Stride<int32_t, Int<1>, int32_t>;
+    using StrideB = Stride<int32_t, Int<1>, int32_t>;
 
     using TMA_A = decltype(make_tma_copy(SM90_TMA_LOAD{},
         make_tensor(recast_ptr<ElementA>(nullptr), repeat_like(StrideA{}, int32_t(0)), StrideA{}),
@@ -270,8 +268,8 @@ struct SM120BlockScaledBuilder
     using SmemLayoutSFB = decltype(tile_to_shape(SmemLayoutAtomSFB{},
         make_shape(shape<1>(ScaleTileShape{}), shape<2>(ScaleTileShape{}), Int<SF_Stages>{}), Step<_1, _2, _3>{}));
 
-    using StrideSFA = Stride<Int<1>, int64_t, int64_t>; // column major
-    using StrideSFB = Stride<Int<1>, int64_t, int64_t>; // column major
+    using StrideSFA = Stride<Int<1>, int32_t, int32_t>; // column major
+    using StrideSFB = Stride<Int<1>, int32_t, int32_t>; // column major
 
     using TMA_SFA = decltype(make_tma_copy(SM90_TMA_LOAD{},
         make_tensor(recast_ptr<ElementSFLoad>(nullptr), repeat_like(StrideSFA{}, int32_t(0)), StrideSFA{}),
@@ -294,25 +292,8 @@ struct SM120BlockScaledBuilder
         cutlass::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFB{})) * cute::sizeof_bits_v<ElementSFLoad>));
     static constexpr uint32_t TmaSFTransactionBytes = TmaTransactionBytesSFA + TmaTransactionBytesSFB;
 
-    // ====== store rf -> smem ======
-    using SmemAtomLayoutStore = decltype(composition(
-        // Swizzle<3, 2, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})); //  8x32
-        Swizzle<3, 3, 3>{}, Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{})); //  8x64
-
-    using SmemLayoutO = decltype(tile_to_shape(SmemAtomLayoutStore{}, Shape<Int<kTileM>, Int<kTileN>>{}));
-
-    using SmemCopyAtomR2S = Copy_Atom<AutoVectorizingCopy, ElementD>;
-
-    // ====== store smem -> gmem ======
-    using SmemCopyAtomS2R = Copy_Atom<AutoVectorizingCopy, ElementD>;
-    using GmemCopyAtomR2G = SmemCopyAtomS2R;
-
-    using TiledCopyS2G = decltype(make_tiled_copy(SmemCopyAtomS2R{}, Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-        // Layout<Shape<_1, _4>>{})); // 16x32
-        Layout<Shape<_1, _8>>{})); // 16x64
-
     // ====== TMA store ======
-    using StrideD = Stride<int64_t, Int<1>, int64_t>;
+    using StrideD = Stride<int32_t, Int<1>, int32_t>;
     using EpilogueTile_MN = Shape<Int<kTileM>, Int<kTileN>>;
 
     using CopyAtomC = Copy_Atom<SM90_U32x2_STSM_N, cutlass::half_t>;
@@ -339,8 +320,7 @@ struct SM120BlockScaledBuilder
 
     struct SharedStorageStore : cute::aligned_struct<128, _0>
     {
-        alignas(1024) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutO>> smem_D;
-        // alignas(1024) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutD>> smem_D;
+        alignas(1024) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutD>> smem_D;
     };
 
     union TensorStorage
