@@ -232,7 +232,8 @@ def find_input_mm_embeds(
     # Calculate total tokens that need processing (both cached and current chunk)
     total_mm_tokens = sum(param.multimodal_runtime.num_mm_tokens_in_chunk -
                           param.multimodal_runtime.num_special_tokens_in_chunk
-                          for param in multimodal_params if param.multimodal_runtime is not None)
+                          for param in multimodal_params
+                          if param.multimodal_runtime is not None)
 
     # No tokens need processing - return empty list
     if total_mm_tokens == 0:
