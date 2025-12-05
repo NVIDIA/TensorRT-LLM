@@ -187,7 +187,8 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     th::Tensor const& ldb, // Leading dimensions for B matrices [layer_module_num, max_lora_size]
     th::Tensor const& ldd, // Leading dimensions for C matrices [layer_module_num, max_lora_size] (unused)
     th::Tensor const& ldb_prime, th::Tensor const& ldd_prime, th::Tensor const& host_max_in_sizes,
-    th::Tensor const& host_max_out_sizes, th::Tensor const& splitk_offsets, c10::ScalarType dtype, int64_t minKN)
+    th::Tensor const& host_max_out_sizes, th::Tensor const& splitk_offsets, c10::ScalarType dtype, int64_t minKN,
+    int64_t splitKSlices = 16)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -238,15 +239,12 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
             d_ptrs_gpu, lda_gpu, ldb_gpu, ldd_gpu, ldd_gpu, // Precomputed leading dimensions
             true,                                           // isLoraIn
             loraRuntimeDataType,
-            16,                                             // splitKSlices
+            static_cast<int>(splitKSlices),                 // splitKSlices
             minKnInt,                                       // minKN
             host_max_in_sizes_ptr, splitk_offsets_gpu, stream);
         sync_check_cuda_error(stream);
-    }
 
-    // Call CUDA Graph compatible grouped GEMM for lora_out
-    if (problem_count > 0)
-    {
+        // Call CUDA Graph compatible grouped GEMM for lora_out
         TLLM_LOG_TRACE("Start Grouped GEMM for LoRA out.");
         tk::cuda_graph_grouped_gemm(problem_sizes_2_ptr, problem_count, a_prime_ptrs_gpu, b_prime_ptrs_gpu,
             d_prime_ptrs_gpu,                                                       // ptrC (no bias)
@@ -378,7 +376,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor host_max_out_sizes, "
         "Tensor splitk_offsets, "
         "ScalarType dtype, "
-        "int minKN) -> ()");
+        "int minKN, "
+        "int splitKSlices=16) -> ()");
 
     m.def(
         "lora_group_gemm_param_fill_row_reorder_fusion("

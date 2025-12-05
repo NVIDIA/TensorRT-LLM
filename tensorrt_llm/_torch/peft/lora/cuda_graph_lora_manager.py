@@ -47,7 +47,7 @@ class CudaGraphLoraManager:
         self.max_lora_rank = max_lora_rank
         self.device = device
 
-        self.adapter_slot_manager = AdapterSlotManager(max_lora_size, device)
+        self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
         lora_target_modules = lora_model_config.lora_target_modules
         self.target_modules_ids: Optional[tuple[int, ...]] = (
@@ -82,7 +82,10 @@ class CudaGraphLoraManager:
         """
         self.layer_info = dict()
 
-        def get_layer_idx(model: torch.nn.Module, lora_module: LoraLayer, lora_module_name: str):
+        def get_layer_idx(
+            model: torch.nn.Module, lora_module: LoraLayer, lora_module_name: str
+        ) -> Optional[int]:
+            """Find the layer index of the given LoRA module in the model."""
             module = lora_module
             name = lora_module_name
             while module is not None and (
@@ -113,9 +116,10 @@ class CudaGraphLoraManager:
                 )
                 assert layer_key not in self.layer_info, f"Layer {layer_key} already exists"
 
-                self.layer_info[layer_key] = CudaGraphLoraParams.LoraLayerInfo()
-                self.layer_info[layer_key].output_sizes = module.output_hidden_sizes
-                self.layer_info[layer_key].module_num = len(module.lora_module_types)
+                self.layer_info[layer_key] = CudaGraphLoraParams.LoraLayerInfo(
+                    module_num=len(module.lora_module_types),
+                    output_sizes=module.output_hidden_sizes,
+                )
 
     @nvtx_range("prepare_cuda_graph_lora_params")
     def prepare_cuda_graph_lora_params(
@@ -155,7 +159,7 @@ class CudaGraphLoraManager:
         # Update weight pointers if slot assignments changed
         if self.adapter_slot_manager.has_slots_changed():
             cuda_graph_lora_params.update_weight_pointers(peft_table, slot2task)
-            self.adapter_slot_manager.reset_changed_flag()
+            self.adapter_slot_manager.reset_slots_changed()
 
         # Update GEMM sizes and prefix sums using batch
         cuda_graph_lora_params.update_slots_params(batch_slot_ids=request_slot_ids)

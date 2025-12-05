@@ -21,6 +21,8 @@ from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.lora_helper import LoraConfig
 
+from .test_utils import DelayedAssert
+
 _RU_LORA_ADAPTER_PROMPTS = [
     "Назови главную площадь в центре Москвы.",
     "Напиши полное предложение, описывающее, что в музее не хватает женских скульптур. Используй фразу \"не хватает\".",
@@ -424,36 +426,6 @@ def create_grouped_gemm_params_filler_input(
             output_sizes_offset=output_sizes_offset,
         )
         return inputs, layer
-
-
-class DelayedAssert:
-
-    def __init__(self, store_stack: bool = False):
-        self.assertions = []
-        self.store_stack = store_stack
-
-    def add(self, result: bool, msg: str):
-        import traceback
-        self.assertions.append(
-            (bool(result), str(msg), traceback.format_stack()))
-
-    def get_msg(self):
-        ret = ['Some assertions failed:']
-        for result, msg, stack in self.assertions:
-            ret.append('\n'.join([
-                f'Assert result: {result}', msg,
-                ''.join(stack) if self.store_stack else ''
-            ]))
-        ret = '\n-----------------------------------------\n'.join(ret)
-        ret = 'Some assertions failed:\n' + ret
-        return ret
-
-    def clear(self):
-        self.assertions.clear()
-
-    def assert_all(self):
-        assert all(ret[0] for ret in self.assertions), self.get_msg()
-        self.clear()
 
 
 def compare_grouped_gemm_params(

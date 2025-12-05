@@ -1,6 +1,6 @@
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -107,7 +107,7 @@ class CudaGraphLoraParams:
                 key, info.module_num, info.output_sizes
             )
 
-    def _calculate_layer_module2key(self):
+    def _calculate_layer_module2key(self) -> Dict[Tuple[int, int], LoraLayerKey]:
         layer_module2key = dict()
         for key in self.layer_info.keys():
             layer_id = key.layer_idx

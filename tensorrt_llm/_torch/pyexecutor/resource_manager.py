@@ -1442,8 +1442,6 @@ class PeftCacheManager(BaseResourceManager):
         self._batch_peft_table, _ = self.impl.ensure_batch_map_task_id(
             context_batch, generation_batch, False)
 
-        # torch.cuda.synchronize()
-
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
 

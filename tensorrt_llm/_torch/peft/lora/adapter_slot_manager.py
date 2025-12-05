@@ -11,25 +11,23 @@ from ...pyexecutor.scheduler import RequestList
 
 class AdapterSlotManager:
     """
-    Manages max_lora_sizes ordered slots for distinct task_ids to enable CUDA Graph compatibility.
+    Manages max_num_adapters ordered slots for distinct task_ids to enable CUDA Graph compatibility.
 
     Each slot can hold one adapter (task_id) and maintains a consistent ordering that allows
     the CUDA Graph to be captured with fixed buffer layouts.
     """
 
-    def __init__(self, max_lora_size: int, device: str = "cuda"):
+    def __init__(self, max_num_adapters: int):
         """
         Initialize the AdapterSlotManager.
 
         Args:
-            max_lora_size: Maximum number of LoRA adapters that can be active simultaneously
-            device: Device to allocate tensors on
+            max_num_adapters: Maximum number of LoRA adapters that can be active simultaneously
         """
-        self.max_lora_size = max_lora_size
-        self.device = device
+        self.max_num_adapters = max_num_adapters
 
         # Slot management
-        self.slot2task: List[Optional[int]] = [None] * max_lora_size
+        self.slot2task: List[Optional[int]] = [None] * max_num_adapters
         self.task2slot: OrderedDict[int, int] = OrderedDict()  # represent LRU order
 
         # State tracking
@@ -62,7 +60,7 @@ class AdapterSlotManager:
             self.task2slot.move_to_end(task_id)
         else:
             self.slots_changed = True
-            if len(self.task2slot) < self.max_lora_size:
+            if len(self.task2slot) < self.max_num_adapters:
                 free_slot = self.find_free_slot()
                 self.slot2task[free_slot] = task_id
                 self.task2slot[task_id] = free_slot
@@ -92,22 +90,23 @@ class AdapterSlotManager:
             scheduled_requests: The scheduled requests for the current batch
 
         Returns:
-            Dict mapping request_id to slot_id, with slot_id=max_lora_size for base model requests
+            Dict mapping request_id to slot_id, with slot_id=max_num_adapters for base model requests
         """
         # remove task evicted in PeftCacheManager in C++
         self.remove_evicted_slots_in_cpp(peft_cache_manager)
 
-        # check if total number of unique tasks in the requests is not larger than max_lora_size
+        # check if total number of unique tasks in the requests is not larger than max_num_adapters
         tasks = [request.lora_task_id for request in requests]
         unique_tasks = {t for t in tasks if t is not None}
-        assert len(unique_tasks) <= self.max_lora_size, (
-            "Currently do not support batch with more LoRA task ID than loRA slot size!"
+        assert len(unique_tasks) <= self.max_num_adapters, (
+            f"Batch with more unique LoRA adapters ({len(unique_tasks)}) than max_num_adapters={self.max_num_adapters} "
+            "is not supported"
         )
 
         # assign slots to tasks
         for i, task in enumerate(tasks):
             if task is None:
-                tasks[i] = self.max_lora_size
+                tasks[i] = self.max_num_adapters
             else:
                 tasks[i], evicted_task = self.get_or_assign_task(task)
 
@@ -126,6 +125,6 @@ class AdapterSlotManager:
         """Check if slot assignments have changed since last check."""
         return self.slots_changed
 
-    def reset_changed_flag(self):
+    def reset_slots_changed(self):
         """Reset the slots_changed flag."""
         self.slots_changed = False
