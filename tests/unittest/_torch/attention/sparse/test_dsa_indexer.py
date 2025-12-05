@@ -516,6 +516,23 @@ def _create_mock_metadata(request_ids,
             self.runtime_features = RuntimeFeatures()
 
             # Add skip indexer attributes
+            def get_dense_topk_indices(seq_lens, kv_lens, num_tokens):
+                past_kv_lens = kv_lens - seq_lens
+                # get position ids
+                seq_ends = torch.cumsum(seq_lens, dim=0)
+                seq_starts = seq_ends - seq_lens
+                per_seq_offsets = past_kv_lens - seq_starts  # Shape: [batch_size]
+                global_indices = torch.arange(num_tokens)
+                batch_indices = torch.searchsorted(seq_ends,
+                                                   global_indices,
+                                                   side='right')
+                repeated_offsets = per_seq_offsets[batch_indices]
+                position_ids = global_indices + repeated_offsets
+                # get the dense topk indices with causal mask
+                range_row = torch.arange(self.sparse_mla_topk)
+                mask = range_row <= position_ids.unsqueeze(1)
+                return torch.where(mask, range_row, -1)
+
             self.topk_indices_buffer = torch.zeros(
                 (num_tokens, self.sparse_mla_topk),
                 device='cuda',
@@ -524,45 +541,26 @@ def _create_mock_metadata(request_ids,
                 self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
                 ).item() <= self.sparse_mla_topk
                 if self.skip_indexer_for_ctx_reqs:
-                    ctx_seq_lens = kv_lens[:self.num_contexts]
-                    ctx_kv_lens = kv_lens[:self.num_contexts]
-                    # for causal mask
-                    ends = torch.cumsum(ctx_kv_lens, dim=0)
-                    starts = ends - ctx_kv_lens
-                    repeated_starts = torch.repeat_interleave(
-                        starts, ctx_seq_lens)
-                    global_indices = torch.arange(self.num_ctx_tokens)
-                    position_ids = global_indices - repeated_starts
-                    # get the dense topk indices with causal mask
-                    range_row = torch.arange(self.sparse_mla_topk)
-                    mask = range_row <= position_ids.unsqueeze(1)
                     ctx_range = slice(self.num_ctx_tokens)
-                    host_topk_indices_buffer = torch.where(mask, range_row, -1)
+                    host_topk_indices_buffer = get_dense_topk_indices(
+                        self.seq_lens[:self.num_contexts],
+                        kv_lens[:self.num_contexts], self.num_ctx_tokens)
                     self.topk_indices_buffer[ctx_range, :].copy_(
                         host_topk_indices_buffer, non_blocking=True)
             else:
                 self.skip_indexer_for_ctx_reqs = False
 
             if self.num_generations > 0 and self.enable_indexer_skip:
-                next_n = self.max_draft_tokens + 1
+                self.max_draft_tokens + 1
                 self.skip_indexer_for_gen_reqs = kv_lens[
                     self.num_contexts:self.num_seqs].max().item(
                     ) <= self.sparse_mla_topk
                 if self.skip_indexer_for_gen_reqs:
-                    gen_seq_lens = self.seq_lens[self.num_contexts:self.
-                                                 num_seqs]
-                    gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
-                    # for causal mask
-                    row_indices = torch.arange(self.num_gen_tokens) // next_n
-                    next_n_offset = torch.arange(self.num_gen_tokens) % next_n
-                    index_end_pos = gen_kv_lens[
-                        row_indices] - next_n + next_n_offset
-                    # get the dense topk indices with causal mask
-                    range_row = torch.arange(self.sparse_mla_topk)
-                    mask = range_row <= index_end_pos.unsqueeze(1)
-                    print(f"mask: {mask}")
                     gen_range = slice(self.num_ctx_tokens, self.num_tokens)
-                    host_topk_indices_buffer = torch.where(mask, range_row, -1)
+                    host_topk_indices_buffer = get_dense_topk_indices(
+                        self.seq_lens[self.num_contexts:self.num_seqs],
+                        kv_lens[self.num_contexts:self.num_seqs],
+                        self.num_gen_tokens)
                     self.topk_indices_buffer[gen_range, :].copy_(
                         host_topk_indices_buffer, non_blocking=True)
             else:
@@ -1689,30 +1687,36 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
     min_seq_len, max_seq_len = seq_len_range
     enable_indexer_skip = max_seq_len <= 2048
 
-    # Generate KV cache lengths (90% >= 2048 to test realistic scenarios)
-    kv_lens = torch.zeros(batch_size, dtype=torch.int32)
-    is_long = torch.rand(batch_size) < 0.9
+    # Generate KV cache lengths
+    if enable_indexer_skip:
+        kv_lens = torch.randint(min_seq_len,
+                                max_seq_len, (batch_size, ),
+                                dtype=torch.int32)
+    else:
+        # (90% >= 2048 to test realistic scenarios)
+        kv_lens = torch.zeros(batch_size, dtype=torch.int32)
+        is_long = torch.rand(batch_size) < 0.9
 
-    num_long = is_long.sum().item()
-    if num_long > 0:
-        long_min = max(2048, min_seq_len)
-        long_max = max(long_min + 1, max_seq_len)
-        kv_lens[is_long] = torch.randint(long_min,
-                                         long_max, (num_long, ),
-                                         dtype=torch.int32)
+        num_long = is_long.sum().item()
+        if num_long > 0:
+            long_min = max(2048, min_seq_len)
+            long_max = max(long_min + 1, max_seq_len)
+            kv_lens[is_long] = torch.randint(long_min,
+                                             long_max, (num_long, ),
+                                             dtype=torch.int32)
 
-    num_short = (~is_long).sum().item()
-    if num_short > 0:
-        short_max = min(2048, max_seq_len)
-        if short_max > min_seq_len:
-            kv_lens[~is_long] = torch.randint(min_seq_len,
-                                              short_max, (num_short, ),
-                                              dtype=torch.int32)
-        else:
-            kv_lens[~is_long] = torch.randint(max(2048, min_seq_len),
-                                              max(2049, max_seq_len),
-                                              (num_short, ),
-                                              dtype=torch.int32)
+        num_short = (~is_long).sum().item()
+        if num_short > 0:
+            short_max = min(2048, max_seq_len)
+            if short_max > min_seq_len:
+                kv_lens[~is_long] = torch.randint(min_seq_len,
+                                                  short_max, (num_short, ),
+                                                  dtype=torch.int32)
+            else:
+                kv_lens[~is_long] = torch.randint(max(2048, min_seq_len),
+                                                  max(2049, max_seq_len),
+                                                  (num_short, ),
+                                                  dtype=torch.int32)
 
     seq_lens = torch.full((batch_size, ), next_n, dtype=torch.int32)
     num_gen_tokens = batch_size * next_n
@@ -2162,7 +2166,8 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
 
 
 @skip_pre_hopper
-def test_indexer_topk_multi_request_with_different_cache():
+@pytest.mark.parametrize("enable_indexer_skip", [True, False])
+def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     """
     Test that custom topk kernel handles multi-request batches with different cached amounts.
     """
@@ -2178,7 +2183,10 @@ def test_indexer_topk_multi_request_with_different_cache():
 
     # Critical: different cached amounts
     seq_lens = [256, 237]  # NEW tokens
-    cached_tokens = [0, 3584]  # Req0: no cache, Req1: large cache
+    if enable_indexer_skip:
+        cached_tokens = [256, 584]  # Req0: no cache, Req1: short cache
+    else:
+        cached_tokens = [0, 3584]  # Req0: no cache, Req1: large cache
     total_kv_lens = [seq_lens[i] + cached_tokens[i] for i in range(batch_size)]
     total_tokens = sum(seq_lens)
 
@@ -2260,6 +2268,32 @@ def test_indexer_topk_multi_request_with_different_cache():
                                                 weights,
                                                 use_custom_topk=False)
 
+    # Test with indexer skip enabled
+    if enable_indexer_skip:
+        metadata_skip = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            batch_size,
+            0,
+            torch.tensor(seq_lens, dtype=torch.int32),
+            torch.tensor(total_kv_lens, dtype=torch.int32),
+            cached_tokens,
+            cache_manager,
+            total_tokens,
+            total_tokens,
+            indexer_max_chunk_size=32768,
+            enable_context_mla_with_cached_kv=True,
+            enable_indexer_skip=True)
+        Indexer.prepare(metadata_skip)
+        indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
+        topk_indices_skip = indexer.sparse_attn_indexer(metadata_skip,
+                                                        hidden_states,
+                                                        q_fp8,
+                                                        k_fp8,
+                                                        k_scale,
+                                                        weights,
+                                                        use_custom_topk=True)
+
     # Validate: custom and fallback should match
     print(f"\n=== Validation ===")
 
@@ -2314,3 +2348,14 @@ def test_indexer_topk_multi_request_with_different_cache():
 
     assert avg_similarity >= 0.95, \
         f"Custom vs fallback differ: avg similarity {avg_similarity:.4f} < 0.95"
+
+    if enable_indexer_skip:
+        num_exact_matches, total_similarity, min_similarity = validate_topk_indices(
+            topk_custom, topk_indices_skip, total_tokens)
+        avg_similarity = total_similarity / total_tokens
+        print(f"  Exact matches: {num_exact_matches}/{total_tokens}")
+        print(
+            f"  Similarity - Min: {min_similarity:.4f}, Avg: {avg_similarity:.4f}"
+        )
+        assert avg_similarity >= 0.95, \
+            f"Custom vs indexer skip differ: avg similarity {avg_similarity:.4f} < 0.95"
