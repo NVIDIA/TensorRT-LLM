@@ -272,34 +272,6 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         }
     }
 
-    auto const numGenRequests = scheduledRequests.size();
-    auto const numCtxRequests = pendingRequests.size();
-
-    if (numGenRequests != 0 &&                // We have generation requests to handle
-        numCtxRequests < mMaxPendingRequests) // We don't have enough context requests yet
-    {
-        // Heuristic: wait a bit to see if there will be new context requests
-        if (numCtxRequests == mLastPendingRequests)
-        {
-            ++mPendingIterations;
-        }
-        else
-        {
-            mPendingIterations = 0;
-        }
-
-        if (mPendingIterations < mMaxPendingIterations)
-        {
-            pendingRequests.clear(); // Do not schedule context request for this batch
-            mLastPendingRequests = numCtxRequests;
-        }
-    }
-    if (!pendingRequests.empty())
-    {
-        mLastPendingRequests = 0;
-        mPendingIterations = 0;
-    }
-
     // If StaticBatchScheduling == true check if we can add pending requests only when no requests are active.
     // Otherwise, add just check that we can add pending requests.
     if (!StaticBatchScheduling || scheduledRequests.size() == 0)
