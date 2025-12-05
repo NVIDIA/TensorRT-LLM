@@ -4,7 +4,11 @@
 set -Eeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
-install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname).${DISAGG_SERVING_TYPE}"
+if [ -n "${DISAGG_SERVING_TYPE:-}" ]; then
+    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname).${DISAGG_SERVING_TYPE}"
+else
+    install_lock_file="install_lock.lock.${SLURM_JOB_ID}.$(hostname)"
+fi
 if [ $SLURM_LOCALID -eq 0 ]; then
     echo "Installing dependencies on $(hostname) for process $SLURM_PROCID"
     cd $llmSrcNode
