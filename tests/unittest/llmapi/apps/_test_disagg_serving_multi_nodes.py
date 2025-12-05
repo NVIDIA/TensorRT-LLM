@@ -10,7 +10,8 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
-from .utils import expand_slurm_nodelist
+from .utils import (expand_slurm_nodelist, wait_for_endpoint_down,
+                    wait_for_endpoint_ready)
 
 RANK = int(os.environ.get("SLURM_PROCID", 0))
 NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
