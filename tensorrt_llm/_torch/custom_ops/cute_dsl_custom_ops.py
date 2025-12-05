@@ -1709,6 +1709,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.top_k = top_k
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
+            if tile_size not in [128, 256]:
+                raise ValueError(
+                    f"Tile size {tile_size} is not supported, it only supports 128 and 256."
+                )
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
@@ -1739,9 +1743,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             k = a.size(1) * 2
             l, n = b.size(0), b.size(1)
 
-            # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            if self.tile_size == 128:
+                mma_tiler_mn_candidates = [(128, 128), (128, 256)]
+                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            elif self.tile_size == 256:
+                mma_tiler_mn_candidates = [(256, 128), (256, 256)]
+                cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            else:
+                raise ValueError(f"Tile size {self.tile_size} is not supported")
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -1752,7 +1761,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         sf_vec_size=self.scaling_vector_size,
                         acc_dtype=cutlass.Float32,
                         c_dtype=cutlass.Float4E2M1FN,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -1886,7 +1894,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn, cluster_shape_mn = (self.tile_size,
+                                                  128), (self.tile_size // 128,
+                                                         1)
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
@@ -1894,7 +1904,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,

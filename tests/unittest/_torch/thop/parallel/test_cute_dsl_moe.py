@@ -710,7 +710,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
 
 
 @pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
-@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
@@ -919,6 +919,6 @@ if __name__ == "__main__":
         num_tokens=515,
         top_k=1,
         ep_size=8,
-        tile_size=128,
+        tile_size=256,
     )
     print("Test passed!")

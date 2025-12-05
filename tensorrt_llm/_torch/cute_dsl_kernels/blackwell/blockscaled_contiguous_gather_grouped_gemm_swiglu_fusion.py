@@ -203,9 +203,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     :type sf_vec_size: int
     :param acc_dtype: Data type of the accumulator (e.g., cutlass.Float32).
     :type acc_dtype: Type[cutlass.Numeric]
-    :param use_2cta_instrs: Whether to use 2 CTA groups (True for M=256, False for M=128).
-    :type use_2cta_instrs: bool
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
+    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N).
+        Note: use_2cta_instrs is automatically inferred from mma_tiler_mn[0]
+        (True when M=256, False when M=128).
     :type mma_tiler_mn: Tuple[int, int]
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
@@ -240,11 +240,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
 
     Example:
+        >>> # Note: use_2cta_instrs is auto-inferred from mma_tiler_mn[0]
+        >>> # (True when M=256, False when M=128)
         >>> gemm = BlockScaledContiguousGatherGroupedGemmKernel(
         ...     sf_vec_size=16,
         ...     acc_dtype=cutlass.Float32,
-        ...     use_2cta_instrs=True,
-        ...     mma_tiler_mn=(256, 128),
+        ...     mma_tiler_mn=(256, 128),  # use_2cta_instrs=True since M=256
         ...     cluster_shape_mn=(2, 1),
         ...     vectorized_f32=True,
         ... )
@@ -270,7 +271,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self,
         sf_vec_size: int,
         acc_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
@@ -283,8 +283,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         1.  MMA Instruction Settings (tcgen05):
             - acc_dtype: Data types for MMA accumulator.
             - mma_tiler_mn: The (M, N) shape of the MMA instruction tiler.
-            - use_2cta_instrs: Boolean indicating if the tcgen05 MMA variant
-              with cta_group=2 should be used.
+            - use_2cta_instrs: Automatically inferred from mma_tiler_mn[0]
+              (True when M=256, False when M=128).
 
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
@@ -299,9 +299,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type sf_vec_size: int
         :param acc_dtype: Data type of the accumulator.
         :type acc_dtype: type[cutlass.Numeric]
-        :param use_2cta_instrs: Boolean, True to use cta_group=2 MMA variant.
-        :type use_2cta_instrs: bool
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
+            use_2cta_instrs is automatically set based on M (True if M=256, False if M=128).
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
@@ -311,12 +310,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.use_2cta_instrs = use_2cta_instrs
+        self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
-        self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -2856,7 +2855,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sf_vec_size: int,
         acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         m: int,
@@ -2920,6 +2918,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             can_implement = False
 
+        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape and cluster shape
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
