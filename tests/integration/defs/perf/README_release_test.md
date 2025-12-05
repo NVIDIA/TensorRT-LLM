@@ -26,7 +26,7 @@ For trtllm-bench, the test extracts the following key performance metrics from l
 ```python
 data_cmd += [
     "trtllm-bench", f"--model={tokenizer_dir}",
-        "dataset", "--output", dataset_path, "token-norm-dist",
+        "prepare-dataset", "--output", dataset_path, "token-norm-dist",
         f"--num-requests={self._config.num_reqs}",
         f"--input-mean={input_len}", f"--output-mean={output_len}",
         f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
@@ -36,7 +36,7 @@ data_cmd += [
 #### With LoRA
 ```python
 "trtllm-bench", f"--model={tokenizer_dir}",
-    "dataset", "--output", dataset_path,
+    "prepare-dataset", "--output", dataset_path,
     f"--rand-task-id 0 {nloras-1}",
     f"--lora-dir={lora_dir}",
     f"token-norm-dist",
