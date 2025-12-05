@@ -25,7 +25,8 @@ from utils.llm_data import llm_models_root
 
 from ._test_openai_mmencoder import RemoteMMEncoderServer
 from ._test_openai_mmencoder import server as mm_encoder_server
-from ._test_openai_mmencoder import test_multimodal_content_mm_encoder
+from ._test_openai_mmencoder import \
+    test_multimodal_content_mm_encoder as _test_multimodal_content_mm_encoder
 
 assert mm_encoder_server is not None  # keep 'mm_encoder_server' fixture visible in this module
 
@@ -176,7 +177,7 @@ def test_single_chat_session_image_embeds(
     mm_encoder_server: RemoteMMEncoderServer,
 ):
     client = server_patched.get_client()
-    messages, mm_embed_handle = test_multimodal_content_mm_encoder(
+    messages, mm_embed_handle = _test_multimodal_content_mm_encoder(
         mm_encoder_server.get_client(), model_name)
 
     max_completion_tokens = 10
