@@ -24,6 +24,7 @@ from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -174,13 +175,19 @@ def get_balanced_rank_imbalanced_expert_selection(
 
 
 def make_balanced_routing_method(
-    apply_method_orig, num_experts, balance_method, balance_ratio, dp_size, dp_rank, ep_size
+    moe_module,
+    apply_method_orig,
+    num_experts,
+    balance_method,
+    balance_ratio,
+    dp_size,
+    dp_rank,
+    ep_size,
 ):
     def balanced_routing_method(router_logits):
         token_selected_experts, token_final_scales = apply_method_orig(router_logits)
-        if balance_method == BalanceMethod.NotModified:
-            pass
-        elif balance_method == BalanceMethod.Balanced:
+        assert moe_module._routing_results_replaced_at in [None, "make_balanced_routing_method"]
+        if balance_method == BalanceMethod.Balanced:
             token_selected_experts = get_balanced_selection(
                 token_selected_experts.shape[0],
                 token_selected_experts.shape[1],
@@ -217,9 +224,119 @@ def make_balanced_routing_method(
             )
         else:
             raise NotImplementedError(f"Not support balance_method {balance_method}")
+        moe_module._routing_results_replaced_at = "make_balanced_routing_method"
         return token_selected_experts, token_final_scales
 
     return balanced_routing_method
+
+
+@functools.cache
+def get_token_final_scales(shape, device):
+    return torch.full(shape, 1.0 / shape[-1], dtype=torch.bfloat16, device=device)
+
+
+def make_balanced_run_moe(
+    moe_module,
+    run_moe_orig,
+    top_k,
+    num_experts,
+    balance_method,
+    balance_ratio,
+    dp_size,
+    dp_rank,
+    ep_size,
+):
+    def balanced_run_moe(
+        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
+    ):
+        if moe_module._routing_results_replaced_at is not None:
+            return run_moe_orig(
+                x,
+                token_selected_experts,
+                token_final_scales,
+                x_sf,
+                router_logits,
+                do_finalize,
+                moe_output,
+            )
+        logger.warning_once(
+            'Layer-wise benchmarks: Specifying routing results of "TRTLLM" MoE backend in TEP cases leads to different'
+            " execution path around the topk kernel",
+            key="replace_routing_method_ctx_trtllm_tp",
+        )
+        if balance_method == BalanceMethod.Balanced:
+            token_selected_experts = get_balanced_selection(
+                x.shape[0],
+                top_k,
+                num_experts,
+                torch.int32,
+                x.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        elif balance_method == BalanceMethod.ImbalancedRanks:
+            token_selected_experts = get_all_to_one_selection(
+                x.shape[0],
+                top_k,
+                num_experts,
+                balance_ratio,
+                torch.int32,
+                x.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        elif balance_method == BalanceMethod.ImbalancedExperts:
+            token_selected_experts = get_balanced_rank_imbalanced_expert_selection(
+                x.shape[0],
+                top_k,
+                num_experts,
+                balance_ratio,
+                torch.int32,
+                x.device,
+                dp_size,
+                dp_rank,
+                ep_size,
+            )
+        else:
+            raise NotImplementedError(f"Not support balance_method {balance_method}")
+        token_final_scales = get_token_final_scales(
+            token_selected_experts.shape, token_selected_experts.device
+        )
+        router_logits = None
+        final_hidden_states = run_moe_orig(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            x_sf,
+            router_logits,
+            do_finalize,
+            moe_output,
+        )
+        if not do_finalize:
+            final_hidden_states = (
+                final_hidden_states[0],
+                token_final_scales,  # WAR for TRTLLMGenFusedMoE bug that it returns wrong `token_final_scales`
+                final_hidden_states[2],
+            )
+        moe_module._routing_results_replaced_at = "make_balanced_run_moe"
+        return final_hidden_states
+
+    return balanced_run_moe
+
+
+def make_forward_impl_check(moe_module, forward_impl_orig):
+    def forward_impl(*args, **kwargs):
+        moe_module._routing_results_replaced_at = None
+        res = forward_impl_orig(*args, **kwargs)
+        assert moe_module._routing_results_replaced_at is not None, (
+            "Routing results are not replaced"
+        )
+        del moe_module._routing_results_replaced_at
+        return res
+
+    return forward_impl
 
 
 class RunnerMixin(ABC):
@@ -423,8 +540,9 @@ class RunnerMixin(ABC):
     @contextlib.contextmanager
     def replace_routing_method_ctx(self, balance_method: BalanceMethod, balance_ratio: float):
         if balance_method == BalanceMethod.NotModified:
-            pass
-        elif self.model_config.moe_backend not in [
+            yield
+            return
+        if self.model_config.moe_backend not in [
             "CUTEDSL",
             "CUTLASS",
             "DEEPGEMM",
@@ -435,22 +553,33 @@ class RunnerMixin(ABC):
                 f'Not support replace routing method for moe_backend "{self.model_config.moe_backend}",'
                 f' please set balance_method to "NotModified"'
             )
-        elif (
-            self.model_config.moe_backend == "TRTLLM"
-            and not self.model_config.mapping.enable_attention_dp
-        ):
-            raise NotImplementedError(
-                'Not support replace routing method for moe_backend "TRTLLM" with attention TP,'
-                ' please set balance_method to "NotModified"'
-            )
+        original_methods = []
         dp_rank = self.model_config.mapping.rank // (
             self.model_config.mapping.world_size // self.model_config.mapping.dp_size
         )
-        apply_methods_orig = [layer.mlp.experts.routing_method.apply for layer in self.layers]
-        try:
-            for layer, apply_method_orig in zip(self.layers, apply_methods_orig):
-                layer.mlp.experts.routing_method.apply = make_balanced_routing_method(
-                    apply_method_orig,
+        for layer in self.layers:
+            moe_module = layer.mlp.experts
+
+            # Replace `routing_method.apply` for normal cases
+            apply_method_orig = moe_module.routing_method.apply
+            moe_module.routing_method.apply = make_balanced_routing_method(
+                moe_module,
+                apply_method_orig,
+                moe_module.num_experts,
+                balance_method,
+                balance_ratio,
+                self.model_config.mapping.dp_size,
+                dp_rank,
+                self.model_config.mapping.moe_ep_size,
+            )
+
+            # Replace `run_moe` for TRTLLMGenFusedMoE TEP because it does not call `routing_method.apply`
+            if isinstance(moe_module, TRTLLMGenFusedMoE):
+                run_moe_orig = moe_module.run_moe
+                moe_module.run_moe = make_balanced_run_moe(
+                    moe_module,
+                    run_moe_orig,
+                    layer.mlp.experts.routing_method.top_k,
                     layer.mlp.experts.num_experts,
                     balance_method,
                     balance_ratio,
@@ -458,10 +587,25 @@ class RunnerMixin(ABC):
                     dp_rank,
                     self.model_config.mapping.moe_ep_size,
                 )
+            else:
+                run_moe_orig = None
+
+            # Replace `forward_impl` to ensure that routing results are replaced
+            forward_impl_orig = moe_module.forward_impl
+            moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
+
+            original_methods.append((apply_method_orig, run_moe_orig, forward_impl_orig))
+        try:
             yield
         finally:
-            for layer, apply_method_orig in zip(self.layers, apply_methods_orig):
-                layer.mlp.experts.routing_method.apply = apply_method_orig
+            for layer, (apply_method_orig, run_moe_orig, forward_impl_orig) in zip(
+                self.layers, original_methods
+            ):
+                moe_module = layer.mlp.experts
+                moe_module.routing_method.apply = apply_method_orig
+                if isinstance(moe_module, TRTLLMGenFusedMoE):
+                    moe_module.run_moe = run_moe_orig
+                moe_module.forward_impl = forward_impl_orig
 
     @staticmethod
     def create_kv_cache_manager(
