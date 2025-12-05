@@ -11,7 +11,8 @@ from tensorrt_llm.logger import logger
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor, ceil_div)
 from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
 
@@ -75,6 +76,7 @@ class CutlassFusedMoE(MoE):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         init_load_balancer: bool = True,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
         super().__init__(
@@ -92,6 +94,7 @@ class CutlassFusedMoE(MoE):
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
         # Store original hidden size before any potential padding
@@ -153,14 +156,22 @@ class CutlassFusedMoE(MoE):
                 self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                     model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
-                workspace_mb = int(
-                    os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "2048"))
+                # Calculate required workspace size
+                ep_size = self.mapping.moe_ep_size
+                max_num_tokens = model_config.max_num_tokens
+                hidden_size = self.hidden_size
+                dtype = self.dtype or torch.float16
+
+                workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+                    ep_size, self.routing_method.experts_per_token,
+                    max_num_tokens, hidden_size, dtype)
+
                 self.moe_a2a = MoeAlltoAll(
                     mapping=self.mapping,
                     max_num_tokens=model_config.max_num_tokens,
                     top_k=self.routing_method.experts_per_token,
                     num_experts=self.num_slots,
-                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                    workspace_size_per_rank=workspace_size,
                 )
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
@@ -426,6 +437,14 @@ class CutlassFusedMoE(MoE):
             elif self.has_int8_woq_per_channel:
                 use_int8_woq_per_channel = True
             elif self.has_nvfp4:
+                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    assert not isinstance(
+                        x, Fp4QuantizedTensor
+                    ), "Fp4QuantizedTensor is not expected for AWQ quantization."
+                    x = x * self.fc31_act_scale
                 if run_post_quant_allgather or self.enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"

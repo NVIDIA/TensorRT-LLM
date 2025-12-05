@@ -8,21 +8,14 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
                                              PatternMatcherPass, fwd_only,
                                              register_replacement)
 
-import tensorrt_llm
-
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
 from tensorrt_llm.mapping import Mapping
 
 
-def register_ar_residual_norm(custom_pass: PatternMatcherPass):
-    # TODO: add pp + tp support
-    mapping = Mapping(
-        world_size=tensorrt_llm.mpi_world_size(),
-        tp_size=tensorrt_llm.mpi_world_size(),
-        rank=tensorrt_llm.mpi_rank(),
-    )
+def register_ar_residual_norm(custom_pass: PatternMatcherPass,
+                              mapping: Mapping):
     residual_key = KeywordArg("residual")
     trtllm_allreduce_default = CallFunction(
         torch.ops.trtllm.allreduce.default, KeywordArg("input"), None, None,
@@ -117,14 +110,8 @@ def check_non_ub_strategy(match, strategy_node) -> bool:
     return True
 
 
-def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass):
-    # TODO: add pp + tp support
-    mapping = Mapping(
-        world_size=tensorrt_llm.mpi_world_size(),
-        tp_size=tensorrt_llm.mpi_world_size(),
-        rank=tensorrt_llm.mpi_rank(),
-    )
-
+def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
+                                            mapping: Mapping):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
     allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
@@ -200,14 +187,8 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass):
     )
 
 
-def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass):
-    # TODO: add pp + tp support
-    mapping = Mapping(
-        world_size=tensorrt_llm.mpi_world_size(),
-        tp_size=tensorrt_llm.mpi_world_size(),
-        rank=tensorrt_llm.mpi_rank(),
-    )
-
+def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
+                                        mapping: Mapping):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
     allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
@@ -282,14 +263,8 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass):
     )
 
 
-def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass):
-    # TODO: add pp + tp support
-    mapping = Mapping(
-        world_size=tensorrt_llm.mpi_world_size(),
-        tp_size=tensorrt_llm.mpi_world_size(),
-        rank=tensorrt_llm.mpi_rank(),
-    )
-
+def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
+                                            mapping: Mapping):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
     allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
@@ -360,14 +335,8 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass):
     )
 
 
-def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass):
-    # TODO: add pp + tp support
-    mapping = Mapping(
-        world_size=tensorrt_llm.mpi_world_size(),
-        tp_size=tensorrt_llm.mpi_world_size(),
-        rank=tensorrt_llm.mpi_rank(),
-    )
-
+def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
+                                        mapping: Mapping):
     input_node = KeywordArg("input")
     strategy_node = KeywordArg("strategy")
     allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
@@ -437,12 +406,8 @@ def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass):
     )
 
 
-def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
-    mapping = Mapping(
-        world_size=tensorrt_llm.mpi_world_size(),
-        tp_size=tensorrt_llm.mpi_world_size(),
-        rank=tensorrt_llm.mpi_rank(),
-    )
+def register_ub_patterns(custom_passes: List[PatternMatcherPass],
+                         mapping: Mapping):
 
     def register_convert_supported_ar_to_ub(custom_pass: PatternMatcherPass):
         strategy = int(AllReduceStrategy.AUTO)
@@ -554,11 +519,24 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             )
 
         def register_nvfp4_gemm_prologue(custom_pass: PatternMatcherPass):
+            act_fp4_key = KeywordArg('act_fp4')
+            weight_key = KeywordArg('weight')
+            act_sf_key = KeywordArg('act_sf')
+            weight_scale_key = KeywordArg('weight_scale')
+            alpha_key = KeywordArg('alpha')
+            output_dtype_key = KeywordArg('output_dtype')
+            to_userbuffers_key = KeywordArg('to_userbuffers')
+            backend_key = KeywordArg('backend')
             trtllm_nvfp4_gemm_default = CallFunction(
-                torch.ops.trtllm.nvfp4_gemm.default, KeywordArg('act_fp4'),
-                KeywordArg('weight'), KeywordArg('act_sf'),
-                KeywordArg('weight_scale'), KeywordArg('alpha'),
-                KeywordArg('output_dtype'))
+                torch.ops.trtllm.nvfp4_gemm.default,
+                act_fp4_key,
+                weight_key,
+                act_sf_key,
+                weight_scale_key,
+                alpha_key,
+                output_dtype_key,
+                to_userbuffers=to_userbuffers_key,
+                backend=backend_key)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
 
@@ -569,6 +547,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                backend: str,
             ):
                 return
 
@@ -579,14 +559,28 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
+                to_userbuffers: bool,
+                backend: str,
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    True)
+                    True, backend)
                 return nvfp4_gemm_output
 
-            # No extra check needed as the output dtype of nvfp4_gemm has been verified when
-            # ub_copy is inserted.
+            def extra_check(match: Match) -> bool:
+                # Validate backend value
+                backend_value = match.kwargs.get('backend')
+                if backend_value is None:
+                    # No backend specified, use default - OK
+                    return True
+
+                # backend should be a string literal
+                if not isinstance(backend_value, str):
+                    return False
+
+                valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
+                return backend_value in valid_backends
+
             register_replacement(
                 empty_nvfp4_gemm_prologue_pattern,
                 target_nvfp4_gemm_prologue_pattern,
@@ -594,6 +588,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
+                extra_check=extra_check,
             )
 
         def register_mm_prologue(custom_pass: PatternMatcherPass):
@@ -717,16 +712,16 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
 
 
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
-                        enable_ub: bool):
-    register_ar_residual_norm(custom_passes[-1])
+                        mapping: Mapping, enable_ub: bool):
+    register_ar_residual_norm(custom_passes[-1], mapping)
 
     custom_passes.append(PatternMatcherPass())
-    register_ar_residual_norm_fp8_quant(custom_passes[-1])
-    register_ar_residual_norm_fp4_quant(custom_passes[-1])
+    register_ar_residual_norm_fp8_quant(custom_passes[-1], mapping)
+    register_ar_residual_norm_fp4_quant(custom_passes[-1], mapping)
     # AR-Residual-Norm-Out-Quant-X is not supported by Userbuffers kernel.
     if not enable_ub:
-        register_ar_residual_norm_out_fp8_quant(custom_passes[-1])
-        register_ar_residual_norm_out_fp4_quant(custom_passes[-1])
+        register_ar_residual_norm_out_fp8_quant(custom_passes[-1], mapping)
+        register_ar_residual_norm_out_fp4_quant(custom_passes[-1], mapping)
 
     if enable_ub:
-        register_ub_patterns(custom_passes)
+        register_ub_patterns(custom_passes, mapping)

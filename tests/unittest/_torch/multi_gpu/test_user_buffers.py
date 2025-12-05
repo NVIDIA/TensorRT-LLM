@@ -33,6 +33,14 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+def create_tp_mapping(tp_size, rank):
+    return Mapping(
+        world_size=tp_size,
+        tp_size=tp_size,
+        rank=rank,
+    )
+
+
 def init_userbuffers_allocator(tp_size, rank, max_ub_size):
     ub.initialize_userbuffers_manager(tp_size, 1, 1, rank,
                                       torch.cuda.device_count(), max_ub_size,
@@ -126,11 +134,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        mapping = Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=rank,
-        )
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
         ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
@@ -217,11 +221,8 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        mapping = Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=rank,
-        )
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
+
         ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
@@ -322,11 +323,8 @@ class UBTestModel(nn.Module):
         quant_config.layer_quant_mode
         self.rank = rank
         self.tp_size = tp_size
-        mapping = Mapping(
-            world_size=tp_size,
-            tp_size=tp_size,
-            rank=rank,
-        )
+        mapping = create_tp_mapping(tp_size, rank)
+
         self.l0 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
@@ -452,7 +450,9 @@ def run_single_rank_ub_pass(
             quant(l3_weight, l3_weight_scale), l3_input_scale, l3_weight_scale,
             quant(l4_weight, l4_weight_scale), l4_input_scale, l4_weight_scale,
             norm0_gamma, norm1_gamma, norm2_gamma)
-        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_fused = model_opt(input)
@@ -602,11 +602,7 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        mapping = Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=rank,
-        )
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
         ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
@@ -688,11 +684,7 @@ class UBMMAddModel(nn.Module):
         self.rank = rank
         self.hidden_size = hidden_size
         self.dtype = dtype
-        mapping = Mapping(
-            world_size=tp_size,
-            tp_size=tp_size,
-            rank=rank,
-        )
+        mapping = create_tp_mapping(tp_size, rank)
         self.ar_0 = AllReduce(mapping=mapping).cuda()
         self.ar_1 = AllReduce(mapping=mapping).cuda()
         self.ar_2 = AllReduce(mapping=mapping).cuda()
@@ -748,7 +740,9 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
         init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
         model = UBMMAddModel(tensor_parallel_size, rank, hidden_size, dtype,
                              eps, norm0_gamma, norm1_gamma, norm2_gamma)
-        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_fused = model_opt(mm0_input_0, mm0_input_1, mm1_input_0,
@@ -819,59 +813,40 @@ class UBFp4TestModel(nn.Module):
         quant_config.layer_quant_mode
         self.rank = rank
         self.tp_size = tp_size
+        mapping = create_tp_mapping(tp_size, rank)
         self.l0 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
                          quant_config=quant_config).cuda()
         self.l1 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
                          quant_config=quant_config).cuda()
         self.l2 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
                          quant_config=quant_config).cuda()
         self.l3 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
                          quant_config=quant_config).cuda()
         self.l4 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
                          quant_config=quant_config).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -1006,7 +981,9 @@ def run_single_rank_ub_pass_fp4(
             l4_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
             l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)
 
-        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_ref = model(input)

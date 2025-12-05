@@ -206,8 +206,7 @@ class ReportUtility:
             self.get_max_draft_len())
         self.streaming = streaming
 
-    @staticmethod
-    def _query_gpu_info() -> Dict[str, Any]:
+    def _query_gpu_info(self) -> Dict[str, Any]:
         """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
         if not torch.cuda.is_available():
             return None
@@ -227,13 +226,22 @@ class ReportUtility:
                 None,
             }
             if pynvml:
-                # Memory clock information is not reported by torch, using NVML instead
-                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
-                gpu_info["clocks.mem"] = pynvml.nvmlDeviceGetMaxClockInfo(
-                    handle, pynvml.NVML_CLOCK_MEM) / 1000.0
-            return gpu_info
-        except (RuntimeError, AssertionError):
+                try:
+                    # Memory clock information is not reported by torch, using NVML instead
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+                    clocks_mem = pynvml.nvmlDeviceGetMaxClockInfo(
+                        handle, pynvml.NVML_CLOCK_MEM) / 1000.0
+                    gpu_info["clocks.mem"] = clocks_mem
+                except pynvml.NVMLError as e:
+                    self.logger.info(
+                        f"Error querying GPU clock info with NVML: {e}")
+                    gpu_info["clocks.mem"] = None
+        except Exception as e:
+            # broad catch for any other errors, since this is a non-critical operation
+            self.logger.warning(f"Error querying GPU info: {e}")
             return None
+        return gpu_info
 
     @staticmethod
     def convert_to_ms(ns: float) -> float:

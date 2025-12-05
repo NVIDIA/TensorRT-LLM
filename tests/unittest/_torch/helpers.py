@@ -93,9 +93,12 @@ def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
     return atol
 
 
-def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
-                        final_scales: torch.Tensor, num_experts: int,
-                        weights: Dict[str, torch.Tensor]) -> torch.Tensor:
+def reference_moe_torch(x: torch.Tensor,
+                        selected_experts: torch.Tensor,
+                        final_scales: torch.Tensor,
+                        num_experts: int,
+                        weights: Dict[str, torch.Tensor],
+                        apply_routing_on_input: bool = False) -> torch.Tensor:
     # cast back to the input dtype
     results = torch.zeros_like(x)
 
@@ -106,9 +109,63 @@ def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
         w2_weight = weights[f"{expert_id}.w2.weight"]
         w3_weight = weights[f"{expert_id}.w3.weight"]
         expert_inputs = x[batch_idx]
+        if apply_routing_on_input:
+            expert_inputs = expert_inputs * final_scales[batch_idx, nth_expert,
+                                                         None]
         output = (F.silu(expert_inputs @ w1_weight.t()) *
                   (expert_inputs @ w3_weight.t())) @ w2_weight.t()
-        results[batch_idx] += final_scales[batch_idx, nth_expert, None] * output
+        if not apply_routing_on_input:
+            output = output * final_scales[batch_idx, nth_expert, None]
+        results[batch_idx] += output
+
+    return results.view_as(x)
+
+
+def reference_bmm_moe_torch(
+        x: torch.Tensor,
+        selected_experts: torch.Tensor,
+        final_scales: torch.Tensor,
+        w3_w1_stacked_weight: torch.Tensor,
+        w2_stacked_weight: torch.Tensor,
+        apply_routing_on_input: bool = True) -> torch.Tensor:
+    """Reference for stacked MoE in TRT-LLM format.
+
+    Args:
+        x: (seq_len, hidden_size)
+        selected_experts: (seq_len, topk)
+        final_scales: (seq_len, topk)
+        w3_w1_stacked_weight: (num_experts, 2*intermediate_size, hidden_size) - TRT-LLM format
+        w2_stacked_weight: (num_experts, hidden_size, intermediate_size) - TRT-LLM format
+    """
+    num_experts = w3_w1_stacked_weight.shape[0]
+    intermediate_size = w3_w1_stacked_weight.shape[1] // 2
+    results = torch.zeros_like(x)
+
+    # Loop over experts (matches reference_moe_torch pattern)
+    for expert_id in range(num_experts):
+        batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+        if len(batch_idx) == 0:
+            continue
+
+        # Get weights for this expert (TRT-LLM format)
+        gate_up = w3_w1_stacked_weight[expert_id]  # (2*I, H)
+        w3_weight = gate_up[:intermediate_size, :]  # (I, H)
+        w1_weight = gate_up[intermediate_size:, :]  # (I, H)
+        w2_weight = w2_stacked_weight[expert_id]  # (H, I)
+
+        expert_inputs = x[batch_idx]
+        if apply_routing_on_input:
+            expert_inputs = expert_inputs * final_scales[batch_idx, nth_expert,
+                                                         None]
+
+        # Gated MLP computation - TRT-LLM format uses .t()
+        output = (F.silu(expert_inputs @ w1_weight.t()) *
+                  (expert_inputs @ w3_weight.t())) @ w2_weight.t()
+
+        if not apply_routing_on_input:
+            output = output * final_scales[batch_idx, nth_expert, None]
+
+        results[batch_idx] += output
 
     return results.view_as(x)
 

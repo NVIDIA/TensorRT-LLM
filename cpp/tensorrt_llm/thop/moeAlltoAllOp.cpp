@@ -237,7 +237,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
     int64_t sizePerRank = workspace.size(1);
     int64_t requiredSize = offsets[PAYLOAD_DATA_OFFSET_INDEX] + totalBytesNeeded;
     TORCH_CHECK(sizePerRank >= requiredSize,
-        "Workspace size per rank insufficient. "
+        "Workspace size per rank insufficient for dispatch. "
         "Need at least ",
         requiredSize, " bytes (", offsets[PAYLOAD_DATA_OFFSET_INDEX], " for auxiliary data + ", totalBytesNeeded,
         " for payloads), but got ", sizePerRank);
@@ -404,8 +404,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     int64_t payloadSize = payload.numel() * payload.element_size();
     TORCH_CHECK(combinePayloadOffset >= 0 && combinePayloadOffset + payloadSize <= sizePerRank,
-        "workspace does not contain enough space for the payload region for combine. combine payload offset=",
-        combinePayloadOffset, ", payload size needed=", payloadSize, ", workspace size per rank=", sizePerRank);
+        "Workspace size per rank insufficient for combine. "
+        "Need at least ",
+        combinePayloadOffset + payloadSize, " bytes (", combinePayloadOffset, " for offset + ", payloadSize,
+        " for payload), but got ", sizePerRank);
 
     // Create output tensor (local on current rank), no need for initialization
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
@@ -508,6 +510,13 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
     return t;
 }
 
+// Return the size of auxiliary data in workspace
+int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens)
+{
+    MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens));
+    return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+}
+
 } // namespace moe_comm
 
 } // namespace torch_ext
@@ -536,6 +545,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int "
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
+    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens) -> int",
+        &torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)

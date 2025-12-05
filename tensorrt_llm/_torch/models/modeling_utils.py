@@ -18,7 +18,7 @@ from tensorrt_llm.models.convert_utils import split_matrix_tp
 from ...logger import logger
 from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
-from ..distributed.communicator import pp_recv, pp_send
+from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
@@ -71,6 +71,7 @@ class MetaInitMode(TorchDispatchMode):
     random_init_ops = {
         aten.normal_.default,
         aten.uniform_.default,
+        aten.log.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
 
@@ -172,11 +173,12 @@ def forward_after_recv(forward_fn):
         residual=...,
         **kwargs,
     ):
-        pp_recv(hidden_states)
         if residual is not ...:
             if residual is None:
                 residual = torch.empty_like(hidden_states)
-            pp_recv(residual)
+            pp_recv_tensors([hidden_states, residual])
+        else:
+            pp_recv_tensors([hidden_states])
         return forward_fn(
             position_ids,
             hidden_states,
@@ -209,11 +211,10 @@ def forward_before_send(forward_fn):
         )
         if residual is not ...:
             hidden_states, residual = output
-            pp_send(hidden_states)
-            pp_send(residual)
+            pp_send_tensors([hidden_states, residual])
         else:
             hidden_states = output
-            pp_send(hidden_states)
+            pp_send_tensors([hidden_states])
         return output
 
     forward_before_send_fn.__wrapped_by_forward_before_send__ = True
@@ -381,6 +382,7 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
             )

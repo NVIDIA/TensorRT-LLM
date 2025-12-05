@@ -32,6 +32,11 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._torch.auto_deploy.models.patches.nemotron_h import (
+    _nemotron_h_moe_forward,
+    _nemotron_h_topk_router_forward,
+)
+
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, group_size, eps=1e-5):
@@ -261,6 +266,8 @@ class NemotronHBlock(nn.Module):
             self.mixer = NemotronHAttention(config, layer_idx=layer_idx)
         elif self.block_type == "mlp":
             self.mixer = NemotronHMLP(config, layer_idx=layer_idx)
+        elif self.block_type == "moe":
+            self.mixer = NemotronHMOE(config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Invalid layer pattern {config.hybrid_override_pattern[layer_idx]}")
 
@@ -277,18 +284,62 @@ class NemotronHBlock(nn.Module):
 
 # Copied from transformers.models.nemotron.modeling_nemotron Nemotron->NemotronH
 class NemotronHMLP(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, intermediate_size: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = intermediate_size or config.intermediate_size
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.mlp_hidden_act]
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.up_proj(x)))
+
+
+class NemotronHMOE(nn.Module):
+    def __init__(self, config, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList(
+            [
+                NemotronHMLP(
+                    config, intermediate_size=config.moe_intermediate_size, layer_idx=layer_idx
+                )
+                for _ in range(config.n_routed_experts)
+            ]
+        )
+        self.gate = NemotronHTopkRouter(config)
+        self.shared_experts = NemotronHMLP(
+            config=config,
+            intermediate_size=config.moe_shared_expert_intermediate_size,
+            layer_idx=layer_idx,
+        )
+
+    # TODO: inline code from `_nemotron_h_moe_forward` when removing patches.
+    forward = _nemotron_h_moe_forward
+
+
+class NemotronHTopkRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "e_score_correction_bias", torch.zeros(self.n_routed_experts, dtype=torch.float32)
+        )
+
+    forward = _nemotron_h_topk_router_forward
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -544,4 +595,6 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
 
 
 # TODO: uncomment after removing patches (and make sure it is imported in `__init__.py`).
+# from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+#
 # AutoModelForCausalLMFactory.register_custom_model_cls("NemotronHConfig", NemotronHForCausalLM)

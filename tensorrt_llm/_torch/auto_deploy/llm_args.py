@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
+from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, SamplerType, _ParallelConfig
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -130,6 +130,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "supported in AutoDeploy.",
     )
 
+    sampler_type: Union[str, SamplerType] = Field(
+        default=SamplerType.TorchSampler,
+        description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
+    )
+
     # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
     # see https://github.com/NVIDIA/TensorRT-LLM/issues/7142
     kv_cache_config: KvCacheConfig = Field(
@@ -183,6 +188,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             " be used to determine the batch sizes.",
             "cuda_graph_batch_sizes",
         ),
+    )
+
+    draft_checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################

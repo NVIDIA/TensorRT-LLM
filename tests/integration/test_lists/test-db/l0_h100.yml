@@ -33,6 +33,8 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_nemotron"
   - unittest/_torch/modeling -k "modeling_gemma3"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:float32]
+  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:None]
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
@@ -63,6 +65,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=eagle-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=vanilla-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=fp8-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=False-fp8kv=False-overlap_scheduler=True]
@@ -113,6 +116,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8
   - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_bf16
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec[1]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec[4]
 - condition:
     ranges:
       system_gpu_count:
@@ -138,7 +143,7 @@ l0_h100:
     - unittest/_torch/executor
     - unittest/_torch/ray_orchestrator/single_gpu
     - unittest/llmapi/test_llm_pytorch.py
-    - examples/test_ray.py::test_llm_inference_async_ray[no_rpc]
+    - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
     ranges:
       system_gpu_count:
@@ -395,6 +400,7 @@ l0_h100:
   - examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16]
   - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
   - unittest/trt/attention/test_gpt_attention_no_cache.py
+  - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
 - condition:
     ranges:
       system_gpu_count:

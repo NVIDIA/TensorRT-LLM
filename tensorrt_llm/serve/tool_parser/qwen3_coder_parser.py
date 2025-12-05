@@ -16,17 +16,6 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 )
 
 
-def _safe_val(raw: str) -> Any:
-    raw = html.unescape(raw.strip())
-    try:
-        return json.loads(raw)
-    except Exception:
-        try:
-            return ast.literal_eval(raw)
-        except Exception:
-            return raw
-
-
 class Qwen3CoderToolParser(BaseToolParser):
     """Tool parser for Qwen 3 models.
 
@@ -163,7 +152,8 @@ class Qwen3CoderToolParser(BaseToolParser):
             # Parse parameters incrementally
             if self._function_name_sent:
                 # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf)
+                param_config = self._get_arguments_config(self._current_function_name, tools)
+                parameter_calls = self._parse_and_stream_parameters(self._buf, param_config)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
@@ -199,7 +189,9 @@ class Qwen3CoderToolParser(BaseToolParser):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
+    def _parse_and_stream_parameters(
+        self, text_to_parse: str, param_config: dict
+    ) -> List[ToolCallItem]:
         """Parse complete parameter blocks from text and return any tool call items to emit.
 
         This method:
@@ -226,7 +218,9 @@ class Qwen3CoderToolParser(BaseToolParser):
         for match in param_matches:
             param_name = match.group(1).strip()
             param_value = match.group(2)
-            new_params[param_name] = _safe_val(param_value)
+            new_params[param_name] = self._convert_param_value(
+                param_value, param_name, param_config, self._current_function_name
+            )
 
         # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
@@ -327,14 +321,16 @@ class Qwen3CoderToolParser(BaseToolParser):
                 pidx = ptxt.index(">")
                 pname = ptxt[:pidx].strip()
                 pval = ptxt[pidx + 1 :].lstrip("\n").rstrip("\n")
-                params[pname] = _safe_val(pval)
+                # Convert parameter value to the correct type.
+                param_config = self._get_arguments_config(fname, tools)
+                params[pname] = self._convert_param_value(pval, pname, param_config, fname)
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function
                 # call will always be -1 in parse_base_json
                 res.extend(self.parse_base_json(raw, tools))
             except Exception:
-                logger.warning("invalid tool call for %s dropped", fname)
+                logger.warning(f"invalid tool call for {fname} dropped")
         return res
 
     def supports_structural_tag(self) -> bool:
@@ -342,3 +338,110 @@ class Qwen3CoderToolParser(BaseToolParser):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def _get_arguments_config(self, func_name: str, tools: list[Tool] | None) -> dict:
+        """Extract argument configuration for a function."""
+        # Copy from `vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py`.
+        if tools is None:
+            return {}
+        for config in tools:
+            if not hasattr(config, "type") or not (
+                hasattr(config, "function") and hasattr(config.function, "name")
+            ):
+                continue
+            if config.type == "function" and config.function.name == func_name:
+                if not hasattr(config.function, "parameters"):
+                    return {}
+                params = config.function.parameters
+                if isinstance(params, dict) and "properties" in params:
+                    return params["properties"]
+                elif isinstance(params, dict):
+                    return params
+                else:
+                    return {}
+        logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
+        return {}
+
+    def _convert_param_value(
+        self, param_value: str, param_name: str, param_config: dict, func_name: str
+    ) -> Any:
+        """Convert parameter value based on its type in the schema."""
+        # Copy and modify from `vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py`.
+        param_value = html.unescape(param_value.strip())
+        if param_value.lower() == "null":
+            return None
+
+        if param_name not in param_config:
+            if param_config != {}:
+                logger.warning(
+                    f"Parsed parameter '{param_name}' is not defined in the tool "
+                    f"parameters for tool '{func_name}', directly returning the string value."
+                )
+            return param_value
+
+        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
+            param_type = str(param_config[param_name]["type"]).strip().lower()
+        else:
+            param_type = "string"
+
+        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+            return param_value
+        elif (
+            param_type.startswith("int")
+            or param_type.startswith("uint")
+            or param_type.startswith("long")
+            or param_type.startswith("short")
+            or param_type.startswith("unsigned")
+        ):
+            try:
+                return int(param_value)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an "
+                    f"integer in tool '{func_name}', degenerating to string."
+                )
+                return param_value
+        elif param_type.startswith("num") or param_type.startswith("float"):
+            try:
+                float_param_value = float(param_value)
+                return (
+                    float_param_value
+                    if float_param_value - int(float_param_value) != 0
+                    else int(float_param_value)
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float "
+                    f"in tool '{func_name}', degenerating to string."
+                )
+                return param_value
+        elif param_type in ["boolean", "bool", "binary"]:
+            param_value = param_value.lower()
+            if param_value not in ["true", "false"]:
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean "
+                    f"(`true` or `false`) in tool '{func_name}', degenerating to false."
+                )
+            return param_value == "true"
+        else:
+            if (
+                param_type in ["object", "array", "arr"]
+                or param_type.startswith("dict")
+                or param_type.startswith("list")
+            ):
+                try:
+                    param_value = json.loads(param_value)
+                    return param_value
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    logger.warning(
+                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
+                        f"parsed with json.loads in tool '{func_name}', will try other methods to parse it."
+                    )
+            try:
+                param_value = ast.literal_eval(param_value)  # safer
+            except (ValueError, SyntaxError, TypeError):
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
+                    f"converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                )
+            return param_value

@@ -1,5 +1,6 @@
 import enum
 import random
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
@@ -697,8 +698,6 @@ def create_input_processor_with_hash(
                     input_processor.multimodal_hashing_supported = True
                 return prompt_token_ids, extra_processed_inputs
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 logger.warning(f"Multimodal hashing failed: {e}.")
                 if try_multimodal_hashing:
                     # if trying for first time, fall back to basic input processor
@@ -708,9 +707,8 @@ def create_input_processor_with_hash(
                     try:
                         return input_processor(inputs, sampling_params)
                     except Exception as e2:
-                        import traceback
-                        traceback.print_exc()
                         logger.warning(f"Basic input processor failed: {e}.")
+                        logger.debug(traceback.format_exc())
                         raise e2
                 else:
                     raise e
@@ -718,9 +716,8 @@ def create_input_processor_with_hash(
             try:
                 return input_processor(inputs, sampling_params)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 logger.warning(f"Basic input processor failed: {e}.")
+                logger.debug(traceback.format_exc())
                 raise e
 
     return input_processor_wrapper

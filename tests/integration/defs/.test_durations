@@ -640,7 +640,6 @@
     "examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_fp8]": 314.3205590210273,
     "examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_int8_wo]": 329.1954380639363,
     "examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_sq_ootb]": 216.2645359209855,
-    "examples/test_llama.py::test_llm_llama_v2_lora_benchmark_2gpu[chinese_lora-llama-v2-13b-hf]": 3641.9526145930286,
     "examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[disable_gemm_allreduce_plugin-llama-3.1-70b-enable_fp8]": 1654.751242957951,
     "examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-405b-enable_fp8]": 20655.04908744397,
     "examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-405b-fp8-disable_fp8]": 13962.460933016031,

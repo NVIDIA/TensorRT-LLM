@@ -28,11 +28,9 @@
 import copy
 import math
 import os
-import warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
@@ -42,7 +40,6 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -58,6 +55,7 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
+from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -536,6 +534,7 @@ class DeepseekV3Attention(MLA):
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
         mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
@@ -559,7 +558,8 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream,
-                         mapping_with_cp=mapping_with_cp)
+                         mapping_with_cp=mapping_with_cp,
+                         reduce_output=reduce_output)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
@@ -579,6 +579,7 @@ class DeepseekV32Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
@@ -602,7 +603,8 @@ class DeepseekV32Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream)
+                         aux_stream=aux_stream,
+                         reduce_output=reduce_output)
 
         self.indexer = self.mqa.indexer
 
@@ -648,110 +650,7 @@ class DeepseekV32Attention(MLA):
         self.indexer.wk = None
 
 
-class Deepseekv3RoutingImpl():
-
-    def __init__(
-        self,
-        top_k: int,
-        n_group: int,
-        topk_group: int,
-        routed_scaling_factor: float,
-        is_fused: bool = True,
-    ):
-        super().__init__()
-        self.top_k = top_k
-        self.topk_group = topk_group
-        self.n_group = n_group
-        self.routed_scaling_factor = routed_scaling_factor
-        self.is_fused = is_fused
-
-    @staticmethod
-    @torch.compile(options={"max-autotune": True})
-    def get_scores(logits, e_score_correction_bias):
-        scores = F.sigmoid(logits)
-        scores_with_bias = scores + e_score_correction_bias
-        if enable_llm_debug():
-            has_nan = torch.isnan(scores_with_bias).any()
-            if has_nan:
-                warnings.warn(
-                    "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
-                )
-
-        return scores, scores_with_bias
-
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
-
-        _, num_experts = logits.shape
-        if self.n_group > 1:
-            if self.top_k > 8 or (num_experts / n_group) > 32 or (
-                    num_experts / n_group) * self.topk_group > 128:
-                if (self.is_fused):
-                    warnings.warn(
-                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
-                    )
-                self.is_fused = False
-        else:
-            if num_experts > 384 or self.top_k > 8:
-                if (self.is_fused):
-                    warnings.warn(
-                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
-                    )
-                self.is_fused = False
-
-        if not self.is_fused:
-            scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
-                logits, e_score_correction_bias)
-            scores_shape = list(scores_with_bias.shape)
-            group_scores = torch.sum(torch.topk(
-                scores_with_bias.view(scores_shape[:-1] +
-                                      [n_group, scores_shape[-1] // n_group]),
-                k=2,
-                dim=-1,
-                largest=True,
-                sorted=True)[0],
-                                     dim=-1)
-            _, group_idx = torch.topk(group_scores,
-                                      k=self.topk_group,
-                                      dim=-1,
-                                      largest=True,
-                                      sorted=True)
-            group_mask = torch.zeros_like(group_scores)
-            group_mask.scatter_(-1, group_idx, 1)
-            score_mask = group_mask.unsqueeze(-1).expand(
-                scores_shape[:-1] +
-                [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
-            scores_with_bias = scores_with_bias * score_mask
-            _, topk_idx = torch.topk(scores_with_bias,
-                                     k=self.top_k,
-                                     dim=-1,
-                                     largest=True,
-                                     sorted=True)
-            new_mask = torch.zeros_like(scores)
-            new_mask.scatter_(-1, topk_idx, 1)
-            scores = scores * new_mask
-            score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
-            scores = scores / score_sum * self.routed_scaling_factor
-            topk_values, topk_indices = torch.topk(scores,
-                                                   k=self.top_k,
-                                                   dim=-1,
-                                                   largest=True)
-            return topk_values, topk_indices
-        else:
-            topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
-                logits, e_score_correction_bias, n_group, self.topk_group,
-                self.top_k, self.routed_scaling_factor)
-            return topk_values, topk_indices
-
-    def apply(
-        self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_values, topk_indices = self.noaux_tc(logits,
-                                                  e_score_correction_bias)
-        return topk_indices.to(torch.int32), topk_values.to(torch.float32)
-
-
-class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
+class DeepseekV3Gate(nn.Module):
 
     def __init__(
         self,
@@ -766,7 +665,7 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
     ):
-        super().__init__(top_k=top_k)
+        super().__init__()
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
@@ -782,9 +681,7 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
 
         assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
 
-        # TODO: e_score_correction_bias belongs in this gate class but is required by the routing impl.
-        # To avoid weight-loading issues, we treat this gate as the BaseMoeRoutingMethod and dispatch to the routing impl.
-        # This is a temporary hack that should be refactored later.
+        # NOTE: e_score_correction_bias belongs in this gate class but is required by the routing impl.
         self.routing_impl = Deepseekv3RoutingImpl(
             top_k=top_k,
             n_group=n_group,
@@ -808,16 +705,25 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
             weights[0]["e_score_correction_bias"][:].to(
                 self.e_score_correction_bias.dtype))
 
-    def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # topk routing
-        return self.routing_impl.apply(logits, self.e_score_correction_bias)
-
     @property
     def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
-        return self
+        return DeepSeekV3MoeRoutingMethod(
+            top_k=self.routing_impl.top_k,
+            n_group=self.routing_impl.n_group,
+            topk_group=self.routing_impl.topk_group,
+            routed_scaling_factor=self.routing_impl.routed_scaling_factor,
+            is_fused=self.routing_impl.is_fused,
+            # Pass a callable to fetch the tensor from DeepseekV3Gate at runtime, ensuring it is on the correct device
+            callable_e_score_correction_bias=lambda: self.
+            e_score_correction_bias,
+        )
+
+    def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # topk routing
+        return self.routing_method.apply(logits)
 
     def get_experts_per_token(self):
-        return self.routing_impl.top_k
+        return self.routing_method.top_k
 
 
 class Deepseekv3MoE(nn.Module):
@@ -892,8 +798,10 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             reduce_output=False)
 
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+        self.allreduce = None
+        if not self.use_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -1051,6 +959,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.mapping = model_config.mapping
         mapping = self.mapping
+        self.enable_attention_dp = mapping.enable_attention_dp
+        self.mlp_tp_size = mapping.tp_size
+        self.is_p2p_supported = can_access_peer(mapping)
+
         layer_idx_for_attention = layer_idx
         if is_separate_draft_engine:
             #KVCacheManager only support 1 layer for separate draft engine
@@ -1060,17 +972,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention])
+                aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                reduce_output=not self.enable_attention_dp
+                and self.mapping.tp_size > 1)
         else:
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                mapping_with_cp=mapping_with_cp)
-        self.enable_attention_dp = mapping.enable_attention_dp
-
-        self.mlp_tp_size = mapping.tp_size
-        self.is_p2p_supported = can_access_peer(mapping)
+                mapping_with_cp=mapping_with_cp,
+                reduce_output=not self.enable_attention_dp
+                and self.mapping.tp_size > 1)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -1085,12 +997,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             quant_config.quant_algo
             is not QuantAlgo.MIXED_PRECISION), "MIXED_PRECISION is ambiguous"
 
-        has_tp = mapping.has_tp()
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy,
-                                   dtype=config.torch_dtype)
-        self.moe_allreduce = MoEAllReduce(self.mapping)
+        self.allreduce = None
+        self.moe_allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=model_config.allreduce_strategy,
+                                       dtype=config.torch_dtype)
+            self.moe_allreduce = MoEAllReduce(self.mapping)
 
+        has_tp = mapping.has_tp()
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
@@ -1127,7 +1042,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 dtype=config.torch_dtype,
                                 config=model_config,
                                 overridden_tp_size=self.mlp_tp_size,
-                                reduce_output=True)
+                                reduce_output=has_mlp_tp)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1277,8 +1192,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
-            not (hidden_states.shape[0] <= self.moe_allreduce.max_token
-                 and self.fusion_config.POST_MOE_FUSION
+            not (self.fusion_config.POST_MOE_FUSION
+                 and hidden_states.shape[0] <= self.moe_allreduce.max_token
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 

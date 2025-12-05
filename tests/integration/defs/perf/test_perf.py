@@ -1732,6 +1732,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
+        if self._config.num_gpus > 1:
+            benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
 
         #Add extra-llm-api-config.yml for pytorch backend and tensorrt backend with extra flag
         if self._config.backend == "pytorch" or (self._config.backend == ""

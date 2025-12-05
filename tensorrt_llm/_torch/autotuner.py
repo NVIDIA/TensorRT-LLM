@@ -365,11 +365,14 @@ class AutoTunerProfilingCache:
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
+            runner_id is the index in the current runners list
         """
-        for r in runners:
+        for idx, r in enumerate(runners):
             if (cache_key := self.get_cache_key(custom_op, r, input_shapes,
                                                 tuning_config)) in self.cache:
-                return True, *self.cache[cache_key]
+                # Return the current index in runners list, not the cached runner_id
+                cached_runner_id, tactic, min_time = self.cache[cache_key]
+                return True, idx, tactic, min_time
 
         return False, *self.fallback_entry()
 
@@ -849,14 +852,9 @@ class AutoTuner:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
                     logger.warning_once(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
+                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
                         key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    (logger.info_once
-                     if self._log_level_to_info else logger.debug_once)(
-                         f"[Autotuner] Exception captured: {e}",
-                         key=(custom_op, "debug_autotuning_exception"),
-                     )
 
                     # Record the failed profiling combinations
                     self.stats.failed_profiling_count[custom_op].add(
