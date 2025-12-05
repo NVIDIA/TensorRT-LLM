@@ -1,6 +1,5 @@
 import os
 import tempfile
-from typing import List
 
 import openai
 import pytest
@@ -8,40 +7,9 @@ import requests
 import yaml
 
 from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteMMEncoderServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
-
-
-class RemoteMMEncoderServer(RemoteOpenAIServer):
-    """Remote server for testing multimodal encoder endpoints."""
-
-    def __init__(self,
-                 model: str,
-                 cli_args: List[str] = None,
-                 port: int = None) -> None:
-        # Reuse parent initialization but change the command
-        import subprocess
-        import sys
-
-        from tensorrt_llm.llmapi.mpi_session import find_free_port
-
-        self.host = "localhost"
-        self.port = port if port is not None else find_free_port()
-        self.rank = os.environ.get("SLURM_PROCID", 0)
-
-        args = ["--host", f"{self.host}", "--port", f"{self.port}"]
-        if cli_args:
-            args += cli_args
-
-        # Use mm_embedding_serve command instead of regular serve
-        launch_cmd = ["trtllm-serve", "mm_embedding_serve"] + [model] + args
-
-        self.proc = subprocess.Popen(launch_cmd,
-                                     stdout=sys.stdout,
-                                     stderr=sys.stderr)
-        self._wait_for_server(url=self.url_for("health"),
-                              timeout=self.MAX_SERVER_START_WAIT_S)
 
 
 @pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])
