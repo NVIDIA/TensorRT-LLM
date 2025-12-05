@@ -307,6 +307,12 @@ class LinearMethodBase(ABC):
               bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
 
+    @abstractmethod
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
+
     def load_weights(self,
                      module: Linear,
                      weights: List[Dict],
@@ -392,6 +398,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
         else:
             output = F.linear(input, module.weight, bias)
         return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -508,6 +519,11 @@ class FP8QDQLinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -653,6 +669,11 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
             output = output + bias
         return output
 
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
+
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
         # Actually they hold identical values of data_amax / 448.
@@ -766,6 +787,11 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
@@ -945,6 +971,28 @@ class NVFP4LinearMethod(LinearMethodBase):
                                              module.dtype,
                                              to_userbuffers=False,
                                              backend=module.nvfp4_backend)
+        # Take the dim of out_features if padded. Make sure the output is contiguous
+        if output.shape[-1] > module.out_features:
+            output = output[..., :module.out_features].contiguous()
+
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        if isinstance(input, Fp4QuantizedTensor):
+            act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+        elif isinstance(input, tuple):
+            act_fp4, act_sf = input
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input, module.input_scale, module.scaling_vector_size, False)
+
+        output = torch.ops.trtllm.nvfp4_gemm_allreduce(
+            act_fp4, module.weight, act_sf, module.weight_scale, module.alpha,
+            module.dtype, tp_rank, tp_group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -1229,6 +1277,11 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
             output = output + bias
         return output
 
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
+
     def load_weight_scales(
         self,
         weights: List[Dict],
@@ -1396,6 +1449,16 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int], *args, **kwargs):
+        raise NotImplementedError
 
     def load_weight_scales(self,
                            weights: List[Dict],
@@ -2055,6 +2118,7 @@ class Linear(nn.Module):
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_backend: str = "auto",
+        use_fused_gemm_allreduce: bool = False,
     ):
         """
         Args:
@@ -2124,6 +2188,8 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
+        self.use_fused_gemm_allreduce = use_fused_gemm_allreduce and self.quant_config.layer_quant_mode.has_nvfp4(
+        )
 
         self.enable_cuda_core = False
         if torch.cuda.is_available():
@@ -2223,6 +2289,20 @@ class Linear(nn.Module):
                 output = output + lora_result
         return output
 
+    def apply_linear_allreduce(self,
+                               input,
+                               bias,
+                               lora_params: Optional[dict] | None = None,
+                               layer_idx: Optional[int] | None = None):
+        output = self.quant_method.apply_linear_allreduce(
+            self, input, bias, self.tp_rank, self.mapping.tp_group)
+
+        if self.lora is not None and bool(lora_params):
+            lora_result = self.lora(input, lora_params, layer_idx)
+            if lora_result is not None:
+                output = output + lora_result
+        return output
+
     def _maybe_fuse_bias_into_allreduce(
         self,
         bias: Optional[torch.Tensor],
@@ -2249,16 +2329,23 @@ class Linear(nn.Module):
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         if self.tp_mode == TensorParallelMode.ROW:
+            use_fused_gemm_allreduce = self.use_fused_gemm_allreduce and (
+                all_reduce_params is None or
+                (all_reduce_params.enable_allreduce == True
+                 and all_reduce_params.fusion_op == AllReduceFusionOp.NONE))
             bias = None if (self.tp_rank > 0) else self.bias
             if self.reduce_output:
-                fuse_bias = self._maybe_fuse_bias_into_allreduce(
-                    bias, all_reduce_params)
-                bias = None if fuse_bias else bias
-                output = self.apply_linear(input, bias, lora_params, layer_idx)
-                output = self.all_reduce(
-                    output,
-                    all_reduce_params=all_reduce_params,
-                )
+                if use_fused_gemm_allreduce:
+                    output = self.apply_linear_allreduce(
+                        input, bias, lora_params, layer_idx)
+                else:
+                    fuse_bias = self._maybe_fuse_bias_into_allreduce(
+                        bias, all_reduce_params)
+                    bias = None if fuse_bias else bias
+                    output = self.apply_linear(input, bias, lora_params,
+                                               layer_idx)
+                    output = self.all_reduce(
+                        output, all_reduce_params=all_reduce_params)
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
