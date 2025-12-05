@@ -21,6 +21,7 @@ hardware:
   gpus_per_node: 4
   num_ctx_servers: 2
   num_gen_servers: 1
+  gpu_type: GB200
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false

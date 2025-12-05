@@ -477,6 +477,7 @@ class ConfigLoader:
             ("environment", "work_dir"): lambda: EnvManager.get_script_dir(),
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
+            ("hardware", "gpu_type"): lambda: EnvManager.get_gpu_type(),
         }
 
         # Apply overrides based on field paths
