@@ -7,6 +7,22 @@ export mistral_large_3_model_path=<mistral_large_3_model_path>
 export mistral_large_3_eagle_model_path=<mistral_large_3_eagle_model_path>
 ```
 
+## Multimodal run
+
+* Run the Mistral Large V3 by `quickstart_multimodal.py`
+
+```bash
+mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_multimodal.py \
+    --model_dir ${mistral_large_3_model_path} \
+    --tp_size 4 \
+    --moe_ep_size 4 \
+    --max_tokens 100 \
+    --checkpoint_format mistral_large_3 \
+    --model_type mistral3 \ 
+    --kv_cache_fraction 0.25 \
+    --moe_backend TRTLLM # optional
+```
+
 ## LLM-only run
 
 * Run the Mistral Large V3 by `quickstart_advanced.py`

@@ -9,8 +9,7 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
 import torch
 from PIL import Image
 from torch import Tensor, nn
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedTokenizerBase)
+from transformers import (AutoProcessor, PretrainedConfig, PreTrainedTokenizerBase)
 
 import tensorrt_llm
 
@@ -595,16 +594,13 @@ def create_input_processor(
 
         # FIXME support both HF and mistral-common paths in a better way
         if tokenizer is None:
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_path_or_dir,
-                    config=config,
-                    use_fast=True,
-                    trust_remote_code=True)
+            from tensorrt_llm._torch.models.modeling_mistral import \
+                MistralCommonInputProcessor
+            tokenizer = MistralCommonInputProcessor.load_tokenizer(
+                model_path_or_dir, config=None)
 
-            except ValueError:
-                from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
-                tokenizer = MistralTokenizer.from_pretrained(model_path_or_dir)
+        print(f"loaded tokenizer: {type(tokenizer)}")
+
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")

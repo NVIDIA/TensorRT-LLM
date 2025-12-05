@@ -336,14 +336,12 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         if tokenizer is not None:
             self._tokenizer = tokenizer
         else:
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    model_path,
-                    config=config,
-                    use_fast=self.use_fast,
-                    trust_remote_code=trust_remote_code)
-            except ValueError:
-                self._tokenizer = MistralTokenizer.from_pretrained(model_path)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                config=config,
+                use_fast=self.use_fast,
+                trust_remote_code=trust_remote_code)
+
         self._model_path = model_path
         if isinstance(self._tokenizer, MistralTokenizer):
             self._processor = MistralCommonImageProcessor(
@@ -353,6 +351,9 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
                 model_path,
                 use_fast=self.use_fast,
                 trust_remote_code=trust_remote_code)
+        
+        logger.debug(f"Mistral3InputProcessor: using {type(self._processor)} preprocessor")
+        logger.debug(f"Mistral3InputProcessor: using {type(self._tokenizer)} tokenizer")
 
     @property
     def config(self) -> PretrainedConfig:
@@ -443,6 +444,37 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             self.processor.image_end_token_id,
         ])
 
+class MistralCommonInputProcessor(Mistral3InputProcessor):
+    def __init__(
+        self,
+        model_path: str,
+        config: PretrainedConfig,
+        tokenizer: Optional[AutoTokenizer],
+        trust_remote_code: bool = False,
+        **kwargs,
+    ):
+        tokenizer = self.load_tokenizer(model_path, config=config)
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         **kwargs)
+
+    @staticmethod
+    def load_tokenizer(model_path: str, config: PretrainedConfig, checkpoint_format: Optional[str] = "mistral_large_3"):
+        if checkpoint_format == "mistral_large_3":
+            try:
+                return MistralTokenizer.from_pretrained(model_path)
+            
+            except ValueError:
+                logger.info(f"Could not load mistral-common tokenizer from {model_path}, falling back to HuggingFace")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+                    model_path,
+                    config=config,
+                    use_fast=True,
+                    trust_remote_code=True)
+        return tokenizer
+
 
 class Mistral3Gate(nn.Module):
 
@@ -478,6 +510,16 @@ class Mistral3Gate(nn.Module):
 @register_auto_model("Mistral3ForConditionalGeneration")
 @register_auto_model("PixtralForConditionalGeneration")
 @register_input_processor(
+    MistralCommonInputProcessor,
+    model_type="mistral3",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            # NOTE: mistral-common uses the tokenizer to set placeholders, this will be ignored
+            "image": "[IMG]",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
+@register_input_processor(
     Mistral3InputProcessor,
     model_type="mistral3_hf",
     placeholder_metadata=MultimodalPlaceholderMetadata(
@@ -489,15 +531,6 @@ class Mistral3Gate(nn.Module):
         #      src/mistral_common/tokens/tokenizers/base.py#L326
         # However, accuracy tests show that the model generates higher quality output when the image
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    ))
-@register_input_processor(
-    Mistral3InputProcessor,
-    model_type="mistral3",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "[IMG]",
-        },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ))
 class Mistral3VLM(PreTrainedModel):
