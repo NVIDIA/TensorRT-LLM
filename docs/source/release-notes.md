@@ -95,9 +95,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Know Issues
 
-- **Llama Pipeline Parallelism:** There are known stability issues when running Llama models with Pipeline Parallelism (PP) enabled in specific configurations.
 - **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release.
-- **Context Chunking:** In certain disaggregated serving configurations with specific chunk sizes, context chunking may exhibit performance degradation or instability.
 
 
 ## TensorRT-LLM Release 1.0
