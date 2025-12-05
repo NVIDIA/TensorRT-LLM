@@ -512,8 +512,6 @@ class Mistral3VLM(PreTrainedModel):
                 0] == "MistralLarge3ForCausalLM":
             llm_class = DeepseekV3ForCausalLM
 
-        # This is necessary for the auto weight mapper to figure out what it needs.
-        llm_model_config.pretrained_config.architectures = config.architectures
         self.llm = llm_class(llm_model_config)
         self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
 
@@ -545,25 +543,36 @@ class Mistral3VLM(PreTrainedModel):
             if isinstance(weight_mapper, MistralWeightMapper):
                 vit_params_map = weight_mapper.pixtral_mapping
 
-        llm_weights = filter_weights(weights=weights, prefix="language_model.")
+        llm_weights = filter_weights(weights=weights, prefix="language_model")
+        logger.debug(f"Loading weights for {type(self.llm)}")
         self.llm.load_weights(llm_weights,
                               weight_mapper=weight_mapper,
                               *args,
                               **kwargs)
+        logger.debug(f"Successfully loaded weights for {type(self.llm)}")
 
-        vit_weights = filter_weights(weights=weights, prefix="vision_tower.")
+        vit_weights = filter_weights(weights=weights, prefix="vision_tower")
+        logger.debug(f"Loading weights for {type(self._vision_tower)}")
+
+        # FIXME rename_weights_with_regex in _load_weights_impl breaks this, fall back to manual renaming
+        if vit_params_map is not None:
+            vit_weights = weight_mapper.rename_by_params_map(
+                weights=vit_weights, params_map=vit_params_map)
+        
         self._vision_tower.load_weights(vit_weights,
-                                        params_map=vit_params_map,
-                                        *args,
-                                        **kwargs)
+                                        params_map=vit_params_map)
+        logger.debug(f"Successfully loaded weights for {type(self._vision_tower)}")
 
+        logger.debug(f"Loading weights for {type(self._multi_modal_projector)}")
         mm_projector_weights = filter_weights(weights=weights,
-                                              prefix="multi_modal_projector.")
+                                              prefix="multi_modal_projector")
+            
         if vit_params_map is not None:
             mm_projector_weights = weight_mapper.rename_by_params_map(
                 weights=mm_projector_weights, params_map=vit_params_map)
 
         self._multi_modal_projector.load_state_dict(mm_projector_weights)
+        logger.debug(f"Successfully loaded weights for {type(self._multi_modal_projector)}")
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

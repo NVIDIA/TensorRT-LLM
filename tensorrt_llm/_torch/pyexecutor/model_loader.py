@@ -281,8 +281,8 @@ class ModelLoader:
 
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
-                self._call_load_weights(model.load_weights, weights,
-                                        self.weight_mapper)
+                self._call_load_weights(model.load_weights, weights=weights,
+                                        weight_mapper=self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
