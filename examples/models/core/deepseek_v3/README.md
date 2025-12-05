@@ -249,6 +249,7 @@ cuda_graph_config:
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
 stream_interval: 10
 EOF
@@ -260,22 +261,34 @@ cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
+  - 2048
   - 1024
   - 896
   - 512
+  - 384
   - 256
+  - 192
+  - 160
   - 128
+  - 96
   - 64
+  - 48
   - 32
+  - 24
   - 16
   - 8
   - 4
   - 2
   - 1
 kv_cache_config:
+  enable_block_reuse: false
   dtype: fp8
 stream_interval: 10
 enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
 EOF
 ```
 
@@ -287,6 +300,7 @@ cuda_graph_config:
     max_batch_size: 1024
 enable_attention_dp: false
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
     free_gpu_memory_fraction: 0.8
 stream_interval: 10
@@ -303,7 +317,12 @@ cuda_graph_config:
     enable_padding: true
     max_batch_size: 512
 enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
 kv_cache_config:
+    enable_block_reuse: false
     dtype: fp8
     free_gpu_memory_fraction: 0.8
 stream_interval: 10
@@ -318,12 +337,11 @@ trtllm-serve \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 1024 \
+  --max_batch_size 2048 \
   --max_num_tokens 8192 \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.9 \
   --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 It's possible seeing OOM issues on some configs. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem. If you are using max-throughput config, reduce `max_num_tokens` to `3072` to avoid OOM issues.
@@ -865,12 +883,3 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_pref
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-## Known Issues
-- Support for KV Cache Reuse and Chunked Prefill in DeepSeek-V3.2-Exp is currently under development. When running `quickstart_advanced.py`, please include `--disable_kv_cache_reuse` to disable KV Cache Reuse. When using `trtllm-eval`/`trtllm-serve`/`trtllm-bench`, please include the following configuration in the extra llm_api options:
-```
-kv_cache_config:
-    enable_block_reuse: false
-    tokens_per_block: 64
-enable_chunked_prefill: false
-```
