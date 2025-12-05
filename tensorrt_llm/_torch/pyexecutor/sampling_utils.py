@@ -287,7 +287,7 @@ def beam_search_sampling_batch(
     beam_width_in: int,
     beam_width_out: int,
     beam_search_args: BeamSearchMetadata,
-    temperature: float | torch.Tensor,
+    temperature: float | None,
     generator: Optional[torch.Generator] = None,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -301,14 +301,8 @@ def beam_search_sampling_batch(
 
     # compute probability distribution
     logits = logits.view(batch_size, beam_width_in, vocab_size)
-    if isinstance(temperature, torch.Tensor):
-        if any(temperature != 0):
-            temperature = temperature.view(-1, 1, 1)
-
-            logits /= torch.clamp(temperature, min=1e-5)
-    else:
-        if temperature != 0:
-            logits /= max(temperature, 1e-5)
+    if temperature is not None and temperature != 0:
+        logits = logits / max(temperature, 1e-5)
     softmax: Optional[torch.Tensor] = None
     if return_probs:
         softmax = torch.softmax(logits, dim=-1)

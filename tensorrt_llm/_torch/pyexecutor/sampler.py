@@ -201,11 +201,11 @@ class SampleStateWithMMResult:
 
 @dataclass(kw_only=True, frozen=True)
 class RequestGroupKey(Generic[GenericStrategyKeyType]):
-    strategy: GenericStrategyKeyType
+    strategy_key: GenericStrategyKeyType
     speculation_needs_probs: bool
 
     def __iter__(self):
-        return iter((self.strategy, self.speculation_needs_probs))
+        return iter((self.strategy_key, self.speculation_needs_probs))
 
     def __len__(self):
         return 2
@@ -359,7 +359,7 @@ def _group_requests_by_strategy_key(
         group_dict_entry[1].append(strategy)
     return {
         RequestGroupKey(
-            strategy=group_key[0], speculation_needs_probs=group_key[1]
+            strategy_key=group_key[0], speculation_needs_probs=group_key[1]
         ): RequestGroupValue(
             indices=torch.tensor(indices, pin_memory=pin_memory, dtype=torch.int32),
             strategies=strategies,
@@ -663,7 +663,8 @@ class BeamHistory:
     cum_logprobs: torch.Tensor | None = None
 
 
-class SamplingRequestsMetadata(NamedTuple):
+@dataclass(kw_only=True)
+class SamplingRequestsMetadata:
     req_num_generated_tokens: torch.Tensor
     req_num_beams: torch.Tensor
     req_num_steps: torch.Tensor
@@ -1513,13 +1514,13 @@ class TorchSampler(Sampler):
         grouped_requests: dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValue],
         seq_slots: torch.Tensor,
         seq_lens: torch.Tensor | None,
-        get_metadata_type_for_group_fn: Callable[GenericStrategyKeyType, Type[StrategyMetadata]],
+        get_metadata_type_for_group_fn: Callable[[GenericStrategyKeyType], Type[StrategyMetadata]],
     ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata]:
         grouped_requests_with_metadata: dict[
             RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata
         ] = {}
         for key, value in grouped_requests.items():
-            metadata_type = get_metadata_type_for_group_fn(key.strategy)
+            metadata_type = get_metadata_type_for_group_fn(key.strategy_key)
             if metadata_type is BeamSearchMetadata:
                 assert seq_lens is not None, "seq_lens is required for beam search"
                 metadata = BeamSearchMetadata(

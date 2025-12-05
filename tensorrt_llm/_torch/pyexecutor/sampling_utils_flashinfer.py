@@ -173,6 +173,66 @@ class _StrategyImpls:
             new_tokens = cls._sample_from_probs(probs, generator=generator)
             return new_tokens, probs
 
+    class BeamSearchMixin(StrategyImpl):
+        def __init__(
+            self,
+            beam_width_in: torch.Tensor,
+            beam_width_out: torch.Tensor,
+            temperature: torch.Tensor,
+        ):
+            self._beam_width_in = beam_width_in
+            self._beam_width_out = beam_width_out
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Strategy], cuda_device: torch.device
+        ) -> "_StrategyImpls.BeamSearchMixin":
+            assert all(strat[0] == "beam_search" for strat in strategies)
+            narrowed_strats = cast(list[BeamSearch], strategies)
+            beam_width_in = cls._make_tensor(
+                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
+            )
+            beam_width_out = cls._make_tensor(
+                [strat[2] for strat in narrowed_strats], torch.int32, cuda_device
+            )
+            temperature = cls._make_tensor(
+                [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
+            )
+            return cls(beam_width_in, beam_width_out, temperature)
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: StrategyMetadata | None = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
+                "BeamSearchMetadata is required for beam_search_sampling_batch"
+            )
+            assert torch.unique(self._beam_width_in).numel() == 1, (
+                "beam_width_in must be the same for all strategies"
+            )
+            assert torch.unique(self._beam_width_out).numel() == 1, (
+                "beam_width_out must be the same for all strategies"
+            )
+            logits = self._prepare_logits_with_temperature(
+                logits, group_logit_indices, self._temperature
+            )
+            return beam_search_sampling_batch(
+                logits,
+                beam_width_in=self._beam_width_in[0],
+                beam_width_out=self._beam_width_out[0],
+                beam_search_args=group_metadata,
+                temperature=None,
+                generator=generator,
+                return_probs=self.computes_probs(),
+            )
+
     class StrategyImplWithProbs(StrategyImpl):
         @override
         @classmethod
@@ -355,62 +415,8 @@ class _StrategyImpls:
             )
             return new_tokens, probs
 
-    class BeamSearchWithProbs(StrategyImplWithProbs):
-        def __init__(
-            self,
-            beam_width_in: torch.Tensor,
-            beam_width_out: torch.Tensor,
-            temperature: torch.Tensor,
-        ):
-            self._beam_width_in = beam_width_in
-            self._beam_width_out = beam_width_out
-            self._temperature = temperature
-
-        @override
-        @classmethod
-        def from_strategies(
-            cls, strategies: list[Strategy], cuda_device: torch.device
-        ) -> "_StrategyImpls.BeamSearchWithProbs":
-            assert all(strat[0] == "beam_search" for strat in strategies)
-            narrowed_strats = cast(list[BeamSearch], strategies)
-            beam_width_in = cls._make_tensor(
-                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
-            )
-            beam_width_out = cls._make_tensor(
-                [strat[2] for strat in narrowed_strats], torch.int32, cuda_device
-            )
-            temperature = cls._make_tensor(
-                [strat[3] for strat in narrowed_strats], torch.float32, cuda_device
-            )
-            return cls(beam_width_in, beam_width_out, temperature)
-
-        @override
-        def sample(
-            self,
-            logits: torch.Tensor,
-            *,
-            group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
-            group_metadata: StrategyMetadata | None = None,
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
-                "BeamSearchMetadata is required for beam_search_sampling_batch"
-            )
-            assert all(self._beam_width_in == self._beam_width_in[0]), (
-                "beam_width_in must be the same for all strategies"
-            )
-            assert all(self._beam_width_out == self._beam_width_out[0]), (
-                "beam_width_out must be the same for all strategies"
-            )
-            return beam_search_sampling_batch(
-                logits,
-                beam_width_in=self._beam_width_in[0],
-                beam_width_out=self._beam_width_out[0],
-                beam_search_args=group_metadata,
-                temperature=self._temperature,
-                generator=generator,
-                return_probs=True,
-            )
+    class BeamSearchWithProbs(BeamSearchMixin, StrategyImplWithProbs):
+        pass
 
     class StrategyImplSampleOnly(StrategyImpl):
         @override
@@ -622,70 +628,20 @@ class _StrategyImpls:
             )
             return new_tokens, None
 
-    class BeamSearchSampleOnly(StrategyImplSampleOnly):
-        def __init__(
-            self,
-            beam_width_in: torch.Tensor,
-            beam_width_out: torch.Tensor,
-            temperature: torch.Tensor,
-        ):
-            self._beam_width_in = beam_width_in
-            self._beam_width_out = beam_width_out
-            self._temperature = temperature
-
-        @override
-        @classmethod
-        def from_strategies(
-            cls, strategies: list[Strategy], cuda_device: torch.device
-        ) -> "_StrategyImpls.BeamSearchSampleOnly":
-            assert all(strat[0] == "beam_search" for strat in strategies)
-            narrowed_strats = cast(list[BeamSearch], strategies)
-            beam_width_in = cls._make_tensor(
-                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
-            )
-            beam_width_out = cls._make_tensor(
-                [strat[2] for strat in narrowed_strats], torch.int32, cuda_device
-            )
-            temperature = cls._make_tensor(
-                [strat[3] for strat in narrowed_strats], torch.float32, cuda_device
-            )
-            return cls(beam_width_in, beam_width_out, temperature)
-
-        @override
-        def sample(
-            self,
-            logits: torch.Tensor,
-            *,
-            group_logit_indices: Optional[torch.Tensor] = None,
-            generator: Optional[torch.Generator] = None,
-            group_metadata: StrategyMetadata | None = None,
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
-                "BeamSearchMetadata is required for beam_search_sampling_batch"
-            )
-            assert all(self._beam_width_in == self._beam_width_in[0]), (
-                "beam_width_in must be the same for all strategies"
-            )
-            assert all(self._beam_width_out == self._beam_width_out[0]), (
-                "beam_width_out must be the same for all strategies"
-            )
-            return beam_search_sampling_batch(
-                logits,
-                beam_width_in=self._beam_width_in[0],
-                beam_width_out=self._beam_width_out[0],
-                beam_search_args=group_metadata,
-                temperature=self._temperature,
-                generator=generator,
-                return_probs=False,
-            )
+    class BeamSearchSampleOnly(BeamSearchMixin, StrategyImplSampleOnly):
+        pass
 
 
-def create_beam_search_sample_only_cls(
-    beam_width_in: torch.Tensor, beam_width_out: torch.Tensor
-) -> Type[_StrategyImpls.BeamSearchSampleOnly]:
-    """Create a class that implements BeamSearchSampleOnly with static parameters for grouping."""
+def _create_beam_search_specialized_cls(
+    beam_width_in: torch.Tensor,
+    beam_width_out: torch.Tensor,
+    return_probs: bool,
+) -> Type[_StrategyImpls.BeamSearchMixin]:
+    """Create a class that implements BeamSearchMixin with static parameters for grouping."""
 
-    class BeamSearchSampleOnly_local(_StrategyImpls.BeamSearchSampleOnly):
+    class BeamSearchSpecialized(
+        _StrategyImpls.BeamSearchWithProbs if return_probs else _StrategyImpls.BeamSearchSampleOnly
+    ):
         static_beam_width_in = beam_width_in
         static_beam_width_out = beam_width_out
 
@@ -701,31 +657,7 @@ def create_beam_search_sample_only_cls(
                 and self.static_beam_width_out == other.static_beam_width_out
             )
 
-    return BeamSearchSampleOnly_local
-
-
-def create_beam_search_with_probs_cls(
-    beam_width_in: torch.Tensor, beam_width_out: torch.Tensor
-) -> Type[_StrategyImpls.BeamSearchWithProbs]:
-    """Create a class that implements BeamSearchWithProbs with static parameters for grouping."""
-
-    class BeamSearchWithProbs_local(_StrategyImpls.BeamSearchWithProbs):
-        static_beam_width_in = beam_width_in
-        static_beam_width_out = beam_width_out
-
-        @override
-        def __hash__(self) -> int:
-            return hash((super(), self.static_beam_width_in, self.static_beam_width_out))
-
-        @override
-        def __eq__(self, other: object) -> bool:
-            return (
-                super().__eq__(other)
-                and self.static_beam_width_in == other.static_beam_width_in
-                and self.static_beam_width_out == other.static_beam_width_out
-            )
-
-    return BeamSearchWithProbs_local
+    return BeamSearchSpecialized
 
 
 class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpls.StrategyImpl]]):
@@ -753,7 +685,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
                 case ("greedy", None):
                     return _StrategyImpls.GreedyWithProbs
                 case ("beam_search", beam_width_in, beam_width_out, _):
-                    return create_beam_search_with_probs_cls(beam_width_in, beam_width_out)
+                    return _create_beam_search_specialized_cls(beam_width_in, beam_width_out, True)
         else:
             match strategy:
                 case ("top_p", _, _):
@@ -767,16 +699,14 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
                 case ("greedy", None):
                     return _StrategyImpls.GreedySampleOnly
                 case ("beam_search", beam_width_in, beam_width_out, _):
-                    return create_beam_search_sample_only_cls(beam_width_in, beam_width_out)
+                    return _create_beam_search_specialized_cls(beam_width_in, beam_width_out, False)
 
     @override
     @staticmethod
     def get_metadata_type_for_group(
         strategy_key: STRATEGY_KEY_TYPE,
     ) -> Type[StrategyMetadata] | None:
-        if issubclass(strategy_key, _StrategyImpls.BeamSearchSampleOnly):
-            return BeamSearchMetadata
-        elif issubclass(strategy_key, _StrategyImpls.BeamSearchWithProbs):
+        if issubclass(strategy_key, _StrategyImpls.BeamSearchMixin):
             return BeamSearchMetadata
         else:
             return None
