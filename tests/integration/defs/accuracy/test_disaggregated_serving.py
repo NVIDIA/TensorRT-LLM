@@ -1,8 +1,11 @@
 import concurrent
 import contextlib
+import functools
 import itertools
 import json
 import os
+import re
+import subprocess
 import tempfile
 import time
 from collections import namedtuple
@@ -47,6 +50,40 @@ DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 DEFAULT_TEST_TIMEOUT = 1200
 DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+
+
+@functools.lru_cache(maxsize=1)
+def has_nvlink():
+    """
+    Check if the system has NVLink connectivity between GPUs.
+
+    Returns:
+        bool: True if NVLink is detected, False otherwise.
+    """
+    try:
+        # Execute nvidia-smi nvlink command to query NVLink status
+        result = subprocess.run(['nvidia-smi', 'nvlink', '-s'],
+                                capture_output=True,
+                                text=True,
+                                check=False)
+
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            return False
+
+        # Look for bandwidth information (Link X: XX.XXX GB/s pattern)
+        # which indicates active NVLink connections
+        if re.search(r'Link \d+:\s+[\d.]+\s+GB/s', result.stdout):
+            return True
+
+        return False
+
+    except (FileNotFoundError, subprocess.SubprocessError):
+        # nvidia-smi not found or execution failed
+        return False
+    except Exception:
+        # Any other unexpected error
+        return False
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -196,6 +233,8 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
