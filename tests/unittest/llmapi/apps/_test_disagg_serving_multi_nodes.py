@@ -1,14 +1,13 @@
 import os
 import socket
-import time
 
 import openai
 import pytest
-import requests
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
-from .utils import expand_slurm_nodelist
+from .utils import (expand_slurm_nodelist, wait_for_endpoint_down,
+                    wait_for_endpoint_ready)
 
 RANK = int(os.environ.get("SLURM_PROCID", 0))
 NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
@@ -136,32 +135,6 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             yield server
     else:
         yield None
-
-
-def wait_for_endpoint_ready(url: str, timeout: int = 300):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        try:
-            time.sleep(1)
-            if requests.get(url).status_code == 200:
-                print(f"endpoint {url} is ready")
-                return
-        except Exception as err:
-            print(f"endpoint {url} is not ready, with exception: {err}")
-
-
-def wait_for_endpoint_down(url: str, timeout: int = 300):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        try:
-            if requests.get(url).status_code >= 100:
-                print(
-                    f"endpoint {url} returned status code {requests.get(url).status_code}"
-                )
-                time.sleep(1)
-        except Exception as err:
-            print(f"endpoint {url} is down, with exception: {err}")
-            return
 
 
 @pytest.fixture(scope="module")
