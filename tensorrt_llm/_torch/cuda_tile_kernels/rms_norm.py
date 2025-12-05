@@ -1,4 +1,4 @@
-# Adapted from https://gitlab-master.nvidia.com/dl/tileir/cutile-python/-/blob/main/test/kernels/rms_norm.py
+# Adapted from https://github.com/NVIDIA/cutile-python/blob/main/test/kernels/rms_norm.py
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
