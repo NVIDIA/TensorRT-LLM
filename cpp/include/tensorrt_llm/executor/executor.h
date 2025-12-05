@@ -48,7 +48,9 @@ namespace tensorrt_llm::executor
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
-// Type alias for multimodal hash key (hash array + start offset)
+// Mmkey is used in KVCacheBlock when multimodal data presents in a block.
+// Type alias for hash array + start offset at per-block granularity.
+// This differs from the per-request level multimodal hash in MultimodalInput.
 using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 
 /// @brief Version of TRT-LLM

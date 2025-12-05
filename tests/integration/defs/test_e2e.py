@@ -1806,69 +1806,6 @@ def parse_output(text):
     return results
 
 
-def parse_kv_cache_events(text):
-    """Parse KV cache events from command output.
-
-    Looks for JSON between KV_CACHE_EVENTS_START and KV_CACHE_EVENTS_END markers.
-
-    Args:
-        text: The full output text from the command
-
-    Returns:
-        A list of KV cache event dictionaries, or empty list if not found.
-    """
-    start_marker = "=== KV_CACHE_EVENTS_START ==="
-    end_marker = "=== KV_CACHE_EVENTS_END ==="
-
-    try:
-        start_idx = text.find(start_marker)
-        end_idx = text.find(end_marker)
-
-        if start_idx == -1 or end_idx == -1:
-            return []
-
-        json_str = text[start_idx + len(start_marker):end_idx].strip()
-        return json.loads(json_str)
-
-    except (json.JSONDecodeError, Exception) as e:
-        print(f"Warning: Failed to parse KV cache events: {e}")
-        return []
-
-
-def get_mm_keys_offsets(events):
-    """Extract mm_keys start_offsets from stored events.
-
-    Args:
-        events: List of KV cache event dictionaries
-
-    Returns:
-        List of start_offset values from mm_keys in stored blocks.
-    """
-    return [
-        block["mm_keys"][0]["start_offset"] for event in events
-        if event and event.get("data", {}).get("type") == "stored"
-        for block in event["data"].get("blocks", []) if block.get("mm_keys")
-    ]
-
-
-def verify_mm_keys_duplicates(output, expected_duplicates, test_description):
-    """Verify KV cache reuse by checking mm_keys offset duplicates.
-
-    Args:
-        output: Command output containing KV cache events
-        expected_duplicates: Expected number of duplicate offsets
-        test_description: Description for error message
-    """
-    events = parse_kv_cache_events(output)
-    mm_keys_offsets = get_mm_keys_offsets(events)
-    num_duplicates = len(mm_keys_offsets) - len(set(mm_keys_offsets))
-
-    print(f"mm_keys_offsets: {mm_keys_offsets}, duplicates: {num_duplicates}")
-    assert num_duplicates == expected_duplicates, (
-        f"{test_description}: Expected {expected_duplicates} duplicate mm_keys offsets, "
-        f"got {num_duplicates}. Offsets: {mm_keys_offsets}")
-
-
 def test_ptp_quickstart(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
 
@@ -2737,7 +2674,6 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
         *accuracy_inputs[modality]["media"],
         "--max_batch_size",  # single request at a time to test kv cache reuse
         "1",
-        "--log_kv_cache_events",
     ]
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
@@ -2754,86 +2690,6 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     # TODO: Setting max_batch_size=1 and repeating the same request helps test KV cache reuse indirectly,
     # but does not directly measure the KV cache hit rate. For a more direct test, we would need to enable
     # return_perf_metrics=True, which is not currently supported by the quickstart example CLI.
-
-    # Verify KV cache reuse: identical requests should fully reuse blocks (0 duplicates)
-    verify_mm_keys_duplicates(
-        output,
-        expected_duplicates=0,
-        test_description="Same media + same prompts (full reuse)")
-    print("All answers are correct!")
-
-
-@pytest.mark.parametrize("modality", ["image", "video"])
-@pytest.mark.parametrize(
-    "model_name,model_path,match_ratio",
-    [
-        pytest.param(
-            "mistral-small-3.1-24b-instruct",
-            "Mistral-Small-3.1-24B-Instruct-2503",
-            # Lower threshold to give some wiggle room for flakiness.
-            0.6,
-            marks=pytest.mark.skip_less_device_memory(80000)),
-    ])
-def test_ptp_quickstart_multimodal_kv_cache_reuse_same_media_different_prompts(
-        llm_root, llm_venv, model_name, model_path, modality, match_ratio):
-    # NOTE: individual tests need to be enabled in
-    # tests/integration/test_lists/qa/examples_test_list.txt
-
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    test_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals", "test_data"))
-    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
-    if modality == "video" and model_name == "mistral-small-3.1-24b-instruct":
-        pytest.skip(f"Skipping video modality test for {model_name}")
-
-    num_same_requests = 3  # test kv cache reuse with multiple same requests
-    accuracy_inputs = {
-        "image": {
-            "prompt": [
-                "Describe the natural environment in the image.",
-                "Describe the object and the weather condition in the image.",
-                "Describe the traffic condition on the road in the image.",
-            ],
-            "media": [
-                str(test_data_root / "seashore.png"),
-            ] * num_same_requests,
-        },
-        "video": {
-            "prompt": [
-                "Tell me what you see in the video briefly.",
-                "Describe the scene in the video briefly.",
-                "What is the weather condition in the video?",
-            ],
-            "media": [
-                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
-            ] * num_same_requests,
-        },
-    }
-
-    cmd = [
-        str(example_root / "quickstart_multimodal.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--modality",
-        modality,
-        "--prompt",
-        *accuracy_inputs[modality]["prompt"],
-        "--media",
-        *accuracy_inputs[modality]["media"],
-        "--max_batch_size",  # single request at a time to test kv cache reuse
-        "1",
-        "--log_kv_cache_events",
-    ]
-
-    output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    # With 3 requests sharing same media but different prompts:
-    # Prefix is shared until end of media, then diverges at different prompt tokens.
-    # Each request stores a new block for its unique suffix, resulting in 2 duplicates.
-    verify_mm_keys_duplicates(
-        output,
-        expected_duplicates=2,
-        test_description="Same media + different prompts (partial reuse)")
     print("All answers are correct!")
 
 

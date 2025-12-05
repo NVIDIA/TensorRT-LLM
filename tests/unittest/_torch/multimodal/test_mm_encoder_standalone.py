@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -288,3 +289,85 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
                 zip(ref_output.outputs, test_output.outputs)):
             assert ref_gen.text == test_gen.text, \
                 f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
+
+
+@pytest.mark.parametrize(
+    "prompts,expected_num_duplicates",
+    [
+        # Full reuse: same media + same prompts
+        # All blocks are reused, thus no duplicates
+        (["Describe the natural environment in the image."] * 2, 0),
+        # Partial reuse: same media + different prompts
+        # Prefix blocks are reused, thus 2 duplicates
+        ([
+            "Describe the natural environment in the image.",
+            "What objects can you see in the image?",
+            "Describe the weather in the image.",
+        ], 2),
+    ])
+def test_mm_keys_kv_cache_reuse(prompts, expected_num_duplicates,
+                                multimodal_model_config):
+    """Test mm_keys in KV cache events with cache reuse scenarios.
+
+    This test verifies:
+    1. KV cache events contain mm_keys for multimodal blocks
+    2. mm_keys have the expected structure (hash + start_offset)
+    3. Cache reuse behavior based on media and prompts:
+       - Same media + same prompts: full reuse (0 duplicate offsets)
+       - Same media + different prompts: partial reuse (prefix blocks reused)
+    """
+    encoder_model_dir = multimodal_model_config['model_dir']
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.6
+
+    # Use same image for all prompts
+    media = [example_images[0]] * len(prompts)
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=1024,  # Enable KV cache events
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    config_path = os.path.join(llm._hf_model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    model_type = model_config['model_type']
+
+    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                             model_dir=llm._hf_model_dir,
+                                             model_type=model_type,
+                                             modality="image",
+                                             prompts=prompts,
+                                             media=media,
+                                             image_data_format="pt")
+
+    # Generate for each input separately to test KV cache reuse
+    for inp in inputs:
+        _ = llm.generate([inp], sampling_params=sampling_params)
+
+    time.sleep(0.5)  # Wait for events to be dispatched
+    events = llm.get_kv_cache_events(10)
+
+    # Extract mm_keys offsets from stored events
+    mm_keys_offsets = []
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        assert "hash" in mm_key, "mm_key should have 'hash' field"
+                        assert "start_offset" in mm_key, "mm_key should have 'start_offset' field"
+                        mm_keys_offsets.append(mm_key["start_offset"])
+
+    num_duplicates = len(mm_keys_offsets) - len(set(mm_keys_offsets))
+    assert num_duplicates == expected_num_duplicates, (
+        f"Expected {expected_num_duplicates} duplicate mm_keys offsets, "
+        f"got {num_duplicates}. Offsets: {mm_keys_offsets}")
