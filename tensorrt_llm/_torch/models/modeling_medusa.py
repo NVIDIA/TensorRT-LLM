@@ -6,6 +6,8 @@ from transformers import LlamaConfig
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
+                              WeightsLoadingConfig)
 from ..speculative import SpecMetadata
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_llama import LlamaModel
@@ -36,7 +38,10 @@ class MedusaModel(nn.Module):
 
         # Create the Medusa layers
         self.medusa_layers = nn.ModuleList(
-            [nn.Linear(self.hidden_size, self.hidden_size) for _ in range(self.num_layers)]
+            [Linear(self.hidden_size,
+                         self.hidden_size,
+                         bias=True,
+                         dtype=model_config.torch_dtype) for _ in range(self.num_layers)]
         )
         self.act = nn.SiLU()
 
@@ -54,8 +59,8 @@ class MedusaModel(nn.Module):
             Processed hidden states after Medusa head
         """
         for layer in self.medusa_layers:
-            hidden_states = layer(hidden_states)
-            hidden_states = self.act(hidden_states) + hidden_states
+            hidden_states_out = layer(hidden_states)
+            hidden_states = self.act(hidden_states_out) + hidden_states
         return hidden_states
 
 
@@ -71,20 +76,18 @@ class MedusaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
+        start_layer_idx: int = 0,
         head_idx: int = 0,
     ):
         # Initialize with the base model (shared or new)
 
-        super().__init__(
+        super().__init__(MedusaModel(model_config, start_layer_idx + head_idx),
             config=model_config,
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
         self.head_idx = head_idx
-
-        # Initialize the Medusa head for this model
-        self.model = MedusaModel(model_config, head_idx)
 
     def forward(
         self,
@@ -115,7 +118,7 @@ class MedusaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
         """
 
         # Process through Medusa head
-        output = self.medusa_head(hidden_states)
+        output = self.model(hidden_states)
 
         # Process through logits processor (each head has its own)
         return self.logits_processor.forward(
