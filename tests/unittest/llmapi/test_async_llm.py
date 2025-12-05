@@ -34,10 +34,6 @@ async def test_async_llm_awaitable():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
-    """Verifies that:
-    1. Memory is released/restored when calling release()/resume()
-    2. generation_async() works correctly before and after release/resume cycle(s)
-    """
     llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
 
@@ -67,7 +63,8 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
                     f"[Cycle {cycle + 1}] Memory usage after release: {memory_usage_released:.2f} GB"
                 )
                 assert memory_usage_released < memory_usage_active, (
-                    f"Released memory ({memory_usage_released:.2f} GB) should be < active memory ({memory_usage_active:.2f} GB)"
+                    f"Released memory ({memory_usage_released:.2f} GB) should be < "
+                    f"active memory ({memory_usage_active:.2f} GB)"
                 )
 
             await llm.resume(tags)
@@ -75,7 +72,8 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
             print(f"[Cycle {cycle + 1}] Memory usage after resume: {memory_usage_resumed:.2f} GB")
             if process_gpu_memory_info_available:
                 assert memory_usage_resumed > memory_usage_released, (
-                    f"Resumed memory ({memory_usage_resumed:.2f} GB) should be > released memory ({memory_usage_released:.2f} GB)"
+                    f"Resumed memory ({memory_usage_resumed:.2f} GB) should be > "
+                    f"released memory ({memory_usage_released:.2f} GB)"
                 )
 
         output_after = await llm.generate_async(prompt, sampling_params)

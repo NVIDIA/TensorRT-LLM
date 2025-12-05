@@ -1011,18 +1011,24 @@ class OpenAIServer:
         return JSONResponse(content={"detail": "None"})
 
     async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        print(f"HTTP received: release_memory {request.tags}")
-        self.llm._collective_rpc('sleep', args=(request.tags,))
+        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
+            await self.llm.collective_rpc('sleep', args=(request.tags,))
+        else:
+            self.llm._collective_rpc('sleep', args=(request.tags,))
         return JSONResponse(content={"status": "success"})
 
     async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        print(f"HTTP received: resume_memory {request.tags}")
-        self.llm._collective_rpc('wakeup', args=(request.tags,))
+        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
+            await self.llm.collective_rpc('wakeup', args=(request.tags,))
+        else:
+            self.llm._collective_rpc('wakeup', args=(request.tags,))
         return JSONResponse(content={"status": "success"})
 
     async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
-        print(f"HTTP received: update_weights")
-        self.llm._collective_rpc('update_weights', args=(request.weights,))
+        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
+            await self.llm.collective_rpc('update_weights', args=(request.weights,))
+        else:
+            self.llm._collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):
