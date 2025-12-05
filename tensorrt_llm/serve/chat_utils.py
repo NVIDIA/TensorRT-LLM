@@ -34,9 +34,16 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
+class ImageEmbedsData(TypedDict):
+    """Type definition for serialized image embeddings structure."""
+    data: Required[str]
+
+
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     """Type definition for image embeddings passed in base64-encoded PyTorch tensor format."""
-    image_embeds: Required[str]
+    image_embeds: Required[
+        # NB: Besides "data", could support "url" and "ipc_handle" in the future.
+        ImageEmbedsData]
     type: Required[Literal["image_embeds"]]
 
 
@@ -75,7 +82,8 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         "audio_url":
         lambda part: _AudioParser(part).get("audio_url", {}).get("url", None),
         "image_embeds":
-        lambda part: _ImageEmbedsParser(part).get("image_embeds", None),
+        lambda part: _ImageEmbedsParser(part).get("image_embeds", {}).get(
+            "data", None),
     }
 
 # Map from content part tags used to directly provide embeddings

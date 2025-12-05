@@ -197,7 +197,9 @@ def test_single_chat_session_image_embeds(
     assert image_content["type"] == "image_url"
     image_content.clear()
     image_content["type"] = "image_embeds"
-    image_content["image_embeds"] = b64encode(mm_embed_bytes).decode("ascii")
+    image_content["image_embeds"] = {
+        "data": b64encode(mm_embed_bytes).decode("ascii")
+    }
 
     # test single completion
     #
