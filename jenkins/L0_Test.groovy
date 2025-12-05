@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/1205_jira_9018']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
