@@ -1,3 +1,5 @@
+import base64
+import pickle
 from typing import Optional
 
 import torch
@@ -56,7 +58,15 @@ class WorkerExtension:
                     raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
 
                 weights = {}
-                all_handles = ipc_handles[device_uuid]
+                # Deserialize the base64-encoded pickled data
+                serialized_handles = ipc_handles[device_uuid]
+                if isinstance(serialized_handles, str):
+                    # Data is base64-encoded pickled bytes - deserialize it
+                    logger.info("Deserializing base64-encoded weight handles")
+                    all_handles = pickle.loads(base64.b64decode(serialized_handles))
+                else:
+                    # Data is already in the correct format (backward compatibility)
+                    all_handles = serialized_handles
 
                 for param_name, tensor_handle in all_handles:
                     func, args = tensor_handle

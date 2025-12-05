@@ -45,9 +45,11 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
-                                                ErrorResponse, ModelCard,
+                                                ErrorResponse,
+                                                MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
-                                                ResponsesRequest, UsageInfo,
+                                                ResponsesRequest,
+                                                UpdateWeightsRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -261,6 +263,15 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        self.app.add_api_route("/release_memory",
+                                self.release_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/resume_memory",
+                                self.resume_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/update_weights",
+                                self.update_weights,
+                                methods=["POST"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -297,6 +308,15 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        self.app.add_api_route("/release_memory",
+                                self.release_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/resume_memory",
+                                self.resume_memory,
+                                methods=["POST"])
+        self.app.add_api_route("/update_weights",
+                                self.update_weights,
+                                methods=["POST"])
 
     async def health(self) -> Response:
         if self._check_health():
@@ -989,6 +1009,26 @@ class OpenAIServer:
 
         return JSONResponse(content={"detail": "None"})
 
+    async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
+        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
+            await self.llm.collective_rpc('sleep', args=(request.tags,))
+        else:
+            self.llm._collective_rpc('sleep', args=(request.tags,))
+        return JSONResponse(content={"status": "success"})
+
+    async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
+        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
+            await self.llm.collective_rpc('wakeup', args=(request.tags,))
+        else:
+            self.llm._collective_rpc('wakeup', args=(request.tags,))
+        return JSONResponse(content={"status": "success"})
+
+    async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
+        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
+            await self.llm.collective_rpc('update_weights', args=(request.weights,))
+        else:
+            self.llm._collective_rpc('update_weights', args=(request.weights,))
+        return JSONResponse(content={"status": "success"})
 
     async def __call__(self, host, port):
         # Store the binding address for server registration
