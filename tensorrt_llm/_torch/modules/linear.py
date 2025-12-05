@@ -898,6 +898,10 @@ class NVFP4LinearMethod(LinearMethodBase):
         module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                          requires_grad=False)
 
+        # NOTE: Not in all linear we have this tensor - pre_quant_scale is computed as an average and merged with the
+        # LayerNorm for QKV and Gate/Up projection layers when possible. we can see the tensor only for o_proj and down_proj
+        module.pre_quant_scale = None
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -907,10 +911,28 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         if isinstance(input, Fp4QuantizedTensor):
+            # Input is already quantized - this should not happen if pre_quant_scale exists
+            # because we disable FP4 output for attention output when pre_quant_scale is present
+            if module.pre_quant_scale is not None:
+                raise RuntimeError(
+                    "Received FP4 quantized input but pre_quant_scale exists. "
+                    "This indicates FP4 output was not properly disabled for the previous layer."
+                )
             act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
         elif isinstance(input, tuple):
+            # Input is a tuple of (fp4_tensor, scaling_factor)
+            if module.pre_quant_scale is not None:
+                raise RuntimeError(
+                    "Received FP4 quantized tuple input but pre_quant_scale exists. "
+                    "This indicates FP4 output was not properly disabled for the previous layer."
+                )
             act_fp4, act_sf = input
         else:
+            # Input is a regular tensor () - apply pre_quant_scale if it exists (for NVFP4_AWQ)
+            if module.pre_quant_scale is not None:
+                assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
+                input = input * module.pre_quant_scale
+
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
@@ -1003,6 +1025,24 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
 
+        # Load pre_quant_scale if it exists (for NVFP4_AWQ)
+        if "pre_quant_scale" in weights[0]:
+            device = module.weight.device
+            pre_quant_scale = load_weight_shard(
+                weights[0]["pre_quant_scale"],
+                module.tp_size,
+                module.tp_rank,
+                # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+                TensorParallelMode.flip(module.tp_mode),
+                device,
+            )
+
+            module.pre_quant_scale = Parameter(
+                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+                requires_grad=False).to(device=device)
+
+            copy_weight(module.pre_quant_scale, pre_quant_scale)
+
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
@@ -1058,6 +1098,25 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
+
+        # Load pre_quant_scale if it exists (for NVFP4_AWQ)
+        # NOTE: pre_quant_scale is the same for gate and up since modelopt checks which layer shared the same input
+        if "pre_quant_scale" in weights[0]:
+            device = module.weight.device
+            pre_quant_scale = load_weight_shard(
+                weights[0]["pre_quant_scale"],
+                module.tp_size,
+                module.tp_rank,
+                # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+                TensorParallelMode.flip(module.tp_mode),
+                device,
+            )
+
+            module.pre_quant_scale = Parameter(
+                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+                requires_grad=False).to(device=device)
+
+            copy_weight(module.pre_quant_scale, pre_quant_scale)
 
     def post_load_weights(self, module: Linear):
         super().post_load_weights(module)

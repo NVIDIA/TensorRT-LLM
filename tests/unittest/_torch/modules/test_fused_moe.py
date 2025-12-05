@@ -335,10 +335,6 @@ def test_fused_moe_alltoall(alltoall_method_type):
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
-
-    if alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-        pytest.skip("Skipped due to https://nvbugs/5467531")
-
     world_size = 4
     dtype = torch.bfloat16
     HIDDEN_SIZE = 4096

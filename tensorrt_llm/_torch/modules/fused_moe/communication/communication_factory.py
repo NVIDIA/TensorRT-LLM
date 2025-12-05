@@ -87,7 +87,7 @@ class CommunicationFactory:
         # Extract parameters from model_config
         mapping = model_config.mapping
         hidden_size = model_config.pretrained_config.hidden_size
-        weight_dtype = model_config.torch_dtype
+        act_dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
         max_num_tokens = model_config.max_num_tokens
         moe_max_num_tokens = model_config.moe_max_num_tokens
@@ -126,8 +126,10 @@ class CommunicationFactory:
                 mapping,
                 num_slots,
                 top_k,
-                max_num_tokens_per_rank=max_num_tokens,
-                payload_in_workspace=payload_in_workspace,
+                max_num_tokens,
+                payload_in_workspace,
+                hidden_size=hidden_size,
+                dtype=act_dtype,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
@@ -149,13 +151,13 @@ class CommunicationFactory:
             logger.debug(f"NVLinkTwoSided not available: {e}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1" and weight_dtype == torch.bfloat16:
+        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1" and act_dtype == torch.bfloat16:
             try:
                 strategy = DeepEP(
                     mapping,
                     num_slots,
                     hidden_size,
-                    weight_dtype,
+                    act_dtype,
                     quant_config,
                     expert_size_per_partition,
                     use_cuda_graph,
@@ -171,7 +173,7 @@ class CommunicationFactory:
                     mapping,
                     num_slots,
                     hidden_size,
-                    weight_dtype,
+                    act_dtype,
                     quant_config,
                     expert_size_per_partition,
                     max_num_tokens,
@@ -209,7 +211,7 @@ class CommunicationFactory:
         # Extract parameters from model_config
         mapping = model_config.mapping
         hidden_size = model_config.pretrained_config.hidden_size
-        weight_dtype = model_config.torch_dtype
+        act_dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
         max_num_tokens = model_config.max_num_tokens
         moe_max_num_tokens = model_config.moe_max_num_tokens
@@ -229,21 +231,21 @@ class CommunicationFactory:
                 alltoall_result_do_sum=alltoall_result_do_sum,
             )
         elif method in ["NVLINK_ONE_SIDED"]:
-            # NVLinkOneSided requires max_num_tokens_per_rank
-            # max_num_tokens is per-rank value (as passed from callers like cutlass)
             return NVLinkOneSided(
                 mapping,
                 num_slots,
                 top_k,
-                max_num_tokens_per_rank=max_num_tokens,
-                payload_in_workspace=payload_in_workspace,
+                max_num_tokens,
+                payload_in_workspace,
+                hidden_size=hidden_size,
+                dtype=act_dtype,
             )
         elif method == "DEEPEP":
             return DeepEP(
                 mapping,
                 num_slots,
                 hidden_size,
-                weight_dtype,
+                act_dtype,
                 quant_config,
                 expert_size_per_partition,
                 use_cuda_graph,
@@ -253,7 +255,7 @@ class CommunicationFactory:
                 mapping,
                 num_slots,
                 hidden_size,
-                weight_dtype,
+                act_dtype,
                 quant_config,
                 expert_size_per_partition,
                 max_num_tokens,
