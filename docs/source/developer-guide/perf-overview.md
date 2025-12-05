@@ -168,20 +168,6 @@ All performance values are measured in **output tokens per second per GPU**.
 
 ---
 
-<a id="llama-v4-maverick-rtx-configurations"></a>
-
-# LLaMA v4 Maverick - RTX Configurations (TP/PP)
-
-*Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
-
-| Sequence Length (ISL/OSL) | **4 GPUs**<br/>DEP4,PP1 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) |
-|---|---|---|
-| 1000/1000 | | 1,582 |
-| 1024/1024 | 1,734 | |
-| 1024/8192 | 620 | 638 |
-
----
-
 <a id="qwen3-235b-a22b"></a>
 
 # Qwen3 235B A22B
@@ -314,11 +300,10 @@ run an offline maximum throughput scenario such that all requests are queued in 
 a model name (HuggingFace reference or path to a local model), a [generated dataset](#preparing-a-dataset), and a file containing any desired extra options to the LLM APIs (details in [tensorrt_llm/llmapi/llm_args.py:LlmArgs](source:tensorrt_llm/llmapi/llm_args.py)).
 
 For dense / non-MoE models:
-
-Llama 3.3
 ```shell
 trtllm-bench --tp $tp_size --pp $pp_size --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
 ```
+Llama 3.3
 
 `llm_options.yml`
 ```yaml
@@ -334,6 +319,7 @@ trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throu
 ```
 
 GPT-OSS:
+
 `llm_options.yml`
 ```yaml
 cuda_graph_config
@@ -348,7 +334,9 @@ moe_config
   # Hopper: use TRITON
 ```
 
-DeepSeek R1
+DeepSeek R1:
+
+`llm_options.yml`
 ```yaml
 attention_dp_config
   batching_wait_iters: 0
@@ -368,6 +356,8 @@ speculative_config (only if MTP)
 ```
 
 Qwen3 MoE, Llama4 Maverick:
+
+`llm_options.yml`
 ```yaml
 enable_attention_dp: true
 cuda_graph_config
