@@ -11,7 +11,7 @@ import openai
 import requests
 import yaml
 
-from tensorrt_llm.llmapi.mpi_session import find_free_port
+from tensorrt_llm._utils import get_free_port
 
 
 class RemoteOpenAIServer:
@@ -26,12 +26,16 @@ class RemoteOpenAIServer:
                  host: str = "localhost",
                  env: Optional[dict] = None,
                  rank: int = -1,
-                 extra_config: Optional[dict] = None) -> None:
+                 extra_config: Optional[dict] = None,
+                 log_path: Optional[str] = None,
+                 wait: bool = True) -> None:
         self.host = host
-        self.port = port if port is not None else find_free_port()
+        self.port = port if port is not None else get_free_port()
         self.rank = rank if rank != -1 else int(
             os.environ.get("SLURM_PROCID", 0))
         self.extra_config_file = None
+        self.log_path = log_path
+        self.log_file = None
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
         if cli_args:
             args += cli_args
@@ -50,10 +54,19 @@ class RemoteOpenAIServer:
             env = os.environ.copy()
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
-                                     stdout=sys.stdout,
-                                     stderr=sys.stderr)
-        self._wait_for_server(url=self.url_for("health"),
-                              timeout=self.MAX_SERVER_START_WAIT_S)
+                                     stdout=self._get_output(),
+                                     stderr=self._get_output())
+        if wait:
+            self.wait_for_server(timeout=self.MAX_SERVER_START_WAIT_S)
+
+    def _get_output(self):
+        if self.log_file:
+            return self.log_file
+        elif self.log_path:
+            self.log_file = open(self.log_path, "w+")
+            return self.log_file
+        else:
+            return sys.stdout
 
     def __enter__(self):
         return self
@@ -76,6 +89,12 @@ class RemoteOpenAIServer:
         except Exception as e:
             print(f"Error removing extra config file: {e}")
         self.proc = None
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
+
+    def wait_for_server(self, timeout: float):
+        self._wait_for_server(url=self.url_for("health"), timeout=timeout)
 
     def _wait_for_server(self, *, url: str, timeout: float):
         # run health check on the first rank only.
@@ -126,16 +145,21 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
                  gen_servers: List[str],
                  port: int = -1,
                  env: Optional[dict] = None,
-                 llmapi_launch: bool = False) -> None:
+                 llmapi_launch: bool = False,
+                 disagg_config: Optional[dict] = None,
+                 log_path: Optional[str] = None) -> None:
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.host = "localhost"
-        self.port = find_free_port() if port is None or port < 0 else port
+        self.port = get_free_port() if port is None or port < 0 else port
         self.rank = 0
+        self.disagg_config = disagg_config or self._get_extra_config()
+        self.log_path = log_path
+        self.log_file = None
         with tempfile.NamedTemporaryFile(mode="w+",
                                          delete=False,
                                          delete_on_close=False) as f:
-            f.write(self._get_extra_config())
+            f.write(yaml.dump(self.disagg_config))
             f.flush()
             self.extra_config_file = f.name
         launch_cmd = [
@@ -148,13 +172,13 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
             env = os.environ.copy()
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
-                                     stdout=sys.stdout,
-                                     stderr=sys.stderr)
+                                     stdout=self._get_output(),
+                                     stderr=self._get_output())
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)
 
     def _get_extra_config(self):
-        return yaml.dump({
+        return {
             "context_servers": {
                 "num_instances": len(self.ctx_servers),
                 "urls": self.ctx_servers
@@ -165,4 +189,37 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
             },
             "port": self.port,
             "hostname": self.host,
-        })
+        }
+
+
+class RemoteMMEncoderServer(RemoteOpenAIServer):
+    """Remote server for testing multimodal encoder endpoints."""
+
+    def __init__(self,
+                 model: str,
+                 cli_args: List[str] = None,
+                 port: int = None,
+                 log_path: Optional[str] = None) -> None:
+        # Reuse parent initialization but change the command
+        import subprocess
+
+        from tensorrt_llm._utils import get_free_port
+
+        self.host = "localhost"
+        self.port = port if port is not None else get_free_port()
+        self.rank = os.environ.get("SLURM_PROCID", 0)
+        self.log_path = log_path
+        self.log_file = None
+
+        args = ["--host", f"{self.host}", "--port", f"{self.port}"]
+        if cli_args:
+            args += cli_args
+
+        # Use mm_embedding_serve command instead of regular serve
+        launch_cmd = ["trtllm-serve", "mm_embedding_serve"] + [model] + args
+
+        self.proc = subprocess.Popen(launch_cmd,
+                                     stdout=self._get_output(),
+                                     stderr=self._get_output())
+        self._wait_for_server(url=self.url_for("health"),
+                              timeout=self.MAX_SERVER_START_WAIT_S)

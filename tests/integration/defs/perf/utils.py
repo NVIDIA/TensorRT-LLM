@@ -19,7 +19,6 @@ import io
 import os
 import re
 import subprocess
-import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -27,10 +26,12 @@ from typing import Dict, List, NamedTuple, Optional
 
 import requests
 import yaml
+import time
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
                                        print_info)
+from test_common.http_utils import wait_for_endpoint_ready
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -245,29 +246,6 @@ class PerfAggrScriptTestCmds(NamedTuple):
     timeout: int
     output_dir: str
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
-        start = time.monotonic()
-        while True:
-            elapsed_time = time.monotonic() - start
-            if elapsed_time > timeout:
-                print_error(
-                    f"Timeout waiting for endpoint {url} to be ready after {timeout} seconds"
-                )
-                break
-            try:
-                print_info(
-                    f"Waiting for endpoint {url} to be ready, elapsed time: {elapsed_time}s"
-                )
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print_info(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print_info(
-                    f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         server_proc = None
@@ -276,33 +254,21 @@ class PerfAggrScriptTestCmds(NamedTuple):
         client_file_path = os.path.join(
             self.output_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
         try:
-            server_envs = copy.deepcopy(os.environ)
-            # server_envs.update(self.server_envs[cmd_idx])
-            print_info(
-                f"Starting server. cmd is {self.server_cmds[cmd_idx]} envs are {server_envs}"
-            )
-            with open(server_file_path, 'w') as server_ctx:
-                server_proc = subprocess.Popen(
-                    self.server_cmds[cmd_idx],
-                    stdout=server_ctx,
-                    stderr=subprocess.STDOUT,
-                    env=server_envs,
-                )
-            self.wait_for_endpoint_ready("http://localhost:8000/health",
-                                         timeout=self.timeout)
-            client_envs = copy.deepcopy(os.environ)
-            # client_envs.update(self.client_envs[cmd_idx])
-            print_info(
-                f"Starting client. cmd is {self.client_cmds[cmd_idx]} envs are {client_envs}"
-            )
-            output = subprocess.check_output(
-                self.client_cmds[cmd_idx],
-                env=client_envs,
-                stderr=subprocess.STDOUT,
-            ).decode()
-
-            with open(client_file_path, 'w') as client_ctx:
-                client_ctx.write(output)
+            with (  # Start server process
+                    open(server_file_path, 'w') as server_ctx,
+                    popen(self.server_cmds[cmd_idx],
+                          stdout=server_ctx,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as server_proc):
+                wait_for_endpoint_ready(
+                    "http://localhost:8000/v1/models",
+                    timeout=7200)  # 120 minutes for large models
+                output += subprocess.check_output(self.client_cmds[cmd_idx],
+                                                  env=venv._new_env).decode()
+                # Write output to client file path
+                with open(client_file_path, 'w') as client_ctx:
+                    client_ctx.write(output)
         finally:
             server_proc.terminate()
             server_proc.wait()
@@ -318,19 +284,6 @@ class PerfDisaggScriptTestCmds(NamedTuple):
     server_cmd: str
     client_cmd: List[str]
     benchmark_cmd: List[str]
-
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -356,7 +309,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
-                self.wait_for_endpoint_ready(
+                wait_for_endpoint_ready(
                     f"http://localhost:8000/health",
                     timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)

@@ -1,10 +1,12 @@
 import os
 import socket
-import time
 
 import openai
 import pytest
-import requests
+from test_common.http_utils import (wait_for_endpoint_down,
+                                    wait_for_endpoint_ready)
+from test_common.perf_metrics_utils import (get_timing_metrics,
+                                            validate_timing_metrics)
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -19,7 +21,8 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 # This test assumes that there are >2 nodes, we run ctx/disagg-server/client on the first node,
 # and run gen the second node.
-
+# This is a multi-node test, and will not be scheduled to the same node running other tests
+# using fixed ports should be safe.
 CTX_SERVER_PORT = 8001
 GEN_SERVER_PORT = 8002
 DISAGG_SERVER_PORT = 8000
@@ -138,32 +141,6 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
         yield None
 
 
-def wait_for_endpoint_ready(url: str, timeout: int = 300):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        try:
-            time.sleep(1)
-            if requests.get(url).status_code == 200:
-                print(f"endpoint {url} is ready")
-                return
-        except Exception as err:
-            print(f"endpoint {url} is not ready, with exception: {err}")
-
-
-def wait_for_endpoint_down(url: str, timeout: int = 300):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        try:
-            if requests.get(url).status_code >= 100:
-                print(
-                    f"endpoint {url} returned status code {requests.get(url).status_code}"
-                )
-                time.sleep(1)
-        except Exception as err:
-            print(f"endpoint {url} is down, with exception: {err}")
-            return
-
-
 @pytest.fixture(scope="module")
 def disagg_server(worker: RemoteOpenAIServer):
     if is_disagg_node():
@@ -210,6 +187,9 @@ def test_completion(client: openai.OpenAI,
         assert completion.id is not None
         message = completion.choices[0].text
         assert message.startswith('2.')
+
+        perf_metrics = get_timing_metrics(disagg_server.url_root)
+        validate_timing_metrics(perf_metrics, "multinode test_completion")
         disagg_server.terminate()
 
     elif is_gen_node():

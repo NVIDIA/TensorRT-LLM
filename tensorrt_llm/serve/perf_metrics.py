@@ -15,7 +15,7 @@
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
@@ -64,7 +64,7 @@ class MetricsDefinition:
     buckets: Optional[List[float]] = None
 
 
-METRICS_DEFINITIONS = [
+CLIENT_METRICS_DEFINITIONS = [
     MetricsDefinition("total_requests", "Total number of requests", "counter"),
     MetricsDefinition("error_requests", "Total number of error requests", "counter"),
     MetricsDefinition("retry_requests", "Total number of retry requests", "counter"),
@@ -96,29 +96,52 @@ ROLE_TO_CLIENT_TYPE = {
 }
 
 
+def instance_metric(definition: MetricsDefinition, role: Optional[ServerRole] = None):
+    # import lazily to avoid breaking `set_prometheus_multiproc_dir`
+    from prometheus_client import Counter, Histogram
+
+    name = (
+        f"{ROLE_TO_CLIENT_TYPE[role]}_{definition.name}"
+        if role in ROLE_TO_CLIENT_TYPE
+        else definition.name
+    )
+    if definition.type == "counter":
+        return Counter(name, definition.description)
+    elif definition.type == "histogram":
+        return Histogram(name, definition.description, buckets=definition.buckets)
+    else:
+        raise ValueError(f"Invalid metric type: {definition.type}")
+
+
 class ClientMetricsCollector:
     def __init__(self, role: ServerRole):
         self._role = role
-        # import lazily to avoid breaking `set_prometheus_multiproc_dir`
-        from prometheus_client import Counter, Histogram
-
-        def instance_metric(definition: MetricsDefinition) -> Union[Counter | Histogram]:
-            name = f"{ROLE_TO_CLIENT_TYPE[role]}_{definition.name}"
-            if definition.type == "counter":
-                return Counter(name, definition.description)
-            elif definition.type == "histogram":
-                return Histogram(name, definition.description, buckets=definition.buckets)
-            else:
-                raise ValueError(f"Invalid metric type: {definition.type}")
-
         self._metrics = {
-            definition.name: instance_metric(definition) for definition in METRICS_DEFINITIONS
+            definition.name: instance_metric(definition, role)
+            for definition in CLIENT_METRICS_DEFINITIONS
         }
 
     def __getattr__(
         self, key: str
     ):  # no return type hint to not import prometheus_client at module level
         return self._metrics[key]
+
+
+SERVER_METRICS_DEFINITIONS = [
+    MetricsDefinition("total_requests", "Total number of requests", "counter"),
+    MetricsDefinition("stream_requests", "Total number of stream requests", "counter"),
+    MetricsDefinition("nonstream_requests", "Total number of non-stream requests", "counter"),
+    MetricsDefinition("validation_exceptions", "Total number of validation exceptions", "counter"),
+    MetricsDefinition("http_exceptions", "Total number of HTTP exceptions", "counter"),
+    MetricsDefinition("internal_errors", "Total number of internal errors", "counter"),
+    MetricsDefinition("total_responses", "Total number of responses", "counter"),
+    MetricsDefinition(
+        "queue_latency_seconds",
+        "Histogram of latency from request arrival to being processed in seconds",
+        "histogram",
+        SHORT_TIME_BUCKETS,
+    ),
+]
 
 
 class DisaggPerfMetricsCollector:
@@ -128,9 +151,16 @@ class DisaggPerfMetricsCollector:
         self._server_metrics = defaultdict(dict)
         self._lock = asyncio.Lock()
         self._clients = []
+        self._metrics = {
+            definition.name: instance_metric(definition)
+            for definition in SERVER_METRICS_DEFINITIONS
+        }
 
     def add_client(self, client):
         self._clients.append(client)
+
+    def __getattr__(self, key: str):
+        return self._metrics[key]
 
     async def add_per_request_metrics(
         self,
