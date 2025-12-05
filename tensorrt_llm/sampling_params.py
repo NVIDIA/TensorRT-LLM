@@ -337,7 +337,9 @@ class SamplingParams:
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
 
-        # correct types as users might pass in logprob=True for Top-1 logprobs
+        # correct types as users might pass in logprob=True for Top-1 logprobs and logprobs=False for no logprobs
+        if self.logprobs is False:
+            self.logprobs = None
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 

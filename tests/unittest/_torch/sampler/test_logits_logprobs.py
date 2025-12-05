@@ -7,6 +7,10 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.sampling_utils import \
+    top_k_top_p_sampling_batch
+from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import \
+    _StrategyImpls
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
 prompts = ["A B C"]
@@ -101,6 +105,18 @@ def llm(
 
         with llm:
             yield llm
+
+
+@pytest.fixture(scope="module", params=[False, True])
+def simple_llm(request) -> LLM:
+    disable_flashinfer_sampling = request.param
+    llm = LLM(
+        model=os.path.join(llm_models_root(), "llama-models-v2",
+                           "TinyLlama-1.1B-Chat-v1.0"),
+        max_batch_size=8,
+        disable_flashinfer_sampling=disable_flashinfer_sampling,
+    )
+    return llm
 
 
 @force_ampere  # Save H100 resource
@@ -242,13 +258,12 @@ def test_generate_async_with_return_logits(
 
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3],
                          ids=["top_0", "top_1", "top_3"])
-def test_sampled_token_always_in_logprobs(logprobs_k: int):
+@pytest.mark.threadleak(enabled=False)
+def test_sampled_token_always_in_logprobs(logprobs_k: int, simple_llm: LLM):
     """Two scenarios:
         - logprobs=0: Returns only sampled token (1 element)
         - logprobs=K (K>0): Returns top-K tokens + sampled token if not in top-K (up to K+1 elements)
     """
-    llm = LLM(model=os.path.join(llm_models_root(), "llama-models-v2",
-                                 "TinyLlama-1.1B-Chat-v1.0"), )
 
     sampling_params = SamplingParams(
         max_tokens=8,
@@ -257,8 +272,8 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int):
         logprobs=logprobs_k,
     )
 
-    for output in llm.generate(["The future of AI is"],
-                               sampling_params=sampling_params):
+    for output in simple_llm.generate(["The future of AI is"],
+                                      sampling_params=sampling_params):
         print(f"\n{'='*80}")
         print(f"Generated text: {output.outputs[0].text!r}")
         print(f"Generated token IDs: {output.outputs[0].token_ids}")
@@ -272,7 +287,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int):
         for token_idx, (sampled_token_id,
                         token_logprobs) in enumerate(zip(token_ids, logprobs)):
             print(
-                f"\n  Token {token_idx}: ID={sampled_token_id}, Text={llm.tokenizer.decode([sampled_token_id])!r}"
+                f"\n  Token {token_idx}: ID={sampled_token_id}, Text={simple_llm.tokenizer.decode([sampled_token_id])!r}"
             )
 
             assert sampled_token_id in token_logprobs, \
@@ -302,7 +317,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int):
             for rank_idx, (token_id,
                            logprob_obj) in enumerate(sorted_tokens_by_prob,
                                                      start=1):
-                token_text = llm.tokenizer.decode([token_id])
+                token_text = simple_llm.tokenizer.decode([token_id])
                 is_sampled = "← SAMPLED" if token_id == sampled_token_id else ""
                 print(f"    • Token {token_id:5d} ({token_text:15s}): "
                       f"logprob={logprob_obj.logprob:8.4f}, "
@@ -317,13 +332,10 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int):
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
-def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int):
+@pytest.mark.threadleak(enabled=False)
+def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
+                                                    simple_llm: LLM):
     """Test logprobs when requests are reordered by sampling strategy grouping"""
-    llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2",
-                           "TinyLlama-1.1B-Chat-v1.0"),
-        max_batch_size=8,
-    )
 
     test_prompts = [
         "The capital of France is",
@@ -357,7 +369,7 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int):
     ]
 
     outputs = list(
-        llm.generate(test_prompts, sampling_params=sampling_params_list))
+        simple_llm.generate(test_prompts, sampling_params=sampling_params_list))
 
     for req_idx, output in enumerate(outputs):
         generation_logits = output.outputs[0].generation_logits
@@ -389,6 +401,137 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int):
                 f"Returned {returned_logprob:.6f} but expected {expected_logprob:.6f} " \
                 f"(diff={logprob_diff:.6f}). This indicates the logprob might be extracted from " \
                 f"the wrong token position."
+
+
+@pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
+@pytest.mark.threadleak(enabled=False)
+def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
+    """Test logprobs when requests are reordered by sampling strategy grouping"""
+
+    test_prompts = [
+        "The capital of France is",
+        "The future of AI is",
+        "Hello, my name is",
+        "Write a short story about a cat",
+    ]
+
+    sampling_params_list = [
+        # greedy decoding
+        SamplingParams(max_tokens=6,
+                       temperature=0.0,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True,
+                       logprobs_mode="processed"),
+        # temperature sampling
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True,
+                       logprobs_mode="processed"),
+        # top-p sampling
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_p=0.9,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True,
+                       logprobs_mode="processed"),
+        # top-k sampling
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_k=50,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True,
+                       logprobs_mode="processed"),
+        # top-p sampling 2
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_p=0.9,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True,
+                       logprobs_mode="processed"),
+        # top-p and top-k sampling
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
+                       top_p=0.9,
+                       top_k=50,
+                       logprobs=logprobs_k,
+                       return_generation_logits=True,
+                       logprobs_mode="processed"),
+    ]
+
+    outputs = list(
+        simple_llm.generate(test_prompts, sampling_params=sampling_params_list))
+
+    for req_idx, output in enumerate(outputs):
+        generation_logits = output.outputs[0].generation_logits
+        token_ids = output.outputs[0].token_ids
+        logprobs = output.outputs[0].logprobs
+
+        assert generation_logits is not None
+        assert len(logprobs) == len(token_ids), "Logprobs length mismatch"
+
+        # generation_logits might be shorter than token_ids
+        num_logits = len(generation_logits)
+
+        for token_idx, token_logprobs_dict in enumerate(logprobs[:num_logits]):
+
+            logits_for_token = generation_logits[token_idx:token_idx + 1]
+            topk = sampling_params_list[req_idx].top_k
+            topp = sampling_params_list[req_idx].top_p
+            temperature = sampling_params_list[req_idx].temperature
+            if sampling_params_list[req_idx]._greedy_decoding:
+                probs = torch.zeros_like(logits_for_token)
+                probs[0, token_ids[token_idx]] = 1.0
+            else:
+                topk = topk if topk is not None else logits_for_token.shape[-1]
+                topp = topp if topp is not None else 1.0
+                temperature = temperature if temperature is not None else 1.0
+
+                # perform maksing top-k top-p
+                if simple_llm.args.disable_flashinfer_sampling:
+                    _, probs = top_k_top_p_sampling_batch(
+                        logits_for_token,
+                        top_k=topk,
+                        top_p=topp,
+                        temperature=temperature)
+                else:
+                    logits_for_token = logits_for_token.to(device="cuda")
+                    _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
+                        logits_for_token,
+                        group_logit_indices=None,
+                        top_k=torch.tensor([topk],
+                                           dtype=torch.int32,
+                                           device="cuda"),
+                        top_p=torch.tensor([topp],
+                                           dtype=torch.float32,
+                                           device="cuda"),
+                        temperature=torch.tensor([temperature],
+                                                 dtype=torch.float32,
+                                                 device="cuda"),
+                        generator=None)
+
+            if temperature != 0:
+                logits_for_token /= temperature
+            adjusted_logits_for_token = torch.where(probs != 0,
+                                                    logits_for_token,
+                                                    float("-inf"))[0]
+            expected_logprobs = torch.nn.functional.log_softmax(
+                adjusted_logits_for_token, dim=-1).to(device="cpu")
+            for logprob_token, logprob_values in token_logprobs_dict.items():
+                expected_logprob = expected_logprobs[logprob_token].item()
+                returned_logprob = logprob_values.logprob
+                logprob_diff = abs(returned_logprob - expected_logprob)
+                if returned_logprob == float(
+                        "-inf") and expected_logprob == float("-inf"):
+                    logprob_diff = 0
+                print(
+                    f"Req {req_idx}, Token {token_idx} ({logprob_token}): returned={returned_logprob:.6f}, expected={expected_logprob:.6f}, diff={logprob_diff:.6f}"
+                )
+
+                assert logprob_diff < 1e-4, \
+                    f"Req {req_idx}, Token {token_idx}: Logprob mismatch! " \
+                    f"Returned {returned_logprob:.6f} but expected {expected_logprob:.6f} " \
+                    f"(diff={logprob_diff:.6f})."
 
 
 @force_ampere
