@@ -7,6 +7,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+from ...flashinfer_utils import get_env_enable_pdl
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args
@@ -275,6 +276,10 @@ def flashinfer_mha_with_cache(
         sm_scale=scale,
     )
 
+    if k_cache.dtype == torch.float8_e4m3fn:
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
+
     flashinfer.page.append_paged_kv_cache(
         k,
         v,
@@ -294,7 +299,9 @@ def flashinfer_mha_with_cache(
         paged_kv_last_page_len,
         pp,
     )
-    y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+    y = wrapper.run(
+        q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, enable_pdl=get_env_enable_pdl()
+    )
 
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
