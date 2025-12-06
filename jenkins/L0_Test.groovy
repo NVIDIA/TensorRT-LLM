@@ -630,6 +630,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
                     }
                     counter++
+                    // If entrypoint script fails to start, do not poll for agent connection
+                    try {
+                        SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
+                    } catch (Exception e) {
+                        error("Slurm job ${slurmJobID} exited before Jenkins agent connected. ${e.message}")
+                    }
                 }
             }
 
