@@ -156,14 +156,14 @@ class TRTLLMGenFusedMoE(MoE):
                     raise NotImplementedError(
                         f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
                     )
-            else:
-                # When without_comm=True, set minimal attributes
-                # Communication will be handled by parent wrapper (e.g., ConfigurableMoE)
-                self.alltoall_method_type = AlltoallMethodType.NotEnabled
-                self.alltoall_workspace = None
-                self.alltoall_prepare_workspace = None
-                self.use_low_precision_combine = False
-                self.moe_a2a = None
+        else:
+            # When without_comm=True, set minimal attributes
+            # Communication will be handled by parent wrapper (e.g., ConfigurableMoE)
+            self.alltoall_method_type = AlltoallMethodType.NotEnabled
+            self.alltoall_workspace = None
+            self.alltoall_prepare_workspace = None
+            self.use_low_precision_combine = False
+            self.moe_a2a = None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:

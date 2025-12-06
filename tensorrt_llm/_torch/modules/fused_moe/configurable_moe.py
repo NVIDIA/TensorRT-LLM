@@ -47,7 +47,9 @@ from .communication import (
     NVLinkOneSided,
     NVLinkTwoSided,
 )
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
+from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
 
@@ -56,7 +58,7 @@ class ConfigurableMoE(MoE):
     Configurable MoE layer using composition pattern with automatic configuration
 
     This class orchestrates the MoE execution flow by composing:
-    - moe_backend: Existing FusedMoE implementation (CutlassFusedMoE, WideEPMoE, etc.)
+    - moe_backend: Existing FusedMoE implementation (CutlassFusedMoE, CuteDslFusedMoE, etc.)
                    Note: Current FusedMoE implementations are used as backends (transitional).
                          Future will have dedicated MoEBackend interface.
     - Communication: Handles distributed communication (auto-selected)
@@ -797,7 +799,7 @@ class ConfigurableMoE(MoE):
         """
         Get the current MoE backend implementation
 
-        Note: Returns a FusedMoE instance (e.g., CutlassFusedMoE, WideEPMoE)
+        Note: Returns a FusedMoE instance (e.g., CutlassFusedMoE, CuteDslFusedMoE)
         """
         return self._backend
 
@@ -902,27 +904,26 @@ class ConfigurableMoE(MoE):
         Returns:
             Dict: Backend-specific keyword arguments
         """
-        backend_name = self.backend.__class__.__name__
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if backend_name in ["CutlassFusedMoE", "DeepGemmFusedMoE"]:
+        if self.backend.__class__ in (CutlassFusedMoE, DeepGemmFusedMoE, CuteDslFusedMoE):
             pass
 
         # Cutlass-specific parameters
-        if backend_name == "CutlassFusedMoE":
+        if self.backend.__class__ == CutlassFusedMoE:
             pass
 
-        # WideEP-specific parameters
-        elif backend_name == "WideEPMoE":
-            pass
+        # CuteDSL-specific parameters
+        elif self.backend.__class__ == CuteDslFusedMoE:
+            kwargs["enable_alltoall"] = self.enable_alltoall
 
         # DeepGemm-specific parameters
-        elif backend_name == "DeepGemmFusedMoE":
+        elif self.backend.__class__ == DeepGemmFusedMoE:
             pass
 
         # TRTLLMGen-specific parameters
-        elif backend_name == "TRTLLMGenFusedMoE":
+        elif self.backend.__class__ == TRTLLMGenFusedMoE:
             # Determine router_logits based on whether routing has been done
             # If backend doesn't support load balancer, routing is done before communication
             # In that case, router_logits should be None (routing already done)
