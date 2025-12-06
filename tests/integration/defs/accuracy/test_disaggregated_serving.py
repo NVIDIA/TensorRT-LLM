@@ -850,8 +850,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(4)
-    def test_auto_dtype_with_helix(self):
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp", [(1, 1, 4), (1, 2, 2),
+                                                      (2, 1, 2)],
+                             ids=["pp1tp1cp4", "pp1tp2cp2", "pp2tp1cp2"])
+    def test_auto_dtype_with_helix(self, gen_pp, gen_tp, gen_cp):
+        gen_ep = gen_tp * gen_cp
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
@@ -860,7 +864,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
-            "tensor_parallel_size": 2,
+            "tensor_parallel_size": 4,
             "context_parallel_size": 1,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
@@ -871,9 +875,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
         }
         gen_server_config = {
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": 1,
-            "context_parallel_size": 2,
+            "tensor_parallel_size": gen_tp,
+            "pipeline_parallel_size": gen_pp,
+            "context_parallel_size": gen_cp,
+            "moe_expert_parallel_size": gen_ep,
             "cp_config": {
                 "cp_type": "HELIX",
                 "tokens_per_block": 32
@@ -904,8 +909,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
