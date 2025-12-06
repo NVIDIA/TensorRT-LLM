@@ -81,7 +81,6 @@ inline AllReduceStrategyType SelectStrategyLP(size_t seq_len, size_t hidden_size
     {
         return AllReduceStrategyType::ONESHOT;
     }
-    return AllReduceStrategyType::NCCL;
 }
 
 // use 1D vector to store the best strategy instead of a map for each sm version
@@ -143,7 +142,7 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
         sm_version = 100;
     }
 
-    // Check if the entry is out of bounds, otherwise return NCCL as fallback
+    // Check if the entry is out of bounds, otherwise return NCCL_SYMMETRIC as fallback
     if (AllReduceBestStrategyTable.find(sm_version) == AllReduceBestStrategyTable.end()
         || tp_index >= AllReduceBestStrategyTable.at(sm_version).size()
         || fusion_op_index >= AllReduceBestStrategyTable.at(sm_version).at(tp_index).size()
@@ -151,7 +150,7 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
         || num_token_index
             >= AllReduceBestStrategyTable.at(sm_version).at(tp_index).at(fusion_op_index).at(hidden_size_index).size())
     {
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     return static_cast<AllReduceStrategyType>(
