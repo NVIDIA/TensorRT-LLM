@@ -11,7 +11,7 @@ The detailed LLM quantization recipe is distributed to the README.md of the corr
 
 ## Installation
 
-The NVIDIA TensorRT Model Optimizer quantization toolkit is installed automatically as a dependency of TensorRT-LLM.
+The NVIDIA Model Optimizer quantization toolkit is installed automatically as a dependency of TensorRT-LLM.
 
 ```bash
 # Install the additional requirements

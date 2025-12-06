@@ -773,7 +773,7 @@ You can enable FP8 MLA through either of these methods:
 
 **Option 1: Checkpoint config**
 
-TensorRT LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+TensorRT LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/Model-Optimizer).
 
 To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 GEMM quantization + FP8 MLA:
 
@@ -808,14 +808,14 @@ Or you can follow the steps to generate one by yourselves.
 
 #### Activation calibration
 
-[ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) is used for calibrating activations of MoE layers. We provide a calibrated file at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main/act_scales.safetensors) or you can run the following commands to generate by yourselves.
+[ModelOpt](https://github.com/NVIDIA/Model-Optimizer) is used for calibrating activations of MoE layers. We provide a calibrated file at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main/act_scales.safetensors) or you can run the following commands to generate by yourselves.
 
 ```bash
 # Make sure for enough GPU resources (8xH200s) to run the following commands
 PATH_OF_DEEPSEEK_R1=/llm-models/DeepSeek-R1/DeepSeek-R1
 
 # Install ModelOpt from source
-git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer/ && cd modelopt
+git clone https://github.com/NVIDIA/Model-Optimizer/ && cd modelopt
 pip install "nvidia-modelopt[all]" -U --extra-index-url https://pypi.nvidia.com
 
 # Clone DeepSeek-V3 (base model of R1) Github repository for FP8 inference,
