@@ -58,6 +58,7 @@ enum class AllReduceStrategyType : int8_t
     LOWPRECISION = 6,
     MNNVL = 7,
     NCCL_SYMMETRIC = 8,
+    NCCL_DEVICE = 9,
 };
 
 enum class AllReduceStrategyConfig : int8_t
@@ -119,6 +120,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceStrategyType op)
     case AllReduceStrategyType::LOWPRECISION: os << "LOWPRECISION"; break;
     case AllReduceStrategyType::MNNVL: os << "MNNVL"; break;
     case AllReduceStrategyType::NCCL_SYMMETRIC: os << "NCCL_SYMMETRIC"; break;
+    case AllReduceStrategyType::NCCL_DEVICE: os << "NCCL_DEVICE"; break;
     }
     return os;
 }
@@ -128,6 +130,15 @@ inline std::string toString(AllReduceStrategyType op)
     std::ostringstream oss;
     oss << op;
     return oss.str();
+}
+
+// Helper function to determine if a strategy should skip topology detection
+// These strategies manage connectivity internally
+inline bool shouldSkipTopologyDetection(AllReduceStrategyType strategy)
+{
+    return (strategy == AllReduceStrategyType::NCCL || strategy == AllReduceStrategyType::NCCL_SYMMETRIC
+        || strategy == AllReduceStrategyType::NCCL_DEVICE || strategy == AllReduceStrategyType::UB
+        || strategy == AllReduceStrategyType::MNNVL);
 }
 
 struct AllReduceFusionParams

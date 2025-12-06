@@ -25,6 +25,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
+#include "tensorrt_llm/kernels/nccl_device/config.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
@@ -291,6 +292,8 @@ public:
         case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::NCCL_SYMMETRIC:
             return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::NCCL_DEVICE:
+            return runNCCLAllReduceDeviceFusion(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
@@ -309,10 +312,16 @@ public:
         {
             mNcclComm = getComm(mGroup);
         }
-        if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB)
+        // Skip topology detection for strategies that manage connectivity internally
+        if (!shouldSkipTopologyDetection(mStrategy))
         {
-
             initGroupTopology();
+        }
+        else
+        {
+            // For strategies that skip topology detection, assume connectivity is supported
+            mIsP2PSupported = true;
+            mIsNVLINKSupported = true;
         }
 
         TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, getRank());
@@ -335,6 +344,14 @@ private:
         TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
         auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+        if (ub_buffer0.invalid())
+        {
+            auto [symmetric_input, symmetric_ub_buffer0]
+                = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+            cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
+                cudaMemcpyDeviceToDevice, stream);
+            ub_buffer0 = symmetric_ub_buffer0;
+        }
         TLLM_CHECK(!ub_buffer0.invalid());
 
         auto ub_comm = ub_manager.comm();
@@ -435,14 +452,60 @@ private:
 
     std::vector<torch::Tensor> runNCCLAllReduceSymmetric(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
     {
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
-        auto ub_tensor0 = input;
         auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+        if (ub_buffer0.invalid())
+        {
+            auto [symmetric_input, symmetric_ub_buffer0]
+                = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+            cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
+                cudaMemcpyDeviceToDevice, stream);
+            ub_buffer0 = symmetric_ub_buffer0;
+        }
+
+        TLLM_CHECK(!ub_buffer0.invalid());
+        auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+
+        auto& rawComm = std::get<std::shared_ptr<ncclComm_t>>(mNcclComm);
+        NCCLCHECK(ncclAllReduce(
+            ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+
+        if (mOp == AllReduceFusionOp::NONE)
+        {
+            return {norm_out};
+        }
+
+        // Treat any other patterns as fallback cases.
+        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
+    }
+
+    std::vector<torch::Tensor> runNCCLAllReduceDeviceFusion(torch::Tensor const& input,
+        torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
+    {
+        auto const myRank = getRank();
+        TLLM_LOG_DEBUG("runNCCLAllReduceDeviceFusion: rank=%d, fusion_op=%s", myRank,
+            tensorrt_llm::kernels::toString(mOp).c_str());
+
+        TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(),
+            "UserBuffer has not been initialized (required for NCCL_DEVICE)");
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        auto ub_tensor0 = input;
+        auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
+        auto& allocator = tensorrt_llm::runtime::ub::UserBufferAllocator::Instance();
+        auto* nccl_ub_allocator_ptr = dynamic_cast<tensorrt_llm::runtime::ub::NCCLUserBufferAllocator*>(&allocator);
+        TLLM_CHECK_WITH_INFO(nccl_ub_allocator_ptr != nullptr,
+            "NCCL_DEVICE requires the UBAllocator to be set up with the use_nccl option = True.");
+        auto& nccl_ub_allocator = *nccl_ub_allocator_ptr;
+
+        auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+
         if (ub_buffer0.invalid())
         {
             auto [symmetric_input, symmetric_ub_buffer0]
@@ -452,29 +515,82 @@ private:
             ub_buffer0 = symmetric_ub_buffer0;
             ub_tensor0 = symmetric_input;
         }
-
         TLLM_CHECK(!ub_buffer0.invalid());
+
         auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+        TLLM_CHECK(!ub_buffer1.invalid());
+        // Get communicator size
+        auto& rawComm = std::get<std::shared_ptr<ncclComm_t>>(mNcclComm);
+        int nRanks;
+        ncclResult_t ncclError = ncclCommCount(*rawComm, &nRanks);
+        TLLM_CHECK_WITH_INFO(
+            ncclError == ncclSuccess, "Failed to get NCCL communicator size: %s", ncclGetErrorString(ncclError));
 
-        std::visit(overloaded{[&, norm_out_ = norm_out](std::shared_ptr<ncclComm_t>& rawComm)
-                       {
-                           NCCLCHECK_THROW(ncclAllReduce(ub_buffer0.addr, norm_out_.mutable_data_ptr(), size,
-                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
-                       },
-                       [&, norm_out_ = norm_out](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
-                       {
-                           PGCHECK_THROW(PgHelper{torchPg}.allreduce(ub_tensor0, {c10d::ReduceOp::SUM}));
-                           std::ignore = norm_out_.copy_(ub_tensor0, true);
-                       }},
-            mNcclComm);
-
-        if (mOp == AllReduceFusionOp::NONE)
+        switch (mOp)
         {
-            return {norm_out};
-        }
+        case AllReduceFusionOp::NONE:
+            NCCLCHECK(ncclAllReduce(ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType],
+                ncclSum, *rawComm, stream));
 
-        // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
+            return {norm_out};
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM:
+        {
+            TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
+            TORCH_CHECK(residual, "residual is required for residual rms norm allreduce");
+            TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
+
+            int const hidden_size = input.size(-1);
+            int const numTokens = size / hidden_size;
+
+            TLLM_LOG_DEBUG("NCCL_DEVICE RESIDUAL_RMS_NORM: rank=%d, hidden_size=%d, numTokens=%d, nRanks=%d, dtype=%d",
+                myRank, hidden_size, numTokens, nRanks, static_cast<int>(mType));
+
+            std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> launchConfig
+                = nccl_ub_allocator.getCachedNCCLDeviceLaunchConfig(
+                    mType, hidden_size, numTokens, myRank, nRanks, true, false);
+
+            // Check if multimem is supported for this data type
+            bool multimemSupported = launchConfig->supportsMultimem();
+            TLLM_LOG_DEBUG("NCCL_DEVICE: rank=%d, supportsMultimem=%s", myRank, multimemSupported ? "true" : "false");
+
+            if (multimemSupported)
+            {
+                ncclWindow_t inWindow = ub_buffer0.window;
+                ncclWindow_t outWindow = ub_buffer1.window;
+                TLLM_CHECK(inWindow != nullptr);
+                TLLM_CHECK(outWindow != nullptr);
+
+                auto [residual_out, ub_buffer2]
+                    = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+                TLLM_CHECK(!ub_buffer2.invalid());
+                ncclDevComm devComm = nccl_ub_allocator.getNCCLDevComm(launchConfig->getNumSMs());
+
+                launchConfig->launchRMSNorm(inWindow, outWindow, residual.value().data_ptr(), ub_buffer2.window,
+                    norm_weight.value().data_ptr(), nullptr, devComm, mEps, stream);
+
+                TLLM_LOG_DEBUG("NCCL_DEVICE: rank=%d, fused kernel launched successfully", myRank);
+                return {norm_out, residual_out};
+            }
+            // Fall back to old strategy with warning
+            if (myRank == 0)
+            {
+                TLLM_LOG_WARNING(
+                    "[RANK 0] NCCL device Fused AR not supported for data type %d, hidden size %d & %d nRanks. "
+                    "Check DEBUG logs from supportsMultimem() for reason. Falling back to standard allreduce + "
+                    "separate RMSNorm.",
+                    static_cast<int>(mType), hidden_size, nRanks);
+            }
+            TLLM_LOG_WARNING(
+                "NCCL device Fused AR not supported for data type %d, hidden size %d & %d nRanks on current "
+                "architecture. Falling back to standard allreduce + separate RMSNorm.",
+                static_cast<int>(mType), hidden_size, nRanks);
+        }
+        // Intentional fallthrough to default
+        default:
+            NCCLCHECK(ncclAllReduce(
+                ub_buffer0.addr, ub_buffer1.addr, size, (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+            return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
+        }
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
@@ -797,6 +913,79 @@ private:
         return {};
     }
 
+    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
+    {
+        AllReduceStrategyType runtime_strategy;
+        if (mStrategy == AllReduceStrategyType::UB)
+        {
+            runtime_strategy = AllReduceStrategyType::UB;
+        }
+        else if (mStrategy == AllReduceStrategyType::NCCL)
+        {
+            runtime_strategy = AllReduceStrategyType::NCCL;
+        }
+        else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+        {
+            runtime_strategy = AllReduceStrategyType::NCCL_SYMMETRIC;
+        }
+        else if (mStrategy == AllReduceStrategyType::NCCL_DEVICE)
+        {
+            runtime_strategy = AllReduceStrategyType::NCCL_DEVICE;
+        }
+        else
+        {
+            // This is for DEBUG and BENCHMARK purpose. It will overried the strategy if AUTO is set.
+            static char* ifForBenchMark = std::getenv("OVERRIDE_HEURISTIC_ALLREDUCE_STRATEGY");
+            if (ifForBenchMark != nullptr)
+            {
+                runtime_strategy = mStrategy;
+            }
+            else
+            {
+                runtime_strategy = selectImplementation(seq_len, size);
+            }
+        }
+        return runtime_strategy;
+    }
+
+    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
+    {
+        switch (strategy)
+        {
+        case AllReduceStrategyType::NCCL:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
+            break;
+        }
+        case AllReduceStrategyType::NCCL_SYMMETRIC:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
+            break;
+        }
+        case AllReduceStrategyType::NCCL_DEVICE:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_DEVICE", rank);
+            break;
+        }
+        case AllReduceStrategyType::MIN_LATENCY:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
+            break;
+        }
+        case AllReduceStrategyType::UB:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
+            break;
+        }
+        case AllReduceStrategyType::LOWPRECISION:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
+            break;
+        }
+        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
+        }
+    }
+
     void initGroupTopology()
     {
         static std::map<std::set<int>, std::tuple<bool, bool>> cache;
@@ -928,9 +1117,11 @@ private:
     {
         if (mStrategy != AllReduceStrategyType::AUTO)
         {
-            // For UB,NCCL,NCCL_SYMMETRIC, the correctness of the strategy dispatching is guaranteed by the user.
+            // For UB,NCCL,NCCL_SYMMETRIC,NCCL_DEVICE, the correctness of the strategy dispatching is guaranteed by the
+            // user.
             if (mStrategy == AllReduceStrategyType::UB || mStrategy == AllReduceStrategyType::NCCL
-                || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+                || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC
+                || mStrategy == AllReduceStrategyType::NCCL_DEVICE)
             {
                 return mStrategy;
             }
@@ -981,6 +1172,12 @@ private:
         // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
+            auto const rank = getRank();
+            if (rank == 0)
+            {
+                TLLM_LOG_INFO("[RANK 0] Fallback to NCCL: msg_size_bytes=%zu, max_workspace=%zu, P2P=%d, NVLINK=%d",
+                    message_size_bytes, max_workspace_size, mIsP2PSupported, mIsNVLINKSupported);
+            }
             return true;
         }
 

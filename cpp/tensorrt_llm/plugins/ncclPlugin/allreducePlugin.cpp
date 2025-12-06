@@ -137,7 +137,8 @@ bool AllreducePlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     int base_inputs = 0;
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB)
+    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB
+        || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC || mStrategy == AllReduceStrategyType::NCCL_DEVICE)
     {
         base_inputs = 1;
     }
@@ -169,7 +170,9 @@ bool AllreducePlugin::supportsFormatCombination(
 
     TLLM_CHECK(nbInputs == (base_inputs + fusion_op_extra_inputs));
 
-    if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB && pos == 1)
+    if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB
+        && mStrategy != AllReduceStrategyType::NCCL_SYMMETRIC && mStrategy != AllReduceStrategyType::NCCL_DEVICE
+        && pos == 1)
     {
         return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
@@ -341,6 +344,14 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
         runtimeStrategy = AllReduceStrategyType::UB;
     }
+    else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL_SYMMETRIC;
+    }
+    else if (mStrategy == AllReduceStrategyType::NCCL_DEVICE)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL_DEVICE;
+    }
     else
     {
         runtimeStrategy = selectImplementation(size, mGroup.size(), mType);
@@ -368,6 +379,16 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     case AllReduceStrategyType::UB:
     {
         TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
+        break;
+    }
+    case AllReduceStrategyType::NCCL_SYMMETRIC:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
+        break;
+    }
+    case AllReduceStrategyType::NCCL_DEVICE:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_DEVICE", rank);
         break;
     }
     default: break;
@@ -798,9 +819,16 @@ int AllreducePlugin::initialize() noexcept
 
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     mNcclComm = getComm(mGroup);
-    if (mStrategy != AllReduceStrategyType::NCCL)
+    // Skip topology detection for strategies that manage connectivity internally
+    if (!shouldSkipTopologyDetection(mStrategy))
     {
         initGroupTopology();
+    }
+    else
+    {
+        // For strategies that skip topology detection, assume connectivity is supported
+        mIsP2PSupported = true;
+        mIsNVLINKSupported = true;
     }
 
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
