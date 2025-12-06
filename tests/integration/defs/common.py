@@ -17,11 +17,13 @@ import os
 import platform
 import re
 import socket
+import tempfile
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+import yaml
 from packaging import version
 
 from tensorrt_llm import LLM as LLM_torch
@@ -1172,3 +1174,18 @@ def revise_disaggregated_server_config_urls_with_free_ports(
             i] = f"{url_map[url][0]}:{url_map[url][1]}"
 
     return disaggregated_server_config
+
+
+def revise_disagg_config_file_with_free_ports(disagg_config_file: str) -> str:
+    # Revise the config file to use free ports
+    new_config = None
+    with open(disagg_config_file, 'r') as f:
+        config = yaml.safe_load(f)
+        new_config = revise_disaggregated_server_config_urls_with_free_ports(
+            config)
+
+    temp_fd, new_config_file = tempfile.mkstemp(suffix='.yaml')
+    with os.fdopen(temp_fd, 'w') as f:
+        yaml.dump(new_config, f)
+
+    return new_config_file

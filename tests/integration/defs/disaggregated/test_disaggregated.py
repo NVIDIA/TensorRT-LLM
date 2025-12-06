@@ -22,8 +22,8 @@ from typing import Callable
 
 import pytest
 import yaml
-from defs.common import (
-    revise_disaggregated_server_config_urls_with_free_ports, wait_for_server)
+from defs.common import (revise_disagg_config_file_with_free_ports,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
@@ -278,18 +278,8 @@ def get_test_config(test_desc, example_dir, test_root):
         raise ValueError(f"Invalid test description: {test_desc}, "
                          f"valid descriptions are: {config_map.keys()}")
 
-    # Revise the config file to use free ports
-    new_config = None
-    with open(config_map[test_desc][1], 'r') as f:
-        config = yaml.safe_load(f)
-        new_config = revise_disaggregated_server_config_urls_with_free_ports(
-            config)
-
-    temp_fd, new_config_file = tempfile.mkstemp(suffix=f'_{test_desc}.yaml')
-    with os.fdopen(temp_fd, 'w') as f:
-        yaml.dump(new_config, f)
-
-    return (config_map[test_desc][0], new_config_file)
+    return (config_map[test_desc][0],
+            revise_disagg_config_file_with_free_ports(config_map[test_desc][1]))
 
 
 def get_extra_llm_config(config, suffix, cwd):
