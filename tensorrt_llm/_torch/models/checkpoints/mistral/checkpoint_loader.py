@@ -21,6 +21,12 @@ class MistralCheckpointLoader(HfCheckpointLoader):
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
         )
         self._checkpoint_format = "mistral"
+        self.mm_module_mapping = {
+            "vision_encoder": "vision_tower",
+            "pre_mm_projector_norm": "multi_modal_projector.norm",
+            "vision_language_adapter": "multi_modal_projector",
+            "patch_merger": "multi_modal_projector.patch_merger",
+        }
 
     def preprocess_weights(self, weights: dict) -> dict:
         """
@@ -29,7 +35,14 @@ class MistralCheckpointLoader(HfCheckpointLoader):
         hf_weights = {}
 
         for key, value in weights.items():
-            hf_weights["language_model." + key] = value
+            modules = key.split(".")
+
+            if modules[0] not in self.mm_module_mapping.keys():
+                hf_weights["language_model." + key] = value
+
+            else:
+                modules[0] = self.mm_module_mapping[modules[0]]
+                hf_weights[".".join(modules)] = value
 
         return hf_weights
 
@@ -54,7 +67,7 @@ class MistralCheckpointLoader(HfCheckpointLoader):
     def load_weights(self, checkpoint_dir: str, **kwargs):
         weights = super().weight_loader.load_weights(checkpoint_dir, **kwargs)
         weights = self.preprocess_weights(weights)
-        # FIXME @okozlova mimic DS fp8 till per tensor supported
+        # FIXME mimic DS fp8 till per tensor supported
         self.broadcast_per_tensor_scales(weights)
         self.reverse_nvfp4_global_scales(weights)
         return weights

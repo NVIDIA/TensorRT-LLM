@@ -375,8 +375,8 @@ NOTE:
     placeholder for the model needs to be added in retrieve_multimodal_placeholder().
 """
 
-HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
-PLACEHOLDER_EXCEPTIONS = ["llava_next", "NemotronH_Nano_VL_V2"]
+HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral3"]
+PLACEHOLDER_EXCEPTIONS = ["llava_next", "NemotronH_Nano_VL_V2", "mistral3"]
 
 
 # Helpers to always get the latest supported multimodal model types from the registry
@@ -621,6 +621,7 @@ def default_multimodal_input_loader(
         prompts: List[str],
         processor: Optional[BaseMultimodalInputProcessor] = None,
         media: Optional[Union[List[str], List[List[str]]]] = None,
+        keep_source_media: bool = False,
         image_data_format: str = "pt",
         num_frames: int = 8,
         mm_embeddings: Optional[Union[List[torch.Tensor],
@@ -766,6 +767,10 @@ def default_multimodal_input_loader(
             add_generation_prompt=True,
             mm_placeholder_counts=[mm_placeholder_counts])
         input = {"prompt": prompt}
+
+        if keep_source_media:  # WAR for mistral-common processors
+            input["mm_processor_kwargs"] = {"media": media}
+
         if mm_placeholder_counts:
             if mm_embeddings is not None:
                 input[

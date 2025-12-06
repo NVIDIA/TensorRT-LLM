@@ -272,15 +272,21 @@ def main():
         args.prompt = example_medias_and_prompts[args.modality]["prompt"]
     if args.media is None:
         args.media = example_medias_and_prompts[args.modality]["media"]
-    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
-                                             model_dir=str(llm._hf_model_dir),
-                                             model_type=model_type,
-                                             modality=args.modality,
-                                             prompts=args.prompt,
-                                             media=args.media,
-                                             image_data_format=image_format,
-                                             num_frames=args.num_frames,
-                                             device=args.device)
+    
+    #FIXME WAR for mistral-common processors
+    keep_source_media=(args.model_type=="mistral3" and args.checkpoint_format == "mistral_large_3")
+    inputs = default_multimodal_input_loader(
+        tokenizer=llm.tokenizer,
+        model_dir=str(llm._hf_model_dir),
+        model_type=model_type,
+        modality=args.modality,
+        prompts=args.prompt,
+        media=args.media,
+        keep_source_media=keep_source_media,
+        processor=getattr(llm, "input_processor", None),
+        image_data_format=image_format,
+        num_frames=args.num_frames,
+        device=args.device)
 
     lora_request = None
     if args.load_lora:

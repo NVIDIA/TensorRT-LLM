@@ -9,8 +9,7 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
 import torch
 from PIL import Image
 from torch import Tensor, nn
-from transformers import (AutoProcessor, PretrainedConfig,
-                          PreTrainedTokenizerBase)
+from transformers import (AutoProcessor, PretrainedConfig, PreTrainedTokenizerBase)
 
 import tensorrt_llm
 
@@ -591,10 +590,17 @@ def create_input_processor(
             MistralConfigLoader
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        config.torch_dtype = model_config.torch_dtype
 
+        # FIXME support both HF and mistral-common paths in a better way
         if tokenizer is None:
-            from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
-            tokenizer = MistralTokenizer.from_pretrained(model_path_or_dir)
+            from tensorrt_llm._torch.models.modeling_mistral import \
+                MistralCommonInputProcessor
+            tokenizer = MistralCommonInputProcessor.load_tokenizer(
+                model_path_or_dir, config=None)
+
+        print(f"loaded tokenizer: {type(tokenizer)}")
+
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
@@ -693,7 +699,8 @@ def create_input_processor_with_hash(
             # TODO: add audio support
             if len(modalities) == 1 and modalities[0] in ['image', 'video']:
                 # only try multimodal hashing if the inputs only contain image data
-                if input_processor.multimodal_hashing_supported is not None:
+                if getattr(input_processor, "multimodal_hashing_supported",
+                           None) is not None:
                     use_multimodal_hashing = input_processor.multimodal_hashing_supported
                 else:
                     # we need to try the multimodal hashing for the first time to determine if it is supported

@@ -27,14 +27,14 @@ class MistralWeightMapper(HfWeightMapper):
 
         self.mistral_llm_mapping = {
             "layers": "model.layers",
-            "attention": "self_attn",  # llm-only
+            "attention": "self_attn",
             "qscale_act": "input_scale",
             "qscale_weight": "weight_scale_inv",
             "kv_fake_quantizer.qscale_act": "kv_scale",
             "q_fake_quantizer.qscale_act": "attn.q_scale",
             "k_fake_quantizer.qscale_act": "k_scale",
             "v_fake_quantizer.qscale_act": "v_scale",
-            "attention_norm": "input_layernorm",  # llm-only
+            "attention_norm": "input_layernorm",
             "feed_forward": "mlp",
             "ffn_norm": "post_attention_layernorm",
             "tok_embeddings": "model.embed_tokens",
@@ -78,6 +78,15 @@ class MistralWeightMapper(HfWeightMapper):
         processed_weights = {}
         config = self.config.pretrained_config
 
+        def permute(w, n_heads: int, attn_out: int):
+            attn_in = config.head_dim * n_heads
+
+            return (
+                w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
+                .transpose(1, 2)
+                .reshape(attn_in, attn_out)
+            )
+
         # rotary embeds should be sliced
         # If using quantized model in mistral format,
         # quantization scales (qscale_weight) also need to be sliced
@@ -87,27 +96,14 @@ class MistralWeightMapper(HfWeightMapper):
                 config.num_key_value_heads if new_name == "k_proj" else config.num_attention_heads
             )
 
-            processed_weights["weight"] = self._permute_helper(
-                weights["weight"], n_heads, config.hidden_size
-            )
+            processed_weights["weight"] = permute(weights["weight"], n_heads, config.hidden_size)
 
             if "qscale_weight" in weights and weights["qscale_weight"].numel() > 1:
-                processed_weights["qscale_weight"] = self._permute_helper(
-                    weights["qscale_weight"], n_heads, 1
-                )
+                processed_weights["qscale_weight"] = permute(weights["qscale_weight"], n_heads, 1)
 
             return processed_weights
 
         return weights
-
-    def _permute_helper(self, w, n_heads: int, attn_out: int):
-        attn_in = self.config.pretrained_config.head_dim * n_heads
-
-        return (
-            w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
-            .transpose(1, 2)
-            .reshape(attn_in, attn_out)
-        )
 
 
 @register_mapper("mistral_large_3")

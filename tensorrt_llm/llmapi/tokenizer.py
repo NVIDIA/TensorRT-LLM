@@ -2,15 +2,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import torch
-from mistral_common.protocol.instruct.chunk import ImageChunk
 from mistral_common.tokens.tokenizers.base import (SpecialTokenPolicy,
                                                    SpecialTokens)
-from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from mistral_common.tokens.tokenizers.sentencepiece import \
     SentencePieceTokenizer
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
-from transformers import (AutoTokenizer, BatchFeature, PreTrainedTokenizerBase,
+from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 from transformers.tokenization_mistral_common import \
     MistralCommonTokenizer as TransformersMistralTokenizer
@@ -590,102 +587,7 @@ class MistralTokenizer(TransformersTokenizer):
             self, conversation: Union[List[Dict[str, str]],
                                       List[List[Dict[str, str]]]], *args,
             **kwargs) -> Union[str, List[int], List[str], List[List[int]]]:
-        # FIXME
-        new_conversation = []
-        # only keep the str contents since the tokenizer does not support data of other types
-        for idx in range(len(conversation)):
-            new_conversation.append({})
-            for key in conversation[idx]:
-                if isinstance(conversation[idx][key], str):
-                    new_conversation[idx][key] = conversation[idx][key]
-        return self.transformers_tokenizer.apply_chat_template(
-            new_conversation, *args, **kwargs)
-
-
-class PixtralProcessorAdapter:
-    """
-    Provide a HF-compatible interface for
-    `mistral_common.tokens.tokenizers.multimodal.ImageEncoder`.
-    """
-
-    def __init__(self, tokenizer: MistralTokenizer) -> None:
-        super().__init__()
-
-        self.tokenizer = tokenizer
-
-    @property
-    def image_processor(self) -> ImageEncoder:
-        image_encoder = self.tokenizer.instruct.mm_encoder
-        assert isinstance(image_encoder, ImageEncoder)
-        return image_encoder
-
-    @property
-    def image_break_id(self) -> int:
-        return self.image_processor.special_ids.img_break
-
-    @property
-    def image_token_id(self) -> int:
-        return self.image_processor.special_ids.img
-
-    @property
-    def image_end_id(self) -> int:
-        return self.image_processor.special_ids.img_end
-
-    @property
-    def image_size(self) -> int:
-        return self.image_processor.mm_config.max_image_size
-
-    @property
-    def patch_size(self) -> int:
-        return self.image_processor.mm_config.image_patch_size
-
-    def __call__(
-        self,
-        text=None,
-        images=None,
-        return_tensors=None,
-        **kwargs,
-    ) -> BatchFeature:  # Mapping[str, NestedTensors]:
-        if text is None:
-            text = []
-        if not isinstance(text, list):
-            text = [text]
-        if images is None:
-            images = []
-        if not isinstance(images, list):
-            images = [images]
-
-        if not images:
-            input_ids = self.tokenizer(text).input_ids
-
-            return {"input_ids": torch.tensor(input_ids)}
-
-        # Allow dummy text, which is used for profiling as well as token inputs
-        if any(len(t) > 0 for t in text):
-            raise ValueError(
-                "You've passed text inputs instead of token inputs. "
-                "Make sure to process your input via `mistral_common`'s "
-                "tokenizer or pass a chat completion request. "
-                "For more info, see: "
-                "https://github.com/vllm-project/vllm/issues/8411.")
-
-        images_processed = list[torch.Tensor]()
-        images_tokens = list[torch.Tensor]()
-
-        for image in images:
-            image_inputs = self.image_processor(ImageChunk(image=image))
-            image_processed = torch.tensor(image_inputs.image)
-            image_tokens = torch.tensor(image_inputs.tokens)
-
-            images_processed.append(image_processed)
-            images_tokens.append(image_tokens)
-
-        return BatchFeature({
-            "input_ids":
-            torch.cat(images_tokens)[None].expand(len(text), -1),
-            "images":
-            images_processed,
-        })
+        raise NotImplementedError
 
 
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
