@@ -28134,14 +28134,13 @@ License: `Apache 2.0`
   - `Homepage`: https://github.com/NVIDIA/TensorRT/tree/main/tools/onnx-graphsurgeon
 
 
-## openai (2.3.0)
+## openai (2.8.1)
 
 ### Licenses
 License: `Apache-2.0`
 
   - `licenses/LICENSE`:
 ```
-
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
@@ -28330,7 +28329,7 @@ License: `Apache-2.0`
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright [yyyy] [name of copyright owner]
+   Copyright 2025 OpenAI
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -28342,7 +28341,8 @@ License: `Apache-2.0`
    distributed under the License is distributed on an "AS IS" BASIS,
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
-   limitations under the License.```
+   limitations under the License.
+```
 
 ### URLs
   - `Homepage`: https://github.com/openai/openai-python
