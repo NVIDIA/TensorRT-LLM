@@ -272,9 +272,10 @@ def main():
         args.prompt = example_medias_and_prompts[args.modality]["prompt"]
     if args.media is None:
         args.media = example_medias_and_prompts[args.modality]["media"]
-    
+
     #FIXME WAR for mistral-common processors
-    keep_source_media=(args.model_type=="mistral3" and args.checkpoint_format == "mistral_large_3")
+    keep_source_media = (args.model_type == "mistral3"
+                         and args.checkpoint_format == "mistral_large_3")
     inputs = default_multimodal_input_loader(
         tokenizer=llm.tokenizer,
         model_dir=str(llm._hf_model_dir),

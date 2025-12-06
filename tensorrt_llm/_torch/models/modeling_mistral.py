@@ -286,8 +286,6 @@ class MistralCommonImageProcessor:
 
         mm_items = [{"type": "image_url", "image_url": url} for url in media]
 
-        print(f"text: {text}")
-
         conversation = [{
             "role": "user",
             "content": [{
@@ -298,13 +296,6 @@ class MistralCommonImageProcessor:
 
         encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
             conversation, tokenize=True, return_dict=True, return_tensors='pt')
-
-        print(
-            f"encoded.pixel_values.shape: {encoded.pixel_values.shape}, encoded.input_ids: {encoded.input_ids[0][-20:]}"
-        )
-        print(
-            f"encoded.input_ids list: {self.tokenizer.transformers_tokenizer.apply_chat_template(conversation)}"
-        )
 
         processed = {
             "input_ids": encoded.input_ids,
@@ -351,9 +342,12 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
                 model_path,
                 use_fast=self.use_fast,
                 trust_remote_code=trust_remote_code)
-        
-        logger.debug(f"Mistral3InputProcessor: using {type(self._processor)} preprocessor")
-        logger.debug(f"Mistral3InputProcessor: using {type(self._tokenizer)} tokenizer")
+
+        logger.debug(
+            f"Mistral3InputProcessor: using {type(self._processor)} preprocessor"
+        )
+        logger.debug(
+            f"Mistral3InputProcessor: using {type(self._tokenizer)} tokenizer")
 
     @property
     def config(self) -> PretrainedConfig:
@@ -444,7 +438,9 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             self.processor.image_end_token_id,
         ])
 
+
 class MistralCommonInputProcessor(Mistral3InputProcessor):
+
     def __init__(
         self,
         model_path: str,
@@ -460,19 +456,22 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
                          **kwargs)
 
     @staticmethod
-    def load_tokenizer(model_path: str, config: PretrainedConfig, checkpoint_format: Optional[str] = "mistral_large_3"):
+    def load_tokenizer(model_path: str,
+                       config: PretrainedConfig,
+                       checkpoint_format: Optional[str] = "mistral_large_3"):
         if checkpoint_format == "mistral_large_3":
             try:
                 return MistralTokenizer.from_pretrained(model_path)
-            
-            except ValueError:
-                logger.info(f"Could not load mistral-common tokenizer from {model_path}, falling back to HuggingFace")
 
-        tokenizer = AutoTokenizer.from_pretrained(
-                    model_path,
-                    config=config,
-                    use_fast=True,
-                    trust_remote_code=True)
+            except ValueError:
+                logger.info(
+                    f"Could not load mistral-common tokenizer from {model_path}, falling back to HuggingFace"
+                )
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                                  config=config,
+                                                  use_fast=True,
+                                                  trust_remote_code=True)
         return tokenizer
 
 

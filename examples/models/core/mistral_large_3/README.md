@@ -14,8 +14,7 @@ export mistral_large_3_eagle_model_path=<mistral_large_3_eagle_model_path>
 ```bash
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_multimodal.py \
     --model_dir ${mistral_large_3_model_path} \
-    --tp_size 4 \
-    --moe_ep_size 4 \
+    --tp_size 8 \
     --max_tokens 100 \
     --checkpoint_format mistral_large_3 \
     --model_type mistral3 \ 
