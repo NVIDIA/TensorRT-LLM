@@ -400,6 +400,7 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Predict draft tokens
         next_draft_tokens = []
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         for i in range(self.max_draft_len):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
@@ -419,6 +420,13 @@ class Eagle3OneModelWorker(nn.Module):
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
                                                     draft_step=i)
+
+            # Update attn_metadata.all_rank_num_tokens for attention DP
+            if original_all_rank_num_tokens is not None:
+                if i == 0:
+                    attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                elif spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
@@ -460,9 +468,6 @@ class Eagle3OneModelWorker(nn.Module):
                     attn_metadata.kv_lens_cuda[:num_contexts] += 1
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
-            # support attention dp
-            if spec_metadata.all_rank_num_tokens is not None:
-                spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -475,6 +480,9 @@ class Eagle3OneModelWorker(nn.Module):
         # restore attn_metadata to support cuda graph
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
+        # restore all_rank_num_tokens for attention DP
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[

@@ -28,9 +28,10 @@ from ..modules.fused_moe.moe_load_balancer import (
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
-    "auto": "auto"
+    "auto": "auto",
+    "force_no_quant": QuantAlgo.NO_QUANT,
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto", "force_no_quant")
 
 
 def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
@@ -71,7 +72,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # If we get to this point we have a valid quantization setting, but if
     # we have an existing setting and it doesn't match we shouldn't proceed.
-    if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
+    if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant and pyt_kv_cache_dtype != "force_no_quant":
         raise RuntimeError(
             "Attempting to override KV cache quantization "
             f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
@@ -212,6 +213,37 @@ class ModelLoader:
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
 
+    def _load_model_with_moe_load_balancer(self, config: ModelConfig):
+        try:
+            with maybe_create_moe_load_balancer(
+                    config, self.mapping) as moe_load_balancer:
+                # config will be modified in-place for some models, like Qwen2
+                config_copy = copy.deepcopy(config)
+                with MetaInitMode():
+                    model = AutoModelForCausalLM.from_config(config_copy)
+
+                memo = dict()
+
+                def init_meta_tensor(t: torch.Tensor):
+                    if t.device != torch.device('meta'):
+                        return t
+                    if t not in memo:
+                        memo[t] = torch.empty_like(t, device='cuda')
+                    return memo[t]
+
+                model._apply(init_meta_tensor)
+                config = config_copy
+                return model, moe_load_balancer
+
+        except Exception:
+            logger.info(
+                f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
+            )
+            with maybe_create_moe_load_balancer(
+                    config, self.mapping) as moe_load_balancer:
+                model = AutoModelForCausalLM.from_config(config)
+                return model, moe_load_balancer
+
     def load(
         self,
         checkpoint_dir: str,
@@ -231,31 +263,9 @@ class ModelLoader:
                                                 checkpoint_loader)
         load_format = self.llm_args.load_format
 
-        with timing("Model init total"), maybe_create_moe_load_balancer(
-                config, self.mapping) as moe_load_balancer:
-            try:
-                # config will be modified in-place for some models, like Qwen2
-                config_copy = copy.deepcopy(config)
-                with MetaInitMode():
-                    model = AutoModelForCausalLM.from_config(config_copy)
-
-                memo = dict()
-
-                def init_meta_tensor(t: torch.Tensor):
-                    if t.device != torch.device('meta'):
-                        return t
-                    if t not in memo:
-                        memo[t] = torch.empty_like(t, device='cuda')
-                    return memo[t]
-
-                model._apply(init_meta_tensor)
-                config = config_copy
-
-            except Exception:
-                logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
-                )
-                model = AutoModelForCausalLM.from_config(config)
+        with timing("Model init total"):
+            model, moe_load_balancer = self._load_model_with_moe_load_balancer(
+                config)
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
@@ -277,18 +287,25 @@ class ModelLoader:
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
+                    # FIXME should have a better way to handle the multimodal models
+                    from tensorrt_llm._torch.models.modeling_mistral import \
+                        Mistral3VLM
+                    if isinstance(model, Mistral3VLM):
+                        model_ = model.llm
+                    else:
+                        model_ = model
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model_dir,
                         mapping=self.mapping)
 
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                    draft_model_arch = model_.draft_config.pretrained_config.architectures[
                         0]
                     draft_weight_mapper = AutoCheckpointMapper.get(
                         checkpoint_loader.checkpoint_format, draft_model_arch)
                     draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
+                        model_.draft_model, model_.draft_config)
 
-                    self._call_load_weights(model.load_draft_weights, weights,
+                    self._call_load_weights(model_.load_draft_weights, weights,
                                             draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
@@ -297,7 +314,14 @@ class ModelLoader:
                 initialize_dummy_weights(model)
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    model.draft_model.load_weights_from_target_model(model)
+                    # FIXME should have a better way to handle the multimodal models
+                    from tensorrt_llm._torch.models.modeling_mistral import \
+                        Mistral3VLM
+                    if isinstance(model, Mistral3VLM):
+                        model_ = model.llm
+                    else:
+                        model_ = model
+                    model_.draft_model.load_weights_from_target_model(model_)
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.

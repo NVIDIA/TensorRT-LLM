@@ -707,9 +707,17 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
 
-    tokenizer = get_tokenizer(tokenizer_id,
-                              tokenizer_mode=tokenizer_mode,
-                              trust_remote_code=args.trust_remote_code)
+    if isinstance(args.tokenizer,
+                  str) and args.checkpoint_format == "mistral_large_3":
+        from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
+        tokenizer = MistralTokenizer.from_pretrained(
+            args.tokenizer,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=args.trust_remote_code)
+    else:
+        tokenizer = get_tokenizer(tokenizer_id,
+                                  tokenizer_mode=tokenizer_mode,
+                                  trust_remote_code=args.trust_remote_code)
 
     if args.dataset_name is None:
         raise ValueError(
@@ -881,7 +889,7 @@ def main(args: argparse.Namespace):
 
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
-
+    sampling_params["detokenize"] = not args.disable_detokenize
     # Avoid GC - reduce pause times.
     gc.disable()
 
@@ -1403,6 +1411,15 @@ if __name__ == "__main__":
         help=
         "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
     )
+    parser.add_argument(
+        "--disable-detokenize",
+        action="store_true",
+        help="Disable detokenize the output.",
+    )
+    parser.add_argument('--checkpoint-format',
+                        type=str,
+                        default=None,
+                        help="Model checkpoint format.")
 
     args = parser.parse_args()
 

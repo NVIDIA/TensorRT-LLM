@@ -312,21 +312,39 @@ class ModelConfig(Generic[TConfig]):
         layer_quant_config = None
 
         # DeepSeek V3 FP8 ckpt
-        if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
-                "weight_block_size", []):
-            quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-            if moe_backend == 'TRTLLM':
-                # TODO: This is a hack. Remove after fp8 bmm is integrated.
-                quant_config.exclude_modules = [
-                    "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
-                ]
-            else:
-                quant_config.exclude_modules = ["*eh_proj"]
+        if hf_quant_config.get("quant_method") == "fp8":
+            if hf_quant_config.get("weight_block_size", []):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                if moe_backend == 'TRTLLM':
+                    # TODO: This is a hack. Remove after fp8 bmm is integrated.
+                    quant_config.exclude_modules = [
+                        "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                    ]
+                else:
+                    quant_config.exclude_modules = ["*eh_proj"]
 
-            block_size = hf_quant_config.get("weight_block_size", [])
-            assert tuple(block_size) == (
-                128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
-            quant_config.group_size = block_size[0]
+                block_size = hf_quant_config.get("weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.group_size = block_size[0]
+
+            # DeepSeek V3 FP8 per tensor hack
+            elif hf_quant_config.get("activation_scheme", None) == "static":
+                logger.debug(f"Expanding weight scale to mimic DS FP8 recipe")
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                if moe_backend == 'TRTLLM':
+                    # TODO: This is a hack. Remove after fp8 bmm is integrated.
+                    quant_config.exclude_modules = [
+                        "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                    ]
+                else:
+                    quant_config.exclude_modules = ["*eh_proj"]
+
+                block_size = (128, 128)
+                quant_config.group_size = block_size[0]
+                logger.info(f"quant_config: {quant_config}")
+
         # MXFP4 checkpoints.
         elif hf_quant_config.get("quant_method") == "mxfp4":
             quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
@@ -337,6 +355,31 @@ class ModelConfig(Generic[TConfig]):
                 'embedding', 'unembedding'
             ]
 
+        # Mistral checkpoints.
+        elif hf_quant_config.get("quant_method") == "compressed-tensors":
+            if 'NVFP4' in hf_quant_config.get("config_groups"):
+                quant_config.quant_algo = QuantAlgo.NVFP4
+                quant_config.group_size = 16
+                quant_config.exclude_modules = [
+                    "layers.*.attention.wq*", "layers.*.attention.wk*",
+                    "patch_merger*", "vision_encoder*",
+                    "vision_language_adapter*",
+                    "language_model.model.layers.*.self_attn.q*",
+                    "language_model.model.layers.*.self_attn.k*",
+                    "language_model.model.layers.*.self_attn.fused_qkv*",
+                    "language_model.model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                    "model.layers.*.self_attn.q*",
+                    "model.layers.*.self_attn.k*",
+                    "model.layers.*.self_attn.fused_qkv*",
+                    "model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                    "model.layers.*.self_attn.o_proj"
+                ]
+            elif 'FP8_BLOCK' in hf_quant_config.get("config_groups"):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.group_size = 128
+                quant_config.exclude_modules = [
+                    "*q_a_proj*", "*kv_a_proj_with_mqa*"
+                ]
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -394,6 +437,7 @@ class ModelConfig(Generic[TConfig]):
     @classmethod
     def from_pretrained(cls,
                         checkpoint_dir: str,
+                        pretrained_hf_config=None,
                         trust_remote_code=False,
                         **kwargs):
         # Use file lock to prevent race conditions when multiple processes
@@ -401,36 +445,42 @@ class ModelConfig(Generic[TConfig]):
         with config_file_lock():
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
-            if checkpoint_dir is not None:
+            if checkpoint_dir is not None and pretrained_hf_config is not None:
+                logger.warning(
+                    f"Both checkpoint_dir and pretrained config specified. Using pretrained_config."
+                )
+
+            if pretrained_hf_config is not None:
+                pretrained_config = pretrained_hf_config
+            elif checkpoint_dir is not None:
                 pretrained_config = load_pretrained_config(
                     checkpoint_dir,
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
-                if pretrained_config.architectures[
-                        0] == "DeepseekV32ForCausalLM":
-                    sparse_attention_config = kwargs.get(
-                        'sparse_attention_config')
-                    if sparse_attention_config:
-                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
-                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
-                        indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
-                    else:
-                        index_n_heads = pretrained_config.index_n_heads
-                        index_head_dim = pretrained_config.index_head_dim
-                        index_topk = pretrained_config.index_topk
-                        indexer_max_chunk_size = None
-                    kwargs[
-                        'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
-                            index_n_heads=index_n_heads,
-                            index_head_dim=index_head_dim,
-                            index_topk=index_topk,
-                            indexer_max_chunk_size=indexer_max_chunk_size)
             else:
                 raise ValueError(
-                    "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
+                    "checkpoint_dir is None and pretrained config is not specified. Cannot load model config without a valid checkpoint directory or a pretrained config."
                 )
+
+            if pretrained_config.architectures[0] == "DeepseekV32ForCausalLM":
+                sparse_attention_config = kwargs.get('sparse_attention_config')
+                if sparse_attention_config:
+                    index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                    index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                    index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                    indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                else:
+                    index_n_heads = pretrained_config.index_n_heads
+                    index_head_dim = pretrained_config.index_head_dim
+                    index_topk = pretrained_config.index_topk
+                    indexer_max_chunk_size = None
+                kwargs[
+                    'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+                        index_n_heads=index_n_heads,
+                        index_head_dim=index_head_dim,
+                        index_topk=index_topk,
+                        indexer_max_chunk_size=indexer_max_chunk_size)
 
         # Get cached file from path or repo id, return None if not exists.
         def cached_file(path_or_repo_id, file_name):

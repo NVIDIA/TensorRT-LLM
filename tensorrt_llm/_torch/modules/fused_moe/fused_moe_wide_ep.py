@@ -59,6 +59,7 @@ class WideEPMoE(MoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        init_load_balancer: Optional[bool] = True,
     ):
 
         super().__init__(
@@ -72,6 +73,7 @@ class WideEPMoE(MoE):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
         )
 
         assert self.use_dp, "Attention DP should be used with WideEP."

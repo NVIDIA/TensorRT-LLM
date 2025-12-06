@@ -1078,6 +1078,7 @@ moe_model_arch_list = [
     'Llama4ForConditionalGeneration',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
+    'PixtralForConditionalGeneration',
 ]
 
 

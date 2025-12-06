@@ -105,7 +105,13 @@ class PostprocWorker:
         self._q = deque()
 
         # Load the tokenizer and share in all records
-        self._tokenizer = load_hf_tokenizer(tokenizer_dir)
+        if isinstance(tokenizer_dir,
+                      str) and "mistral_large_3" in tokenizer_dir:
+            from tensorrt_llm.llmapi.tokenizer import MistralTokenizer
+            self._tokenizer = MistralTokenizer.from_pretrained(
+                tokenizer_dir, tokenizer_mode='fast', trust_remote_code=True)
+        else:
+            self._tokenizer = load_hf_tokenizer(tokenizer_dir)
 
     @staticmethod
     def default_record_creator(

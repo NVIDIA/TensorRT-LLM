@@ -237,8 +237,9 @@ class PixtralVisionModel(torch.nn.Module):
 
         return out
 
-    def load_weights(self, weights):
-        modeling_utils._load_weights_impl(self, weights)
+    def load_weights(self, weights, *args, **kwargs):
+        params_map = kwargs.get("params_map")
+        modeling_utils._load_weights_impl(self, weights=weights, params_map=params_map)
 
     def _prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int]):
         request_ids = list(range(1, batch_size + 1))

@@ -20,6 +20,8 @@ from tensorrt_llm.mapping import Mapping
 
 
 @register_checkpoint_weight_loader("HF")
+@register_checkpoint_weight_loader("mistral")
+@register_checkpoint_weight_loader("mistral_large_3")
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
