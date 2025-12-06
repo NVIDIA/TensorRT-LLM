@@ -305,8 +305,8 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
             "Describe the weather in the image.",
         ], 2),
     ])
-def test_mm_keys_kv_cache_reuse(prompts, expected_num_duplicates,
-                                multimodal_model_config):
+def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates,
+                                     multimodal_model_config):
     """Test mm_keys in KV cache events with cache reuse scenarios.
 
     This test verifies:

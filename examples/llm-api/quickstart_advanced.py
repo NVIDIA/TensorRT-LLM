@@ -1,4 +1,6 @@
 import argparse
+import json
+import time
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
@@ -346,6 +348,13 @@ def main():
                     print(
                         f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
                     )
+
+    if args.log_kv_cache_events:
+        time.sleep(1)  # Wait for events to be dispatched
+        events = llm.get_kv_cache_events(5)
+        print("=== KV_CACHE_EVENTS_START ===")
+        print(json.dumps(events, indent=2))
+        print("=== KV_CACHE_EVENTS_END ===")
 
 
 if __name__ == '__main__':
