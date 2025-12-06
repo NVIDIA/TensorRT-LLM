@@ -25,6 +25,7 @@ hardware:
   gpus_per_node: 4  # Modify this with your hardware configuration
   num_ctx_servers: 1  # Number of context servers
   num_gen_servers: 1  # Number of generation servers
+  gpu_type: "GB200" # GPU type, default is GB200
 
 # Environment Configuration
 environment:
