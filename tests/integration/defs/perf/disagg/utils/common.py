@@ -1,6 +1,7 @@
 """Disaggregated Benchmark Configuration."""
 
 import os
+from datetime import datetime
 
 SESSION_COLLECT_CMD_TYPE = "session_collect"
 
@@ -169,7 +170,8 @@ def extract_config_fields(config_data: dict) -> dict:
 
     # Generate derived fields
     dep_flag = "dep" if gen_enable_dp else "tep"
-    log_base = f"{isl}-{osl}"
+    date_prefix = datetime.now().strftime("%Y%m%d")
+    log_base = f"{date_prefix}/{isl}-{osl}"
     context_dir = (
         f"ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
         f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}"
