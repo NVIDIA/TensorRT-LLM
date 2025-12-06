@@ -306,3 +306,18 @@ Run `bench.sh` to begin a serving benchmark.
 ```shell
 ./bench.sh
 ```
+
+## Troubleshooting
+
+Since Kimi K2 Thinking has larger weight size than other models, it's possible seeing host OOM issues, as the following:
+
+```log
+Loading weights: 100%|█████████████████████| 1408/1408 [03:43<00:00,  6.30it/s]
+ 0: [12/04/2025-18:38:28] [TRT-LLM] [RANK 0] [I] moe_load_balancer finalizing model...
+ 1: [nvl72136-T14:452151:0:452151] Caught signal 7 (Bus error: nonexistent physical address)
+ 1: ==== backtrace (tid: 452151) ====
+ 1:  0  /usr/local/ucx//lib/libucs.so.0(ucs_handle_error+0x2cc) [0xffff9638274c]
+ 1:  1  /usr/local/ucx//lib/libucs.so.0(+0x328fc) [0xffff963828fc]
+ 1:  2  /usr/local/ucx//lib/libucs.so.0(+0x32c78) [0xffff96382c78]
+```
+This can be addressed by mounting `tmpfs:/dev/shm:size=640G` when launching the Docker container, to increase the shm size that the container can access.
