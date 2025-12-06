@@ -38,8 +38,9 @@ namespace tg = trtllm::gen;
 
 #ifdef TLLM_ENABLE_CUDA
 
-inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, std::vector<uint64_t> const& shapes,
-    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr, bool doSwizzle = true)
+inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
+    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr, bool doPad,
+    bool doSwizzle = true)
 {
     // The multiplication factor of the data padding in SMEM.
     int32_t padMultiplier = 1;
@@ -64,15 +65,13 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
     }
     else if (dtype == tg::Dtype::MxE2m1 || dtype == tg::Dtype::MxInt4)
     {
-        if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+        if (doPad)
         {
             padMultiplier = 2;
             tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
         }
         else
         {
-            // Note: this is used with the MMA kind MxFp4NvFp4 and also when casting to a higher-precision
-            // type such as Bfloat16 before the MMA.
             tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
         }
     }

@@ -664,6 +664,7 @@
             "sfLayoutB": "linear",
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e4m3",
+            "mmaK": 32,
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
                 [8, 8, 8, 512, 3],
                 [8, 8, 8, 256, 5],
@@ -683,6 +684,7 @@
             "fusedAct": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
+            "mmaK": 32,
             "mmaN,tileN,epilogueTileN,tileK,numStages": [
                 [8, 8, 8, 512, 3],
                 [8, 8, 8, 256, 5],
