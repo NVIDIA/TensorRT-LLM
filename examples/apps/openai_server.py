@@ -430,14 +430,16 @@ def entrypoint(model_dir: str,
     logging.info(f"Starting server at {host}:{port}")
 
     build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
 
     llm = LLM(model_dir,
               tokenizer,
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,
-              build_config=build_config)
+              build_config=build_config,
+              kv_cache_config=kv_cache_config)
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+    # kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
     hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_dir)
 
     server = OpenaiServer(llm=llm,
