@@ -1952,12 +1952,13 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
-    orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
-        default=None,
-        description=
-        "The orchestrator type to use. Defaults to None, which uses MPI.",
-        status="prototype",
-    )
+    orchestrator_type: Optional[Literal[
+        "rpc", "ray", "rpc_torch_dist"]] = Field(
+            default=None,
+            description=
+            "The orchestrator type to use. Defaults to None, which uses MPI.",
+            status="prototype",
+        )
 
     env_overrides: Optional[Dict[str, str]] = Field(
         default=None,

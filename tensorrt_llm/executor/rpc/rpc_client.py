@@ -80,6 +80,15 @@ class RemoteCall:
 class RPCClient:
     """
     An RPC Client that connects to the RPCServer.
+
+    Design contract: **all ZeroMQ socket I/O is performed from a single
+    dedicated asyncio event-loop (self._loop) that lives in its own
+    background thread**.  Synchronous helpers marshal work onto that loop via
+    run_coroutine_threadsafe(); asynchronous streaming helpers submit the
+    actual socket operation to the loop and then yield results in the caller’s
+    loop.  Violating this invariant (i.e. touching self._client_socket from
+    multiple event-loops) leads to rare hangs / message loss because pyzmq
+    sockets are not thread-safe.
     """
 
     def __init__(self,
