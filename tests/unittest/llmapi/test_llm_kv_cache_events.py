@@ -93,6 +93,9 @@ def test_kv_cache_event_data_serialization():
     assert serialized_event[0]["data"]["parent_hash"] is None
     assert len(serialized_event[0]["data"]["blocks"]) == 1
     assert len(serialized_event[0]["data"]["blocks"][0]["tokens"]) == 4
+    # Verify mm_keys field exists (empty for text-only requests)
+    assert "mm_keys" in serialized_event[0]["data"]["blocks"][0]
+    assert serialized_event[0]["data"]["blocks"][0]["mm_keys"] == []
 
     req2 = create_llm_request(1, [1, 2, 3, 4, 5])
     kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len, 1,
@@ -102,6 +105,109 @@ def test_kv_cache_event_data_serialization():
     flush_events(kv_cache_manager)
     events = kv_cache_manager.get_latest_events(10)
     serialized_event = KVCacheEventSerializer.serialize(events)
+
+
+def test_mm_keys_serialization():
+    """Test serialization of multimodal keys (mm_keys) in KV cache events."""
+    # Test _mm_key_to_json with a mock mm_key tuple (bytes, int)
+    # MmKey from C++ is converted to (bytes, int) tuple by pybind11
+    mock_hash = b'\x01\x02\x03\x04\x05\x06\x07\x08' + b'\x00' * 24  # 32 bytes
+    mock_offset = 42
+    mock_mm_key = (mock_hash, mock_offset)
+
+    result = KVCacheEventSerializer._mm_key_to_json(mock_mm_key)
+
+    assert result["type"] == "mm_key"
+    assert result["start_offset"] == 42
+    # Hash should be converted to hex string
+    assert result["hash"] == "0102030405060708" + "00" * 24
+    assert len(result["hash"]) == 64  # 32 bytes = 64 hex chars
+
+    # Test with different hash values
+    mock_hash2 = bytes(range(32))  # 0x00 to 0x1f
+    mock_mm_key2 = (mock_hash2, 100)
+    result2 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key2)
+
+    assert result2["type"] == "mm_key"
+    assert result2["start_offset"] == 100
+    expected_hash = ''.join(f'{i:02x}' for i in range(32))
+    assert result2["hash"] == expected_hash
+
+
+def test_mm_keys_deserialization():
+    """Test deserialization of mm_keys JSON back to 32-byte hash."""
+    # Test case 1: Simple hash pattern
+    mock_hash = b'\x01\x02\x03\x04\x05\x06\x07\x08' + b'\x00' * 24  # 32 bytes
+    mock_offset = 42
+    mock_mm_key = (mock_hash, mock_offset)
+
+    # Serialize to JSON
+    json_result = KVCacheEventSerializer._mm_key_to_json(mock_mm_key)
+
+    # Deserialize hex string back to bytes
+    recovered_hash = bytes.fromhex(json_result["hash"])
+
+    # Verify the recovered hash matches the original
+    assert recovered_hash == mock_hash
+    assert len(recovered_hash) == 32
+    assert json_result["start_offset"] == mock_offset
+
+    # Test case 2: Sequential bytes 0x00 to 0x1f
+    mock_hash2 = bytes(range(32))
+    mock_offset2 = 100
+    mock_mm_key2 = (mock_hash2, mock_offset2)
+
+    json_result2 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key2)
+    recovered_hash2 = bytes.fromhex(json_result2["hash"])
+
+    assert recovered_hash2 == mock_hash2
+    assert len(recovered_hash2) == 32
+    assert json_result2["start_offset"] == mock_offset2
+
+    # Test case 3: All 0xFF bytes
+    mock_hash3 = b'\xff' * 32
+    mock_offset3 = 255
+    mock_mm_key3 = (mock_hash3, mock_offset3)
+
+    json_result3 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key3)
+    recovered_hash3 = bytes.fromhex(json_result3["hash"])
+
+    assert recovered_hash3 == mock_hash3
+    assert len(recovered_hash3) == 32
+    assert json_result3["hash"] == "ff" * 32
+
+    # Test case 4: Random-like pattern
+    mock_hash4 = bytes([0xde, 0xad, 0xbe, 0xef] + [0xca, 0xfe] * 14)
+    mock_offset4 = 1024
+    mock_mm_key4 = (mock_hash4, mock_offset4)
+
+    json_result4 = KVCacheEventSerializer._mm_key_to_json(mock_mm_key4)
+    recovered_hash4 = bytes.fromhex(json_result4["hash"])
+
+    assert recovered_hash4 == mock_hash4
+    assert len(recovered_hash4) == 32
+
+
+def test_mm_keys_in_stored_events():
+    """Test that mm_keys field is present in stored block events."""
+    llm = create_llm()
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+
+    _ = llm.generate(prompt, sampling_params=sampling_params)
+
+    events = llm.get_kv_cache_events(5)
+
+    # Find stored events and verify mm_keys field
+    for event in events:
+        if event and event["data"]["type"] == "stored":
+            blocks = event["data"]["blocks"]
+            for block in blocks:
+                # mm_keys should always be present (empty list for text-only)
+                assert "mm_keys" in block
+                assert isinstance(block["mm_keys"], list)
+                # For text-only requests, mm_keys should be empty
+                assert block["mm_keys"] == []
 
 
 def test_expected_kv_cache_events():

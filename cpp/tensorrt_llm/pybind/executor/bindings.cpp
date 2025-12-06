@@ -221,7 +221,22 @@ void initBindings(pybind11::module_& m)
         .def_readonly("tokens", &tle::KVCacheStoredBlockData::tokens)
         .def_readonly("lora_id", &tle::KVCacheStoredBlockData::loraId)
         .def_readonly("cache_level", &tle::KVCacheStoredBlockData::cacheLevel)
-        .def_readonly("priority", &tle::KVCacheStoredBlockData::priority);
+        .def_readonly("priority", &tle::KVCacheStoredBlockData::priority)
+        .def_property_readonly("mm_keys",
+            [](tle::KVCacheStoredBlockData const& self)
+            {
+                // Convert std::vector<MmKey> to Python list of tuples (bytes, int)
+                // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+                py::list result;
+                for (auto const& mmKey : self.mmKeys)
+                {
+                    auto const& hashArray = mmKey.first;
+                    auto offset = mmKey.second;
+                    py::bytes hashBytes(reinterpret_cast<char const*>(hashArray.data()), hashArray.size());
+                    result.append(py::make_tuple(hashBytes, offset));
+                }
+                return result;
+            });
 
     py::class_<tle::KVCacheStoredData>(executor_kv_cache, "KVCacheStoredData")
         .def_readonly("parent_hash", &tle::KVCacheStoredData::parentHash)
