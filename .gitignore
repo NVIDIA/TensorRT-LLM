@@ -72,6 +72,7 @@ llm-test-workspace/
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h
+cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.cpp
 .devcontainer/.env
 /examples/layer_wise_benchmarks/profiles/
 

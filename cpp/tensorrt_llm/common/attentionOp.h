@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -36,7 +37,9 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
-namespace tensorrt_llm::common::op
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::op
 {
 
 class AttentionOp
@@ -543,4 +546,6 @@ private:
     UniqPtrWNullCopy<int32_t[], Deleter> mMultiBlockSemaphores = {};
 };
 
-} // namespace tensorrt_llm::common::op
+} // namespace common::op
+
+TRTLLM_NAMESPACE_END

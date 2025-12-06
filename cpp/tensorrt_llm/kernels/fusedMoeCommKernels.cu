@@ -14,16 +14,17 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #include <type_traits>
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1779,4 +1780,5 @@ void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFie
 } // namespace fused_moe_comm_tests
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -15,11 +15,13 @@
  */
 #include "ipcsocket.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+
 #if ENABLE_MULTI_DEVICE
 namespace tensorrt_llm::runtime::ub
 {
@@ -300,4 +302,5 @@ ipcSocketResult_t ipcSocketSendFd(IpcSocketHandle* handle, int const sendFd, int
     return ipcSocketSendMsg(handle, NULL, 0, sendFd, rank, hash);
 }
 } // namespace tensorrt_llm::runtime::ub
+
 #endif

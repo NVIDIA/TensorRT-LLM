@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #endif
 #else
+
 using ncclWindow_t = void*;
 #endif
 
@@ -61,7 +62,7 @@ public:
 
     UserBufferAllocator() = default;
 
-    virtual void initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig);
+    virtual void initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig);
     bool isInitialized();
     UBBuffer allocate(size_t bytes);
     void deallocate(void* addr);
@@ -77,7 +78,7 @@ private:
 protected:
     std::vector<UBBuffer> mBuffers;
     bool mIsInitialized;
-    tensorrt_llm::runtime::WorldConfig mWorldConfig;
+    ::tensorrt_llm::runtime::WorldConfig mWorldConfig;
 };
 
 class NCCLHelper
@@ -118,7 +119,7 @@ private:
 class NCCLUserBufferAllocator : public UserBufferAllocator
 {
 public:
-    void initialize(tensorrt_llm::runtime::WorldConfig const& world_config) override;
+    void initialize(::tensorrt_llm::runtime::WorldConfig const& world_config) override;
     UBBuffer registerUBBuffer(size_t bytes) override;
 
     // Get shared NCCLHelper instance
