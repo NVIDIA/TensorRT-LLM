@@ -15,5 +15,8 @@ methods:
       prompt_ignore_length:
         annotation: Optional[int]
         default: null
+      logprobs_mode:
+        annotation: Literal["raw", "processed"]
+        default: "raw"
     return_annotation: None
 properties: {}
