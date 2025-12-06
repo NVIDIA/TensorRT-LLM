@@ -1,6 +1,6 @@
 import os
 import tempfile
-from typing import List
+from typing import Any, List
 
 import openai
 import pytest
@@ -98,7 +98,9 @@ def async_client(server: RemoteMMEncoderServer):
     return server.get_async_client()
 
 
-def test_multimodal_content_mm_encoder(client: openai.OpenAI, model_name: str):
+def test_multimodal_content_mm_encoder(
+        client: openai.OpenAI,
+        model_name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
     content_text = "Describe the natural environment in the image."
     image_url = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
@@ -134,6 +136,8 @@ def test_multimodal_content_mm_encoder(client: openai.OpenAI, model_name: str):
         0] == 324  # qwen2.5-vl: 324 tokens for the same image
     assert mm_handle["tensor_size"][
         1] == 2048  # qwen2.5-vl: hidden_size of the vision encoder
+
+    return messages, mm_handle  # used by tests/unittest/llmapi/apps/_test_openai_chat_multimodal.py
 
 
 def test_health(server: RemoteMMEncoderServer):
