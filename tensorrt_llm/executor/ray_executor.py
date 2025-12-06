@@ -82,6 +82,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                  is_llm_executor=is_llm_executor)
 
             self.init_rpc_executor()
+            # Inject the generated HMAC key into worker_kwargs for workers
+            worker_kwargs['hmac_key'] = self.hmac_key
             worker_kwargs['rpc_addr'] = self.rpc_addr
             self.create_workers(RayGPUWorker, worker_kwargs)
             self.setup_engine_remote()

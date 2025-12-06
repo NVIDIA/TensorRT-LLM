@@ -168,6 +168,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
+        hmac_key: Optional[bytes] = None,
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
@@ -191,7 +192,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if rpc_addr is None:
             raise RuntimeError(
                 "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
-        self.init_rpc_worker(self.global_rank, rpc_addr)
+        self.init_rpc_worker(self.global_rank, rpc_addr, hmac_key)
         self.start_rpc_server()
 
     def setup_engine(self):

@@ -48,6 +48,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
         self._create_mpi_session(model_world_size, mpi_session)
 
+        # Inject the generated HMAC key into worker_kwargs for workers
+        worker_kwargs['hmac_key'] = self.hmac_key
         self.worker_kwargs = worker_kwargs
 
         self.launch_workers()
