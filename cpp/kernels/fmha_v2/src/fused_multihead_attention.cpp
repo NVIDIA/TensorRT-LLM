@@ -433,7 +433,7 @@ static inline void determine_launch_params(Launch_params& launch_params, Data_ty
     const size_t d, const Attention_mask_type attention_mask_type, const Attention_input_layout input_layout,
     bool const interleaved, bool const ignore_b1opt, bool const force_unroll, bool const use_tma,
     bool const force_non_flash_attention, bool const force_non_warp_specialization,
-    bool const force_non_granular_tiling, bool const force_fp32_acc,
+    bool const force_non_granular_tiling, bool const force_fp32_acc, float const skip_softmax_threshold_scale_factor,
     // device props
     const cudaDeviceProp props)
 {
@@ -474,6 +474,9 @@ static inline void determine_launch_params(Launch_params& launch_params, Data_ty
             "are not supported on Ada currently.\n");
         launch_params.use_granular_tiling = false;
     }
+
+    // Enable skip softmax attention or not.
+    launch_params.enable_skip_softmax = skip_softmax_threshold_scale_factor > 0.f;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1068,7 +1071,7 @@ int main(int argc, char** argv)
     Launch_params launch_params;
     determine_launch_params(launch_params, data_type, sm, s, d, attention_mask_type, input_layout, interleaved,
         ignore_b1opt, force_unroll, use_tma, force_non_flash_attention, force_non_warp_specialization,
-        force_non_granular_tiling, force_fp32_acc, props);
+        force_non_granular_tiling, force_fp32_acc, skip_softmax_threshold_scale_factor, props);
 
     // The Q, K and V matrices are packed into one big matrix of size S x B x H x 3 x D.
     const size_t qkv_size = s * b * h * (2 * d + dv);
@@ -2119,7 +2122,7 @@ int main(int argc, char** argv)
             total_bytes / (fused_elapsed / float(runs) / 1e-6));
     }
 #ifdef SKIP_SOFTMAX_STAT
-    if (skip_softmax_threshold_scale_factor != 0)
+    if (skip_softmax_threshold_scale_factor > 0)
     {
         uint32_t total_blocks, skipped_blocks;
         FMHA_CHECK_CUDA(

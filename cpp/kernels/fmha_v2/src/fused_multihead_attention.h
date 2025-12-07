@@ -332,6 +332,8 @@ struct Fused_multihead_attention_launch_params
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
+    // skip softmax attention
+    bool enable_skip_softmax = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
