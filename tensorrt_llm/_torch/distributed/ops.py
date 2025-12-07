@@ -722,11 +722,11 @@ class AllReduce(nn.Module):
                 return symm_mem_output
         elif self.symm_mem_allreduce and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
             # Log once per rank that we're skipping symm_mem due to fusion
-            if not hasattr(self, '_logged_fusion_skip'):
-                logger.debug(
-                    f"Skipping SymmetricMemoryAllReduce for fused operation (fusion_op={all_reduce_params.fusion_op}), using regular allreduce"
-                )
-                self._logged_fusion_skip = True
+            logger.debug_once(
+                f"Skipping SymmetricMemoryAllReduce for fused operation (fusion_op={all_reduce_params.fusion_op}), using regular allreduce",
+                key=(self.mapping.tp_rank, all_reduce_params.fusion_op,
+                     "debug_fusion_skip"),
+            )
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
