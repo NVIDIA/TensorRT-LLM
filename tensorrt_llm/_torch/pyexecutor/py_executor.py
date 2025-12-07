@@ -902,6 +902,9 @@ class PyExecutor:
                 if not self.dist.is_first_pp_rank:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
+                    # Run scheduler locally because scheduler may change llm requests' state.
+                    self.scheduler.schedule_request(self.active_requests,
+                                                    self.inflight_req_ids)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
