@@ -193,9 +193,9 @@ public:
 struct RequestStatuses
 {
     /// Requests that have completed their transfer successfully.
-    std::vector<LlmRequest::RequestIdType> completedRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> completedRequestIds;
     /// Requests that have encountered an error during their transfer.
-    std::vector<LlmRequest::RequestIdType> errorRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> errorRequestIds;
 };
 
 class BaseCacheTransceiver

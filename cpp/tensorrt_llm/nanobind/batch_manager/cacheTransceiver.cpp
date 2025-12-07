@@ -98,7 +98,11 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
                     result = self.checkContextTransferStatus(atLeastRequestNum);
                 }
 
-                return nb::make_tuple(result.completedRequestIds, result.errorRequestIds);
+                auto completedRequestIds
+                    = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
+                auto errorRequestIds
+                    = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
+                return nb::make_tuple(completedRequestIds, errorRequestIds);
             },
             nb::arg("at_least_request_num") = std::nullopt)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,

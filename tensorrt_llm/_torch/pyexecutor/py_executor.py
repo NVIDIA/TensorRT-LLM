@@ -110,6 +110,16 @@ class BatchStatePP(BatchState):
 
 
 class AsyncTransferManager:
+    """
+    Handle asynchronous transfer or KV cache after a request has completed.
+    When running with both the KV cache transceiver and the KV cache connector, we must ensure that BOTH transfers (if any) are completed before we can release the KV cache blocks.
+    The AsyncTransferManager has a few key responsibilities:
+    1. Track requests in transfer.
+    2. Pin blocks for reuse while blocks are in transfer.
+    3. Unpin blocks after all transfers are complete.
+
+    TODO(jthomson04): This only handles async send/saving, not loading. Loading kv cache is handled through a separate codepath. Eventually, we'll want to merge these two paths.
+    """
 
     def __init__(self, resource_manager: "ResourceManager"):
         self.resource_manager = resource_manager
@@ -121,6 +131,12 @@ class AsyncTransferManager:
         return {k: v[0] for k, v in self.requests.items()}
 
     def start_transfer(self, request: LlmRequest):
+        """
+        Called when a Cache transceiver or connector transfer is started.
+        1. Increment the counter for the request.
+        2. Releases all resources except for the KV cache, if not already released.
+        3. Store KV cache blocks for reuse.
+        """
         if request.py_request_id not in self.requests:
             for resource_mgr_type in (
                     ResourceManagerType.SEQ_SLOT_MANAGER,
@@ -139,6 +155,11 @@ class AsyncTransferManager:
                                                     counter + 1)
 
     def end_transfer(self, request: LlmRequest):
+        """
+        Called after a send of KV cache is complete.
+        1. Decrements counter for request.
+        2. If there are no more inflight transfers for this request, unpin the blocks and mark the request as complete.
+        """
         request, block_id, counter = self.requests.pop(request.py_request_id)
 
         if counter == 1:

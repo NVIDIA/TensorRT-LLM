@@ -490,8 +490,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> 
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
-                    requestsStatus.completedRequestIds.push_back(request->mRequestId);
+                    requestsStatus.completedRequestIds.insert(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -506,7 +505,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> 
                         "Future returned unexpected status for request %ld. Marking as error", request->mRequestId);
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                    requestsStatus.errorRequestIds.push_back(request->mRequestId);
+                    requestsStatus.errorRequestIds.insert(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -515,7 +514,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(std::optional<int> 
                 TLLM_LOG_ERROR(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                requestsStatus.errorRequestIds.push_back(request->mRequestId);
+                requestsStatus.errorRequestIds.insert(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
