@@ -41,13 +41,13 @@ Chat API
 
 You can query Chat API with any http clients, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../examples/serve/openai_chat_client.py
+.. literalinclude:: ../../../../examples/serve/openai_chat_client.py
     :language: python
     :linenos:
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_chat_client.sh
+.. literalinclude:: ../../../../examples/serve/curl_chat_client.sh
     :language: bash
     :linenos:
 
@@ -56,13 +56,13 @@ Completions API
 
 You can query Completions API with any http clients, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../examples/serve/openai_completion_client.py
+.. literalinclude:: ../../../../examples/serve/openai_completion_client.py
     :language: python
     :linenos:
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_completion_client.sh
+.. literalinclude:: ../../../../examples/serve/curl_completion_client.sh
     :language: bash
     :linenos:
 
@@ -97,13 +97,13 @@ Multimodal Chat API
 
 You can query Completions API with any http clients, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../examples/serve/openai_completion_client_for_multimodal.py
+.. literalinclude:: ../../../../examples/serve/openai_completion_client_for_multimodal.py
     :language: python
     :linenos:
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
+.. literalinclude:: ../../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
 
@@ -254,7 +254,23 @@ Example output:
         }
     ]
 
+Configuring with YAML Files
+----------------------------
 
+You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--extra_llm_api_options`` option to the path of a YAML file, the arguments in the file will override the corresponding command line arguments.
+
+The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
+
+.. code-block:: yaml
+
+   max_batch_size: 8
+
+To configure the nested level arguments like ``moe_config.backend``, the yaml file should be like:
+
+.. code-block:: yaml
+
+   moe_config:
+       backend: CUTLASS
 
 Syntax
 ------

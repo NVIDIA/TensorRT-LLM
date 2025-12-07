@@ -19,6 +19,199 @@ try:
 except ImportError:
     from cuda import cuda
 
+
+class GroupedGemmInputsHelper:
+
+    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
+                 local_expert_offset: int, tile_size: int):
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.tile_size = tile_size
+        # Padding values should never be accessed.
+        # Intentionally use a large padding value to expose issues early.
+        self.pad_val = int(2e9)
+
+    def get_max_num_tiles(self, num_tokens: int) -> int:
+        num_expanded_tokens = num_tokens * self.top_k
+        if num_expanded_tokens <= self.num_local_experts:
+            return num_expanded_tokens
+        return (num_expanded_tokens +
+                (self.tile_size - 1) * self.num_local_experts) // self.tile_size
+
+    def get_max_num_permuted_tokens(self, num_tokens: int) -> int:
+        return self.get_max_num_tiles(num_tokens) * self.tile_size
+
+    def infer_num_tokens(self, max_num_permuted_tokens: int) -> int:
+        """Infer the maximum possible number of tokens given the max_num_permuted_tokens.
+        """
+        max_num_tiles = max_num_permuted_tokens // self.tile_size
+        if max_num_tiles >= self.num_local_experts:
+            return (max_num_permuted_tokens - (self.tile_size - 1) *
+                    (self.num_local_experts - 1)) // self.top_k
+        return max_num_tiles // self.top_k
+
+    def gen_tuning_buckets(self, max_num_tokens: int) -> List[int]:
+        buckets = get_last_power_of_2_num_tokens_buckets(
+            self.infer_num_tokens(max_num_tokens))
+        return sorted(
+            list(set(self.get_max_num_permuted_tokens(x) for x in buckets)))
+
+    def map_to_tuning_buckets(self, x: int) -> int:
+        return self.get_max_num_permuted_tokens(
+            last_positive_power_of_2(self.infer_num_tokens(x)))
+
+    def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
+        return self.infer_num_tokens(input_shapes[0][0])
+
+    def infer_shape_max_num_tiles(self, input_shapes: List[torch.Size]) -> int:
+        return input_shapes[0][0] // self.tile_size
+
+    def infer_shape_max_num_permuted_tokens(
+            self, input_shapes: List[torch.Size]) -> int:
+        return self.infer_shape_max_num_tiles(input_shapes) * self.tile_size
+
+    def generate_num_tokens_per_expert(self, num_tokens: int) -> List[int]:
+        average_num_tokens_per_expert = num_tokens * self.top_k / self.num_experts
+        balance = 0
+        num_tokens_per_expert = []
+        for i in range(self.num_local_experts):
+            balance += average_num_tokens_per_expert
+            if balance <= 1e-3:
+                continue
+            curr_num_tokens = int(balance) + 1
+            num_tokens_per_expert.append(curr_num_tokens)
+            balance -= curr_num_tokens
+        return num_tokens_per_expert
+
+    def generate_tile_idx_to_group_idx(
+            self, num_tokens_per_expert: List[int]) -> List[int]:
+        tile_idx_to_group_idx = []
+        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
+            curr_num_tiles = (curr_num_tokens + self.tile_size -
+                              1) // self.tile_size
+            tile_idx_to_group_idx.extend([i] * curr_num_tiles)
+        return tile_idx_to_group_idx
+
+    def generate_tile_idx_to_mn_limit(
+            self, num_tokens_per_expert: List[int]) -> List[int]:
+        tile_idx_to_mn_limit = []
+        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
+            curr_num_tiles = (curr_num_tokens + self.tile_size -
+                              1) // self.tile_size
+            prev_mn_limit = len(tile_idx_to_mn_limit) * self.tile_size
+            for j in range(curr_num_tiles):
+                tile_idx_to_mn_limit.append(prev_mn_limit + min(
+                    (j + 1) * self.tile_size, curr_num_tokens))
+        return tile_idx_to_mn_limit
+
+    def generate_permuted_idx_to_expanded_idx(
+            self, num_tokens: int,
+            num_tokens_per_expert: List[int]) -> List[int]:
+        permuted_idx_to_expanded_idx = []
+        colmajor_expanded_idx = 0
+        for i, curr_num_tokens in enumerate(num_tokens_per_expert):
+            curr_num_tiles = (curr_num_tokens + self.tile_size -
+                              1) // self.tile_size
+            for j in range(curr_num_tiles * self.tile_size):
+                if j < curr_num_tokens:
+                    token_idx = colmajor_expanded_idx % num_tokens
+                    topk_idx = colmajor_expanded_idx // num_tokens
+                    expanded_idx = token_idx * self.top_k + topk_idx
+                    permuted_idx_to_expanded_idx.append(expanded_idx)
+                    colmajor_expanded_idx += 1
+                else:
+                    permuted_idx_to_expanded_idx.append(self.pad_val)
+        return permuted_idx_to_expanded_idx
+
+    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others = inputs
+        num_tokens = self.infer_num_tokens(a.size(0))
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
+        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
+            num_tokens_per_expert)
+        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
+        num_padding_tiles_val = tile_idx_to_group_idx.size(
+            0) - num_non_exiting_tiles_val
+        assert num_non_exiting_tiles_val > 0
+        assert num_padding_tiles_val >= 0
+
+        tile_idx_to_group_idx = torch.tensor(
+            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
+            dtype=tile_idx_to_group_idx.dtype,
+            device=tile_idx_to_group_idx.device)
+        num_non_exiting_tiles = torch.tensor(
+            [num_non_exiting_tiles_val],
+            dtype=num_non_exiting_tiles.dtype,
+            device=num_non_exiting_tiles.device)
+        return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others
+
+    def inputs_pre_hook_finalize_fusion(
+            self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+        num_tokens = self.infer_num_tokens(a.size(0))
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
+        tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
+            num_tokens_per_expert)
+        tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
+            num_tokens_per_expert)
+        permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
+            num_tokens, num_tokens_per_expert)
+        num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
+        num_padding_tiles_val = tile_idx_to_group_idx.size(
+            0) - num_non_exiting_tiles_val
+        assert num_non_exiting_tiles_val > 0
+        assert num_padding_tiles_val >= 0
+        assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
+        assert len(permuted_idx_to_expanded_idx_list
+                   ) == num_non_exiting_tiles_val * self.tile_size
+
+        tile_idx_to_group_idx = torch.tensor(
+            tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
+            dtype=tile_idx_to_group_idx.dtype,
+            device=tile_idx_to_group_idx.device)
+        tile_idx_to_mn_limit = torch.tensor(
+            tile_idx_to_mn_limit_list + [self.pad_val] * num_padding_tiles_val,
+            dtype=tile_idx_to_mn_limit.dtype,
+            device=tile_idx_to_mn_limit.device)
+        permuted_idx_to_expanded_idx = torch.tensor(
+            permuted_idx_to_expanded_idx_list + [self.pad_val] *
+            (num_padding_tiles_val * self.tile_size),
+            dtype=permuted_idx_to_expanded_idx.dtype,
+            device=permuted_idx_to_expanded_idx.device)
+        num_non_exiting_tiles = torch.tensor(
+            [num_non_exiting_tiles_val],
+            dtype=num_non_exiting_tiles.dtype,
+            device=num_non_exiting_tiles.device)
+        return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
+
+
+class FusedMoEInputsHelper:
+
+    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
+                 local_expert_offset: int):
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+
+    def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
+        return input_shapes[0][0]
+
+    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        x, x_sf, token_selected_experts, token_final_scales, *others = inputs
+        num_tokens = token_selected_experts.size(0)
+        new_token_final_scales, new_token_selected_experts = torch.randn(
+            num_tokens, self.num_experts,
+            device=token_selected_experts.device).topk(self.top_k, dim=-1)
+        new_token_selected_experts = new_token_selected_experts.to(
+            token_selected_experts.dtype)
+        new_token_final_scales = new_token_final_scales.softmax(dim=-1).to(
+            token_final_scales.dtype)
+        return x, x_sf, new_token_selected_experts, new_token_final_scales, *others
+
+
 if IS_CUTLASS_DSL_AVAILABLE:
 
     import cutlass
@@ -75,8 +268,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
-            sm_version = get_sm_version()
-            if sm_version not in [100, 103]:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
                     f"CuteDSL: SM version {sm_version} is not supported. "
                     f"CuteDSL NVFP4 only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
@@ -404,8 +596,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             for automatic backend selection with better performance.
         """
         # Validate SM version before attempting to use CuteDSL
-        sm_version = get_sm_version()
-        if sm_version not in [100, 103]:
+        if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
                 f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
@@ -443,180 +634,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class GroupedGemmInputsHelper:
-
-        def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                     local_expert_offset: int, tile_size: int):
-            self.num_experts = num_experts
-            self.top_k = top_k
-            self.num_local_experts = num_local_experts
-            self.local_expert_offset = local_expert_offset
-            self.tile_size = tile_size
-            # Padding values should never be accessed.
-            # Intentionally use a large padding value to expose issues early.
-            self.pad_val = int(2e9)
-
-        def get_max_num_tiles(self, num_tokens: int) -> int:
-            num_expanded_tokens = num_tokens * self.top_k
-            if num_expanded_tokens <= self.num_local_experts:
-                return num_expanded_tokens
-            return (
-                num_expanded_tokens +
-                (self.tile_size - 1) * self.num_local_experts) // self.tile_size
-
-        def get_max_num_permuted_tokens(self, num_tokens: int) -> int:
-            return self.get_max_num_tiles(num_tokens) * self.tile_size
-
-        def infer_num_tokens(self, max_num_permuted_tokens: int) -> int:
-            """Infer the maximum possible number of tokens given the max_num_permuted_tokens.
-            """
-            max_num_tiles = max_num_permuted_tokens // self.tile_size
-            if max_num_tiles >= self.num_local_experts:
-                return (max_num_permuted_tokens - (self.tile_size - 1) *
-                        (self.num_local_experts - 1)) // self.top_k
-            return max_num_tiles // self.top_k
-
-        def gen_tuning_buckets(self, max_num_tokens: int) -> List[int]:
-            buckets = get_last_power_of_2_num_tokens_buckets(
-                self.infer_num_tokens(max_num_tokens))
-            return sorted(
-                list(set(self.get_max_num_permuted_tokens(x) for x in buckets)))
-
-        def map_to_tuning_buckets(self, x: int) -> int:
-            return self.get_max_num_permuted_tokens(
-                last_positive_power_of_2(self.infer_num_tokens(x)))
-
-        def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
-            return self.infer_num_tokens(input_shapes[0][0])
-
-        def infer_shape_max_num_tiles(self,
-                                      input_shapes: List[torch.Size]) -> int:
-            return input_shapes[0][0] // self.tile_size
-
-        def infer_shape_max_num_permuted_tokens(
-                self, input_shapes: List[torch.Size]) -> int:
-            return self.infer_shape_max_num_tiles(input_shapes) * self.tile_size
-
-        def generate_num_tokens_per_expert(self, num_tokens: int) -> List[int]:
-            average_num_tokens_per_expert = num_tokens * self.top_k / self.num_experts
-            balance = 0
-            num_tokens_per_expert = []
-            for i in range(self.num_local_experts):
-                balance += average_num_tokens_per_expert
-                if balance <= 1e-3:
-                    continue
-                curr_num_tokens = int(balance) + 1
-                num_tokens_per_expert.append(curr_num_tokens)
-                balance -= curr_num_tokens
-            return num_tokens_per_expert
-
-        def generate_tile_idx_to_group_idx(
-                self, num_tokens_per_expert: List[int]) -> List[int]:
-            tile_idx_to_group_idx = []
-            for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-                curr_num_tiles = (curr_num_tokens + self.tile_size -
-                                  1) // self.tile_size
-                tile_idx_to_group_idx.extend([i] * curr_num_tiles)
-            return tile_idx_to_group_idx
-
-        def generate_tile_idx_to_mn_limit(
-                self, num_tokens_per_expert: List[int]) -> List[int]:
-            tile_idx_to_mn_limit = []
-            for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-                curr_num_tiles = (curr_num_tokens + self.tile_size -
-                                  1) // self.tile_size
-                prev_mn_limit = len(tile_idx_to_mn_limit) * self.tile_size
-                for j in range(curr_num_tiles):
-                    tile_idx_to_mn_limit.append(prev_mn_limit + min(
-                        (j + 1) * self.tile_size, curr_num_tokens))
-            return tile_idx_to_mn_limit
-
-        def generate_permuted_idx_to_expanded_idx(
-                self, num_tokens: int,
-                num_tokens_per_expert: List[int]) -> List[int]:
-            permuted_idx_to_expanded_idx = []
-            colmajor_expanded_idx = 0
-            for i, curr_num_tokens in enumerate(num_tokens_per_expert):
-                curr_num_tiles = (curr_num_tokens + self.tile_size -
-                                  1) // self.tile_size
-                for j in range(curr_num_tiles * self.tile_size):
-                    if j < curr_num_tokens:
-                        token_idx = colmajor_expanded_idx % num_tokens
-                        topk_idx = colmajor_expanded_idx // num_tokens
-                        expanded_idx = token_idx * self.top_k + topk_idx
-                        permuted_idx_to_expanded_idx.append(expanded_idx)
-                        colmajor_expanded_idx += 1
-                    else:
-                        permuted_idx_to_expanded_idx.append(self.pad_val)
-            return permuted_idx_to_expanded_idx
-
-        def inputs_pre_hook(self,
-                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others = inputs
-            num_tokens = self.infer_num_tokens(a.size(0))
-            num_tokens_per_expert = self.generate_num_tokens_per_expert(
-                num_tokens)
-            tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-                num_tokens_per_expert)
-            num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-            num_padding_tiles_val = tile_idx_to_group_idx.size(
-                0) - num_non_exiting_tiles_val
-            assert num_non_exiting_tiles_val > 0
-            assert num_padding_tiles_val >= 0
-
-            tile_idx_to_group_idx = torch.tensor(
-                tile_idx_to_group_idx_list +
-                [self.pad_val] * num_padding_tiles_val,
-                dtype=tile_idx_to_group_idx.dtype,
-                device=tile_idx_to_group_idx.device)
-            num_non_exiting_tiles = torch.tensor(
-                [num_non_exiting_tiles_val],
-                dtype=num_non_exiting_tiles.dtype,
-                device=num_non_exiting_tiles.device)
-            return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others
-
-        def inputs_pre_hook_finalize_fusion(
-                self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
-            num_tokens = self.infer_num_tokens(a.size(0))
-            num_tokens_per_expert = self.generate_num_tokens_per_expert(
-                num_tokens)
-            tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
-                num_tokens_per_expert)
-            tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
-                num_tokens_per_expert)
-            permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
-                num_tokens, num_tokens_per_expert)
-            num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-            num_padding_tiles_val = tile_idx_to_group_idx.size(
-                0) - num_non_exiting_tiles_val
-            assert num_non_exiting_tiles_val > 0
-            assert num_padding_tiles_val >= 0
-            assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-            assert len(permuted_idx_to_expanded_idx_list
-                       ) == num_non_exiting_tiles_val * self.tile_size
-
-            tile_idx_to_group_idx = torch.tensor(
-                tile_idx_to_group_idx_list +
-                [self.pad_val] * num_padding_tiles_val,
-                dtype=tile_idx_to_group_idx.dtype,
-                device=tile_idx_to_group_idx.device)
-            tile_idx_to_mn_limit = torch.tensor(
-                tile_idx_to_mn_limit_list +
-                [self.pad_val] * num_padding_tiles_val,
-                dtype=tile_idx_to_mn_limit.dtype,
-                device=tile_idx_to_mn_limit.device)
-            permuted_idx_to_expanded_idx = torch.tensor(
-                permuted_idx_to_expanded_idx_list + [self.pad_val] *
-                (num_padding_tiles_val * self.tile_size),
-                dtype=permuted_idx_to_expanded_idx.dtype,
-                device=permuted_idx_to_expanded_idx.device)
-            num_non_exiting_tiles = torch.tensor(
-                [num_non_exiting_tiles_val],
-                dtype=num_non_exiting_tiles.dtype,
-                device=num_non_exiting_tiles.device)
-            return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
-
     class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmKernel
         kernel_cache = dict()
@@ -641,9 +658,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -928,9 +945,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -996,11 +1013,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         helper.map_to_tuning_buckets), ),
                     constraint_specs=(
                         ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                        ConstraintSpec(5, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                         ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(7, 0, helper.infer_shape_max_num_tiles),
                         ConstraintSpec(
-                            7, 0, helper.infer_shape_max_num_permuted_tokens),
-                        ConstraintSpec(9, 0, helper.infer_shape_num_tokens)),
+                            8, 0, helper.infer_shape_max_num_permuted_tokens),
+                        ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cuda_graph=True,
                 )
@@ -1008,7 +1026,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
             assert b.dtype == torch.float4_e2m1fn_x2
@@ -1032,6 +1050,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b_sf.size(2) == scale_k
             assert alpha.size(0) == l
 
+            assert c.dtype == self.output_dtype
+            assert c.dim() == 2
+            num_tokens = c.size(0)
+            assert c.size(1) == n
+
             num_tiles = m // self.tile_size
             assert tile_idx_to_group_idx.dtype == torch.int32
             assert tile_idx_to_group_idx.size() == (num_tiles, )
@@ -1043,14 +1066,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert num_non_exiting_tiles.numel() == 1
             assert token_final_scales.dtype == torch.float32
             assert token_final_scales.dim() == 2
-            num_tokens = token_final_scales.size(0)
-            assert token_final_scales.size(1) == self.top_k
-
-            # TODO: Overlap the memset
-            c = torch.zeros(num_tokens,
-                            n,
-                            dtype=self.output_dtype,
-                            device=a.device)
+            assert token_final_scales.size() == (num_tokens, self.top_k)
 
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
@@ -1164,6 +1180,51 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c
 
     @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+        mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, output_dtype, scaling_vector_size)
+
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha, output,
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+            token_final_scales
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
         mutates_args=(),
         device_types="cuda")
@@ -1186,25 +1247,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
-        tuner = AutoTuner.get()
-
-        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
-        inputs = [
-            input, weight, input_scale, weight_scale, alpha,
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
-            token_final_scales
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
+        num_tokens = token_final_scales.size(0)
+        n = weight.size(1)
+        output = torch.zeros(num_tokens,
+                             n,
+                             dtype=output_dtype,
+                             device=input.device)
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            input=input,
+            weight=weight,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            alpha=alpha,
+            output=output,
+            tile_idx_to_group_idx=tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_size,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
         )
-        output = runner(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake(
@@ -1256,9 +1324,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -1543,32 +1611,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
-
-    class FusedMoEInputsHelper:
-
-        def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
-                     local_expert_offset: int):
-            self.num_experts = num_experts
-            self.top_k = top_k
-            self.num_local_experts = num_local_experts
-            self.local_expert_offset = local_expert_offset
-
-        def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
-            return input_shapes[0][0]
-
-        def inputs_pre_hook(self,
-                            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-            x, x_sf, token_selected_experts, token_final_scales, *others = inputs
-            num_tokens = token_selected_experts.size(0)
-            new_token_final_scales, new_token_selected_experts = torch.randn(
-                num_tokens,
-                self.num_experts,
-                device=token_selected_experts.device).topk(self.top_k, dim=-1)
-            new_token_selected_experts = new_token_selected_experts.to(
-                token_selected_experts.dtype)
-            new_token_final_scales = new_token_final_scales.softmax(dim=-1).to(
-                token_final_scales.dtype)
-            return x, x_sf, new_token_selected_experts, new_token_final_scales, *others
 
     class Sm100BlockScaledFusedMoERunner(TunableRunner):
         tuning_config_cache = dict()

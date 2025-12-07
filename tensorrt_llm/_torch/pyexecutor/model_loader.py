@@ -6,8 +6,8 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
-    BaseCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
+    AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
@@ -265,9 +265,10 @@ class ModelLoader:
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir)
+                        model.llm_checkpoint_dir, mapping=self.mapping)
                 else:
-                    weights = checkpoint_loader.load_weights(checkpoint_dir)
+                    weights = checkpoint_loader.load_weights(
+                        checkpoint_dir, mapping=self.mapping)
 
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
@@ -277,9 +278,18 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model_dir)
+                        self.spec_config.speculative_model_dir,
+                        mapping=self.mapping)
+
+                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                        0]
+                    draft_weight_mapper = AutoCheckpointMapper.get(
+                        checkpoint_loader.checkpoint_format, draft_model_arch)
+                    draft_weight_mapper.init_model_and_config(
+                        model.draft_model, model.draft_config)
+
                     self._call_load_weights(model.load_draft_weights, weights,
-                                            self.weight_mapper)
+                                            draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
@@ -349,7 +359,13 @@ class ModelLoader:
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
-            use_low_precision_moe_combine)
+            use_low_precision_moe_combine,
+            nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
+            allowed_backends)
+
+        # Store nvfp4 config in extra_attrs for Linear layer access
+        config.extra_attrs[
+            'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)

@@ -91,11 +91,16 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
             "check_context_transfer_status",
             [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum)
             {
-                auto result = self.checkContextTransferStatus(atLeastRequestNum);
+                RequestStatuses result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.checkContextTransferStatus(atLeastRequestNum);
+                }
                 return py::make_tuple(result.completedRequestIds, result.errorRequestIds);
             },
             py::arg("at_least_request_num") = std::nullopt)
-        .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
+        .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
+            py::call_guard<py::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
 

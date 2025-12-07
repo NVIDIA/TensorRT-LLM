@@ -216,12 +216,14 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     model = encoder_args["model"]
+    encoder_args.pop("build_config")
     mm_encoder = MultimodalEncoder(**encoder_args)
 
     server = OpenAIServer(llm=mm_encoder,
                           model=model,
                           server_role=ServerRole.MM_ENCODER,
-                          metadata_server_cfg=metadata_server_cfg)
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None)
     asyncio.run(server(host, port))
 
 
@@ -299,20 +301,28 @@ class ChoiceWithAlias(click.Choice):
     default=BuildConfig.model_fields["max_seq_len"].default,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
-@click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
-@click.option("--pp_size",
+@click.option("--tensor_parallel_size",
+              "--tp_size",
+              type=int,
+              default=1,
+              help='Tensor parallelism size.')
+@click.option("--pipeline_parallel_size",
+              "--pp_size",
               type=int,
               default=1,
               help='Pipeline parallelism size.')
-@click.option("--cp_size",
+@click.option("--context_parallel_size",
+              "--cp_size",
               type=int,
               default=1,
               help='Context parallelism size.')
-@click.option("--ep_size",
+@click.option("--moe_expert_parallel_size",
+              "--ep_size",
               type=int,
               default=None,
               help="expert parallelism size")
-@click.option("--cluster_size",
+@click.option("--moe_cluster_parallel_size",
+              "--cluster_size",
               type=int,
               default=None,
               help="expert cluster parallelism size")
@@ -321,7 +331,8 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="Number of GPUs per node. Default to None, and it will be "
               "detected automatically.")
-@click.option("--kv_cache_free_gpu_memory_fraction",
+@click.option("--free_gpu_memory_fraction",
+              "--kv_cache_free_gpu_memory_fraction",
               type=float,
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
@@ -400,20 +411,22 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="[Experimental] Specify a custom chat template. "
               "Can be a file path or one-liner template string")
-def serve(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        cp_size: int, ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        revision: Optional[str], extra_llm_api_options: Optional[str],
-        reasoning_parser: Optional[str], tool_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
-        custom_module_dirs: list[Path], chat_template: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tensor_parallel_size: int, pipeline_parallel_size: int,
+          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          moe_cluster_parallel_size: Optional[int],
+          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          revision: Optional[str], extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool,
+          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+          disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+          custom_module_dirs: list[Path], chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -427,7 +440,6 @@ def serve(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
-
     llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
@@ -436,13 +448,13 @@ def serve(
         max_batch_size=max_batch_size,
         max_num_tokens=max_num_tokens,
         max_seq_len=max_seq_len,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        context_parallel_size=cp_size,
-        moe_expert_parallel_size=ep_size,
-        moe_cluster_parallel_size=cluster_size,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        context_parallel_size=context_parallel_size,
+        moe_expert_parallel_size=moe_expert_parallel_size,
+        moe_cluster_parallel_size=moe_cluster_parallel_size,
         gpus_per_node=gpus_per_node,
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         revision=revision,

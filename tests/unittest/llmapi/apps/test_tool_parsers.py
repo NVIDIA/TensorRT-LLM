@@ -780,26 +780,50 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 name="multi_param_func",
                 description="Function with multiple parameters",
                 parameters={
-                    "type": "object",
+                    "type":
+                    "object",
                     "properties": {
                         "param1": {
                             "type": "string"
                         },
                         "param2": {
-                            "type": "string"
+                            "type": "float"
                         },
                         "param3": {
                             "type": "integer"
+                        },
+                        "param4": {
+                            "type": "boolean"
+                        },
+                        "param5": {
+                            "type": "object"
+                        },
+                        "param6": {
+                            "type": "array"
+                        },
+                        "param7": {
+                            "type": "null"
+                        },
+                        "param8": {
+                            "type": "other_type"
                         }
                     },
-                    "required": ["param1", "param2", "param3"]
+                    "required": [
+                        "param1", "param2", "param3", "param4", "param5",
+                        "param6", "param7", "param8"
+                    ]
                 }))
 
         text = ("<tool_call>\n"
                 "<function=multi_param_func>\n"
-                "<parameter=param1>value1</parameter>\n"
-                "<parameter=param2>value2</parameter>\n"
+                "<parameter=param1>42</parameter>\n"
+                "<parameter=param2>41.9</parameter>\n"
                 "<parameter=param3>42</parameter>\n"
+                "<parameter=param4>true</parameter>\n"
+                "<parameter=param5>{\"key\": \"value\"}</parameter>\n"
+                "<parameter=param6>[1, 2, 3]</parameter>\n"
+                "<parameter=param7>null</parameter>\n"
+                "<parameter=param8>{'arg1': 3, 'arg2': [1, 2]}</parameter>\n"
                 "</function>\n"
                 "</tool_call>")
 
@@ -808,9 +832,19 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "multi_param_func"
         assert json.loads(result.calls[0].parameters) == {
-            "param1": "value1",
-            "param2": "value2",
-            "param3": 42
+            "param1": "42",
+            "param2": 41.9,
+            "param3": 42,
+            "param4": True,
+            "param5": {
+                "key": "value"
+            },
+            "param6": [1, 2, 3],
+            "param7": None,
+            "param8": {
+                "arg1": 3,
+                "arg2": [1, 2]
+            }
         }
 
     def test_qwen3_coder_format_compliance(
