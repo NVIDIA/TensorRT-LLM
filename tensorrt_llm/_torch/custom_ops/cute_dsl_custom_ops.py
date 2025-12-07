@@ -1734,9 +1734,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if get_sm_version() != 100 and get_sm_version() != 103:
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100 and SM 103"
                 )
 
         def unique_id(self):
