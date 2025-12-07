@@ -2631,6 +2631,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // 2
+        scale_interm_size = interm_size // scaling_vector_size
         num_tiles = m // tile_size
         a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
@@ -2652,7 +2653,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         c_sf = cute.make_tensor(
             c_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, interm_size // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, m // 128, 4, scale_interm_size // 4, 1), order=(2, 1, 4, 0, 3, 5)
             ),
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))

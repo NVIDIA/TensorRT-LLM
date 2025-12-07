@@ -122,13 +122,32 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
-        def downloadSucceed = false
+        def hasTimeoutTest = false
+        def downloadResultSucceed = false
 
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
+            // Download timeout test results
+            def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
+            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            if (downloadTimeoutTestSucceed) {
+                sh "ls ${stageName}"
+                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                if (timeoutTestXml != null) {
+                    sh """
+cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
+${timeoutTestXml}
+EOF_TIMEOUT_XML
+                    """
+                    hasTimeoutTest = true
+                }
+            }
+            // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
-            downloadSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
-            if (downloadSucceed) {
+            downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
@@ -142,7 +161,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             }
         }
 
-        if (downloadSucceed) {
+        if (hasTimeoutTest || downloadResultSucceed) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
@@ -165,12 +184,12 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
             !cmd.contains("--test-list=") &&
             !cmd.contains("--test-prefix=") &&
             !cmd.contains("--csv=") &&
-            !cmd.contains("--junit-xml")
+            !cmd.contains("--periodic-junit-xmlpath")
         }
         isolateTestCmdLine += ["--test-list=${singleTestFile}"]
         isolateTestCmdLine += ["--test-prefix=${stageName}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-        isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+        isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
         isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
 
         try {
@@ -774,13 +793,16 @@ def getPytestBaseCommandLine(
         "--waives-file=${waivesFilePath}",
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
-        "--junit-xml ${outputPath}/results.xml",
         "-o junit_logging=out-err",
         "--cov=${llmSrc}/examples/",
         "--cov=${llmSrc}/tensorrt_llm/",
         "--cov=${trtllmWheelPath}/tensorrt_llm/",
         "--cov-report=",
         "--cov-config=${coverageConfigFile}",
+        "--periodic-junit",
+        "--periodic-junit-xmlpath ${outputPath}/results.xml",
+        "--periodic-batch-size=1",
+        "--periodic-save-unfinished-test",
     ]
 
     if (perfMode) {
@@ -1258,6 +1280,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
+                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                if (timeoutTestXml != null) {
+                    sh """
+cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
+${timeoutTestXml}
+EOF_TIMEOUT_XML
+                    """
+                }
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
@@ -1609,6 +1639,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             sh "NVIDIA_TRITON_SERVER_VERSION=25.10 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
@@ -1618,9 +1649,32 @@ def launchTestListCheck(pipeline)
     })
 }
 
+def generateTimeoutTestResultXml(stageName, testFilePath) {
+    if (!fileExists("${stageName}/${testFilePath}")) {
+        echo "No ${testFilePath} found in ${stageName}, skipping timeout XML generation"
+        return null
+    }
+    String timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
+    echo "timeoutTests: ${timeoutTests}"
+
+    if (timeoutTests == null || timeoutTests == "") {
+        return null
+    }
+    def testList = timeoutTests.split("\n")
+    String xmlContent = """<?xml version="1.0" encoding="UTF-8"?><testsuites>
+        <testsuite name="${stageName}" errors="${testList.size()}" failures="0" skipped="0" tests="${testList.size()}" time="1.00">"""
+    testList.each { test ->
+        xmlContent += """<testcase name="${test}" classname="${stageName}" time="1.0">
+        <error message="Test terminated unexpectedly"> Test terminated unexpectedly
+        </error></testcase>"""
+    }
+    xmlContent += "</testsuite></testsuites>"
+    return xmlContent
+}
+
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
     String resultFiles = sh(script: "cd ${stageName} && ls -l ${resultPath} | wc -l", returnStdout: true).trim()
-    echo "${resultFiles}"
+    echo "resultFiles: ${resultFiles}"
     if (resultFiles != "0") {
         return null
     }
@@ -1941,14 +1995,14 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
         def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--cov"]
-        def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        def needToChangeLine = ["--test-list", "--csv", "--periodic-junit-xmlpath"]
         def newTestCmdLine = testCmdLine.findAll { cmd ->
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
         }
         newTestCmdLine += [
             "--test-list=${currentRerunTestList}",
             "--csv=${rerunDir}/rerun_report_${times}.csv",
-            "--junit-xml ${xmlFile}",
+            "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
         try {
@@ -2154,6 +2208,8 @@ ${reusedTestsContent}
 REUSED_TESTS_EOF
 """)
             echo "Appended ${reusedTests.size()} reused tests to ${waivesTxt}"
+        } else {
+            echo "No reused tests found"
         }
     } catch (InterruptedException e) {
         throw e
@@ -2267,6 +2323,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 touch ~/.ssh/authorized_keys
                 chmod 600 ~/.ssh/authorized_keys
             """
+
+            // Write env variables to a file
+            sh 'env | sort | sed -E \'s/^([^=]+)=(.*)$/export \\1="\\2"/\' > debug_env.sh'
+            sh "cat debug_env.sh"
 
             // The portConfig file is in the VM
             def portConfigFilePath = "/root/.ssh/ports_config.txt"
@@ -2844,8 +2904,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-trtllm", "l0_dgx_b200", 2, 2, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // Perf sanity post merge test
         // Disable perf stages due to https://nvbugs/5643646
         // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
@@ -2874,7 +2936,8 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 2, 4],
+        "GB200-4_GPUs-PyTorch-2": ["gb200-x4-oci", "l0_gb200_multi_gpus", 2, 2, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
@@ -3209,6 +3272,7 @@ def launchTestJobs(pipeline, testFilter)
             "pytorch": "-PyTorch-",
             "tensorrt": "-TensorRT-",
             "cpp": "-CPP-",
+            "triton": "-Triton-",
             "fmha": "-FMHA-",
         ]
         def backendModeList = backendMode.collect { changeMap.get(it) }.flatten()
@@ -3233,7 +3297,7 @@ def launchTestJobs(pipeline, testFilter)
         } else {
             echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
             def excludedBackends = new HashMap()
-            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-", "-FMHA-"]
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-FMHA-"]     // Only pytorch file change also need to run triton tests
             excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-FMHA-"]
             excludedBackends["FMHA"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-Triton-"]
             def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]

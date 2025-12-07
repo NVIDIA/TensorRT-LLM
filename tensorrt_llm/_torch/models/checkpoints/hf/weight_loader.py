@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
                                  local_mpi_size)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 
 @register_checkpoint_weight_loader("HF")
@@ -24,7 +25,8 @@ class HfWeightLoader(BaseWeightLoader):
     Loads weights from SafeTensors/bin/pth files.
     """
 
-    def load_weights(self, checkpoint_dir: str) -> dict[str, Any]:
+    def load_weights(self, checkpoint_dir: str,
+                     mapping: Mapping) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former, as there really is no need

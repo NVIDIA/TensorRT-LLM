@@ -335,10 +335,6 @@ def test_fused_moe_alltoall(alltoall_method_type):
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
-
-    if alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-        pytest.skip("Skipped due to https://nvbugs/5467531")
-
     world_size = 4
     dtype = torch.bfloat16
     HIDDEN_SIZE = 4096
@@ -1368,9 +1364,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         if dtype == torch.float16:
             pytest.skip(
                 "CUTEDSL NVFP4 MoE backend does not support float16 yet")
-        if get_sm_version() != 100:
+        if get_sm_version() not in (100, 103):
             pytest.skip(
-                "CUTEDSL NVFP4 MoE backend is only supported on SM 100 GPUs")
+                "CUTEDSL NVFP4 MoE backend supports SM 100 (B200) and SM 103 (B300) only"
+            )
 
     test_all_kernels = True
     if get_sm_version() == 120:

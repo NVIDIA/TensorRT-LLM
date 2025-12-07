@@ -412,6 +412,34 @@ class MoeConfig(StrictBaseModel):
         return cls(**data)
 
 
+class Nvfp4GemmConfig(StrictBaseModel):
+    """
+    Configuration for NVFP4 GEMM backend selection.
+    """
+    allowed_backends: List[str] = Field(
+        default=['cutlass', 'cublaslt', 'cuda_core'],
+        description="List of backends to consider for auto-selection. "
+        "Default excludes 'cutedsl' for faster build time. "
+        "Add 'cutedsl' for extreme performance at the cost of longer server launch time. "
+        "Valid values: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.")
+
+    @model_validator(mode="after")
+    def validate_allowed_backends(self) -> 'Nvfp4GemmConfig':
+        valid_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
+        invalid = set(self.allowed_backends) - valid_backends
+        if invalid:
+            raise ValueError(
+                f"Invalid backends in allowed_backends: {invalid}. "
+                f"Valid backends are: {sorted(valid_backends)}")
+        if not self.allowed_backends:
+            raise ValueError("allowed_backends cannot be empty.")
+        return self
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
 class AttentionDpConfig(StrictBaseModel):
     """
     Configuration for attention DP.
@@ -977,7 +1005,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend == "pytorch" or backend == "_autodeploy"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2566,6 +2594,11 @@ class TorchLlmArgs(BaseLlmArgs):
                                   description="MoE config.",
                                   status="beta")
 
+    nvfp4_gemm_config: Nvfp4GemmConfig = Field(
+        default_factory=Nvfp4GemmConfig,
+        description="NVFP4 GEMM backend config.",
+        status="beta")
+
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",
                               status="beta")
@@ -3050,6 +3083,7 @@ def update_llm_args_with_extra_dict(
         "speculative_config": DecodingBaseConfig,
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
+        "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
         "kv_cache_config": KvCacheConfig,

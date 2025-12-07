@@ -141,6 +141,21 @@ class BaseMultimodalInputProcessor(ABC):
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._multimodal_hashing_supported: Optional[bool] = None
 
+    def attach_multimodal_embeddings(
+        self,
+        inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Handle externally provided multimodal input embeddings.
+
+        While inputs["multi_modal_data"] is handled by __call__, this method is intended to process
+        inputs["multi_modal_embeddings"].
+        """
+        raise NotImplementedError(
+            "Input processor does not support multimodal embedding input")
+
     @property
     @abstractmethod
     def processor(self) -> AutoProcessor:
