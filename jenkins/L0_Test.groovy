@@ -565,7 +565,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
-                def mounts = getMountListForSlurmTest(cluster).join(",")
+                def mounts = getMountListForSlurmTest(cluster, false).join(",")
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
@@ -817,25 +817,40 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
-def getMountListForSlurmTest(SlurmCluster cluster)
+def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
 {
-    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
-        return [
-            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
-            "/home/svc_tensorrt:/home/svc_tensorrt",
+    def mounts = []
+
+    // mounts for SLURM job submission and logs
+    if (useSbatch) {
+        mounts += [
+            "/home/svc_tensorrt/bloom/scripts",
+        ]
+    } else {
+        mounts += [
+            "/home/svc_tensorrt/bloom/scripts",
+            "/home/svc_tensorrt/slurm-logs",
         ]
     }
 
-    if (!cluster.scratchPath) {
-        throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
+    // data/cache mounts
+    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+        mounts += [
+            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
+        ]
+    } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+        if (!cluster.scratchPath) {
+            throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
+        }
+        mounts += [
+            "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
+            "/home/svc_tensorrt/.cache:/root/.cache",
+        ]
+    } else {
+        throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
     }
 
-    return [
-        "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
-        "/home/svc_tensorrt:/home/svc_tensorrt",
-        "/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts",
-        "/home/svc_tensorrt/.cache:/root/.cache"
-    ]
+    return mounts
 }
 
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
@@ -975,7 +990,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
-                def mounts = getMountListForSlurmTest(cluster).join(",")
+                def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
