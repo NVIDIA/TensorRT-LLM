@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from transformers import PretrainedConfig, WhisperConfig
 
@@ -231,7 +231,7 @@ def _remap_moe_args(config: dict) -> dict:
 class MistralConfigLoader(BaseConfigLoader):
     def _load_mistral_config_dict(
         self, checkpoint_dir: str, config_file_name: str
-    ) -> Optional[dict]:
+    ) -> dict | None:
         file_path = Path(checkpoint_dir) / Path(config_file_name)
 
         if file_path.exists() and file_path.is_file():

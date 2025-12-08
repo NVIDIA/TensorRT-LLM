@@ -1,7 +1,7 @@
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torchvision
@@ -58,7 +58,7 @@ class MistralAttention(Attention):
     def __init__(
         self,
         model_config: ModelConfig[MistralConfig],
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
     ):
         config = model_config.pretrained_config
         super().__init__(
@@ -117,8 +117,8 @@ class MistralDecoderLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
+        residual: torch.Tensor | None = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -175,11 +175,11 @@ class MistralModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.IntTensor] = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        lora_params: Optional[Any] = None,
+        input_ids: torch.IntTensor | None = None,
+        position_ids: torch.IntTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        spec_metadata: SpecMetadata | None = None,
+        lora_params: Any | None = None,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -228,7 +228,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         self,
         model_path: str,
         config: PretrainedConfig,
-        tokenizer: Optional[AutoTokenizer],
+        tokenizer: AutoTokenizer | None,
         trust_remote_code: bool = False,
         **kwargs,
     ):
@@ -270,7 +270,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
     @torch.inference_mode()
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+    ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")
         mm_processor_kwargs = inputs.get("mm_processor_kwargs", {})
         do_rescale = getattr(self.processor.image_processor, "do_rescale",
@@ -468,10 +468,10 @@ class Mistral3VLM(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         return_context_logits: bool = False,
-        spec_metadata: Optional[SpecMetadata] = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward method."""
@@ -650,7 +650,7 @@ class Mistral3VLM(PreTrainedModel):
     def load_draft_weights(
             self,
             weights: Dict,
-            weight_mapper: Optional[MistralWeightMapper] = None) -> None:
+            weight_mapper: MistralWeightMapper | None = None) -> None:
         self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
 
 

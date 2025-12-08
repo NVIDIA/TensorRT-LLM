@@ -5,7 +5,7 @@ from .modeling_utils import register_auto_model
 from ..model_config import ModelConfig
 
 from torch import nn
-from typing import Dict, Optional, List
+from typing import Dict, List
 
 from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import (
     MistralLarge3WeightMapper,
@@ -21,7 +21,7 @@ class Mistral3Gate(nn.Module):
         hidden_size: int,
         num_experts: int,
         top_k: int,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         **kwargs,
     ):
         super().__init__()

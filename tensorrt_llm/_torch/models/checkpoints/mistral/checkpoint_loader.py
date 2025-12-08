@@ -1,5 +1,3 @@
-from typing import Optional
-
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
@@ -13,9 +11,9 @@ class MistralCheckpointLoader(HfCheckpointLoader):
     def __init__(
         self,
         *,
-        weight_loader: Optional[BaseWeightLoader] = None,
-        weight_mapper: Optional[BaseWeightMapper] = None,
-        config_loader: Optional[BaseConfigLoader] = None,
+        weight_loader: BaseWeightLoader | None = None,
+        weight_mapper: BaseWeightMapper | None = None,
+        config_loader: BaseConfigLoader | None = None,
     ):
         super().__init__(
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
@@ -81,9 +79,9 @@ class MistralLarge3CheckpointLoader(MistralCheckpointLoader):
     def __init__(
         self,
         *,
-        weight_loader: Optional[BaseWeightLoader] = None,
-        weight_mapper: Optional[BaseWeightMapper] = None,
-        config_loader: Optional[BaseConfigLoader] = None,
+        weight_loader: BaseWeightLoader | None = None,
+        weight_mapper: BaseWeightMapper | None = None,
+        config_loader: BaseConfigLoader | None = None,
     ):
         super().__init__(
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
