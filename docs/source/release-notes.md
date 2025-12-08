@@ -93,7 +93,7 @@ All published functionality in the Release Notes has been fully tested and verif
   - Fixed numerical stability issues for XQA kernels when using speculative decoding.
   - Fixed a memory leak in the `cacheTransceiver` that could lead to hangs in disaggregated serving.
 
-### Know Issues
+### Known Issues
 
 - **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release.
 
