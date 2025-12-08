@@ -291,6 +291,7 @@ class MistralConfigLoader(BaseConfigLoader):
             hf_quant_config, moe_backend
         )
 
+        kwargs.pop("trust_remote_code", None)
         model_config = ModelConfig(
             pretrained_config=pretrained_config,
             quant_config=quant_config,

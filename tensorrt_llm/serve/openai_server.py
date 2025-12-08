@@ -109,7 +109,8 @@ class OpenAIServer:
             from tensorrt_llm._torch.pyexecutor.config_utils import \
                 load_pretrained_config
             self.model_config = load_pretrained_config(hf_tokenizer_path,
-                                                       trust_remote_code=trust_remote_code)
+                                                       trust_remote_code=trust_remote_code,
+                                                       checkpoint_format=getattr(self.llm.args, "checkpoint_format", None))
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
