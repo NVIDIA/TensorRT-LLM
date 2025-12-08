@@ -48,6 +48,8 @@ class ZeroMqQueue:
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
+        assert use_hmac_encryption, "HMAC encryption is always required. Turning off HMAC encryption risks security vulnerability of unauthorized data serialization and deserialization. "
+
         self.socket_type = socket_type
         self.address_endpoint = address[
             0] if address is not None else "tcp://127.0.0.1:*"
