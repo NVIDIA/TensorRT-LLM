@@ -100,10 +100,12 @@ class CUDAGraphRunner:
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
 
-        self.graphs: Dict[Tuple[int, int, int], torch.cuda.CUDAGraph] = {}
-        self.graph_outputs: Dict[Tuple[int, int, int],
+        self.graphs: Dict[Tuple[int, int, bool, bool],
+                          torch.cuda.CUDAGraph] = {}
+        self.graph_outputs: Dict[Tuple[int, int, bool, bool],
                                  Callable[[], Optional[torch.Tensor]]] = {}
-        self.graph_metadata: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        self.graph_metadata: Dict[Tuple[int, int, bool, bool], Dict[str,
+                                                                    Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
 
@@ -181,13 +183,17 @@ class CUDAGraphRunner:
             num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
             max_seq_len = max(total_seq_lens)
             if max_seq_len <= self.sparse_config.seq_len_threshold - num_extra_kv_tokens:
-                seq_len_mode = "short"
+                short_seq_len_mode = True
             else:
-                seq_len_mode = "default"
+                short_seq_len_mode = False
+            if self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+                all_short_seq_len_mode = list(
+                    self.config.dist.tp_allgather(short_seq_len_mode))
+                short_seq_len_mode = all(all_short_seq_len_mode)
         else:
             # For non-sparse attention or sparse attention that does not need separate short and long CUDA graphs,
             # use the default sequence length mode.
-            seq_len_mode = "default"
+            short_seq_len_mode = False
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -195,7 +201,7 @@ class CUDAGraphRunner:
             # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   seq_len_mode)
+                   short_seq_len_mode)
         else:
             # With dynamic spec decode, the draft length maybe zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -205,7 +211,7 @@ class CUDAGraphRunner:
             draft_len = max(draft_len_list)
             assert len(
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
-            key = (batch_size, draft_len, False, seq_len_mode)
+            key = (batch_size, draft_len, False, short_seq_len_mode)
         return key
 
     def __del__(self):
@@ -272,7 +278,7 @@ class CUDAGraphRunner:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
 
-    def needs_capture(self, key: Tuple[int, int, int]):
+    def needs_capture(self, key: Tuple[int, int, bool, bool]):
         return key not in self.graph_outputs
 
     def get_graph_pool(self):
@@ -285,7 +291,7 @@ class CUDAGraphRunner:
         return self.memory_pool
 
     def capture(self,
-                key: Tuple[int, int, int],
+                key: Tuple[int, int, bool, bool],
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
@@ -322,7 +328,7 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: Tuple[int, int, int],
+        def _setup_spec_decoding_and_forward(key: Tuple[int, int, bool, bool],
                                              forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
             is_first_draft = key[2]
@@ -354,7 +360,7 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
-    def replay(self, key: Tuple[int, int, int],
+    def replay(self, key: Tuple[int, int, bool, bool],
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         stored_meta = self.graph_metadata[key]

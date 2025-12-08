@@ -18,7 +18,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, mpi_allgather
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -631,6 +631,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 ) <= self.sparse_mla_topk - num_extra_kv_tokens
         else:
             self.skip_indexer_for_gen_reqs = False
+
+        if self.kv_cache_manager.mapping.enable_attention_dp and self.enable_indexer_skip:
+            all_skip_indexer = mpi_allgather((self.skip_indexer_for_ctx_reqs,
+                                              self.skip_indexer_for_gen_reqs))
+            all_skip_indexer_for_ctx_reqs = [
+                item[0] for item in all_skip_indexer
+            ]
+            all_skip_indexer_for_gen_reqs = [
+                item[1] for item in all_skip_indexer
+            ]
+            self.skip_indexer_for_ctx_reqs = all(all_skip_indexer_for_ctx_reqs)
+            self.skip_indexer_for_gen_reqs = all(all_skip_indexer_for_gen_reqs)
         self.prepare_dense_topk_indices(kv_lens)
 
         # Build indexer_k_cache_block_offsets
