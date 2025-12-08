@@ -653,6 +653,7 @@ class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
             gm,
             node,
             self.config,
+            self.mlp_type,
             scale_names=self.scale_names(),
         )
 
@@ -670,7 +671,7 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         return ["input_scale", "weight_scale", "alpha"]
 
     def apply(self, gm: GraphModule, node: Node) -> None:
-        _insert_sharded_moe(gm, node, self.config, self.scale_names())
+        _insert_sharded_moe(gm, node, self.config, self.mlp_type, scale_names=self.scale_names())
 
 
 EP_SHARDING_RULES = [
@@ -1200,7 +1201,7 @@ def init_process_grid_from_config(
     return process_grid
 
 
-def _canonicalize_node_args(node: Node) -> None:
+def _canonicalize_node_args(node: Node) -> list:
     """
     Canonicalize the node's arguments.
     Actions performed:
@@ -1217,7 +1218,7 @@ def _canonicalize_node_args(node: Node) -> None:
             if len(new_args[i]) == 1:
                 new_args[i] = new_args[i][0]
 
-    node.args = tuple(new_args)
+    return new_args
 
 
 ########################################################
@@ -1689,7 +1690,7 @@ def _insert_sharded_moe_stacked(
     with gm.graph.inserting_after(node):
         dist_node = gm.graph.call_function(
             torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            args=(node, allreduce_strategy.name),
+            args=(node, allreduce_strategy),
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
@@ -1723,18 +1724,18 @@ def _insert_sharded_moe(
         raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
-    _canonicalize_node_args(node)
+    flat_args = _canonicalize_node_args(node)
     # we have two variants of MoE: stacked and listed:
     # - stacked: w1, w2, w3 weight args are order-3 tensors, where the 1st dimension corresponds
     #            to the stacked expert weigthts.
     # - listed: w1, w2, w3 weight args are lists of order-2 tensors, where each expert weight
     #            is a separate entry in the list.
-    if isinstance(node.args[3], Node):
+    if isinstance(flat_args[3], Node):
         is_stacked = True
-        num_experts = node.args[3].meta["val"].shape[0]
+        num_experts = flat_args[3].meta["val"].shape[0]
     else:
         is_stacked = False
-        num_experts = len(node.args[3])
+        num_experts = len(flat_args[3])
     args = list(node.args)
 
     # -- Handle selected_experts and final_scales sharding --
@@ -1782,9 +1783,28 @@ def _insert_sharded_moe(
         return lst[expert_start:expert_end]
 
     if is_stacked:
+        # _insert_sharded_moe_stacked(gm, node, ep_rank, ep_size, allreduce_strategy)
         # bmm-style stacked MoE: sharding is done by slicing the 1st dimension of the stacked weight tensor
-
-        pass
+        # if mlp_type == MLPType.FUSED_GATED_MLP:
+        w_gate_up_stacked = flat_args[3]
+        w_down_stacked = flat_args[4]
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=gm.get_parameter(w_gate_up_stacked.target),
+            param_key=w_gate_up_stacked.target,
+            dim=0,
+            rank=ep_rank,
+            world_size=ep_size,
+        )
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=gm.get_parameter(w_down_stacked.target),
+            param_key=w_down_stacked.target,
+            dim=0,
+            rank=ep_rank,
+            world_size=ep_size,
+        )
+        return
     else:
         # listed MoE: sharding is done by taking a range of the listed weight tensors
         w_up_list_sharded = get_partition(args[3], ep_size, ep_rank)
@@ -1814,21 +1834,21 @@ def _insert_sharded_moe(
                 world_size=tp_size,
             )
 
-    # -- Update args --
-    args[1] = selected_experts_local
-    args[2] = final_scales_local
-    args[3] = w_up_list_sharded
-    args[4] = w_down_list_sharded
-    args[5] = w_gate_list_sharded
+        # -- Update args --
+        args[1] = selected_experts_local
+        args[2] = final_scales_local
+        args[3] = w_up_list_sharded
+        args[4] = w_down_list_sharded
+        args[5] = w_gate_list_sharded
 
-    # Shard scales for quantized ops
-    for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
-        args[6 + i] = get_partition(args[6 + i], ep_size, ep_rank)
+        # Shard scales for quantized ops
+        for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
+            args[6 + i] = get_partition(args[6 + i], ep_size, ep_rank)
 
-    ad_logger.debug(
-        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
-    )
-    node.args = tuple(args)
+        ad_logger.debug(
+            f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
+        )
+        node.args = tuple(args)
 
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
@@ -2707,10 +2727,19 @@ def detect_ep_shard(
     for node in list(gm.graph.nodes):
         if not is_any_moe_op(node):
             continue
+        args = _canonicalize_node_args(node)
+        if isinstance(args[3], Node):
+            mlp_type = MLPType.FUSED_GATED_MLP
+        else:
+            if len(args[5]) > 0:
+                mlp_type = MLPType.GATED_MLP
+            else:
+                mlp_type = MLPType.MLP
         if transform_container.add(
             EPShardingInfo.from_node(
                 node,
                 config=config,
+                mlp_type=mlp_type,
             )
         ):
             num_moe_patterns += 1
