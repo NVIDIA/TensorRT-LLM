@@ -383,6 +383,10 @@ $$
 The following table lists recommended configurations from the comprehensive database for different performance profiles.
 
 ```{eval-rst}
+.. include:: note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+
 .. include:: comprehensive_table.rst
    :start-after: .. start-openai/gpt-oss-120b
    :end-before: .. end-openai/gpt-oss-120b

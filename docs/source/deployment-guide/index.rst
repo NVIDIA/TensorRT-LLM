@@ -17,9 +17,9 @@ The TensorRT LLM Docker container makes these config files available at ``/app/t
 
    export TRTLLM_DIR="/app/tensorrt_llm" # path to the TensorRT LLM repo in your local environment
 
-.. note::
-
-   The configs here are specifically optimized for a target ISL/OSL (Input/Output Sequence Length) of 1024/1024. If your traffic pattern is different, refer to the :ref:`Comprehensive Configuration Database` section below which covers a larger set of traffic patterns and performance profiles.
+.. include:: note_sections.rst
+   :start-after: .. start-note-quick-start-isl-osl
+   :end-before: .. end-note-quick-start-isl-osl
 
 This table is designed to provide a straightforward starting point; for detailed model-specific deployment guides, check out the guides below.
 

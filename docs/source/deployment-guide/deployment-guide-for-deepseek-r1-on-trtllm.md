@@ -435,6 +435,10 @@ $$
 The following tables list recommended configurations from the comprehensive database for different performance profiles.
 
 ```{eval-rst}
+.. include:: note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+
 .. include:: comprehensive_table.rst
    :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
    :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
