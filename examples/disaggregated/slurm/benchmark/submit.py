@@ -54,6 +54,7 @@ def submit_job(config, log_dir):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
+    slurm_config.setdefault('pass_segment', True)
 
     hw_config = config['hardware']
     env_config = config['environment']
@@ -149,6 +150,8 @@ def submit_job(config, log_dir):
     save_worker_config(config, ctx_config_path, 'ctx')
     save_worker_config(config, gen_config_path, 'gen')
 
+
+
     # Prepare sbatch command
     # yapf: disable
     cmd = [
@@ -160,13 +163,7 @@ def submit_job(config, log_dir):
         f'--nodes={total_nodes}',
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
-    ]
-    
-    # Add --segment parameter only for GB200
-    if hw_config.get('gpu_type', "GB200") == 'GB200':
-        cmd.append(f'--segment={total_nodes}')
-    
-    cmd.extend([
+        *([] if not slurm_config['pass_segment'] else [f'--segment={total_nodes}']),
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
         # Hardware configuration
@@ -222,7 +219,7 @@ def submit_job(config, log_dir):
 
         # Server environment variables
         '--server-env-var', env_config['server_env_var']
-    ])
+    ]
     # yapf: enable
 
     # Submit the job
