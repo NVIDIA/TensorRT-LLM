@@ -94,7 +94,7 @@ worker_config:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 1
     max_num_tokens: 8448
-    max_seq_len: 8232
+    max_seq_len: 9256
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true
