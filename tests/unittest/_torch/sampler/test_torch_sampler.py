@@ -435,9 +435,9 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ContextRequestMock:
             def __init__(self, is_last_context_chunk: bool, return_context_logits: bool):
+                self.is_generation_complete_state = False
                 self.is_last_context_chunk = is_last_context_chunk
                 self.py_draft_tokens = torch.tensor([], dtype=torch.int32, device=device)
-                self.sampling_config = SamplingConfig(beam_width=1)
                 self._return_context_logits = return_context_logits
 
             @property
@@ -445,7 +445,8 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 return self._return_context_logits
 
         class GenRequestMock:
-            def __init__(self, draft_len: int):
+            def __init__(self, is_generation_complete: bool, draft_len: int):
+                self.is_generation_complete_state = is_generation_complete
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
 
@@ -492,8 +493,18 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 #     is not empty.
                 return (
                     [
-                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req1)),
-                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req2)),
+                        cast(
+                            LlmRequest,
+                            GenRequestMock(is_generation_complete=False, draft_len=draft_len_req1),
+                        ),
+                        cast(
+                            LlmRequest,
+                            GenRequestMock(is_generation_complete=True, draft_len=draft_len_req1),
+                        ),
+                        cast(
+                            LlmRequest,
+                            GenRequestMock(is_generation_complete=False, draft_len=draft_len_req2),
+                        ),
                     ]
                     if with_gen
                     else []
@@ -545,9 +556,9 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         expected_logits_offsets[0] = 0
 
         # num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
-        generation_requests_total_logits = (draft_len_req1 + 1) + (
-            draft_len_req2 + 1
-        )  # cf. req_num_generation_steps
+        generation_requests_total_logits = (
+            (draft_len_req1 + 1) + (draft_len_req1 + 1) + (draft_len_req2 + 1)
+        )
 
         vocab_size = 12
 
@@ -573,10 +584,14 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 *range(
                     gen_logit_offset, gen_logit_offset + draft_len_req1 + 1
                 ),  # gen logits from gen. req. 1
+                # *range(
+                #     gen_logit_offset + draft_len_req1 + 1,
+                #     gen_logit_offset + 2 * (draft_len_req1 + 1),
+                # ),  # skipped gen logits from gen. req. 2
                 *range(
-                    gen_logit_offset + draft_len_req1 + 1,
+                    gen_logit_offset + 2 * (draft_len_req1 + 1),
                     gen_logit_offset + generation_requests_total_logits,
-                ),  # gen logits from gen. req. 2
+                ),  # gen logits from gen. req. 3
             ]
 
         expected_logits = all_logits[expected_logit_indices]

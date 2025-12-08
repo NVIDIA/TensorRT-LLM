@@ -2259,16 +2259,16 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             - sampling requests metadata: The metadata for the sampling requests.
             - logits: The logits for the sampling requests.
         """
-        assert len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
         logits_begin_indices = []
         logits_end_indices = []
         num_sampling_logits = []
         sampling_requests = []
 
+        assert len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
         for llm_req, logits_end in zip(
             scheduled_requests.context_requests, num_context_logits_prefix_sum[1:]
         ):
-            if llm_req.is_last_context_chunk:
+            if llm_req.is_last_context_chunk and not llm_req.is_generation_complete_state:
                 sampling_requests.append(llm_req)
                 num_logits = 1 + get_draft_token_length(llm_req)
                 num_sampling_logits.append(num_logits)
@@ -2279,13 +2279,15 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         logits_index = num_context_logits_prefix_sum[-1]
         for llm_req in scheduled_requests.generation_requests:
-            sampling_requests.append(llm_req)
             beam_width = llm_req.sampling_config.beam_width
-            num_beams.append(beam_width)
             num_logits = beam_width + get_draft_token_length(llm_req)
-            num_sampling_logits.append(num_logits)
-            logits_begin_indices.append(logits_index)
-            logits_end_indices.append(logits_index + num_logits)
+
+            if not llm_req.is_generation_complete_state:
+                sampling_requests.append(llm_req)
+                num_beams.append(beam_width)
+                num_sampling_logits.append(num_logits)
+                logits_begin_indices.append(logits_index)
+                logits_end_indices.append(logits_index + num_logits)
 
             logits_index += num_logits
 
