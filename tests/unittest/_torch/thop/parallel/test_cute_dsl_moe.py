@@ -1,5 +1,6 @@
 import pytest
 import torch
+from utils.util import check_accuracy
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     GatherGroupedGemmInputsHelper,
@@ -893,12 +894,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         # Compare output values only for valid tokens
         c_valid = c[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
         c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_token_mask]
-        match_ratio = (
-            c_valid.view(torch.uint8) == c_ref_valid.view(torch.uint8)
-        ).sum().item() / c_valid.numel()
-        assert match_ratio > 0.95, (
-            f"Output match ratio {match_ratio} < 0.95 (compared {num_valid_tokens} valid tokens)"
-        )
+        check_accuracy(c_valid, c_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
 
         c_sf_unswizzled = unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
         c_sf_ref_unswizzled = unswizzle_sf(
@@ -915,8 +911,4 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
 
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
-        match_ratio = (c_sf_valid == c_sf_ref_valid).sum().item() / c_sf_valid.numel()
-        assert match_ratio > 0.95, (
-            f"Scale factor match ratio {match_ratio} < 0.95 "
-            f"(compared {num_valid_tokens} valid tokens)"
-        )
+        check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
