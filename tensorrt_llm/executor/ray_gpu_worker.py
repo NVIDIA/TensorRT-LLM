@@ -1,6 +1,7 @@
 import gc
 import importlib
 import os
+from functools import wraps
 from pathlib import Path
 from queue import Queue
 from typing import Any, List, Optional, Type, Union
@@ -43,7 +44,7 @@ class RayWorkerWrapper:
 
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         self.master_address = os.environ["MASTER_ADDR"]
-        self.work_size = world_size
+        self.world_size = world_size
         self.rank = rank
         # Ray can't pickle TensorRT logger
         global logger
@@ -72,7 +73,7 @@ class RayWorkerWrapper:
         actual_port = port if port is not None else 0
         return torch.distributed.TCPStore(host_name=self.master_address,
                                           port=actual_port,
-                                          world_size=self.work_size,
+                                          world_size=self.world_size,
                                           is_master=(self.rank == 0),
                                           wait_for_workers=False)
 
@@ -88,7 +89,7 @@ class RayWorkerWrapper:
 
         torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo",
                                              store=self.store,
-                                             world_size=self.work_size,
+                                             world_size=self.world_size,
                                              rank=self.rank)
         logger.info(
             f"[Rank {self.rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {self.local_gpu}"
@@ -96,37 +97,45 @@ class RayWorkerWrapper:
 
         self.worker = self.worker_cls(device_id=self.local_gpu,
                                       **self.worker_kwargs)
-        self.has_setup_distributed_env_and_worker = True
+        self._has_setup_distributed_env_and_worker = True
 
+    @property
+    def has_setup_distributed_env_and_worker(self) -> bool:
+        return getattr(self, '_has_setup_distributed_env_and_worker', False)
+
+    def ensure_distributed_setup(func):
+
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if not self.has_setup_distributed_env_and_worker:
+                raise RuntimeError(
+                    "Have not setup distributed environment and worker yet")
+            return func(self, *args, **kwargs)
+
+        return wrapper
+
+    @ensure_distributed_setup
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError(
-                "Have not setup distributed environment and worker yet")
         return self.worker.submit(request)
 
+    @ensure_distributed_setup
     def enqueue_request(self,
                         request: GenerationRequest,
                         result_wait_queue: Queue | None = None) -> int:
-        if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError(
-                "Have not setup distributed environment and worker yet")
         return self.worker.enqueue_request(request, result_wait_queue)
 
+    @ensure_distributed_setup
     def abort_request(self, request_id: int) -> None:
-        if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError(
-                "Have not setup distributed environment and worker yet")
         self.worker.abort_request(request_id)
 
+    @ensure_distributed_setup
     def report_device_id(self) -> str:
         local_id = self.physical_to_local_id(self.gpu)
         return get_device_uuid(local_id)
 
+    @ensure_distributed_setup
     def call_worker_method(self, method_name: str, *args, **kwargs):
         """Generic method to call any method on the underlying worker."""
-        if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError(
-                "Have not setup distributed environment and worker yet")
         if hasattr(self.worker, method_name):
             method = getattr(self.worker, method_name)
             if callable(method):
@@ -140,7 +149,8 @@ class RayWorkerWrapper:
                 f"The RayGPUWorker has no method called '{method_name}'.")
 
     def shutdown(self):
-        return self.worker.shutdown()
+        if hasattr(self, 'worker'):
+            self.worker.shutdown()
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
