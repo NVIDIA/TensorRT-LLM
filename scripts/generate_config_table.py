@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+import importlib.util
 import os
 import sys
 from collections import defaultdict
@@ -21,9 +22,14 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
-sys.path.insert(0, str(REPO_ROOT))
 
-from tensorrt_llm.configure.database import DATABASE_LIST_PATH, RecipeList  # noqa: E402
+# Load database module directly to avoid tensorrt_llm.__init__ (requires torch)
+_spec = importlib.util.spec_from_file_location(
+    "database", REPO_ROOT / "tensorrt_llm" / "configure" / "database.py"
+)
+_db = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_db)
+DATABASE_LIST_PATH, RecipeList = _db.DATABASE_LIST_PATH, _db.RecipeList
 
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
@@ -141,20 +147,22 @@ def generate_rst(yaml_path, output_file=None):
 
                 if len(entries) == 1:
                     if conc <= 16:
-                        profile = "Min Latency"
+                        profile = "Low Latency"
                     elif conc >= 64:
-                        profile = "Max Throughput"
+                        profile = "High Throughput"
                     else:
                         profile = "Balanced"
                 else:
-                    relative_pos = (conc - min_conc) / conc_range if conc_range > 0 else 0.5
-
-                    if relative_pos < 0.33:
+                    if conc == min_conc:
                         profile = "Min Latency"
-                    elif relative_pos > 0.67:
+                    elif conc == max_conc:
                         profile = "Max Throughput"
                     else:
-                        profile = "Balanced"
+                        relative_pos = (conc - min_conc) / conc_range
+                        if relative_pos < 0.5:
+                            profile = "Low Latency"
+                        else:
+                            profile = "High Throughput"
 
                 full_config_path = os.path.join("tensorrt_llm/configure", config_path)
                 command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
