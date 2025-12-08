@@ -19,6 +19,7 @@ import io
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -26,7 +27,6 @@ from typing import Dict, List, NamedTuple, Optional
 
 import requests
 import yaml
-import time
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
@@ -254,21 +254,33 @@ class PerfAggrScriptTestCmds(NamedTuple):
         client_file_path = os.path.join(
             self.output_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
         try:
-            with (  # Start server process
-                    open(server_file_path, 'w') as server_ctx,
-                    popen(self.server_cmds[cmd_idx],
-                          stdout=server_ctx,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as server_proc):
-                wait_for_endpoint_ready(
-                    "http://localhost:8000/v1/models",
-                    timeout=7200)  # 120 minutes for large models
-                output += subprocess.check_output(self.client_cmds[cmd_idx],
-                                                  env=venv._new_env).decode()
-                # Write output to client file path
-                with open(client_file_path, 'w') as client_ctx:
-                    client_ctx.write(output)
+            server_envs = copy.deepcopy(os.environ)
+            # server_envs.update(self.server_envs[cmd_idx])
+            print_info(
+                f"Starting server. cmd is {self.server_cmds[cmd_idx]} envs are {server_envs}"
+            )
+            with open(server_file_path, 'w') as server_ctx:
+                server_proc = subprocess.Popen(
+                    self.server_cmds[cmd_idx],
+                    stdout=server_ctx,
+                    stderr=subprocess.STDOUT,
+                    env=server_envs,
+                )
+            wait_for_endpoint_ready("http://localhost:8000/health",
+                                    timeout=self.timeout)
+            client_envs = copy.deepcopy(os.environ)
+            # client_envs.update(self.client_envs[cmd_idx])
+            print_info(
+                f"Starting client. cmd is {self.client_cmds[cmd_idx]} envs are {client_envs}"
+            )
+            output = subprocess.check_output(
+                self.client_cmds[cmd_idx],
+                env=client_envs,
+                stderr=subprocess.STDOUT,
+            ).decode()
+
+            with open(client_file_path, 'w') as client_ctx:
+                client_ctx.write(output)
         finally:
             server_proc.terminate()
             server_proc.wait()
