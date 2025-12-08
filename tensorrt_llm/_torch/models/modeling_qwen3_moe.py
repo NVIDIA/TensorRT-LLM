@@ -223,8 +223,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
-        mrope_config: Optional[dict[str, torch.Tensor]] = None,
-        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        mrope_config: Optional[Dict[str, torch.Tensor]] = None,
+        deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:

@@ -7,6 +7,7 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import Qwen3VLMoeConfig
 from transformers import Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_moe_weight_mapper import (
     Qwen3VLMoeHfWeightMapper,
@@ -71,7 +72,7 @@ QWEN3_VL_30B_A3B_CONFIG = {
     "vision_end_token_id": 151653,
     "vision_start_token_id": 151652,
     "_attn_implementation": "flash_attention_2",
-    "_name_or_path": str(os.path.join("/code/yechan-models", "Qwen3-VL-30B-A3B-Instruct")),
+    "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-30B-A3B-Instruct")),
 }
 
 

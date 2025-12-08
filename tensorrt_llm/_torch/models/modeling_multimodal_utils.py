@@ -17,7 +17,7 @@
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
 import math
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -60,8 +60,6 @@ def _get_uncached_multimodal_params(
 def _cache_multimodal_embeddings(
     multimodal_params: List[MultimodalParams],
     embeddings: List[torch.Tensor],
-    use_deepstack: Optional[bool] = False,
-    deepstack_num_level: Optional[int] = 0,
 ) -> None:
     """
     Cache computed multimodal embeddings back to multimodal_data to avoid recomputation.
@@ -80,9 +78,6 @@ def _cache_multimodal_embeddings(
             embed_lengths.append(
                 param.multimodal_runtime.total_mm_tokens_in_request -
                 param.multimodal_runtime.total_special_tokens_in_request)
-            if use_deepstack:
-                embed_lengths[
-                    -1] += param.multimodal_runtime.total_mm_tokens_in_request * deepstack_num_level
 
     # Validate total length matches
     total_expected = sum(embed_lengths)
@@ -111,8 +106,6 @@ def get_multimodal_embeddings(
     encoder_forward_fn,
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
-    use_deepstack: Optional[bool] = False,
-    deepstack_num_level: Optional[int] = 0,
 ) -> List[torch.Tensor]:
     """
     High-level utility to get multimodal embeddings from encoder or cached embeddings.
@@ -129,8 +122,6 @@ def get_multimodal_embeddings(
                            Tuple[List[torch.Tensor], Dict[str, Any]] for models with auxiliary outputs.
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
-        use_deepstack: Optional flag to use deepstack embeddings.
-        deepstack_num_level: Optional number of deepstack levels.
     Returns:
         List of multimodal embeddings for all multimodal params in the batch.
     """
@@ -164,9 +155,7 @@ def get_multimodal_embeddings(
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
         _cache_multimodal_embeddings(uncached_multimodal_params,
-                                     encoder_embeddings,
-                                     use_deepstack=use_deepstack,
-                                     deepstack_num_level=deepstack_num_level)
+                                     encoder_embeddings)
 
     # Step 4: Gather all embeddings for the batch
     for param in multimodal_params:
@@ -188,10 +177,8 @@ def get_multimodal_embeddings(
 
 
 def find_input_mm_embeds(
-    mm_embeds: List[torch.Tensor],
-    multimodal_params: List[MultimodalParams],
-    deepstack_embeds: Optional[List[torch.Tensor]] = [],
-) -> List[torch.Tensor]:
+        mm_embeds: List[torch.Tensor],
+        multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
     """
     Find the multimodal mm_embeds that need processing from multimodal_params for each batch.
     Supports both KV cache reuse and chunked prefill scenarios.
@@ -199,7 +186,6 @@ def find_input_mm_embeds(
     Args:
         - mm_embeds: List[torch.Tensor] - Multimodal embeddings for each batch
         - multimodal_params: List[MultimodalParams] - Multimodal parameters with runtime data
-        - deepstack_embeds: Optional[List[torch.Tensor]] - Optional deepstack embeddings to slice in parallel
 
     Returns:
         - List[torch.Tensor] - Sliced mm_embeds containing only tokens that need processing:
@@ -207,17 +193,13 @@ def find_input_mm_embeds(
           - For chunked prefill: tokens that are in the current chunk
           - For mixed scenarios: both uncached and current chunk tokens
           - Empty list if all tokens are cached or beyond current chunk
-        - If deepstack_embeds is provided, returns tuple of (sliced_mm_embeds, sliced_deepstack_embeds)
 
     Note:
         - Supports both individual batching (len(mm_embeds) == len(multimodal_params))
           and pre-concatenated batching (len(mm_embeds) == 1)
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
     """
-    has_deepstack = len(deepstack_embeds) > 0
-    is_pre_concatenated = len(mm_embeds) == 1
-
-    # Validate batching modes:
+    # Current support two batching modes:
     # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
     # 2. Individual mm_embeds for each multimodal param, i.e., len(mm_embeds) == len(multimodal_params)
     if len(mm_embeds) > 1 and len(mm_embeds) != len(multimodal_params):
@@ -225,25 +207,26 @@ def find_input_mm_embeds(
             f"Number of mm_embeds ({len(mm_embeds)}) does not match number of multimodal params ({len(multimodal_params)})."
         )
 
-    # No slicing needed - return full embeds
     if not multimodal_params or multimodal_params[0].multimodal_runtime is None:
-        return (mm_embeds, deepstack_embeds) if has_deepstack else mm_embeds
+        # No slicing, return the full mm_embeds
+        return mm_embeds
 
     # Calculate total tokens that need processing (both cached and current chunk)
-    total_mm_tokens = sum(param.multimodal_runtime.num_mm_tokens_in_chunk -
-                          param.multimodal_runtime.num_special_tokens_in_chunk
-                          for param in multimodal_params
-                          if param.multimodal_runtime is not None)
+    total_mm_tokens = sum([
+        param.multimodal_runtime.num_mm_tokens_in_chunk -
+        param.multimodal_runtime.num_special_tokens_in_chunk
+        for param in multimodal_params if param.multimodal_runtime is not None
+    ])
 
-    # No tokens need processing - return empty list
     if total_mm_tokens == 0:
+        # No tokens need processing, return empty list
         logger.debug(
             "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
         )
-        return ([], []) if has_deepstack else []
+        return []
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
-        return (mm_embeds, deepstack_embeds) if has_deepstack else mm_embeds
+        return mm_embeds
 
     current_pos = 0
     slices = []
@@ -251,34 +234,26 @@ def find_input_mm_embeds(
         runtime = param.multimodal_runtime
         if runtime is None:
             continue
-        local_start = runtime.num_unseen_mm_tokens - runtime.num_unseen_special_tokens
-        local_end = local_start + runtime.num_mm_tokens_in_chunk - runtime.num_special_tokens_in_chunk
-        slices.append((current_pos + local_start, current_pos + local_end))
-        if is_pre_concatenated:
-            current_pos += runtime.total_mm_tokens_in_request - runtime.total_special_tokens_in_request
+        local_start_pos = runtime.num_unseen_mm_tokens - runtime.num_unseen_special_tokens
+        local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk - runtime.num_special_tokens_in_chunk
+        slices.append(
+            (current_pos + local_start_pos, current_pos + local_end_pos))
+        if len(mm_embeds
+               ) == 1:  # pre-concatenated mm_embeds, need global offset
+            current_pos += runtime.total_mm_tokens_in_request
+            current_pos -= runtime.total_special_tokens_in_request
 
-    # Apply slices to mm_embeds
-    if is_pre_concatenated:
+    sliced_mm_embeds = []
+    if len(mm_embeds) == 1:
         sliced_mm_embeds = [mm_embeds[0][start:end] for start, end in slices]
+    else:  # slice each mm_embeds individually
+        for i, (start, end) in enumerate(slices):
+            sliced_mm_embeds.append(mm_embeds[i][start:end])
+
+    if len(mm_embeds) == 1:
         sliced_mm_embeds = [torch.cat(sliced_mm_embeds, dim=0)]
-    else:
-        sliced_mm_embeds = [
-            mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)
-        ]
 
-    if not has_deepstack:
-        return sliced_mm_embeds
-
-    # Apply same slices to deepstack_embeds
-    sliced_deepstack_embeds = [[embed[start:end] for start, end in slices]
-                               for embed in deepstack_embeds]
-    if is_pre_concatenated:
-        sliced_deepstack_embeds = [
-            torch.cat(embed_list, dim=0)
-            for embed_list in sliced_deepstack_embeds
-        ]
-
-    return sliced_mm_embeds, sliced_deepstack_embeds
+    return sliced_mm_embeds
 
 
 def filter_mm_token_from_input_ids(
@@ -328,10 +303,11 @@ def fuse_input_embeds(
     mm_token_ids: Optional[torch.IntTensor] = None,
     text_token_indices: Optional[torch.IntTensor] = None,
     mm_token_indices: Optional[torch.IntTensor] = None,
-    deepstack_embeds: Optional[List[torch.Tensor]] = [],
+    deepstack_embeds: Optional[List[torch.Tensor]] = None,
     **kwargs,
-) -> Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor],
-           Optional[List[torch.FloatTensor]]]:
+) -> Union[Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor]],
+           Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor],
+                 Optional[List[torch.FloatTensor]]]]:
     """
     Fuse text and multimodal embeddings. input_ids is [text_total_length + mm_total_length] and mm_embed is [mm_total_length, hidden_dim]. We just need to fuse them into [text_total_length + mm_total_length, hidden_dim] by slice-and-assign to the corresponding entries.
 
@@ -349,7 +325,7 @@ def fuse_input_embeds(
         - This function may involve host-device synchronization if indices are not provided and filtering is performed. See filter_mm_token_from_input_ids for details.
     """
     if len(mm_embeds) == 0:
-        if len(deepstack_embeds) > 0:
+        if deepstack_embeds is not None and len(deepstack_embeds) > 0:
             return input_ids, None, deepstack_embeds
         return input_ids, None
 
@@ -374,7 +350,7 @@ def fuse_input_embeds(
                                mm_embed.shape[-1],
                                device=text_embed.device,
                                dtype=text_embed.dtype)
-    if len(deepstack_embeds) > 0:
+    if deepstack_embeds is not None and len(deepstack_embeds) > 0:
         # only support single modality for deepstack features for now
         for i, deepstack_feature in enumerate(deepstack_embeds):
             deepstack_embed = torch.zeros(
@@ -389,7 +365,7 @@ def fuse_input_embeds(
     input_embeds[text_token_indices, :] = text_embed
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
-    if len(deepstack_embeds) > 0:
+    if deepstack_embeds is not None and len(deepstack_embeds) > 0:
         return None, cast(torch.FloatTensor, input_embeds), deepstack_embeds
     return None, cast(torch.FloatTensor, input_embeds)
 

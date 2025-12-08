@@ -331,7 +331,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
         return mrope_config
 
-    @nvtx_range("Qwen2VLInputProcessorBase forward()")
+    @nvtx_range("Qwen3VLInputProcessorBase forward()")
     @torch.inference_mode()
     def __call__(
         self,
@@ -801,9 +801,8 @@ class Qwen3VisionModelBase(nn.Module):
                 pixel_values, grid_thw=image_grid_thw
             )
             # NOTE: We concatenate deepstack_embeds to mm_embeds
-            mixed_image_embeds = torch.cat(
-                [image_embeds, torch.cat(deepstack_image_embeds, dim=0)], dim=0
-            )
+            # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
+            mixed_image_embeds = torch.cat([image_embeds] + deepstack_image_embeds, dim=1)
             embeds.append(mixed_image_embeds)
 
         if pixel_values_videos is not None:
@@ -812,9 +811,8 @@ class Qwen3VisionModelBase(nn.Module):
                 pixel_values_videos, grid_thw=video_grid_thw
             )
             # NOTE: We concatenate deepstack_embeds to mm_embeds
-            mixed_video_embeds = torch.cat(
-                [video_embeds, torch.cat(deepstack_video_embeds, dim=0)], dim=0
-            )
+            # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
+            mixed_video_embeds = torch.cat([video_embeds] + deepstack_video_embeds, dim=1)
             embeds.append(mixed_video_embeds)
         return embeds
 
@@ -939,9 +937,9 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         return mrope_config
 
-    def split_mm_embeds(self, mm_embed, num_level):
-        num_elements = mm_embed.shape[0] // (num_level + 1)
-        mm_embed_chunks = torch.split(mm_embed, num_elements, dim=0)
+    def split_mm_embeds(self, mm_embed, deepstack_num_level):
+        num_elements = mm_embed.shape[1] // (deepstack_num_level + 1)
+        mm_embed_chunks = torch.split(mm_embed, [num_elements] * (deepstack_num_level + 1), dim=1)
         return mm_embed_chunks[0], list(mm_embed_chunks[1:])
 
     @torch.inference_mode()
@@ -984,14 +982,14 @@ class Qwen3VLModelBase(PreTrainedModel):
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
-                    use_deepstack=self.use_deepstack,
-                    deepstack_num_level=self.deepstack_num_level,
                 )
             else:
                 raise NotImplementedError(
                     "Qwen3VLModel does not support disaggregated inference yet. Please unset "
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
+            mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
+
             if self.use_deepstack:
                 for i, mm_embed in enumerate(mm_embeds):
                     mm_embed, deepstack_embed = self.split_mm_embeds(
@@ -999,9 +997,6 @@ class Qwen3VLModelBase(PreTrainedModel):
                     )
                     mm_embeds[i] = mm_embed
                     deepstack_embeds.extend(deepstack_embed)
-            mm_embeds, deepstack_embeds = find_input_mm_embeds(
-                mm_embeds, mm_multimodal_params, deepstack_embeds=deepstack_embeds
-            )
 
         if not self.model_config.pretrained_config.disable_fuse_rope:
             mrope_config = self.prepare_mrope_config(multimodal_params, num_context_requests)
