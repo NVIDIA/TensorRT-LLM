@@ -632,9 +632,16 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     counter++
                     // If entrypoint script fails to start, do not poll for agent connection
                     try {
-                        SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
+                        SlurmConfig.checkJobStatus(pipeline, cluster, jobId, remote)
+                    } catch (InterruptedException e) {
+                        throw e
                     } catch (Exception e) {
-                        error("Slurm job ${slurmJobID} exited before Jenkins agent connected. ${e.message}")
+                        // If the exception is about job being inactive, enrich it with log path
+                        if (e.message.contains("is no longer active")) {
+                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${jobId}-${nodeName}.out on ${cluster.host}")
+                        }
+                        // Otherwise, log the error but continue (SSH might be temporarily unavailable)
+                        pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
                     }
                 }
             }
