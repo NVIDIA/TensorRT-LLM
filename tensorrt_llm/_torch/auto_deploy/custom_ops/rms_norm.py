@@ -3,6 +3,7 @@
 import flashinfer
 import torch
 
+from ...flashinfer_utils import get_env_enable_pdl
 from ...modules.mamba.layernorm_gated import _layer_norm_fwd
 from .triton_kernels.rms_norm import rms_norm
 
@@ -21,7 +22,7 @@ def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) ->
     """
     # Flashinfer rmsnorm expects a 2D input
     input_flat = input.reshape(-1, input.shape[-1])
-    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps)
+    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps, enable_pdl=get_env_enable_pdl())
     return rmsnorm_flat.reshape(input.shape)
 
 

@@ -102,6 +102,11 @@ class ModelConfig(Generic[TConfig]):
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
 
+    # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
+    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
+    nvfp4_gemm_allowed_backends: List[str] = field(
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
+
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.

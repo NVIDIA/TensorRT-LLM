@@ -22,12 +22,13 @@ from typing import Callable
 
 import pytest
 import yaml
-from defs.common import wait_for_server
+from defs.common import (revise_disagg_config_file_with_free_ports,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
 
-from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm._utils import get_free_port, mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -113,13 +114,16 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
          )), f"gen server_first_token_time is not numeric in {request_context}"
     assert gen_server_arrival <= gen_server_first_token, f"gen server_arrival_time > server_first_token_time in {request_context}"
 
+    # Network Time Protocol can ensure ms-level accuracy in LAN
+    ntp_tolerance = 1e-3
+
     # Validate timing relationships between different levels
     # Disaggregated server should receive request before individual servers
-    assert disagg_arrival <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
-    assert disagg_arrival <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
+    assert disagg_arrival - ntp_tolerance <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
+    assert disagg_arrival - ntp_tolerance <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
 
     # Context should complete before generation starts
-    assert ctx_server_first_token <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
+    assert ctx_server_first_token - ntp_tolerance <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
 
     # Validate internal timing consistency
     ctx_arrival_time = ctx_metrics["arrival_time"]
@@ -143,12 +147,12 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
     return True
 
 
-def get_disagg_server_url_from_cfg(config_file: str) -> str:
+def get_disagg_server_url_from_cfg(config_file: str) -> tuple[str, int]:
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
     server_host = config.get('hostname', 'localhost')
     server_port = config.get('port', 8000)
-    return f"http://{server_host}:{server_port}"
+    return server_host, server_port
 
 
 def get_test_config(test_desc, example_dir, test_root):
@@ -277,7 +281,8 @@ def get_test_config(test_desc, example_dir, test_root):
         raise ValueError(f"Invalid test description: {test_desc}, "
                          f"valid descriptions are: {config_map.keys()}")
 
-    return config_map[test_desc]
+    return (config_map[test_desc][0],
+            revise_disagg_config_file_with_free_ports(config_map[test_desc][1]))
 
 
 def get_extra_llm_config(config, suffix, cwd):
@@ -412,6 +417,14 @@ def run_client_tests(example_dir,
                     assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
 
+# TODO: add test for disaggregated server prometheus metrics
+def fetch_prometheus_metrics(server_url: str):
+    import requests
+    response = requests.get(f"{server_url}/prometheus/metrics", timeout=10)
+    assert response.status_code == 200
+    return response.text
+
+
 def run_disaggregated_test(example_dir,
                            test_desc,
                            num_iters=5,
@@ -473,7 +486,8 @@ def run_disaggregated_test(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
-    server_url = get_disagg_server_url_from_cfg(config_file)
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+    server_url = f"http://{server_host}:{server_port}"
 
     try:
         if not use_ray:
@@ -530,8 +544,8 @@ def run_disaggregated_test(example_dir,
                           env=run_env,
                           cwd=cwd))
 
-                if not wait_for_server("localhost",
-                                       8000,
+                if not wait_for_server(server_host,
+                                       server_port,
                                        timeout_seconds=server_start_timeout):
                     raise RuntimeError(
                         f"Disaggregated server failed to start within {server_start_timeout} seconds"
@@ -1561,6 +1575,7 @@ def run_disaggregated_benchmark(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
     try:
         with (  # Start workers
                 open('output_workers.log', 'w') as output_workers,
@@ -1614,9 +1629,9 @@ def run_disaggregated_benchmark(example_dir,
                 '--max-concurrency',
                 str(max_concurrency),
                 '--host',
-                'localhost',
+                server_host,
                 '--port',
-                '8000',
+                str(server_port),
                 '--ignore-eos',
                 '--no-test-input',
                 '--percentile-metrics',
@@ -1658,7 +1673,7 @@ def get_config_for_benchmark(model_root, backend):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": 8000,
+        "port": get_free_port(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -1672,7 +1687,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": ["localhost:8001"]
+            "urls": [f"localhost:{get_free_port()}"]
         },
         "generation_servers": {
             "num_instances": 1,
@@ -1685,7 +1700,7 @@ def get_config_for_benchmark(model_root, backend):
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
             },
-            "urls": ["localhost:8002"]
+            "urls": [f"localhost:{get_free_port()}"]
         }
     }
     return serve_config
@@ -1716,6 +1731,7 @@ def run_disaggregated_genai_perf(config_file,
     ]
 
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
 
     try:
         with (open('output_workers.log', 'w') as output_workers,
@@ -1732,8 +1748,9 @@ def run_disaggregated_genai_perf(config_file,
                     cwd=cwd) as server_proc):
 
             # Wait for server to be ready
-            if not wait_for_server(
-                    "localhost", 8000, timeout_seconds=server_start_timeout):
+            if not wait_for_server(server_host,
+                                   server_port,
+                                   timeout_seconds=server_start_timeout):
                 raise RuntimeError(
                     f"Disaggregated server did not become ready within {server_start_timeout} seconds"
                 )
@@ -1743,7 +1760,7 @@ def run_disaggregated_genai_perf(config_file,
                 'genai-perf', 'profile', '--model', model_path, '--tokenizer',
                 model_path, '--endpoint-type', 'chat', '--endpoint',
                 '/v1/chat/completions', '--streaming', '--url',
-                'localhost:8000', '--synthetic-input-tokens-mean',
+                f'{server_host}:{server_port}', '--synthetic-input-tokens-mean',
                 str(input_tokens), '--synthetic-input-tokens-stddev', '0',
                 '--output-tokens-mean',
                 str(output_tokens), '--output-tokens-stddev', '0',

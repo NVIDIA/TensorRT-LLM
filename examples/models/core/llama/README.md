@@ -1559,7 +1559,7 @@ Explanation:
 
 
 ### Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
     --tp_size 8 \

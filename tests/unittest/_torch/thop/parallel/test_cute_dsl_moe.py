@@ -228,6 +228,60 @@ def test_moe_unpermute(dtype: str, num_tokens: int, top_k: int, tile_size: int):
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("ep_size", [1, 8, 32])
+@pytest.mark.parametrize("top_k", [1, 2, 8])
+@pytest.mark.parametrize("num_tokens", [128, 515, 1024])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_moe_output_memset_inplace(
+    dtype: str, num_tokens: int, top_k: int, ep_size: int, tile_size: int
+):
+    dtype = getattr(torch, dtype)
+    hidden_size = 4096
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+    enable_alltoall = True
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    x = torch.ones(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    torch.ops.trtllm.moe_output_memset_inplace(
+        x,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        tile_size,
+        top_k,
+        ep_size,
+        enable_alltoall=enable_alltoall,
+    )
+    x_ref = torch.zeros_like(x)
+    if enable_alltoall and ep_size > top_k:
+        x_ref[(expanded_idx_to_permuted_idx < 0).all(dim=-1)] = 1
+    torch.testing.assert_close(x, x_ref)
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
@@ -257,7 +311,10 @@ def test_moe_swiglu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     torch.testing.assert_close(y[:num_permuted_tokens], y_ref[:num_permuted_tokens])
 
 
-@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
@@ -332,7 +389,10 @@ def test_moe_gelu(dtype: str, num_tokens: int, top_k: int, tile_size: int):
     torch.testing.assert_close(y[:num_permuted_tokens], y_ref[:num_permuted_tokens])
 
 
-@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
 @pytest.mark.parametrize("tile_size", [128])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -425,7 +485,10 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
     torch.testing.assert_close(c[:num_valid_permuted_tokens], c_ref[:num_valid_permuted_tokens])
 
 
-@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
 @pytest.mark.parametrize("tile_size", [128])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -523,7 +586,10 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     assert match_ratio > 0.99
 
 
-@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
 @pytest.mark.parametrize("tile_size", [128])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])

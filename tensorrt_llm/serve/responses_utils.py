@@ -6,11 +6,12 @@ import json
 import os
 import time
 import uuid
+# yapf: disable
+from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from copy import copy
 from typing import Any, Literal, Optional, OrderedDict, Tuple, Union
 
-# yapf: disable
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
@@ -56,12 +57,16 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ResponseInputOutputItem,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
-                                                StreamingResponsesResponse)
+                                                StreamingResponsesResponse,
+                                                UCompletionRequest,
+                                                UCompletionResponse)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
+
+# yapf: enable
 
 # yapf: enable
 
@@ -1779,3 +1784,39 @@ class ServerArrivalTimeMiddleware:
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)
+
+
+class ResponseHooks(ABC):
+    """
+    Hooks for response processing and (disagg) service perf observability.
+    """
+
+    @abstractmethod
+    def on_req_begin(self, request: UCompletionRequest):
+        pass
+
+    @abstractmethod
+    def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
+        pass
+
+    @abstractmethod
+    def on_first_token(self,
+                       gen_server: str,
+                       request: UCompletionRequest,
+                       response: UCompletionResponse = None):
+        pass
+
+    @abstractmethod
+    def on_resp_done(self,
+                     gen_server: str,
+                     request: UCompletionRequest,
+                     response: UCompletionResponse = None):
+        pass
+
+
+async def done_generator() -> AsyncGenerator[bytes, None]:
+    yield "data: [DONE]\n\n".encode('utf-8')
+
+
+UCompletionResponseOrGenerator = Union[UCompletionResponse,
+                                       AsyncGenerator[Any, None]]

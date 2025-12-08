@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
+from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, SamplerType, _ParallelConfig
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -128,6 +128,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         default="auto",
         description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
         "supported in AutoDeploy.",
+    )
+
+    sampler_type: Union[str, SamplerType] = Field(
+        default=SamplerType.TorchSampler,
+        description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
     )
 
     # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
