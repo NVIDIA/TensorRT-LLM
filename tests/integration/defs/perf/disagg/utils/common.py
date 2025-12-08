@@ -83,7 +83,7 @@ class EnvManager:
     @staticmethod
     def get_model_dir() -> str:
         return os.getenv("MODEL_DIR", "<Your model directory>")
-    
+
     @staticmethod
     def get_dataset_dir() -> str:
         return os.getenv("DATASET_DIR", "<Your dataset directory>")
@@ -121,7 +121,7 @@ class EnvManager:
 
         # Kimi-K2 needs 640G of shared memory, otherwise will cause host memory OOM.
         if model_name.find("kimi-k2") != -1:
-            mounts.append(f"tmpfs:/dev/shm:size=640G")
+            mounts.append("tmpfs:/dev/shm:size=640G")
 
         if dataset_dir and not dataset_dir.startswith("<"):
             mounts.append(f"{dataset_dir}:{dataset_dir}")

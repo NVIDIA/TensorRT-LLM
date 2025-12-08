@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare performance test results between different backends (UCX vs NIXL)."""
-import os
+
 import argparse
+import os
 import re
 import sys
 
