@@ -412,6 +412,34 @@ class MoeConfig(StrictBaseModel):
         return cls(**data)
 
 
+class Nvfp4GemmConfig(StrictBaseModel):
+    """
+    Configuration for NVFP4 GEMM backend selection.
+    """
+    allowed_backends: List[str] = Field(
+        default=['cutlass', 'cublaslt', 'cuda_core'],
+        description="List of backends to consider for auto-selection. "
+        "Default excludes 'cutedsl' for faster build time. "
+        "Add 'cutedsl' for extreme performance at the cost of longer server launch time. "
+        "Valid values: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.")
+
+    @model_validator(mode="after")
+    def validate_allowed_backends(self) -> 'Nvfp4GemmConfig':
+        valid_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
+        invalid = set(self.allowed_backends) - valid_backends
+        if invalid:
+            raise ValueError(
+                f"Invalid backends in allowed_backends: {invalid}. "
+                f"Valid backends are: {sorted(valid_backends)}")
+        if not self.allowed_backends:
+            raise ValueError("allowed_backends cannot be empty.")
+        return self
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
 class AttentionDpConfig(StrictBaseModel):
     """
     Configuration for attention DP.
@@ -977,7 +1005,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: ClassVar[str] = "Draft_Target"
 
     def supports_backend(self, backend: str) -> bool:
-        return backend == "pytorch"
+        return backend == "pytorch" or backend == "_autodeploy"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -1932,6 +1960,12 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype",
     )
 
+    env_overrides: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand.",
+        status="prototype")
+
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
@@ -2561,6 +2595,11 @@ class TorchLlmArgs(BaseLlmArgs):
                                   description="MoE config.",
                                   status="beta")
 
+    nvfp4_gemm_config: Nvfp4GemmConfig = Field(
+        default_factory=Nvfp4GemmConfig,
+        description="NVFP4 GEMM backend config.",
+        status="beta")
+
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",
                               status="beta")
@@ -2714,7 +2753,7 @@ class TorchLlmArgs(BaseLlmArgs):
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
     disable_flashinfer_sampling: bool = Field(
-        default=True,
+        default=False,
         description=
         "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
         status="prototype",
@@ -3027,6 +3066,15 @@ def update_llm_args_with_extra_dict(
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
 
+    # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
+    if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
+        # Convert KvCacheConfig object to dict if necessary
+        base_kv_config = llm_args['kv_cache_config']
+        if isinstance(base_kv_config, KvCacheConfig):
+            base_kv_config = base_kv_config.model_dump(exclude_unset=True)
+        llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
+            'kv_cache_config']
+
     field_mapping = {
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
@@ -3036,8 +3084,10 @@ def update_llm_args_with_extra_dict(
         "speculative_config": DecodingBaseConfig,
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
+        "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
+        "kv_cache_config": KvCacheConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

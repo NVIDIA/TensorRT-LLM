@@ -122,13 +122,32 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
-        def downloadSucceed = false
+        def hasTimeoutTest = false
+        def downloadResultSucceed = false
 
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
+            // Download timeout test results
+            def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
+            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+            if (downloadTimeoutTestSucceed) {
+                sh "ls ${stageName}"
+                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                if (timeoutTestXml != null) {
+                    sh """
+cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
+${timeoutTestXml}
+EOF_TIMEOUT_XML
+                    """
+                    hasTimeoutTest = true
+                }
+            }
+            // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results.xml"
-            downloadSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
-            if (downloadSucceed) {
+            downloadResultSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
@@ -142,7 +161,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             }
         }
 
-        if (downloadSucceed) {
+        if (hasTimeoutTest || downloadResultSucceed) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
@@ -165,12 +184,12 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
             !cmd.contains("--test-list=") &&
             !cmd.contains("--test-prefix=") &&
             !cmd.contains("--csv=") &&
-            !cmd.contains("--junit-xml")
+            !cmd.contains("--periodic-junit-xmlpath")
         }
         isolateTestCmdLine += ["--test-list=${singleTestFile}"]
         isolateTestCmdLine += ["--test-prefix=${stageName}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-        isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+        isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
         isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
 
         try {
@@ -642,6 +661,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                             echo "--gpus ${gpuCount}"
                         fi
                     """, returnStdout: true).trim()
+
+                    if (cluster.host.contains("dlcluster")) {
+                        dockerArgs += " " + sh(script: 'echo " -e NVIDIA_IMEX_CHANNELS=${NVIDIA_IMEX_CHANNELS:-0}"', returnStdout: true).trim()
+                        dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
+                    }
                 }
 
                 dockerArgs = "${dockerArgs} " +
@@ -655,10 +679,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
 
-                if (partition.clusterName == "dlcluster") {
-                    dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
-                    dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
-                }
                 echo "Final dockerArgs: ${dockerArgs}"
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
@@ -736,6 +756,7 @@ def getNodeArgs(int nodeCount, int gpuCount) {
 def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
+    String waivesFilePath,
     Boolean perfMode,
     String outputPath,
     String trtllmWheelPath,
@@ -750,12 +771,15 @@ def getPytestBaseCommandLine(
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
+    // Enable NCCL debug information for multi-GPU tests
+    extraInternalEnv += " NCCL_DEBUG=INFO"
 
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
         "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
         "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
+        "COLUMNS=200",
         extraInternalEnv,
         pytestUtil,
         "pytest",
@@ -766,23 +790,27 @@ def getPytestBaseCommandLine(
         "--timeout=${pytestTestTimeout}",
         "--rootdir ${llmSrc}/tests/integration/defs",
         "--test-prefix=${stageName}",
-        "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
+        "--waives-file=${waivesFilePath}",
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
-        "--junit-xml ${outputPath}/results.xml",
         "-o junit_logging=out-err",
         "--cov=${llmSrc}/examples/",
         "--cov=${llmSrc}/tensorrt_llm/",
         "--cov=${trtllmWheelPath}/tensorrt_llm/",
         "--cov-report=",
         "--cov-config=${coverageConfigFile}",
+        "--periodic-junit",
+        "--periodic-junit-xmlpath ${outputPath}/results.xml",
+        "--periodic-batch-size=1",
+        "--periodic-save-unfinished-test",
     ]
 
     if (perfMode) {
         testCmdLine += [
             "--perf",
             "--perf-log-formats csv",
-            "--perf-log-formats yaml"
+            "--perf-log-formats yaml",
+            "--enable-gpu-clock-lock"
         ]
     }
     if (stageName.contains("-Ray-")) {
@@ -826,7 +854,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-            def llmWaivesTxtfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
             def resourcePathNode = "/tmp"
@@ -835,6 +862,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
+            def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def outputPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
@@ -873,6 +901,21 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     testListPathNode
                 )
 
+                // Download and Merge waives.txt
+                mergeWaivesTxt(pipeline, llmSrcLocal, stageName)
+
+                // Add passed test list from previous pipeline run to the waives.txt
+                if (testFilter[(REUSE_TEST)] != false) {
+                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
+                }
+
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    "${llmSrcLocal}/tests/integration/test_lists/waives.txt",
+                    waivesListPathNode
+                )
+
                 // generate .coveragerc in workspace and add file path to pytest command
                 sh """
                     touch ./.coveragerc
@@ -900,6 +943,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
+                    waivesListPathNode,
                     perfMode,
                     jobWorkspace,
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
@@ -989,15 +1033,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
-                    export llmWaivesTxtfile=$llmWaivesTxtfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
-                    export NVIDIA_IMEX_CHANNELS=0
-                    [ -z "\${NVIDIA_VISIBLE_DEVICES:-}" ] && export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
+                    export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
+                    export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))}
+
+                    echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
+                    echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
 
                     ${srunPrologue}
 
@@ -1080,7 +1126,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
-  if(nodeCount > 1 || runWithSbatch) {
+  if (nodeCount > 1 || runWithSbatch) {
     runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
   } else {
     runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
@@ -1100,6 +1146,8 @@ def trimForStageList(stageNameList)
 }
 
 // Test filter flags
+@Field
+def REUSE_TEST = "reuse_test"
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
@@ -1132,6 +1180,7 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def testFilter = [
+    (REUSE_TEST): null,
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
     (TEST_STAGE_LIST): null,
@@ -1231,6 +1280,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
+                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                if (timeoutTestXml != null) {
+                    sh """
+cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
+${timeoutTestXml}
+EOF_TIMEOUT_XML
+                    """
+                }
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
@@ -1582,6 +1639,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             sh "NVIDIA_TRITON_SERVER_VERSION=25.10 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
@@ -1591,9 +1649,32 @@ def launchTestListCheck(pipeline)
     })
 }
 
+def generateTimeoutTestResultXml(stageName, testFilePath) {
+    if (!fileExists("${stageName}/${testFilePath}")) {
+        echo "No ${testFilePath} found in ${stageName}, skipping timeout XML generation"
+        return null
+    }
+    String timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
+    echo "timeoutTests: ${timeoutTests}"
+
+    if (timeoutTests == null || timeoutTests == "") {
+        return null
+    }
+    def testList = timeoutTests.split("\n")
+    String xmlContent = """<?xml version="1.0" encoding="UTF-8"?><testsuites>
+        <testsuite name="${stageName}" errors="${testList.size()}" failures="0" skipped="0" tests="${testList.size()}" time="1.00">"""
+    testList.each { test ->
+        xmlContent += """<testcase name="${test}" classname="${stageName}" time="1.0">
+        <error message="Test terminated unexpectedly"> Test terminated unexpectedly
+        </error></testcase>"""
+    }
+    xmlContent += "</testsuite></testsuites>"
+    return xmlContent
+}
+
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
     String resultFiles = sh(script: "cd ${stageName} && ls -l ${resultPath} | wc -l", returnStdout: true).trim()
-    echo "${resultFiles}"
+    echo "resultFiles: ${resultFiles}"
     if (resultFiles != "0") {
         return null
     }
@@ -1688,12 +1769,12 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
 
 def parseMultiNodeTaskConfigFromStageName(String stageName) {
     def taskConfig = null
-    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs-(\d+)_Nodes/)
+    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs(?:-(\d+)_Nodes)?/)
     if (matcher.find()) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
             system_gpu_count: "${matcher.group(2)}",
-            node_count: "${matcher.group(3)}" // "node_count" might not be used currently
+            node_count: matcher.group(3) ?: "1" // Default to 1 if _Nodes not present
         ]
     }
     return taskConfig
@@ -1914,14 +1995,14 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
         def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--cov"]
-        def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        def needToChangeLine = ["--test-list", "--csv", "--periodic-junit-xmlpath"]
         def newTestCmdLine = testCmdLine.findAll { cmd ->
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
         }
         newTestCmdLine += [
             "--test-list=${currentRerunTestList}",
             "--csv=${rerunDir}/rerun_report_${times}.csv",
-            "--junit-xml ${xmlFile}",
+            "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
         try {
@@ -2081,6 +2162,62 @@ def generateRerunReport(stageName, llmSrc) {
     echo "Rerun report generation completed for stage: ${stageName}"
 }
 
+def mergeWaivesTxt(pipeline, llmSrc, stageName) {
+    def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
+    try {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+        if (!fileExists("waives.txt")) {
+            error "There is no merged waives.txt file, use the default waives.txt."
+        }
+        sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
+        sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
+        echo "Download merged waives.txt successfully"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
+    }
+}
+
+def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
+    try {
+        // Get passed test list from open search
+        def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
+        sh """
+            python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
+            --commit-id ${env.gitlabCommit} \
+            --stage-name ${stageName} \
+            --output-file ${passedTestListFile}
+        """
+
+        def passedTestList = readFile(file: passedTestListFile).readLines()
+        def reusedTests = passedTestList.collect { test -> test.trim() }
+
+        // Append reused tests to waives.txt
+        if (reusedTests.size() > 0) {
+            // Build the content to append
+            def reusedTestsContent = reusedTests.collect { test ->
+                "${test} SKIP (Reused from previous pipeline)"
+            }.join('\n')
+
+            echo "Reused tests:\n${reusedTestsContent}"
+
+            sh(label: "Append Reused Tests", script: """
+cat >> ${waivesTxt} << 'REUSED_TESTS_EOF'
+${reusedTestsContent}
+REUSED_TESTS_EOF
+""")
+            echo "Appended ${reusedTests.size()} reused tests to ${waivesTxt}"
+        } else {
+            echo "No reused tests found"
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to add passed test list from previous pipeline run to the waives.txt. Error: ${e.message}"
+    }
+}
+
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
@@ -2135,22 +2272,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
         sh "cd ${llmPath} && tar -zxf ${tarName}"
 
-        // Download the new merged waives.txt
-        def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
-        try {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
-            if (!fileExists("waives.txt")) {
-                error "There is no merged waives.txt file, use the default waives.txt."
-            }
-            sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
-            sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
-            echo "Download merged waives.txt successfully"
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
-        }
-
         // install python package
         if (env.alternativeTRT) {
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
@@ -2203,6 +2324,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 chmod 600 ~/.ssh/authorized_keys
             """
 
+            // Write env variables to a file
+            sh 'env | sort | sed -E \'s/^([^=]+)=(.*)$/export \\1="\\2"/\' > debug_env.sh'
+            sh "cat debug_env.sh"
+
             // The portConfig file is in the VM
             def portConfigFilePath = "/root/.ssh/ports_config.txt"
 
@@ -2248,21 +2373,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
-
-        echoNodeAndGpuInfo(pipeline, stageName)
-        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
-
-        def extraInternalEnv = ""
-        def pytestTestTimeout = "3600"
-
-        // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
-        extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
-        // Enable NCCL debug information for multi-GPU tests
-        extraInternalEnv += " NCCL_DEBUG=INFO"
-
         def testDBList = renderTestDB(testList, llmSrc, stageName)
+
+        // Download and Merge waives.txt
+        mergeWaivesTxt(pipeline, llmSrc, stageName)
+
+        // Add passed test list from previous pipeline run to the waives.txt
+        if (testFilter[(REUSE_TEST)] != false) {
+            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
+        }
 
         // Process shard test list and create separate files for regular and isolate tests
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
@@ -2286,6 +2405,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
+            "${llmSrc}/tests/integration/test_lists/waives.txt",
             perfMode,
             "${WORKSPACE}/${stageName}",
             TRTLLM_WHL_PATH,
@@ -2373,7 +2493,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (perfMode) {
+        if (perfMode && !stageName.contains("Perf-Sanity")) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
@@ -2784,12 +2904,14 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-trtllm", "l0_dgx_b200", 2, 2, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // Perf sanity post merge test
-        // Disable perf stages due to https://nvbugs/5643646
-        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
-        // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
+        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "l0_dgx_b200_perf_sanity", 1, 1, 4],
+        // "DGX_B200-8_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x8", "l0_dgx_b200_perf_sanity", 1, 1, 8],
+        // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "l0_dgx_b300_perf_sanity", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -2814,8 +2936,11 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 2, 4],
+        "GB200-4_GPUs-PyTorch-2": ["gb200-x4-oci", "l0_gb200_multi_gpus", 2, 2, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
+        // Perf sanity post merge test
+        "GB200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
@@ -2830,6 +2955,8 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // Perf sanity post merge test
+        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_perf_sanity", 1, 1, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -3149,6 +3276,7 @@ def launchTestJobs(pipeline, testFilter)
             "pytorch": "-PyTorch-",
             "tensorrt": "-TensorRT-",
             "cpp": "-CPP-",
+            "triton": "-Triton-",
             "fmha": "-FMHA-",
         ]
         def backendModeList = backendMode.collect { changeMap.get(it) }.flatten()
@@ -3173,7 +3301,7 @@ def launchTestJobs(pipeline, testFilter)
         } else {
             echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
             def excludedBackends = new HashMap()
-            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-", "-FMHA-"]
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-FMHA-"]     // Only pytorch file change also need to run triton tests
             excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-FMHA-"]
             excludedBackends["FMHA"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-Triton-"]
             def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]

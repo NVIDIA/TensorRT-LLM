@@ -138,6 +138,7 @@ class Attention(nn.Module):
         disable_deep_gemm: bool = False,
         attn_output_gate: Optional[bool] = None,
         use_custom_cublas_mm: bool = False,
+        reduce_output: bool = True,
     ):
         """
         Initialize the Attention module.
@@ -274,6 +275,7 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
+            reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
@@ -380,8 +382,11 @@ class Attention(nn.Module):
         out_dtype = q.dtype
 
         if self.attn_backend == "TRTLLM":
-            if self.has_quant_scale and (self.attn.has_fp8_kv_cache
-                                         or self.attn.has_fp4_kv_cache):
+            # Don't use FP8 output if o_proj has pre_quant_scale - keep BF16 for better precision
+            has_pre_quant_scale = getattr(self.o_proj, 'pre_quant_scale',
+                                          None) is not None
+            if self.has_quant_scale and not has_pre_quant_scale and (
+                    self.attn.has_fp8_kv_cache or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
         return output
@@ -412,8 +417,18 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        if self.has_quant_scale and not self.attn_output_gate:
+        has_awq_pre_quant_scale = hasattr(
+            self.o_proj,
+            'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
+        # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
+        # and keeps attention output in BF16 for better precision when applying pre_quant_scale
+        if self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale:
             out_scale = self.o_proj.inv_input_scale
+        if has_awq_pre_quant_scale and enable_attn_nvfp4_output:
+            logger.warning_once(
+                "Disable attn nvfp4 output because o_proj has pre_quant_scale for AWQ.",
+                key="disable_attn_nvfp4_output_for_awq")
+            enable_attn_nvfp4_output = False
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output and not self.attn_output_gate:
             out_scale_sf = self.o_proj.input_scale
 
@@ -687,6 +702,7 @@ class MLA(nn.Module):
         config: Optional[ModelConfig] = None,
         enable_unit_test: bool = False,
         mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
     ):
         """
         Initialize the MLA module.
@@ -894,6 +910,7 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization)
 

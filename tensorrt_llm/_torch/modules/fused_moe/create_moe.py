@@ -7,7 +7,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType
+from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -19,6 +19,8 @@ from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
+
+ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "0") == "1"
 
 
 def get_moe_cls(
@@ -33,7 +35,16 @@ def get_moe_cls(
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
     elif moe_backend.upper() == "CUTEDSL":
-        return CuteDslFusedMoE
+        if quant_config is not None and (
+                quant_config.quant_mode.has_fp8_block_scales()
+                or quant_config.quant_mode.has_nvfp4()):
+            return CuteDslFusedMoE
+        else:
+            logger.warning(
+                "CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
+            return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "TRTLLM":
@@ -48,8 +59,8 @@ def get_moe_cls(
         else:
             logger.warning(
                 "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8. "
-                f"Check out details in quant_config: {quant_config}"
-                "Using CutlassFusedMoE instead.")
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
             return CutlassFusedMoE
     elif moe_backend.upper() == "WIDEEP":
         return WideEPMoE
@@ -80,6 +91,7 @@ def create_moe_backend(
     swiglu_limit: Optional[torch.Tensor] = None,
     init_load_balancer: bool = True,
     without_comm: bool = False,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """
     Create MoE backend instance with validation.
@@ -101,6 +113,7 @@ def create_moe_backend(
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
         swiglu_limit: SwiGLU limit parameter
+        activation_type: Activation type
 
     Returns:
         MoE: MoE backend instance
@@ -127,8 +140,8 @@ def create_moe_backend(
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
         assert moe_cls in [
-            WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE
-        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE and TRTLLMGenFusedMoE now."
+            WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE
+        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE and CuteDslFusedMoE now."
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
@@ -183,6 +196,7 @@ def create_moe_backend(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(
@@ -196,9 +210,7 @@ def create_moe_backend(
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx,
-            init_load_balancer=init_load_balancer,
-        )
+            layer_idx=layer_idx)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
 
@@ -212,6 +224,8 @@ def create_moe_backend(
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            activation_type=activation_type,
         )
     elif moe_cls == CuteDslFusedMoE:
         return moe_cls(
@@ -226,6 +240,8 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
         )
     elif moe_cls == DeepGemmFusedMoE:
         return moe_cls(
@@ -280,6 +296,7 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -301,6 +318,7 @@ def create_moe(
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
         swiglu_limit: SwiGLU limit parameter
+        activation_type: Activation type
 
     Returns:
         MoE: MoE instance
@@ -326,13 +344,9 @@ def create_moe(
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
-    # Check if ENABLE_CONFIGURABLE_MOE environment variable is set
-    enable_configurable_moe = os.environ.get('ENABLE_CONFIGURABLE_MOE',
-                                             '0') == '1'
-
-    if enable_configurable_moe:
-        # ConfigurableMoE is only supported for TRTLLMGenFusedMoE backend
-        if moe_cls == TRTLLMGenFusedMoE:
+    if ENABLE_CONFIGURABLE_MOE or moe_cls == CuteDslFusedMoE:
+        # ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends
+        if moe_cls in (TRTLLMGenFusedMoE, CuteDslFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,
@@ -353,12 +367,13 @@ def create_moe(
         else:
             # Check if this is a TRTLLM backend request that fallback to CutlassFusedMoE
             requested_backend = model_config.moe_backend.upper()
-            if requested_backend == "TRTLLM" and moe_cls == CutlassFusedMoE:
+            if requested_backend in ("TRTLLM",
+                                     "CUTEDSL") and moe_cls == CutlassFusedMoE:
                 # Workaround for test cases where TRTLLM backend fallbacks to CutlassFusedMoE due to quant_config incompatibility
                 # Log warning and continue with the fallback backend
                 logger.warning(
                     f"ENABLE_CONFIGURABLE_MOE is set but TRTLLM backend fallback to {moe_cls.__name__} due to quant_config. "
-                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE backend. "
+                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends. "
                     f"Continuing with legacy MoE backend {moe_cls.__name__}.")
             else:
                 # For other incompatible backends, raise error
@@ -384,4 +399,5 @@ def create_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        activation_type=activation_type,
     )

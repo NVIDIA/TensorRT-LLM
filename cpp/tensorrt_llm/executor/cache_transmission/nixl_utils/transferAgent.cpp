@@ -348,11 +348,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     std::string nixlBackend = common::getEnvNixlBackend();
     // List of supported backends - extend this list as new backends are added
-    static const std::set<std::string> kSUPPORTED_BACKENDS = {"UCX"};
+    static const std::set<std::string> kSUPPORTED_BACKENDS = {"UCX", "LIBFABRIC"};
 
     if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
     {
-        TLLM_LOG_ERROR("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
+        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
         nixlBackend = "UCX";
     }
 

@@ -9,7 +9,8 @@ from torch import nn
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
-                      get_model_extra_attrs, is_torch_compiling)
+                      get_model_extra_attrs, is_gated_activation,
+                      is_torch_compiling)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -166,6 +167,11 @@ class MoE(nn.Module):
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
         self.activation_type = int(activation_type)
+        # Note:
+        # - for gated activations, there should be with gate and up projections, so the intermediate size should be expanded by 2.
+        # - for non-gated activations, there is only one up projection (no gate projection), so the intermediate size should not be expanded.
+        self.is_gated_activation = is_gated_activation(activation_type)
+        self.intermediate_size_expand_ratio = 2 if self.is_gated_activation else 1
 
         self._register_layer(model_config)
 
@@ -193,9 +199,12 @@ class MoE(nn.Module):
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=model_config.allreduce_strategy,
-                                    dtype=self.dtype)
+        self.all_reduce = None
+        if not self.use_dp and self.mapping.tp_size > 1:
+            self.all_reduce = AllReduce(
+                mapping=self.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=self.dtype)
 
         # Initialize load balancer related attributes
         if init_load_balancer:

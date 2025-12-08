@@ -12,7 +12,6 @@ from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag,
                                                 verify_sleep_wakeup_tags)
-from tensorrt_llm._utils import ray_use_rpc
 
 from ..bindings import executor as tllm
 from ..builder import Engine
@@ -23,7 +22,7 @@ from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
-from .rpc_worker import RpcWorkerMixin
+from .rpc_worker_mixin import RpcWorkerMixin
 
 __all__ = [
     "RayGPUWorker",
@@ -169,6 +168,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
+        hmac_key: Optional[bytes] = None,
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
@@ -189,14 +189,11 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if self.global_rank > 1:
             logger.set_rank(self.global_rank)
 
-        if ray_use_rpc():
-            if rpc_addr is None:
-                raise RuntimeError(
-                    "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
-            self.init_rpc_worker(self.global_rank, rpc_addr)
-            self.start_rpc_server()
-        else:
-            self.setup_engine()
+        if rpc_addr is None:
+            raise RuntimeError(
+                "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
+        self.init_rpc_worker(self.global_rank, rpc_addr, hmac_key)
+        self.start_rpc_server()
 
     def setup_engine(self):
         if torch.distributed.is_initialized(

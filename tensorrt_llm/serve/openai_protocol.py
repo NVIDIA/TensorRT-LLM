@@ -12,10 +12,20 @@ from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
     ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
-from openai.types.responses import (ResponseFunctionToolCall,
-                                    ResponseInputItemParam, ResponseOutputItem,
-                                    ResponsePrompt, ResponseReasoningItem,
-                                    ResponseStatus, ResponseTextConfig)
+from openai.types.responses import (
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
+    ResponseCodeInterpreterCallInterpretingEvent, ResponseCompletedEvent,
+    ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
+    ResponseCreatedEvent, ResponseFormatTextConfig, ResponseFunctionToolCall,
+    ResponseInProgressEvent, ResponseInputItemParam, ResponseOutputItem,
+    ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponsePrompt,
+    ResponseReasoningItem, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
+    ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent)
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
@@ -213,6 +223,18 @@ def _response_format_to_guided_decoding_params(
         raise ValueError(f"Unsupported response format: {response_format.type}")
 
 
+def _response_format_text_config_to_guided_decoding_params(
+    text_format: Optional[ResponseFormatTextConfig]
+) -> Optional[GuidedDecodingParams]:
+    if text_format is None:
+        return None
+
+    resp_format = ResponseFormat(type=text_format.type,
+                                 json_schema=getattr(text_format, "schema_",
+                                                     None))
+    return _response_format_to_guided_decoding_params(resp_format)
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -366,7 +388,7 @@ class ToolCall(OpenAIBaseModel):
 
 class DeltaToolCall(OpenAIBaseModel):
     id: Optional[str] = None
-    type: Optional[Literal["function"]] = None
+    type: Literal["function"] = "function"
     index: int
     function: Optional[DeltaFunctionCall] = None
 
@@ -786,13 +808,11 @@ class ResponsesRequest(OpenAIBaseModel):
 
     def to_sampling_params(
         self,
-        default_max_tokens: int,
         default_sampling_params: Optional[dict] = None,
     ) -> SamplingParams:
-        if self.max_output_tokens is None:
-            max_tokens = default_max_tokens
-        else:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+        max_tokens = None
+        if self.max_output_tokens is not None:
+            max_tokens = self.max_output_tokens
 
         default_sampling_params = default_sampling_params or {}
         if (temperature := self.temperature) is None:
@@ -801,17 +821,13 @@ class ResponsesRequest(OpenAIBaseModel):
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
                 "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
-        stop_token_ids = default_sampling_params.get("stop_token_ids")
+        stop_token_ids = default_sampling_params.get("stop_token_ids", None)
 
         # Structured output
         guided_decoding = None
         if self.text is not None and self.text.format is not None:
-            response_format = self.text.format
-            if response_format.type == "json_schema":
-                guided_decoding = GuidedDecodingParams(
-                    json=response_format.schema_)
-            elif response_format.type == "json_object":
-                raise NotImplementedError("json_object is not supported")
+            guided_decoding = _response_format_text_config_to_guided_decoding_params(
+                self.text.format)
 
         return SamplingParams(
             temperature=temperature,
@@ -855,6 +871,27 @@ class ResponseUsage(OpenAIBaseModel):
     total_tokens: int
 
 
+StreamingResponsesResponse: TypeAlias = Union[
+    ResponseCreatedEvent,
+    ResponseInProgressEvent,
+    ResponseCompletedEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent,
+    ResponseWebSearchCallCompletedEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallInterpretingEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+]
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
@@ -871,7 +908,7 @@ class ResponsesResponse(OpenAIBaseModel):
     tools: list[Tool]
     top_p: float
     background: bool
-    max_output_tokens: int
+    max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
@@ -967,3 +1004,7 @@ def to_llm_disaggregated_params(
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
         draft_tokens=disaggregated_params.draft_tokens)
+
+
+UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
+UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
