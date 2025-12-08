@@ -129,7 +129,13 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
                 sh "ls -al ${stageName}/"
-                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                // Find the absolute path of generate_timeout_xml.py under the current directory
+                def generateTimeoutXmlPath = sh(
+                    script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
+                    returnStdout: true
+                ).trim()
+                echo "generate_timeout_xml.py absolute path: ${generateTimeoutXmlPath}"
+                def timeoutTestXml = generateTimeoutTestResultXml(generateTimeoutXmlPath, stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
                     sh """
 cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
@@ -1621,7 +1627,13 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
-                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                // Find the absolute path of generate_timeout_xml.py under the current directory
+                def generateTimeoutXmlPath = sh(
+                    script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
+                    returnStdout: true
+                ).trim()
+                echo "generate_timeout_xml.py absolute path: ${generateTimeoutXmlPath}"
+                def timeoutTestXml = generateTimeoutTestResultXml(generateTimeoutXmlPath, stageName, "unfinished_test.txt")
                 if (timeoutTestXml != null) {
                     sh """
 cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
@@ -2023,7 +2035,7 @@ def launchTestListCheck(pipeline)
     })
 }
 
-def generateTimeoutTestResultXml(stageName, testFilePath) {
+def generateTimeoutTestResultXml(path, stageName, testFilePath) {
     if (!fileExists("${stageName}/${testFilePath}")) {
         echo "No ${testFilePath} found in ${stageName}, skipping timeout XML generation"
         return null
@@ -2034,15 +2046,11 @@ def generateTimeoutTestResultXml(stageName, testFilePath) {
     if (timeoutTests == null || timeoutTests == "") {
         return null
     }
-    def testList = timeoutTests.split("\n")
-    String xmlContent = """<?xml version="1.0" encoding="UTF-8"?><testsuites>
-        <testsuite name="${stageName}" errors="${testList.size()}" failures="0" skipped="0" tests="${testList.size()}" time="1.00">"""
-    testList.each { test ->
-        xmlContent += """<testcase name="${test}" classname="${stageName}" time="1.0">
-        <error message="Test terminated unexpectedly"> Test terminated unexpectedly
-        </error></testcase>"""
-    }
-    xmlContent += "</testsuite></testsuites>"
+    def xmlContent = sh(
+        script: "python3 ${path} --tests '${timeoutTests}' --stage-name '${stageName}'",
+        returnStdout: true
+    ).trim()
+    echo "xmlContent: ${xmlContent}"
     return xmlContent
 }
 
