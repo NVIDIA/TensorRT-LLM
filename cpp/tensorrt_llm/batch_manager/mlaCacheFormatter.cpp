@@ -228,8 +228,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
         if (agentConnnecion != nullptr)
         {
-            TLLM_CHECK_WITH_INFO(
-                bufferCoverTargetNum == pPDomainSize * cPDomainSize, "Agent need all buffer pre-allocated");
             TLLM_CHECK(onlyUseDynamicBuffer == false);
         }
 

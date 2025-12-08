@@ -416,7 +416,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
         if (agentConnnecion != nullptr)
         {
-            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent need all buffer pre-allocated");
             TLLM_CHECK(onlyUseDynamicBuffer == false);
         }
         // TODO: add parameters for layerNumForEachOutput
