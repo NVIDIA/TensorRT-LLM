@@ -21,6 +21,10 @@ except ImportError:
 
 
 class GroupedGemmInputsHelper:
+    """Helper class for grouped GEMM input preparation and tuning."""
+    # Input tensor indices for shape inference - update if input order changes
+    IDX_A = 0  # a tensor (non-gather fusion)
+    IDX_TOKEN_ID_MAPPING = 7  # token_id_mapping tensor (gather fusion)
 
     def __init__(self,
                  num_experts: int,
@@ -35,9 +39,9 @@ class GroupedGemmInputsHelper:
         self.local_expert_offset = local_expert_offset
         self.tile_size = tile_size
         self.fuse_gather = fuse_gather
-        # For gather fusion, use token_id_mapping (index 7) to infer shapes
-        # For non-gather fusion, use a (index 0)
-        self.shape_infer_tensor_idx = 7 if fuse_gather else 0
+        # For gather fusion, use token_id_mapping to infer shapes
+        # For non-gather fusion, use a tensor
+        self.shape_infer_tensor_idx = self.IDX_TOKEN_ID_MAPPING if fuse_gather else self.IDX_A
         # Padding values should never be accessed.
         # Intentionally use a large padding value to expose issues early.
         self.pad_val = int(2e9)
@@ -1806,10 +1810,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                  self.tile_size,
                                                  fuse_gather=True)
                 self.__class__.tuning_config_cache[key] = TuningConfig(
-                    # For gather fusion, use token_id_mapping (index 7) to determine
-                    # the max_num_permuted_tokens, not a (index 0) which is orig_m
+                    # For gather fusion, use token_id_mapping to determine
+                    # the max_num_permuted_tokens, not a (which is orig_m)
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        7, 0, helper.gen_tuning_buckets,
+                        GroupedGemmInputsHelper.IDX_TOKEN_ID_MAPPING, 0,
+                        helper.gen_tuning_buckets,
                         helper.map_to_tuning_buckets), ),
                     constraint_specs=(ConstraintSpec(
                         0, 0, helper.infer_shape_num_tokens),
@@ -1830,6 +1835,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
             a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, token_id_mapping, num_non_exiting_tiles, global_sf = inputs
+            # Verify token_id_mapping index matches the constant used in tuning config
+            assert inputs[GroupedGemmInputsHelper.
+                          IDX_TOKEN_ID_MAPPING] is token_id_mapping
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
             assert b.dtype == torch.float4_e2m1fn_x2
