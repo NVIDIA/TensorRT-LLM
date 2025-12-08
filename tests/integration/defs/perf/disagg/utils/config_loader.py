@@ -88,9 +88,9 @@ DEFAULT_METRICS_CONFIG = {
         log_file="bench.log",
         extractor_pattern=r"""
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Median\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
         metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
@@ -99,21 +99,29 @@ DEFAULT_METRICS_CONFIG = {
         log_file="bench.log",
         extractor_pattern=r"""
             ^.*?Mean\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Mean\ TPOT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ TPOT\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ TPOT\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Mean\ ITL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ ITL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ ITL\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Mean\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?Median\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
+            (?:.*\n)*?
             ^.*?P99\ E2EL\ \(ms\):\s+([0-9.]+).*?$\n
-            ^.*?(?:\n|.)*?$\n
+            (?:.*\n)*?
             ^.*?Benchmark\ with\ concurrency\ (\d+)\ done
         """,
         metric_names=[
