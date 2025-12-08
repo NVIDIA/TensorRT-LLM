@@ -647,8 +647,9 @@ void run(Data& data, void* stream)
     //
     // The upper bound is a strict requirement. The number of blocks should be determined by querying
     // the device properties, or conservatively low.
-    // /!\ The following number is not portable!! (but works on H100 and B200)
-    int const numBlocksCoop = 128;
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    // WAR: Reserve 8 SMs for overlapping kernels.
+    int const numBlocksCoop = smCount - 8;
 
     // Maximum number of tokens supported by the kernel using a cooperative launch.
     int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;

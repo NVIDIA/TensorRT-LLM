@@ -206,8 +206,7 @@ class ReportUtility:
             self.get_max_draft_len())
         self.streaming = streaming
 
-    @staticmethod
-    def _query_gpu_info() -> Dict[str, Any]:
+    def _query_gpu_info(self) -> Dict[str, Any]:
         """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
         if not torch.cuda.is_available():
             return None
@@ -227,13 +226,22 @@ class ReportUtility:
                 None,
             }
             if pynvml:
-                # Memory clock information is not reported by torch, using NVML instead
-                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
-                gpu_info["clocks.mem"] = pynvml.nvmlDeviceGetMaxClockInfo(
-                    handle, pynvml.NVML_CLOCK_MEM) / 1000.0
-            return gpu_info
-        except (RuntimeError, AssertionError):
+                try:
+                    # Memory clock information is not reported by torch, using NVML instead
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+                    clocks_mem = pynvml.nvmlDeviceGetMaxClockInfo(
+                        handle, pynvml.NVML_CLOCK_MEM) / 1000.0
+                    gpu_info["clocks.mem"] = clocks_mem
+                except pynvml.NVMLError as e:
+                    self.logger.info(
+                        f"Error querying GPU clock info with NVML: {e}")
+                    gpu_info["clocks.mem"] = None
+        except Exception as e:
+            # broad catch for any other errors, since this is a non-critical operation
+            self.logger.warning(f"Error querying GPU info: {e}")
             return None
+        return gpu_info
 
     @staticmethod
     def convert_to_ms(ns: float) -> float:
@@ -306,6 +314,7 @@ class ReportUtility:
                 "model": self.rt_cfg.model,
                 "model_path": str(self.rt_cfg.model_path),
                 "engine_dir": str(self.rt_cfg.engine_dir),
+                "revision": self.rt_cfg.revision,
                 "version": self.rt_cfg.sw_version,
             },
         }
@@ -539,6 +548,7 @@ class ReportUtility:
                 "===========================================================\n"
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
+                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
                 f"Engine Directory:\t{engine['engine_dir']}\n"
                 f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
@@ -554,6 +564,7 @@ class ReportUtility:
                 "===========================================================\n"
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
+                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
                 f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{engine['dtype']}\n"
                 f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"

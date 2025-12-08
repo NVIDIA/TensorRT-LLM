@@ -3,6 +3,7 @@
 import flashinfer
 import torch
 
+from ...flashinfer_utils import get_env_enable_pdl
 from ...modules.mamba.layernorm_gated import _layer_norm_fwd
 from .triton_kernels.rms_norm import rms_norm
 
@@ -21,7 +22,7 @@ def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) ->
     """
     # Flashinfer rmsnorm expects a 2D input
     input_flat = input.reshape(-1, input.shape[-1])
-    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps)
+    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps, enable_pdl=get_env_enable_pdl())
     return rmsnorm_flat.reshape(input.shape)
 
 
@@ -70,11 +71,13 @@ def torch_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
         weight: Scaling weights for the normalized output.
         eps: Small constant for numerical stability.
     """
-    input_dtype = input.dtype
+    # pre-allocate output to ensure same dtype+stride as input
+    out = torch.empty_like(input)
     input = input.to(torch.float32)
     variance = input.pow(2).mean(-1, keepdim=True)
     input = input * torch.rsqrt(variance + eps)
-    return weight * input.to(input_dtype)
+    out.copy_((weight * input.to(out.dtype)))
+    return out
 
 
 @torch_rmsnorm.register_fake
@@ -113,21 +116,20 @@ def triton_rmsnorm_gated(
 
     # Flatten to (M, H), ensure last-dim contiguous, and run in fp32
     x_shape = x.shape
-    x2 = x.to(torch.float32).reshape(-1, H)
+    x2 = x.reshape(-1, H)
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
 
     z2 = None
     if gate is not None:
-        z2 = gate.to(torch.float32).reshape(-1, H)
+        z2 = gate.reshape(-1, H)
         if z2.stride(-1) != 1:
             z2 = z2.contiguous()
-
-    w = weight.to(torch.float32).contiguous()
+    assert weight.is_contiguous(), "weight must be contiguous"
 
     out2, _, _ = _layer_norm_fwd(
         x2,
-        w,
+        weight,
         None,  # bias
         eps,
         z=z2,

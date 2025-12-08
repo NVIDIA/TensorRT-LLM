@@ -28,6 +28,8 @@ transforms:
     stage: pattern_matcher
   match_dense_moe_pattern:
     stage: pattern_matcher
+  match_bmm_moe_pattern:
+    stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
     run_shape_prop: true
@@ -76,9 +78,11 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    sharding_source: ['factory','heuristic']
+    sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
     sharding_dims: ['tp', 'ep', 'bmm']
+    allreduce_strategy: 'AUTO'
+    dist_backend: auto
     requires_shape_prop: true
   sharding_transform_executor:
     stage: sharding
@@ -151,6 +155,9 @@ transforms:
   insert_cached_causal_conv:
     stage: cache_init
     backend: cuda_causal_conv
+  insert_cached_delta_rule:
+    stage: cache_init
+    backend: fla_delta
   initialize_cache:
     stage: cache_init
     run_per_gm: false
@@ -163,6 +170,9 @@ transforms:
   ############################################################################################
   fuse_causal_conv_activation:
     stage: compile
+  multi_stream_moe:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     run_per_gm: false

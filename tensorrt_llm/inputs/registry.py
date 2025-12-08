@@ -1,5 +1,6 @@
 import enum
 import random
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
@@ -139,6 +140,21 @@ class BaseMultimodalInputProcessor(ABC):
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._multimodal_hashing_supported: Optional[bool] = None
+
+    def attach_multimodal_embeddings(
+        self,
+        inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Handle externally provided multimodal input embeddings.
+
+        While inputs["multi_modal_data"] is handled by __call__, this method is intended to process
+        inputs["multi_modal_embeddings"].
+        """
+        raise NotImplementedError(
+            "Input processor does not support multimodal embedding input")
 
     @property
     @abstractmethod
@@ -697,8 +713,6 @@ def create_input_processor_with_hash(
                     input_processor.multimodal_hashing_supported = True
                 return prompt_token_ids, extra_processed_inputs
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 logger.warning(f"Multimodal hashing failed: {e}.")
                 if try_multimodal_hashing:
                     # if trying for first time, fall back to basic input processor
@@ -708,9 +722,8 @@ def create_input_processor_with_hash(
                     try:
                         return input_processor(inputs, sampling_params)
                     except Exception as e2:
-                        import traceback
-                        traceback.print_exc()
                         logger.warning(f"Basic input processor failed: {e}.")
+                        logger.debug(traceback.format_exc())
                         raise e2
                 else:
                     raise e
@@ -718,9 +731,8 @@ def create_input_processor_with_hash(
             try:
                 return input_processor(inputs, sampling_params)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 logger.warning(f"Basic input processor failed: {e}.")
+                logger.debug(traceback.format_exc())
                 raise e
 
     return input_processor_wrapper

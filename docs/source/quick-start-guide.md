@@ -24,6 +24,15 @@ To start the server, you can run a command like the following example inside a D
 trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
+You may also deploy pre-quantized models to improve performance.
+Ensure your GPU supports FP8 quantization before running the following:
+
+```bash
+trtllm-serve "nvidia/Qwen3-8B-FP8"
+```
+
+For more options, browse the full [collection of generative models](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer) that have been quantized and optimized for inference with the TensorRT Model Optimizer.
+
 ```{note}
 If you are running `trtllm-serve` inside a Docker container, you have two options for sending API requests:
 1. Expose a port (e.g., 8000) to allow external access to the server from outside the container.

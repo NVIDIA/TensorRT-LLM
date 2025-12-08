@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -37,6 +38,11 @@ from tensorrt_llm.logger import logger, severity_map
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
+@click.option("--revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
 @click.pass_context
 def main(
     ctx,
@@ -44,11 +50,13 @@ def main(
     model_path: Path,
     workspace: Path,
     log_level: str,
+    revision: Optional[str],
 ) -> None:
     logger.set_level(log_level)
     ctx.obj = BenchmarkEnvironment(model=model,
                                    checkpoint_path=model_path,
-                                   workspace=workspace)
+                                   workspace=workspace,
+                                   revision=revision)
 
     # Create the workspace where we plan to store intermediate files.
     ctx.obj.workspace.mkdir(parents=True, exist_ok=True)

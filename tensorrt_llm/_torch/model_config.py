@@ -102,6 +102,11 @@ class ModelConfig(Generic[TConfig]):
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
 
+    # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
+    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
+    nvfp4_gemm_allowed_backends: List[str] = field(
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
+
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.
@@ -164,6 +169,11 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(self.allreduce_strategy, str):
             self.allreduce_strategy = get_all_reduce_strategy(
                 self.allreduce_strategy)
+
+        # Set default moe_max_num_tokens if not specified
+        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        if self.moe_max_num_tokens is None:
+            self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
 
     @property
     def torch_dtype(self) -> torch.dtype:

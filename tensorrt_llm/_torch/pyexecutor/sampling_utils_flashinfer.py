@@ -30,11 +30,12 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-from ..flashinfer_utils import ENABLE_PDL
+from ..flashinfer_utils import get_env_enable_pdl
 from .sampling_utils import (
     GREEDY,
     GroupedStrategySampler,
     Strategy,
+    StrategyMetadata,
     TemperatureOnly,
     TopK,
     TopKTopP,
@@ -112,7 +113,7 @@ class _StrategyImpls:
             probs = flashinfer.sampling.softmax(
                 logits,
                 temperature,
-                enable_pdl=ENABLE_PDL,
+                enable_pdl=get_env_enable_pdl(),
             )
             return probs
 
@@ -383,22 +384,17 @@ class _StrategyImpls:
         def from_strategies(
             cls, strategies: list[Strategy], cuda_device: torch.device
         ) -> "_StrategyImpls.TopKTopPSampleOnly":
-            assert all(strat[0] in ["top_k_top_p", "top_k"] for strat in strategies)
-            narrowed_strats = cast(list[TopKTopP | TopK], strategies)
-            top_k_list = []
-            top_p_list = []
-            temperature_list = []
-            for strat in narrowed_strats:
-                top_k_list.append(strat[1])
-                if strat[0] == "top_k_top_p":
-                    top_p_list.append(strat[2])
-                    temperature_list.append(strat[3])
-                else:
-                    top_p_list.append(1.0)
-                    temperature_list.append(strat[2])
-            top_k = cls._make_tensor(top_k_list, torch.int32, cuda_device)
-            top_p = cls._make_tensor(top_p_list, torch.float32, cuda_device)
-            temperature = cls._make_tensor(temperature_list, torch.float32, cuda_device)
+            assert all(strat[0] == "top_k_top_p" for strat in strategies)
+            narrowed_strats = cast(list[TopKTopP], strategies)
+            top_k = cls._make_tensor(
+                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
+            )
+            top_p = cls._make_tensor(
+                [strat[2] for strat in narrowed_strats], torch.float32, cuda_device
+            )
+            temperature = cls._make_tensor(
+                [strat[3] for strat in narrowed_strats], torch.float32, cuda_device
+            )
             return cls(top_k, top_p, temperature)
 
         @override
@@ -424,6 +420,50 @@ class _StrategyImpls:
                 filter_apply_order="top_k_first",
                 deterministic=True,
                 check_nan=self._flashinfer_check_nans(logits),
+                generator=generator,
+            ), None
+
+    class TopKSampleOnly(StrategyImplSampleOnly):
+        def __init__(self, top_k: torch.Tensor, temperature: torch.Tensor):
+            self._top_k = top_k
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Strategy], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopKSampleOnly":
+            assert all(strat[0] == "top_k" for strat in strategies)
+            narrowed_strats = cast(list[TopK], strategies)
+            top_k = cls._make_tensor(
+                [strat[1] for strat in narrowed_strats], torch.int32, cuda_device
+            )
+            temperature = cls._make_tensor(
+                [strat[2] for strat in narrowed_strats], torch.float32, cuda_device
+            )
+            return cls(top_k, temperature)
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            probs = self._prepare_probs_with_temperature(
+                logits, group_logit_indices, self._temperature
+            )
+            return flashinfer.sampling.top_k_sampling_from_probs(
+                probs,
+                top_k=self._top_k,
+                # NB: Leveraging 'indices' would require applying temperature+softmax before batching,
+                #     because 'flashinfer.sampling.softmax' has no 'indices' argument; but that would
+                #     compute unnecessarily softmax also for situations allowing
+                #     flashinfer.sampling...._sampling_from_logits.
+                # indices=group_logit_indices,
+                deterministic=True,
+                check_nan=self._flashinfer_check_nans(probs),
                 generator=generator,
             ), None
 
@@ -540,10 +580,9 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
             match strategy:
                 case ("top_p", _, _):
                     return _StrategyImpls.TopPSampleOnly
-                case ("top_k_top_p", _, _, _) | ("top_k", _, _):
-                    # NB: There is no TopKSampleOnly, because FlashInfer only provides
-                    #     top_k_sampling_from_probs (not top_k_sampling_from_logits),
-                    #     which is likely slower than top_k_top_p_sampling_from_logits.
+                case ("top_k", _, _):
+                    return _StrategyImpls.TopKSampleOnly
+                case ("top_k_top_p", _, _, _):
                     return _StrategyImpls.TopKTopPSampleOnly
                 case ("temperature", _):
                     return _StrategyImpls.TemperatureOnlySampleOnly
@@ -560,6 +599,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[Type[_StrategyImpl
         group_logit_indices: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
+        group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if group_logit_indices is None:
             assert logits.size(0) == len(strategies)

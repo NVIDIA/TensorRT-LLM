@@ -93,6 +93,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap]
   - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
   - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-load_balancing]
   - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
@@ -185,8 +186,14 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-two_model-no_overlap_scheduler]
 - condition:
     ranges:
       system_gpu_count:
