@@ -181,7 +181,7 @@ model.
 
      {"role": "user", "content": [
          {"type": "text", "text": "What's in this image?"},
-         {"type": "image_embeds", "image_embeds": "{image_embeddings_base64}"}}
+         {"type": "image_embeds", "image_embeds": {"data": "{image_embeddings_base64}"}}}
      ]}
 
 .. note::
