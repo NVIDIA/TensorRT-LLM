@@ -486,10 +486,10 @@ class CublasLtFP4GemmRunner(TunableRunner):
         self.cublaslt_runner = CublasLtFP4GemmRunner.runner_dict[instance_key]
 
     def unique_id(self):
-        return hash((
+        return (
             self.to_userbuffers,
             self.output_dtype,
-        ))
+        )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
