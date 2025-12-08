@@ -386,7 +386,6 @@ class PipelineCpAsyncUmma(PipelineAsync):
     - Consumers are UMMA warps that perform MMA operations using the loaded data
 
     Key differences from PipelineAsyncUmma:
-    - Does not require cta_layout_vmnk coordination (no 2CTA MMA semantics for producer)
     - Suitable for gather/permutation operations during load
     - Used in this kernel for A and SFA matrices with token-based gather addressing
     """
@@ -458,6 +457,10 @@ class PipelineCpAsyncUmma(PipelineAsync):
         :type barrier_storage: cute.Pointer, optional
         :param cta_layout_vmnk: Layout of the cluster shape
         :type cta_layout_vmnk: cute.Layout, optional
+        :param defer_sync: Whether to defer the sync
+        :type defer_sync: bool, optional
+        :param enable_cp_async: Whether to enable cp.async instructions
+        :type enable_cp_async: bool, optional
         :raises ValueError: If barrier_storage is not a cute.Pointer instance
         :return: A new PipelineCpAsyncUmma instance configured with the provided parameters
         :rtype: PipelineCpAsyncUmma

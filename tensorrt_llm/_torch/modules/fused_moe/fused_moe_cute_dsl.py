@@ -282,7 +282,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             alpha=self.quant_scales.fc1_global,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            token_id_mapping=permuted_idx_to_expanded_idx,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,

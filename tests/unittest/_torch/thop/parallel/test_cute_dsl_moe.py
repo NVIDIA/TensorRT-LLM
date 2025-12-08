@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+    GatherGroupedGemmInputsHelper,
+    GroupedGemmInputsHelper,
+)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
 from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
@@ -709,7 +712,10 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
     assert match_ratio > 0.95
 
 
-@pytest.mark.skipif(get_sm_version() != 100, reason="This test is only supported on SM 100 GPUs")
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -720,7 +726,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     """Test gather-based grouped GEMM with SwiGLU fusion.
 
     This test validates the gather kernel which:
-    1. Uses LDGSTS for A/SFA loading with token_id_mapping
+    1. Uses LDGSTS for A/SFA loading with permuted_idx_to_expanded_idx
     2. Performs GEMM with interleaved weights
     3. Applies SwiGLU activation fusion
     4. Quantizes output to FP4 with scale factor generation
@@ -747,7 +753,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     num_valid_permuted_tokens = num_valid_tiles * tile_size
 
     # Create helper
-    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
+    helper = GatherGroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, tile_size)
     max_num_tiles = helper.get_max_num_tiles(num_tokens)
     max_num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
     assert 0 <= num_valid_tiles <= max_num_tiles
@@ -774,12 +780,14 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
     tile_idx_to_mn_limit = tile_idx_to_mn_limit.cuda()
 
-    # Generate token_id_mapping for gather operation
-    token_id_mapping_list = helper.generate_token_id_mapping(
+    # Generate permuted_idx_to_expanded_idx for gather operation
+    permuted_idx_to_expanded_idx_list = helper.generate_permuted_idx_to_expanded_idx(
         num_tokens, num_tokens_per_expert.tolist()
     )
-    token_id_mapping = torch.tensor(token_id_mapping_list, dtype=torch.int32, device="cuda")
-    assert token_id_mapping.size(0) == max_num_permuted_tokens
+    permuted_idx_to_expanded_idx = torch.tensor(
+        permuted_idx_to_expanded_idx_list, dtype=torch.int32, device="cuda"
+    )
+    assert permuted_idx_to_expanded_idx.size(0) == max_num_permuted_tokens
 
     # Create input tensors (original size, not permuted)
     a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
@@ -824,8 +832,9 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype, device=a_sf.device
     )
     for i in range(num_valid_permuted_tokens):
-        token_id = token_id_mapping[i].item() // top_k
-        if token_id >= 0:
+        expanded_idx = permuted_idx_to_expanded_idx[i].item()
+        if expanded_idx != helper.pad_val:
+            token_id = expanded_idx // top_k
             a_gathered[i] = a[token_id]
             a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
@@ -861,7 +870,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         alpha,
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
-        token_id_mapping,
+        permuted_idx_to_expanded_idx,
         num_non_exiting_tiles,
         torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
         num_experts=num_experts,
@@ -872,11 +881,11 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         scaling_vector_size=sf_vec_size,
     )
 
-    # Verify output (only compare valid tokens, skip padding tokens where token_id_mapping == -1)
+    # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
     # Create mask for valid tokens
     valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
     for i in range(num_valid_permuted_tokens):
-        if token_id_mapping[i].item() >= 0:
+        if permuted_idx_to_expanded_idx[i].item() != helper.pad_val:
             valid_token_mask[i] = True
 
     num_valid_tokens = valid_token_mask.sum().item()
@@ -900,7 +909,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         c_sf_valid = []
         c_sf_ref_valid = []
         for i in range(num_valid_permuted_tokens):
-            if token_id_mapping[i].item() >= 0:
+            if permuted_idx_to_expanded_idx[i].item() != helper.pad_val:
                 c_sf_valid.append(c_sf_unswizzled[i])
                 c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
 
@@ -911,14 +920,3 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             f"Scale factor match ratio {match_ratio} < 0.95 "
             f"(compared {num_valid_tokens} valid tokens)"
         )
-
-
-if __name__ == "__main__":
-    # Run the gather grouped gemm test with default parameters
-    test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
-        num_tokens=515,
-        top_k=1,
-        ep_size=8,
-        tile_size=256,
-    )
-    print("Test passed!")
