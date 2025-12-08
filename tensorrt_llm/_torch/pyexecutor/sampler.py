@@ -677,10 +677,9 @@ class BeamHistory:
 
 @dataclass(kw_only=True)
 class SamplingRequestsMetadata:
-    req_num_generated_tokens: torch.Tensor
-    req_num_beams: torch.Tensor
-    req_num_steps: torch.Tensor
-    req_offsets: torch.Tensor
+    logits_offsets: torch.Tensor
+    num_sampling_logits: torch.Tensor
+    num_beams: torch.Tensor
 
 
 @dataclass(kw_only=True)
@@ -2210,15 +2209,15 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
     def _apply_min_length_penalty(
         logits: torch.Tensor,
         requests: list[LlmRequest],
-        num_steps: list[int],
-        num_beams: list[int],
+        num_sampling_logits: torch.Tensor,
+        num_beams: torch.Tensor,
     ) -> torch.Tensor:
         """Inplace apply min_length_penalty to logits.
 
         Args:
             logits: The logits to apply min length penalty to
             requests: The requests to apply min length penalty to
-            num_steps: The number of steps per request
+            num_sampling_logits: The number of sampling logits per request
 
         Returns:
             The logits with min length penalty applied
@@ -2228,15 +2227,16 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             for index, r in enumerate(requests):
                 if r.py_min_length:
                     for beam_idx in range(num_beams[index]):
-                        for step in range(num_steps[index]):
+                        num_steps = num_sampling_logits[index] // num_beams[index]
+                        for step in range(num_steps):
                             if r.get_num_tokens(beam_idx) + step < r.py_min_length[0]:
                                 logits[
-                                    current_offset + num_steps[index] * beam_idx + step, r.py_end_id
+                                    current_offset + num_steps * beam_idx + step, r.py_end_id
                                 ] = float("-inf")
                             else:
                                 # early exit
                                 break
-                current_offset += num_steps[index] * num_beams[index]
+                current_offset += num_sampling_logits[index]
         return logits
 
     @staticmethod
@@ -2246,100 +2246,74 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         *,
         num_context_logits_prefix_sum: list[int],
     ) -> tuple[SamplingRequestsMetadata, torch.Tensor]:
-        requests = scheduled_requests.all_requests()
+        """Select the generated logits for the sampling requests.
 
-        req_num_generation_steps_list = [1 + get_draft_token_length(req) for req in requests]
-        req_num_generation_steps = torch.tensor(
-            req_num_generation_steps_list, dtype=torch.int32, pin_memory=True
+        Args:
+            scheduled_requests: The scheduled requests. Sampling requests will be selected from this list.
+            raw_logits_cuda: The raw logits corresponding to the scheduled requests.
+            num_context_logits_prefix_sum: The prefix sum of the number of logits for each context request.
+
+        Returns:
+            A tuple containing the following:
+            - sampling requests: The requests that are selected for sampling.
+            - sampling requests metadata: The metadata for the sampling requests.
+            - logits: The logits for the sampling requests.
+        """
+        assert len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
+        logits_begin_indices = []
+        logits_end_indices = []
+        num_sampling_logits = []
+        sampling_requests = []
+
+        for llm_req, logits_end in zip(
+            scheduled_requests.context_requests, num_context_logits_prefix_sum[1:]
+        ):
+            if llm_req.is_last_context_chunk:
+                sampling_requests.append(llm_req)
+                num_logits = 1 + get_draft_token_length(llm_req)
+                num_sampling_logits.append(num_logits)
+                logits_begin_indices.append(logits_end - num_logits)
+                logits_end_indices.append(logits_end)
+
+        num_beams = [1] * len(sampling_requests)
+
+        logits_index = num_context_logits_prefix_sum[-1]
+        for llm_req in scheduled_requests.generation_requests:
+            sampling_requests.append(llm_req)
+            beam_width = llm_req.sampling_config.beam_width
+            num_beams.append(beam_width)
+            num_logits = beam_width + get_draft_token_length(llm_req)
+            num_sampling_logits.append(num_logits)
+            logits_begin_indices.append(logits_index)
+            logits_end_indices.append(logits_index + num_logits)
+
+            logits_index += num_logits
+
+        num_sampling_logits_tensor = torch.tensor(
+            num_sampling_logits, dtype=torch.int32, pin_memory=True
         )
 
-        # context requests do not have multiple beams yet, so beam width may differ in mixed batches
-        req_num_beams_list = [
-            req.sampling_config.beam_width if not req.is_context_init_state else 1
-            for req in requests
-        ]
-        req_num_beams = torch.tensor(req_num_beams_list, dtype=torch.int32, pin_memory=True)
-
-        req_num_generated_tokens = req_num_generation_steps * req_num_beams
-        # NB: These offsets consider generated tokens _only_ (draft and target, but not context).
-        #     Filter out the context tokens below.
-        req_offsets, sum_num_generated_tokens = _PackedStepIndexer.calculate_request_offsets(
-            req_num_generated_tokens, pin_memory=True
-        )
-
-        generation_requests_total_steps = (
-            # NB: requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
-            sum_num_generated_tokens
-            - cast(int, req_offsets[len(scheduled_requests.context_requests)].item())
-            if scheduled_requests.generation_requests
-            else 0
+        logits_offsets, total_num_sampling_logits = _PackedStepIndexer.calculate_request_offsets(
+            num_sampling_logits_tensor, pin_memory=True
         )
 
         sampling_requests_metadata = SamplingRequestsMetadata(
-            req_num_generated_tokens=req_num_generated_tokens,
-            req_num_beams=req_num_beams,
-            req_num_steps=req_num_generation_steps,
-            req_offsets=req_offsets,
+            logits_offsets=logits_offsets,
+            num_sampling_logits=num_sampling_logits_tensor,
+            num_beams=torch.tensor(num_beams, dtype=torch.int32, pin_memory=True),
         )
 
-        num_logits_to_keep = sum_num_generated_tokens
+        indices_to_keep = torch_multi_arange(
+            starts=torch.tensor(logits_begin_indices),
+            ends=torch.tensor(logits_end_indices),
+            output_length=total_num_sampling_logits,
+        )
+        indices_to_keep_cuda = indices_to_keep.to(device="cuda", non_blocking=True)
+        logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
 
-        # raw_logits should contain only the generated logits.
-        # If return context logits is requested, select only the generated logits.
-        #
-        # NB: Context request logits always precede generation request logits, also
-        #     requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
-        if any(r.py_return_context_logits for r in scheduled_requests.context_requests):
-            assert (
-                len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
-            )
-            req_num_generated_tokens_cuda = req_num_generated_tokens.to(
-                raw_logits_cuda.device, non_blocking=True
-            )
-            context_req_offsets_cuda = torch.tensor(
-                num_context_logits_prefix_sum, dtype=torch.int32, pin_memory=True
-            ).to(device=raw_logits_cuda.device, non_blocking=True)
+        assert logits_cuda.size(0) == total_num_sampling_logits
 
-            if scheduled_requests.generation_requests:
-                # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
-                # only end-offsets of the token storage locations matter.
-                next_context_req_offsets_cuda = context_req_offsets_cuda.roll(
-                    -1
-                )  # trailing '0' is overwritten below
-                # Since logits for generation requests are densely packed, cover them all by a single
-                # fictituous entry in 'context_req_offsets_cuda'.
-                req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : (len(scheduled_requests.context_requests) + 1)
-                ].clone()
-                req_num_steps_fictitious_cuda[-1].fill_(generation_requests_total_steps)
-                next_context_req_offsets_cuda[-1].copy_(
-                    next_context_req_offsets_cuda[-2] + req_num_steps_fictitious_cuda[-1],
-                    non_blocking=True,
-                )
-            else:
-                req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : len(scheduled_requests.context_requests)
-                ]
-                # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
-                # only end-offsets of the token storage locations matter.
-                next_context_req_offsets_cuda = context_req_offsets_cuda[1:]
-
-            # Now, the generated tokens for context request i are at indices
-            #    range(next_context_req_offsets_cuda[i] - req_num_steps_fictitious_cuda[i],
-            #          next_context_req_offsets_cuda[i])
-            # And if generation requests are present, those tensors each include a trailing entry selecting
-            # all tokens/logits generated by all generation requests.
-            indices_to_keep_cuda = torch_multi_arange(
-                starts=(next_context_req_offsets_cuda - req_num_steps_fictitious_cuda),
-                ends=next_context_req_offsets_cuda,
-                output_length=num_logits_to_keep,
-            )
-
-            raw_logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
-
-        logits_cuda = raw_logits_cuda[:num_logits_to_keep]
-
-        return sampling_requests_metadata, logits_cuda
+        return sampling_requests, sampling_requests_metadata, logits_cuda
 
     @staticmethod
     def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
@@ -2613,53 +2587,55 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
         raw_logits_cuda = model_outputs["logits"]
 
-        requests = scheduled_requests.all_requests()
         cuda_device = raw_logits_cuda.device
 
-        sampling_requests_metadata, logits_cuda = self._select_generated_logits(
+        sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
             scheduled_requests,
             raw_logits_cuda,
             num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
 
         # Handle embedding bias
-        self._apply_embedding_bias(logits_cuda, requests, sampling_requests_metadata.req_num_steps)
+        self._apply_embedding_bias(
+            logits_cuda, sampling_requests, sampling_requests_metadata.num_sampling_logits
+        )
 
         logits_cuda = self._apply_min_length_penalty(
             logits_cuda,
-            requests,
-            sampling_requests_metadata.req_num_steps,
-            sampling_requests_metadata.req_num_beams,
+            sampling_requests,
+            sampling_requests_metadata.num_sampling_logits,
+            sampling_requests_metadata.num_beams,
         )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
         steps_dim_size = new_tokens_cuda.size(0)
         logits_cuda_indexer = _PackedStepIndexer(
-            num_steps=sampling_requests_metadata.req_num_generated_tokens,
+            num_steps=sampling_requests_metadata.num_sampling_logits,
             max_steps=steps_dim_size * self.max_beam_width,
-            req_offsets=sampling_requests_metadata.req_offsets,
+            req_offsets=sampling_requests_metadata.logits_offsets,
         )
 
         self._handle_log_probs(
-            requests,
+            sampling_requests,
             logits_cuda,
             logits_cuda_indexer=logits_cuda_indexer,
-            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
+            req_num_generated_tokens=sampling_requests_metadata.num_sampling_logits,
         )
 
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
-            requests,
+            sampling_requests,
             model_outputs,
             cuda_device=cuda_device,
             logits_cuda_indexer=logits_cuda_indexer,
-            req_offsets=sampling_requests_metadata.req_offsets,
+            req_offsets=sampling_requests_metadata.logits_offsets,
             seq_slots=seq_slots,
             seq_lens=seq_lens,
-            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
-            req_num_steps=sampling_requests_metadata.req_num_steps,
+            req_num_generated_tokens=sampling_requests_metadata.num_sampling_logits,
+            req_num_steps=sampling_requests_metadata.num_sampling_logits
+            // sampling_requests_metadata.num_beams,
             token_dtype=new_tokens_cuda.dtype,
         )
 
@@ -2667,7 +2643,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         new_tokens_host = self._unbatch_sampling_results(
             batched_sampling_result,
             new_tokens_cuda=new_tokens_cuda,
-            req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
+            req_num_generated_tokens=sampling_requests_metadata.num_sampling_logits,
             seq_slots=seq_slots,
         )
 

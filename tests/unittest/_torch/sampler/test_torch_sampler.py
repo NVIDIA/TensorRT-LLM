@@ -435,7 +435,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ContextRequestMock:
             def __init__(self, is_last_context_chunk: bool, return_context_logits: bool):
-                self.is_context_init_state = True
                 self.is_last_context_chunk = is_last_context_chunk
                 self.py_draft_tokens = torch.tensor([], dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
@@ -447,7 +446,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
-                self.is_context_init_state = False
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
 
@@ -468,6 +466,13 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                             LlmRequest,
                             ContextRequestMock(
                                 is_last_context_chunk=True, return_context_logits=False
+                            ),
+                        ),
+                        # This request is expected to be skipped
+                        cast(
+                            LlmRequest,
+                            ContextRequestMock(
+                                is_last_context_chunk=False, return_context_logits=False
                             ),
                         ),
                         cast(
@@ -494,11 +499,8 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                     else []
                 )
 
-            def all_requests(self) -> list[LlmRequest]:
-                return self.context_requests + self.generation_requests
-
         expected_num_requests = with_ctx * 3 + with_gen * 2
-        expected_req_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
+        expected_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
 
         num_context_logits_prefix_sum = [
             0,
@@ -506,18 +508,22 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 [
                     100 + 1,  # context req. 1 (assume context len. 100)
                     (100 + 1) + (0 + 1),  # context req. 2 (not returning context)
-                    (100 + 1) + (0 + 1) + (50 + 1),  # context req. 3 (assume context len. 50)
+                    (100 + 1) + (0 + 1) + (0 + 1),  # context req. 3 (not returning context)
+                    (100 + 1)
+                    + (0 + 1)
+                    + (0 + 1)
+                    + (50 + 1),  # context req. 4 (assume context len. 50)
                 ]
                 if with_ctx
                 else []
             ),
         ]
-        expected_req_num_generation_steps = [
+        expected_num_sampling_logits = [
             *(
                 [
                     1,  # context req. 1
                     1,  # context req. 2
-                    1,  # context req. 3
+                    1,  # context req. 4
                 ]
                 if with_ctx
                 else []
@@ -531,22 +537,22 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 else []
             ),
         ]
-        expected_req_num_generation_steps_tensor = torch.tensor(
-            expected_req_num_generation_steps, dtype=torch.int32
+        expected_num_sampling_logits_tensor = torch.tensor(
+            expected_num_sampling_logits, dtype=torch.int32
         )
 
-        expected_req_offsets = torch.cumsum(expected_req_num_generation_steps_tensor, dim=0).roll(1)
-        expected_req_offsets[0] = 0
+        expected_logits_offsets = torch.cumsum(expected_num_sampling_logits_tensor, dim=0).roll(1)
+        expected_logits_offsets[0] = 0
 
         # num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
-        generation_requests_total_steps = (draft_len_req1 + 1) + (
+        generation_requests_total_logits = (draft_len_req1 + 1) + (
             draft_len_req2 + 1
         )  # cf. req_num_generation_steps
 
         vocab_size = 12
 
-        num_total_steps = num_context_logits_prefix_sum[-1] + generation_requests_total_steps
-        all_logits = torch.empty((num_total_steps, vocab_size))
+        num_total_logits = num_context_logits_prefix_sum[-1] + generation_requests_total_logits
+        all_logits = torch.empty((num_total_logits, vocab_size))
 
         for i in range(all_logits.size(0)):
             all_logits[i, :] = torch.arange(i, i + vocab_size)
@@ -558,7 +564,8 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             expected_logit_indices += [
                 100,  # gen logits from context req. 1
                 101,  # gen logits from context req. 2
-                152,  # gen logits from context req. 3
+                # 102,  # skipped gen logits from context req. 3
+                153,  # gen logits from context req. 4
             ]
         if with_gen:
             gen_logit_offset = num_context_logits_prefix_sum[-1]
@@ -568,7 +575,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 ),  # gen logits from gen. req. 1
                 *range(
                     gen_logit_offset + draft_len_req1 + 1,
-                    gen_logit_offset + generation_requests_total_steps,
+                    gen_logit_offset + generation_requests_total_logits,
                 ),  # gen logits from gen. req. 2
             ]
 
@@ -576,10 +583,10 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         @dataclass
         class UutResult:
-            req_num_generated_tokens: torch.Tensor
-            req_num_beams: torch.Tensor
-            req_num_steps: torch.Tensor
-            req_offsets: torch.Tensor
+            selected_requests: list[LlmRequest]
+            logits_offsets: torch.Tensor
+            num_sampling_logits: torch.Tensor
+            num_beams: torch.Tensor
             selected_logits: torch.Tensor
 
         @dataclass
@@ -590,6 +597,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         def _uut(res=res):
             (
+                selected_requests,
                 sampling_requests_metadata,
                 selected_logits,
             ) = TorchSampler._select_generated_logits(
@@ -598,10 +606,10 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 num_context_logits_prefix_sum=num_context_logits_prefix_sum,
             )
             res.result = UutResult(
-                req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
-                req_num_beams=sampling_requests_metadata.req_num_beams,
-                req_num_steps=sampling_requests_metadata.req_num_steps,
-                req_offsets=sampling_requests_metadata.req_offsets,
+                selected_requests=selected_requests,
+                logits_offsets=sampling_requests_metadata.logits_offsets,
+                num_sampling_logits=sampling_requests_metadata.num_sampling_logits,
+                num_beams=sampling_requests_metadata.num_beams,
                 selected_logits=selected_logits,
             )
 
@@ -610,14 +618,12 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         # Check results
         assert res.result is not None
 
+        assert len(res.result.selected_requests) == expected_num_requests
+        torch.testing.assert_close(res.result.logits_offsets.to("cpu"), expected_logits_offsets)
         torch.testing.assert_close(
-            res.result.req_num_generated_tokens.to("cpu"), expected_req_num_generation_steps_tensor
+            res.result.num_sampling_logits.to("cpu"), expected_num_sampling_logits_tensor
         )
-        torch.testing.assert_close(res.result.req_num_beams.to("cpu"), expected_req_num_beams)
-        torch.testing.assert_close(
-            res.result.req_num_steps.to("cpu"), expected_req_num_generation_steps_tensor
-        )
-        torch.testing.assert_close(res.result.req_offsets.to("cpu"), expected_req_offsets)
+        torch.testing.assert_close(res.result.num_beams.to("cpu"), expected_num_beams)
         torch.testing.assert_close(res.result.selected_logits.to("cpu"), expected_logits)
 
     _run_test_with_warmup(_test_runner, max_sync_s=0.3)
