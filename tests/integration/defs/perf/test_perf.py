@@ -2091,10 +2091,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if not os.path.exists(sampler_options_path):
             os.makedirs(os.path.dirname(sampler_options_path), exist_ok=True)
         sampler_config = get_sampler_options_config(self._config.to_string())
-        print_info(f"sampler options config: {sampler_config}")
-        with open(sampler_options_path, 'w') as f:
-            yaml.dump(sampler_config, f, default_flow_style=False)
-        benchmark_cmd += [f"--sampler_options={sampler_options_path}"]
+        if sampler_config:
+            print_info(f"sampler options config: {sampler_config}")
+            with open(sampler_options_path, 'w') as f:
+                yaml.dump(sampler_config, f, default_flow_style=False)
+            benchmark_cmd += [f"--sampler_options={sampler_options_path}"]
         return benchmark_cmd
 
     def get_commands(self):
