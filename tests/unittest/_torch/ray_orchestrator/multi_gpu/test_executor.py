@@ -9,21 +9,19 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import RayPlacementConfig
 
 
-class DummyWorkerExtension:
-
-    def additional_method(self):
-        return "SUCCESS"
-
-
+@pytest.mark.gpu2
 def test_worker_extension():
     llm = LLM(model=llm_models_root() /
               "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-              ray_worker_extension_cls="test_executor.DummyWorkerExtension",
-              orchestrator_type="ray")
-    result = llm._collective_rpc("additional_method")
-    assert result[0] == "SUCCESS"
+              ray_worker_extension_cls=
+              "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+              orchestrator_type="ray",
+              tensor_parallel_size=2)
+    result = llm._collective_rpc("check_weights_updated")
+    assert isinstance(result[0], bool)
 
 
 @pytest.mark.gpu4
@@ -76,18 +74,12 @@ def test_placement_env_vars(monkeypatch):
 
 
 @pytest.mark.gpu2
-# @pytest.mark.gpu4
-@pytest.mark.parametrize(
-    "n_gpus,bundle_indices",
-    [
-        (2, [1]),
-        # (4, [2, 3]),
-    ],
-    ids=["gpu2_tp1"]  # , "gpu4_tp2"
-)
+@pytest.mark.parametrize("n_gpus,bundle_indices", [
+    (2, [1]),
+],
+                         ids=["gpu2_tp1"])
 def test_placement_api(monkeypatch, n_gpus, bundle_indices):
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
-    monkeypatch.setenv("TLLM_RAY_USE_RPC", "1")
 
     tp_size = n_gpus // 2
     pg = None
@@ -103,9 +95,11 @@ def test_placement_api(monkeypatch, n_gpus, bundle_indices):
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
             tensor_parallel_size=tp_size,
             orchestrator_type="ray",
-            placement_groups=[pg],
-            placement_bundle_indices=[bundle_indices],
-            per_worker_gpu_share=0.8,
+            ray_placement_config=RayPlacementConfig(
+                placement_groups=[pg],
+                placement_bundle_indices=[bundle_indices],
+                per_worker_gpu_share=0.8,
+            ),
         )
 
         inference_actor_uuids = llm._collective_rpc("report_device_id")

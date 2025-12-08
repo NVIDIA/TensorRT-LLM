@@ -1,8 +1,13 @@
+import os
+
 import pytest
+import ray
+from ray.util.placement_group import placement_group, remove_placement_group
 from utils.llm_data import llm_models_root
 from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
+from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import ExecutorMemoryType
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
@@ -31,6 +36,7 @@ async def test_async_llm_awaitable():
 
 
 @pytest.mark.ray
+@pytest.mark.gpu2
 @pytest.mark.asyncio
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
@@ -46,6 +52,7 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
         enable_sleep=True,
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
+        tensor_parallel_size=2,
     ) as llm:
         # Generate baseline
         output_before = await llm.generate_async(prompt, sampling_params)
@@ -84,3 +91,46 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
             f"Generated text mismatch after {num_cycles} cycle(s): "
             f"'{baseline_text}' != '{text_after}'"
         )
+
+
+@pytest.mark.ray
+@pytest.mark.gpu4
+@pytest.mark.asyncio
+async def test_async_llm_placement_api(monkeypatch):
+    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+
+    n_gpus = 4
+    bundle_indices = [2, 3]
+    tp_size = len(bundle_indices)
+
+    pg = None
+    try:
+        ray.init()
+        pg = placement_group([{"GPU": 1, "CPU": 1}] * n_gpus)
+        ray.get(pg.ready())
+        print(f"Placement group ready with bundles {pg.bundle_specs}")
+
+        llm = await AsyncLLM(
+            model=os.path.join(
+                str(llm_models_root()), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"
+            ),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+            tensor_parallel_size=tp_size,
+            placement_groups=[pg],
+            placement_bundle_indices=[bundle_indices],
+            per_worker_gpu_share=0.8,
+        )
+
+        inference_actor_uuids = await llm.collective_rpc("report_device_id")
+        expected_uuids = [get_device_uuid(idx) for idx in bundle_indices]
+
+        print(f"{inference_actor_uuids=}, all_uuids={[get_device_uuid(i) for i in range(n_gpus)]}")
+
+        assert sorted(inference_actor_uuids) == sorted(expected_uuids), (
+            f"Workers not placed on expected GPUs. Expected: {expected_uuids}, Got: {inference_actor_uuids}"
+        )
+
+    finally:
+        if pg is not None:
+            remove_placement_group(pg)
+        ray.shutdown()

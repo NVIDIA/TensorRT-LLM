@@ -1,6 +1,7 @@
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from ..llmapi.llm import LLM
+from ..llmapi.llm_args import RayPlacementConfig
 
 
 class AsyncLLM(LLM):
@@ -10,9 +11,22 @@ class AsyncLLM(LLM):
     Currently, RL APIs are only supported with Ray orchestrator.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        placement_groups: Optional[List[Any]] = None,
+        placement_bundle_indices: Optional[List[List[int]]] = None,
+        per_worker_gpu_share: Optional[float] = None,
+        *args,
+        **kwargs,
+    ):
         kwargs["orchestrator_type"] = "ray"
-        kwargs["ray_defer_workers_init"] = True
+        kwargs["ray_placement_config"] = RayPlacementConfig(
+            defer_workers_init=True,
+            placement_groups=placement_groups,
+            placement_bundle_indices=placement_bundle_indices,
+            per_worker_gpu_share=per_worker_gpu_share,
+        )
+
         # WAR: RL integration needs to use NCCL AllReduce for TP>1 due to a bug in TRTLLM's AllReduce
         # which will cause convergence issue when using multiple rollout instances.
         kwargs["allreduce_strategy"] = "NCCL"

@@ -21,6 +21,7 @@ from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.async_llm import AsyncLLM
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -264,6 +265,7 @@ class OpenAIServer:
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
+        # RL-only endpoints
         self.app.add_api_route("/release_memory",
                                 self.release_memory,
                                 methods=["POST"])
@@ -309,6 +311,7 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        # RL-only endpoints
         self.app.add_api_route("/release_memory",
                                 self.release_memory,
                                 methods=["POST"])
@@ -1011,24 +1014,18 @@ class OpenAIServer:
         return JSONResponse(content={"detail": "None"})
 
     async def release_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
-            await self.llm.collective_rpc('sleep', args=(request.tags,))
-        else:
-            self.llm._collective_rpc('sleep', args=(request.tags,))
+        assert isinstance(self.llm, AsyncLLM), "/release_memory endpoint is only supported with AsyncLLM()"
+        await self.llm.collective_rpc('sleep', args=(request.tags,))
         return JSONResponse(content={"status": "success"})
 
     async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
-            await self.llm.collective_rpc('wakeup', args=(request.tags,))
-        else:
-            self.llm._collective_rpc('wakeup', args=(request.tags,))
+        assert isinstance(self.llm, AsyncLLM), "/resume_memory endpoint is only supported with AsyncLLM()"
+        await self.llm.collective_rpc('wakeup', args=(request.tags,))
         return JSONResponse(content={"status": "success"})
 
     async def update_weights(self, request: UpdateWeightsRequest) -> JSONResponse:
-        if hasattr(self.llm, 'collective_rpc') and asyncio.iscoroutinefunction(self.llm.collective_rpc):
-            await self.llm.collective_rpc('update_weights', args=(request.weights,))
-        else:
-            self.llm._collective_rpc('update_weights', args=(request.weights,))
+        assert isinstance(self.llm, AsyncLLM), "/update_weights endpoint is only supported with AsyncLLM()"
+        await self.llm.collective_rpc('update_weights', args=(request.weights,))
         return JSONResponse(content={"status": "success"})
 
     async def __call__(self, host, port, sockets: list[socket.socket] | None = None):

@@ -87,8 +87,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             # Inject the generated HMAC key into worker_kwargs for workers
             self.worker_kwargs['hmac_key'] = self.hmac_key
             self.worker_kwargs['rpc_addr'] = self.rpc_addr
-            defer_workers_init = getattr(self.worker_kwargs['llm_args'],
-                                         'ray_defer_workers_init', False)
+
+            placement_config = getattr(self.worker_kwargs['llm_args'],
+                                       'ray_placement_config', None)
+            defer_workers_init = placement_config.defer_workers_init if placement_config else False
 
             if defer_workers_init:
                 self.workers = [
@@ -108,12 +110,14 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
     def create_workers(self, worker_cls, worker_kwargs):
         llm_args = worker_kwargs.get("llm_args")
+        placement_config = getattr(llm_args, 'ray_placement_config',
+                                   None) if llm_args else None
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
         num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
-        if llm_args and llm_args.per_worker_gpu_share is not None:
-            num_gpus = llm_args.per_worker_gpu_share
+        if placement_config and placement_config.per_worker_gpu_share is not None:
+            num_gpus = placement_config.per_worker_gpu_share
 
         logger.debug(f"{num_gpus=} for each worker.")
 
@@ -347,11 +351,12 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         """
         llm_args = worker_kwargs.get("llm_args") if worker_kwargs else None
 
-        if llm_args and hasattr(
-                llm_args,
-                'placement_groups') and llm_args.placement_groups is not None:
+        placement_config = getattr(llm_args, 'ray_placement_config',
+                                   None) if llm_args else None
+        if placement_config and placement_config.placement_groups is not None:
             total_workers = sum(
-                len(indices) for indices in llm_args.placement_bundle_indices)
+                len(indices)
+                for indices in placement_config.placement_bundle_indices)
             if total_workers != self.world_size:
                 raise ValueError(
                     f"Total bundle indices ({total_workers}) must equal world_size ({self.world_size})"
@@ -363,8 +368,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
             flat_pgs = []
             flat_indices = []
-            for pg, indices in zip(llm_args.placement_groups,
-                                   llm_args.placement_bundle_indices):
+            for pg, indices in zip(placement_config.placement_groups,
+                                   placement_config.placement_bundle_indices):
                 for idx in indices:
                     flat_pgs.append(pg)
                     flat_indices.append(idx)
