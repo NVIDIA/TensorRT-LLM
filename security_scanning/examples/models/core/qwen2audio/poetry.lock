@@ -1853,13 +1853,13 @@ telegram = ["requests"]
 
 [[package]]
 name = "transformers"
-version = "4.57.2"
+version = "4.57.3"
 description = "State-of-the-art Machine Learning for JAX, PyTorch and TensorFlow"
 optional = false
 python-versions = ">=3.9.0"
 files = [
-    {file = "transformers-4.57.2-py3-none-any.whl", hash = "sha256:0918df354853c9931a637792cec519e137aceb150effd4c7924d6b8d36918fab"},
-    {file = "transformers-4.57.2.tar.gz", hash = "sha256:172a455ad5a570ecad89bea510a6c924c45fa90e46e859225fac07305d7946fc"},
+    {file = "transformers-4.57.3-py3-none-any.whl", hash = "sha256:c77d353a4851b1880191603d36acb313411d3577f6e2897814f333841f7003f4"},
+    {file = "transformers-4.57.3.tar.gz", hash = "sha256:df4945029aaddd7c09eec5cad851f30662f8bd1746721b34cc031d70c65afebc"},
 ]
 
 [package.dependencies]
@@ -1962,20 +1962,20 @@ files = [
 
 [[package]]
 name = "urllib3"
-version = "2.5.0"
+version = "2.6.1"
 description = "HTTP library with thread-safe connection pooling, file post, and more."
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "urllib3-2.5.0-py3-none-any.whl", hash = "sha256:e6b01673c0fa6a13e374b50871808eb3bf7046c4b125b216f6bf1cc604cff0dc"},
-    {file = "urllib3-2.5.0.tar.gz", hash = "sha256:3fc47733c7e419d4bc3f6b3dc2b4f890bb743906a30d56ba4a5bfa4bbff92760"},
+    {file = "urllib3-2.6.1-py3-none-any.whl", hash = "sha256:e67d06fe947c36a7ca39f4994b08d73922d40e6cca949907be05efa6fd75110b"},
+    {file = "urllib3-2.6.1.tar.gz", hash = "sha256:5379eb6e1aba4088bae84f8242960017ec8d8e3decf30480b3a1abdaa9671a3f"},
 ]
 
 [package.extras]
-brotli = ["brotli (>=1.0.9)", "brotlicffi (>=0.8.0)"]
+brotli = ["brotli (>=1.2.0)", "brotlicffi (>=1.2.0.0)"]
 h2 = ["h2 (>=4,<5)"]
 socks = ["pysocks (>=1.5.6,!=1.5.7,<2.0)"]
-zstd = ["zstandard (>=0.18.0)"]
+zstd = ["backports-zstd (>=1.0.0)"]
 
 [[package]]
 name = "xxhash"
