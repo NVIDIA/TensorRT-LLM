@@ -66,25 +66,8 @@ class MistralCheckpointLoader(HfCheckpointLoader):
                 weights[key] = 1.0 / weights[key]
 
     def load_weights(self, checkpoint_dir: str, **kwargs):
-        model_config = kwargs.pop("model_config", None)
-        assert model_config is not None, "model_config is required"
-        weights = super().weight_loader.load_weights(checkpoint_dir, mapping=None, **kwargs)
-        params_map = self.weight_mapper.mistral_llm_mapping.copy()
-        if model_config is not None:
-            if model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
-                quantization_weights_map = {
-                    "weight_packed": "weight",
-                    "input_global_scale": "input_scale",
-                    "weight_global_scale": "weight_scale_2",
-                }
-            elif model_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-                quantization_weights_map = {
-                    "weight_scale": "weight_scale_inv",
-                }
-            params_map.update(quantization_weights_map)
+        weights = super().weight_loader.load_weights(checkpoint_dir, **kwargs)
         weights = self.preprocess_weights(weights)
-        weights = self.weight_mapper.rename_by_params_map(weights=weights, params_map=params_map)
-
         # FIXME mimic DS fp8 till per tensor supported
         self.broadcast_per_tensor_scales(weights)
         self.reverse_nvfp4_global_scales(weights)
