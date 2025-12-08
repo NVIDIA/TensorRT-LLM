@@ -30,7 +30,6 @@ hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
   num_gen_servers: 4
-  gpu_type: GB200
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
