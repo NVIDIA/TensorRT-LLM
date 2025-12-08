@@ -440,7 +440,6 @@ unittest/_torch/auto_deploy/unit/singlegpu/custom_ops/test_flashinfer_attention_
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:None] SKIP (https://nvbugs/5721644)
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:float32] SKIP (https://nvbugs/5721644)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5722629)
-disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing] SKIP (https://nvbugs/5649010)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/5722653)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5722653)
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8] SKIP (https://nvbugs/5722653)

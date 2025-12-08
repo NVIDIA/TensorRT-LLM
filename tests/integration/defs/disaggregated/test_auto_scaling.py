@@ -262,6 +262,7 @@ def terminate(*args, show_log_lines=30, release_port=True):
                 print(f"Failed to tail {arg.log_path}: {e}")
                 print(f"Traceback: {traceback.format_exc()}")
             if arg.process:
+                print(f"Killing process {arg.process.pid}")
                 try:
                     arg.process.kill()
                     arg.process.wait(timeout=10)
@@ -274,6 +275,8 @@ def terminate(*args, show_log_lines=30, release_port=True):
                         USED_PORTS.discard(arg.port)
                 except Exception:
                     print(f"Failed to terminate process {arg.process.pid}")
+            else:
+                print(f"Process is None on port {arg.port}")
 
 
 def request_completion(model_name, prompt, port):
@@ -396,7 +399,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                       port=disagg_port)
         print(response)
         # kill gen1, the request should fail
-        terminate(gen_worker1, release_port=False)
+        terminate(gen_worker1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 1, 0, port=disagg_port)
         with pytest.raises(Exception):
@@ -422,7 +425,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         assert len(response.choices[0].text) >= 1
 
         # kill ctx1, the request should fail
-        terminate(ctx_worker1, release_port=False)
+        terminate(ctx_worker1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 0, 1, port=disagg_port)
         with pytest.raises(Exception):
@@ -441,15 +444,11 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         response_text = response.choices[0].text
         assert len(response.choices[0].text) >= 1
 
-        # restart ctx1 and gen1 with the same ports, we have 2 ctxs and 2 gens now
-        ctx_worker1 = run_ctx_worker(model_name,
-                                     worker_config,
-                                     work_dir,
-                                     port=ctx_worker1.port)
-        gen_worker1 = run_gen_worker(model_name,
-                                     worker_config,
-                                     work_dir,
-                                     port=gen_worker1.port)
+        # start ctx1 and gen1 again, we have 2 ctxs and 2 gens now
+        # Note: Do NOT start them with the same ports as the previous ones, the ports may be not released immediately after terminate,
+        # causing a port conflict and test timeout.
+        ctx_worker1 = run_ctx_worker(model_name, worker_config, work_dir)
+        gen_worker1 = run_gen_worker(model_name, worker_config, work_dir)
         await wait_for_worker_ready(ctx_worker1.port)
         await wait_for_worker_ready(gen_worker1.port)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
