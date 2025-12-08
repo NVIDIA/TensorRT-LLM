@@ -20,8 +20,11 @@ from typing import Dict, Optional
 
 import pytest
 import yaml
+from defs.common import get_disagg_server_url_from_cfg
 from defs.conftest import skip_arm, skip_no_hopper
 from defs.trt_test_alternative import check_call
+
+from tensorrt_llm._utils import get_free_port
 
 
 # Utility functions for disaggregated tests
@@ -32,22 +35,6 @@ def cleanup_output_files():
             os.remove(file)
         except FileNotFoundError:
             pass
-
-
-def get_disagg_server_url_from_cfg(config_file: str) -> str:
-    """Extract server URL from configuration file.
-
-    Args:
-        config_file: Path to the YAML configuration file.
-
-    Returns:
-        Server URL in format "http://hostname:port"
-    """
-    with open(config_file, "r") as file:
-        config = yaml.safe_load(file)
-    server_host = config.get("hostname", "localhost")
-    server_port = config.get("port", 8000)
-    return f"http://{server_host}:{server_port}"
 
 
 def validate_timing_metrics(perf_metrics_item, request_context=""):
@@ -134,17 +121,20 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
         f"gen server_arrival_time > server_first_token_time in {request_context}"
     )
 
+    # Network Time Protocol can ensure ms-level accuracy in LAN
+    ntp_tolerance = 1e-3
+
     # Validate timing relationships between different levels
     # Disaggregated server should receive request before individual servers
-    assert disagg_arrival <= ctx_server_arrival, (
+    assert disagg_arrival - ntp_tolerance <= ctx_server_arrival, (
         f"disagg_arrival > ctx_server_arrival in {request_context}"
     )
-    assert disagg_arrival <= gen_server_arrival, (
+    assert disagg_arrival - ntp_tolerance <= gen_server_arrival, (
         f"disagg_arrival > gen_server_arrival in {request_context}"
     )
 
     # Context should complete before generation starts
-    assert ctx_server_first_token <= gen_server_arrival, (
+    assert ctx_server_first_token - ntp_tolerance <= gen_server_arrival, (
         f"ctx_server_first_token > gen_server_arrival in {request_context}"
     )
 
@@ -443,6 +433,8 @@ class DisaggregatedTestConfig:
         """Generate a yaml config file from the parameters."""
         config = self.global_config.copy()
         config["model"] = self.model_root
+        config["hostname"] = "localhost"
+        config["port"] = get_free_port()
 
         # Add default cache_transceiver_config if not present
         if "cache_transceiver_config" not in config:
@@ -461,9 +453,8 @@ class DisaggregatedTestConfig:
         context_servers["num_instances"] = ctx_num_instances
 
         ctx_urls = []
-        base_port = 8001
         for i in range(ctx_num_instances):
-            ctx_urls.append(f"localhost:{base_port + i}")
+            ctx_urls.append(f"localhost:{get_free_port()}")
         context_servers["urls"] = ctx_urls
         config["context_servers"] = context_servers
 
@@ -474,9 +465,8 @@ class DisaggregatedTestConfig:
         gen_servers["num_instances"] = gen_num_instances
 
         gen_urls = []
-        base_port = 8001 + ctx_num_instances
         for i in range(gen_num_instances):
-            gen_urls.append(f"localhost:{base_port + i}")
+            gen_urls.append(f"localhost:{get_free_port()}")
         gen_servers["urls"] = gen_urls
 
         # Special handling for gen-only mode
@@ -1126,6 +1116,7 @@ def pytest_generate_tests(metafunc):
 # TODO: add test for disaggregated server prometheus metrics
 def fetch_prometheus_metrics(server_url: str):
     import requests
+
     response = requests.get(f"{server_url}/prometheus/metrics", timeout=10)
     assert response.status_code == 200
     return response.text
@@ -1251,7 +1242,8 @@ def run_disaggregated_test_parametrized(
             "-c",
             config_path,
         ]
-        server_url = get_disagg_server_url_from_cfg(config_path)
+        server_host, server_port = get_disagg_server_url_from_cfg(config_path)
+        server_url = f"http://{server_host}:{server_port}"
 
         try:
             if not use_ray:

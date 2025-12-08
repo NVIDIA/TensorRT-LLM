@@ -1153,6 +1153,14 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
+def get_disagg_server_url_from_cfg(config_file: str) -> tuple[str, int]:
+    with open(config_file, 'r') as file:
+        config = yaml.safe_load(file)
+    server_host = config.get('hostname', 'localhost')
+    server_port = config.get('port', 8000)
+    return server_host, server_port
+
+
 def revise_disaggregated_server_config_urls_with_free_ports(
         disaggregated_server_config: dict[str, Any]) -> dict[str, Any]:
     # Revise serve port

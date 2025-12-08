@@ -20,11 +20,12 @@ import tempfile
 
 import pytest
 import yaml
-from defs.common import wait_for_server
+from defs.common import get_disagg_server_url_from_cfg, wait_for_server
 from defs.conftest import get_sm_version, llm_models_root
 from defs.disaggregated.test_disaggregated_parametrized import cleanup_output_files
 from defs.trt_test_alternative import check_call, check_output, popen
 
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
 
 
@@ -96,6 +97,7 @@ def run_disaggregated_benchmark(
         "-c",
         config_file,
     ]
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
     try:
         with (  # Start workers
             open("output_workers.log", "w") as output_workers,
@@ -147,9 +149,9 @@ def run_disaggregated_benchmark(
                 "--max-concurrency",
                 str(max_concurrency),
                 "--host",
-                "localhost",
+                server_host,
                 "--port",
-                "8000",
+                str(server_port),
                 "--ignore-eos",
                 "--no-test-input",
                 "--percentile-metrics",
@@ -192,7 +194,7 @@ def get_config_for_benchmark(model_root, backend):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": 8000,
+        "port": get_free_port(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -229,7 +231,7 @@ def get_config_for_llama4_kv_cache_overflow(model_root):
     serve_config = {
         "model": model_root,
         "hostname": "localhost",
-        "port": 8000,
+        "port": get_free_port(),
         "backend": "pytorch",
         "context_servers": {
             "num_instances": 1,
@@ -307,6 +309,8 @@ def run_disaggregated_genai_perf(
         config_file,
     ]
 
+    server_host, server_port = get_disagg_server_url_from_cfg(config_file)
+
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
 
     try:
@@ -321,7 +325,7 @@ def run_disaggregated_genai_perf(
             ) as server_proc,
         ):
             # Wait for server to be ready
-            if not wait_for_server("localhost", 8000, timeout_seconds=server_start_timeout):
+            if not wait_for_server(server_host, server_port, timeout_seconds=server_start_timeout):
                 raise RuntimeError(
                     f"Disaggregated server did not become ready within {server_start_timeout} seconds"
                 )
@@ -340,7 +344,7 @@ def run_disaggregated_genai_perf(
                 "/v1/chat/completions",
                 "--streaming",
                 "--url",
-                "localhost:8000",
+                f"{server_host}:{server_port}",
                 "--synthetic-input-tokens-mean",
                 str(input_tokens),
                 "--synthetic-input-tokens-stddev",
@@ -471,7 +475,7 @@ def get_config_for_empty_batch_test(model_root):
     """Generate config for benchmark test."""
     serve_config = {
         "hostname": "localhost",
-        "port": 8000,
+        "port": get_free_port(),
         "model": model_root,
         "backend": "pytorch",
         "context_servers": {
