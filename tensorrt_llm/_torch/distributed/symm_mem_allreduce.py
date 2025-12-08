@@ -101,7 +101,8 @@ class SymmetricMemoryAllReduce(nn.Module):
         self.max_size = self._MAX_SIZES[self.device_capability][self.world_size]
 
         # Set up process group
-        if group is None:
+        self.group = group
+        if self.group is None:
             # Get or create TP group with correct ranks
             # For TP parallelism, we need ranks [0, 1, 2, ..., tp_size-1] globally
             # NOT starting from tp_rank!
@@ -109,17 +110,9 @@ class SymmetricMemoryAllReduce(nn.Module):
                 logger.warning("SymmetricMemoryAllReduce: torch.distributed not initialized")
                 self.disabled = True
                 return
-
             # Get actual TP group ranks from mapping (tp_group is a property, not a method)
             tp_group_ranks = mapping.tp_group
             self.group = dist.new_group(tp_group_ranks) if len(tp_group_ranks) > 1 else None
-        else:
-            self.group = group
-
-        if self.group is None:
-            logger.warning("SymmetricMemoryAllReduce: No valid process group")
-            self.disabled = True
-            return
 
         # Enable symmetric memory for this group
         try:
@@ -140,9 +133,6 @@ class SymmetricMemoryAllReduce(nn.Module):
             logger.warning(
                 f"SymmetricMemoryAllReduce: Failed to enable symmetric memory for group: {e}"
             )
-            import traceback
-
-            logger.debug(traceback.format_exc())
             self.disabled = True
             return
 
@@ -194,7 +184,7 @@ class SymmetricMemoryAllReduce(nn.Module):
         """Expose the ProcessGroup for use in fallback scenarios."""
         return self.group if not self.disabled else None
 
-    def should_use_symm_mem(self, inp: torch.Tensor) -> bool:
+    def can_use_symm_mem(self, inp: torch.Tensor) -> bool:
         """Check if symmetric memory can be used for this tensor."""
         if self.disabled:
             return False
@@ -222,7 +212,7 @@ class SymmetricMemoryAllReduce(nn.Module):
         Returns:
             Reduced tensor
         """
-        if not self.should_use_symm_mem(inp):
+        if not self.can_use_symm_mem(inp):
             return None  # Caller should fall back to other strategy
 
         if out is None:
