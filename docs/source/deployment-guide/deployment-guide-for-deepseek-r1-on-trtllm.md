@@ -439,13 +439,13 @@ The following tables list recommended configurations from the comprehensive data
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 
-.. include:: comprehensive_table.rst
+.. include:: config_table.rst
    :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
    :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
 ```
 
 ```{eval-rst}
-.. include:: comprehensive_table.rst
+.. include:: config_table.rst
    :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
    :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
 ```

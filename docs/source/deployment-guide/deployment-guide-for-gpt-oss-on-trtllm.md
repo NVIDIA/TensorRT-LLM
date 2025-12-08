@@ -387,7 +387,7 @@ The following table lists recommended configurations from the comprehensive data
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 
-.. include:: comprehensive_table.rst
+.. include:: config_table.rst
    :start-after: .. start-openai/gpt-oss-120b
    :end-before: .. end-openai/gpt-oss-120b
 ```

@@ -28,7 +28,7 @@ from generate_config_table import generate_rst  # noqa: E402
 
 class TestConfigTableSync(unittest.TestCase):
     def test_config_table_sync(self):
-        """Test that the comprehensive_table.rst file is synchronized with the scenario_list.yaml database.
+        """Test that the config_table.rst file is synchronized with the lookup.yaml database.
 
         Ensures that the RST file is up-to-date with the YAML database.
         """
@@ -36,8 +36,8 @@ class TestConfigTableSync(unittest.TestCase):
             self.skipTest("generate_config_table not available")
 
         # Define paths
-        yaml_path = os.path.join(REPO_ROOT, "tensorrt_llm/configure/database/scenario_list.yaml")
-        rst_path = os.path.join(REPO_ROOT, "docs/source/deployment-guide/comprehensive_table.rst")
+        yaml_path = os.path.join(REPO_ROOT, "examples/configs/database/lookup.yaml")
+        rst_path = os.path.join(REPO_ROOT, "docs/source/deployment-guide/config_table.rst")
 
         # Ensure files exist
         self.assertTrue(os.path.exists(yaml_path), f"YAML file not found: {yaml_path}")
@@ -57,7 +57,7 @@ class TestConfigTableSync(unittest.TestCase):
         self.assertEqual(
             existing_content.strip(),
             generated_content.strip(),
-            "comprehensive_table.rst is not synchronized with scenario_list.yaml. "
+            "config_table.rst is not synchronized with lookup.yaml. "
             "Please run 'python3 scripts/generate_config_table.py' from the repo root to update it.",
         )
 

@@ -25,7 +25,7 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 # Load database module directly to avoid tensorrt_llm.__init__ (requires torch)
 _spec = importlib.util.spec_from_file_location(
-    "database", REPO_ROOT / "tensorrt_llm" / "configure" / "database.py"
+    "database", REPO_ROOT / "examples" / "configs" / "database" / "database.py"
 )
 _db = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_db)
@@ -51,7 +51,7 @@ def generate_rst(yaml_path, output_file=None):
     """Generate RST table from YAML config database.
 
     Args:
-        yaml_path: Path to scenario_list.yaml (str or Path)
+        yaml_path: Path to lookup.yaml (str or Path)
         output_file: Optional output file path. If None, prints to stdout.
     """
     recipe_list = RecipeList.from_yaml(Path(yaml_path))
@@ -108,12 +108,10 @@ def generate_rst(yaml_path, output_file=None):
         for key in sorted_keys:
             entries = subgroups[key]
             entries.sort(key=lambda x: x.concurrency)
+            n = len(entries)
+            mid = n // 2
 
-            min_conc = entries[0].concurrency
-            max_conc = entries[-1].concurrency
-            conc_range = max_conc - min_conc
-
-            for entry in entries:
+            for idx, entry in enumerate(entries):
                 gpu = entry.gpu
                 num_gpus = entry.num_gpus
                 gpu_display = f"{num_gpus}x{gpu}" if num_gpus and num_gpus > 1 else gpu
@@ -122,26 +120,25 @@ def generate_rst(yaml_path, output_file=None):
                 conc = entry.concurrency
                 config_path = entry.config_path
 
-                if len(entries) == 1:
+                if n == 1:
                     if conc <= 16:
                         profile = "Low Latency"
                     elif conc >= 64:
                         profile = "High Throughput"
                     else:
                         profile = "Balanced"
+                elif idx == 0:
+                    profile = "Min Latency"
+                elif idx == n - 1:
+                    profile = "Max Throughput"
+                elif n % 2 == 1 and idx == mid:
+                    profile = "Balanced"
+                elif idx < mid:
+                    profile = "Low Latency"
                 else:
-                    if conc == min_conc:
-                        profile = "Min Latency"
-                    elif conc == max_conc:
-                        profile = "Max Throughput"
-                    else:
-                        relative_pos = (conc - min_conc) / conc_range
-                        if relative_pos < 0.5:
-                            profile = "Low Latency"
-                        else:
-                            profile = "High Throughput"
+                    profile = "High Throughput"
 
-                full_config_path = os.path.join("tensorrt_llm/configure", config_path)
+                full_config_path = config_path
                 command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)
@@ -174,5 +171,5 @@ if __name__ == "__main__":
     if not yaml_path.exists():
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)
-    output_path = REPO_ROOT / "docs/source/deployment-guide/comprehensive_table.rst"
+    output_path = REPO_ROOT / "docs/source/deployment-guide/config_table.rst"
     generate_rst(yaml_path, output_file=output_path)

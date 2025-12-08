@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterator, List
 import yaml
 from pydantic import BaseModel, Field, RootModel
 
-DATABASE_LIST_PATH = Path(__file__).parent / "database" / "scenario_list.yaml"
+DATABASE_LIST_PATH = Path(__file__).parent / "lookup.yaml"
 
 
 class RecipeConstraints(BaseModel):
