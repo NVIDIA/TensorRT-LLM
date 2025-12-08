@@ -135,9 +135,9 @@ def deepseek_v3_moe(self, hidden_states):
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        weights_1=[expert.gate_proj.weight for expert in self.experts],
+        weights_2=[expert.down_proj.weight for expert in self.experts],
+        weights_3=[expert.up_proj.weight for expert in self.experts],
     )
 
     if self.config.n_shared_experts is not None:

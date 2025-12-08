@@ -23,6 +23,7 @@ try:
     from triton_kernels.tensor_details import layout
     from triton_kernels.tensor_details.layout import StridedLayout
 
+    from tensorrt_llm._torch.auto_deploy.enums import ActivationFunction
     from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
 
 except Exception as _e:
@@ -122,7 +123,9 @@ def _run_mxfp4_mlp_core(
     )
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (float(alpha), float(limit)), 2
+        FnSpecs(ActivationFunction.SWIGLU, swiglu_fn, ("alpha", "limit")),
+        (float(alpha), float(limit)),
+        2,
     )
 
     # gate_up (with SWiGLU fused)

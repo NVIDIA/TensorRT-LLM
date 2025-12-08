@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from ...enums import ActivationFunction, MLPStyle
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -89,8 +90,8 @@ def _quantize_moe_node(
 
     # Extract mlp_style and act_fn from the original node
     # These can be in args[6:] or in kwargs
-    mlp_style = "gated_mlp"  # default
-    act_fn = "silu"  # default
+    mlp_style = MLPStyle.GATED_MLP  # default
+    act_fn = ActivationFunction.SILU  # default
 
     if len(node.args) > 6:
         mlp_style = node.args[6]

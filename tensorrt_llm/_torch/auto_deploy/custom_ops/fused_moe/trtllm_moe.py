@@ -61,7 +61,7 @@ def trtllm_moe_fused(
         else:
             raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for mlp.")
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'.")
+        raise ValueError(f"Unknown mlp_style '{mlp_style_enum.value}'.")
 
     return torch.ops.trtllm.fused_moe(
         x,
@@ -153,8 +153,8 @@ def trtllm_quant_fp8_moe_fused(
         gemm1_dequant: Precomputed gemm1 dequant scale [E]
         gemm2_act_quant: Precomputed gemm2 act quant scale [1]
         gemm2_dequant: Precomputed gemm2 dequant scale [E]
-        mlp_style: "gated_mlp" or "mlp"
-        act_fn: "silu" for gated_mlp, "relu2" for mlp
+        mlp_style: MLPStyle.GATED_MLP or MLPStyle.MLP
+        act_fn: ActivationFunction.SILU for gated_mlp, ActivationFunction.RELU2 for mlp
 
     Non-Gated MLP:
         activation_fn(expert_inputs @ w1_expert.t())@ w2_expert.t()
@@ -162,11 +162,9 @@ def trtllm_quant_fp8_moe_fused(
     Gated MLP:
         activation_fn(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t()) @ w2_expert.t()
     """
-    # Convert string parameters to enums
+    # Convert string parameters to enums and validate
     mlp_style_enum = mlp_style_from_str(mlp_style)
     act_fn_enum = act_fn_from_str(act_fn)
-
-    # Validate supported combinations
     _validate_mlp_style_and_act_fn(mlp_style_enum, act_fn_enum)
 
     # Store original shape and flatten to 2D
@@ -214,7 +212,7 @@ def trtllm_quant_fp8_moe_fused(
         else:
             raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for mlp.")
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'.")
+        raise ValueError(f"Unknown mlp_style '{mlp_style_enum.value}'.")
 
     # Note! Outputting Float8_e4m3fn directly is not currently supported
     output = torch.ops.trtllm.fused_moe(
@@ -254,7 +252,9 @@ def trtllm_quant_fp8_moe_fused_fake(
     mlp_style: str,
     act_fn: str,
 ) -> torch.Tensor:
-    _validate_mlp_style_and_act_fn(mlp_style, act_fn)
+    mlp_style_enum = mlp_style_from_str(mlp_style)
+    act_fn_enum = act_fn_from_str(act_fn)
+    _validate_mlp_style_and_act_fn(mlp_style_enum, act_fn_enum)
     return torch.empty_like(x)
 
 
@@ -305,7 +305,7 @@ def trtllm_quant_nvfp4_moe_fused(
         else:
             raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for mlp.")
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'.")
+        raise ValueError(f"Unknown mlp_style '{mlp_style_enum.value}'.")
 
     # quant_scales is described by this code:
     # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015

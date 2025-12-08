@@ -644,6 +644,8 @@ def triton_fused_moe(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
+    mlp_style: str = "mlp",
+    act_fn: str = "relu2",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -669,8 +671,8 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # unused
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    mlp_style: str = "mlp",
+    act_fn: str = "relu2",
 ) -> torch.Tensor:
     """Triton FP8 W8A8 MoE with 2-layer MLP and ReLU^2 activation."""
     # Convert string parameters to enums
@@ -775,7 +777,7 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    mlp_style: str = "mlp",
+    act_fn: str = "relu2",
 ) -> torch.Tensor:
     return torch.empty_like(x)

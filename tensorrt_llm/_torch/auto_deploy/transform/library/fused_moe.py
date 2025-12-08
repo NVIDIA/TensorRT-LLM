@@ -59,10 +59,9 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
         )
         if is_stacked_moe:
             # Stacked MoE: supports both GATEUP_DOWN [w1,w3] and UPGATE_DOWN [w3,w1] formats
-            (act_fn_val, weights_fusion_val) = extract_op_args(node, "act_fn", "weights_fusion")
-            weights_fusion_enum = weights_fusion_from_str(weights_fusion_val)
+            act_fn_val = extract_op_args(node, "act_fn")[0]
             _process_llama4_stacked_moe_node(
-                gm, graph, node, replacement_op, act_fn_val, fused_key_counter, weights_fusion_enum
+                gm, graph, node, replacement_op, act_fn_val, fused_key_counter
             )
         else:
             # Standard MoE with per-expert weight lists
@@ -205,36 +204,14 @@ def _process_llama4_stacked_moe_node(
         "weights_2",
     )
 
-    # Handle case where lists are represented as Node objects in FX graphs
-    def unwrap_list(lst):
-        if isinstance(lst, Node):
-            if lst.target is list:
-                # Extract from list() call node
-                if lst.args:
-                    result = lst.args[0]
-                    # If it's a tuple, convert to list
-                    if isinstance(result, tuple):
-                        return list(result)
-                    return result
-            # If it's already a tuple/list stored in the node, return it
-            elif isinstance(lst.args, (list, tuple)) and len(lst.args) > 0:
-                return list(lst.args)
-        # If already a list or tuple, ensure it's a list
-        if isinstance(lst, tuple):
-            return list(lst)
-        return lst if lst else []
-
-    w1_list = unwrap_list(w1_list)
-    w2_list = unwrap_list(w2_list)
-
     # Extract the single stacked tensor from each list
     # Handle both FX graph Nodes (list() calls) and direct Python lists
     def extract_from_list_arg(list_arg):
         if isinstance(list_arg, Node) and list_arg.target is list:
-            # Extract from list() call node
+            # Extract from list() call node: list([tensor])
             return list_arg.args[0][0] if list_arg.args else None
         elif isinstance(list_arg, (list, tuple)):
-            # Direct Python list
+            # Direct Python list/tuple: [tensor]
             return list_arg[0]
         else:
             raise ValueError(f"Unexpected list format: {type(list_arg)}")

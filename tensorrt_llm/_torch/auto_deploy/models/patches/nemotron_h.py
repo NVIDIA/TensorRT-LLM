@@ -146,9 +146,9 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
         x_flat,
         topk_indices,
         topk_weights,
-        w1_weight=[e.up_proj.weight for e in self.experts],
-        w2_weight=[e.down_proj.weight for e in self.experts],
-        w3_weight=[],
+        weights_1=[e.up_proj.weight for e in self.experts],
+        weights_2=[e.down_proj.weight for e in self.experts],
+        weights_3=[],
         act_fn=ActivationFunction.RELU2.value,
         mlp_style=MLPStyle.MLP.value,
     )

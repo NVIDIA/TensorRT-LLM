@@ -4,6 +4,7 @@ from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.load_moe_align import moe_align_block_size
+from tensorrt_llm._torch.auto_deploy.enums import ActivationFunction, MLPStyle
 
 
 def _pack_routed_tokens_reference(
@@ -138,11 +139,11 @@ def test_triton_moe_matches_torch_moe_mlp_relu2(early_exit):
         x,
         selected_experts,
         routing_weights,
-        w1_weight=w_up_list,
-        w2_weight=w_down_list,
-        w3_weight=[],
-        mlp_style="mlp",
-        act_fn="relu2",
+        weights_1=w_up_list,
+        weights_2=w_down_list,
+        weights_3=[],
+        mlp_style=MLPStyle.MLP.value,
+        act_fn=ActivationFunction.RELU2.value,
     )
     torch.testing.assert_close(out_triton, out_torch, rtol=5e-2, atol=5e-2)
 
@@ -364,8 +365,8 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         w1_weight_scale,
         w2_weight_scale,
         w3_weight_scale_tensor,
-        mlp_style="mlp",
-        act_fn="relu2",
+        mlp_style=MLPStyle.MLP,
+        act_fn=ActivationFunction.RELU2,
     )
 
     # Reference: Torch quantized FP8 MoE (uses lists of tensors and scales)
@@ -382,8 +383,8 @@ def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe(early_exit):
         w1_weight_scale=w1_weight_scale_list,
         w2_weight_scale=w2_weight_scale_list,
         w3_weight_scale=w3_weight_scale_list,
-        mlp_style="mlp",
-        act_fn="relu2",
+        mlp_style=MLPStyle.MLP.value,
+        act_fn=ActivationFunction.RELU2.value,
     )
 
     torch.testing.assert_close(out_triton, out_torch, rtol=1e-2, atol=1e-2)

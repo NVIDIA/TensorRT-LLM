@@ -37,9 +37,9 @@ def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        weights_1=[expert.gate_proj.weight for expert in self.experts],
+        weights_2=[expert.down_proj.weight for expert in self.experts],
+        weights_3=[expert.up_proj.weight for expert in self.experts],
     )
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits

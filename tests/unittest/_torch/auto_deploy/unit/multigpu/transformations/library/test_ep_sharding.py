@@ -9,6 +9,7 @@ from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_tr
 from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy.enums import MLPStyle
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -183,7 +184,7 @@ def test_llama4_stacked_moe_pattern_detection():
         moe_node = graph.call_function(
             torch.ops.auto_deploy.torch_moe,
             args=(x, selected_experts, routing_weights, w1_list, w2_list, w3_list),
-            kwargs={"mlp_style": "gated_mlp", "apply_routing_on_input": True},
+            kwargs={"mlp_style": MLPStyle.GATED_MLP, "apply_routing_on_input": True},
         )
         graph.output(moe_node)
 

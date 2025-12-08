@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 from typing import Callable, List
 
 import torch
@@ -99,10 +115,10 @@ def torch_moe(
     weights_1: List[torch.Tensor],
     weights_2: List[torch.Tensor],
     weights_3: List[torch.Tensor],
-    weights_format: str = WeightsFormat.PER_EXPERT.value,
-    weights_fusion: str = WeightsFusion.GATE_UP_DOWN.value,
-    mlp_style: str = MLPStyle.GATED_MLP.value,
-    act_fn: str = ActivationFunction.SILU.value,
+    weights_format: str = "per_expert",
+    weights_fusion: str = "w1_w2_w3_separate",
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     """
@@ -187,8 +203,8 @@ def torch_moe(
         weights_3: Third weight tensor(s) - see WEIGHT INTERPRETATION
         weights_format: "per_expert" (default) or "stacked"
         weights_fusion: "w1_w2_w3_separate" (default), "w3w1_w2", or "w1w3_w2" (only for gated_mlp)
-        mlp_style: "gated_mlp" (default) or "mlp"
-        act_fn: "silu" (default) or "relu2"
+        mlp_style: MLPStyle.GATED_MLP (default) or MLPStyle.MLP
+        act_fn: ActivationFunction.SILU (default) or ActivationFunction.RELU2
         apply_routing_on_input:
             - False (default): routing applied to output
             - True (Llama4): routing applied to input
@@ -296,6 +312,13 @@ def torch_moe(
 
                 mlps = [make_mlp(i) for i in range(num_experts)]
 
+            else:
+                raise ValueError(
+                    f"Unsupported weights_fusion '{weights_fusion}' for stacked+gated_mlp. "
+                    f"Supported: 'w3w1_w2' (UPGATE_DOWN), 'w1_w2_w3_separate' (GATE_UP_DOWN). "
+                    f"Note: 'w1w3_w2' (GATEUP_DOWN) is not supported."
+                )
+
         elif mlp_style_enum == MLPStyle.MLP:
             # STACKED + MLP: weights_1=[w_up E,I,H], weights_2=[w_down E,H,I], weights_3=[]
             # (fusion doesn't apply to mlp style)
@@ -384,6 +407,13 @@ def torch_moe(
 
                 mlps = [make_mlp(i) for i in range(num_experts)]
 
+            else:
+                raise ValueError(
+                    f"Unsupported weights_fusion '{weights_fusion}' for per_expert+gated_mlp. "
+                    f"Supported: 'w3w1_w2' (UPGATE_DOWN), 'w1_w2_w3_separate' (GATE_UP_DOWN). "
+                    f"Note: 'w1w3_w2' (GATEUP_DOWN) is not supported."
+                )
+
         elif mlp_style_enum == MLPStyle.MLP:
             # PER_EXPERT + MLP: weights_1=[w_up], weights_2=[w_down], weights_3=[]
             if len(weights_3) > 0:
@@ -413,10 +443,10 @@ def torch_moe_fake(
     weights_1: List[torch.Tensor],
     weights_2: List[torch.Tensor],
     weights_3: List[torch.Tensor],
-    weights_format: str = WeightsFormat.PER_EXPERT.value,
-    weights_fusion: str = WeightsFusion.GATE_UP_DOWN.value,
-    mlp_style: str = MLPStyle.GATED_MLP.value,
-    act_fn: str = ActivationFunction.SILU.value,
+    weights_format: str = "per_expert",
+    weights_fusion: str = "w1_w2_w3_separate",
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(x)
@@ -503,9 +533,9 @@ def torch_quant_fp8_moe(
     w1_weight_scale: List[torch.Tensor],
     w2_weight_scale: List[torch.Tensor],
     w3_weight_scale: List[torch.Tensor],
-    weights_fusion: str = WeightsFusion.GATE_UP_DOWN.value,
-    mlp_style: str = MLPStyle.GATED_MLP.value,
-    act_fn: str = ActivationFunction.SILU.value,
+    weights_fusion: str = "w1_w2_w3_separate",
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations.
@@ -539,7 +569,7 @@ def torch_quant_fp8_moe(
                     y = down( act(up x) )
         act_fn:
             Elementwise activation applied inside the expert MLP.
-            Supported: "silu" (default), "relu2" (ReLU then square).
+            Supported: ActivationFunction.SILU (default), ActivationFunction.RELU2 (ReLU then square).
     """
     # Convert string parameters to enums
     mlp_style_enum = mlp_style_from_str(mlp_style)
@@ -620,9 +650,9 @@ def torch_quant_fp8_moe_fake(
     w1_weight_scale: List[torch.Tensor],
     w2_weight_scale: List[torch.Tensor],
     w3_weight_scale: List[torch.Tensor],
-    weights_fusion: str = WeightsFusion.GATE_UP_DOWN.value,
-    mlp_style: str = MLPStyle.GATED_MLP.value,
-    act_fn: str = ActivationFunction.SILU.value,
+    weights_fusion: str = "w1_w2_w3_separate",
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -644,9 +674,9 @@ def torch_quant_nvfp4_moe(
     w1_alpha: List[torch.Tensor],
     w2_alpha: List[torch.Tensor],
     w3_alpha: List[torch.Tensor],
-    weights_fusion: str = WeightsFusion.GATE_UP_DOWN.value,
-    mlp_style: str = MLPStyle.GATED_MLP.value,
-    act_fn: str = ActivationFunction.SILU.value,
+    weights_fusion: str = "w1_w2_w3_separate",
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -682,7 +712,7 @@ def torch_quant_nvfp4_moe(
                     y = w2( act(w1 x) )
         act_fn:
             Elementwise activation applied inside the expert MLP.
-            Supported: "silu" (default), "relu2" (ReLU then square).
+            Supported: ActivationFunction.SILU (default), ActivationFunction.RELU2 (ReLU then square).
     """
     # Convert string parameters to enums
     mlp_style_enum = mlp_style_from_str(mlp_style)
@@ -775,9 +805,9 @@ def torch_quant_nvfp4_moe_fake(
     w1_alpha: List[torch.Tensor],
     w2_alpha: List[torch.Tensor],
     w3_alpha: List[torch.Tensor],
-    weights_fusion: str = WeightsFusion.GATE_UP_DOWN.value,
-    mlp_style: str = MLPStyle.GATED_MLP.value,
-    act_fn: str = ActivationFunction.SILU.value,
+    weights_fusion: str = "w1_w2_w3_separate",
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
