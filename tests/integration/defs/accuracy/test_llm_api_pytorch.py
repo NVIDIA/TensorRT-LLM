@@ -4594,7 +4594,7 @@ class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
 
 
 @skip_pre_blackwell
-class TestLlama3_1_8B_Instruct_LongBenchV2(LlmapiAccuracyTestHarness):
+class TestLlama3_1_8B_Instruct_RocketKV(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
 
