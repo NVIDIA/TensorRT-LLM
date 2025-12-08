@@ -258,8 +258,10 @@ def test_generate_async_with_return_logits(
 
 @pytest.mark.parametrize("logprobs_k", [0, 1, 3],
                          ids=["top_0", "top_1", "top_3"])
+@pytest.mark.parametrize("logprobs_mode", ["raw", "processed"])
 @pytest.mark.threadleak(enabled=False)
-def test_sampled_token_always_in_logprobs(logprobs_k: int, simple_llm: LLM):
+def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str,
+                                          simple_llm: LLM):
     """Two scenarios:
         - logprobs=0: Returns only sampled token (1 element)
         - logprobs=K (K>0): Returns top-K tokens + sampled token if not in top-K (up to K+1 elements)
@@ -270,6 +272,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, simple_llm: LLM):
         temperature=0.7,
         top_p=0.9,
         logprobs=logprobs_k,
+        logprobs_mode=logprobs_mode,
     )
 
     for output in simple_llm.generate(["The future of AI is"],
@@ -474,6 +477,8 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
         num_logits = len(generation_logits)
 
         for token_idx, token_logprobs_dict in enumerate(logprobs[:num_logits]):
+            assert token_ids[
+                token_idx] in token_logprobs_dict, "Sampled token not in logprobs"
 
             logits_for_token = generation_logits[token_idx:token_idx + 1]
             topk = sampling_params_list[req_idx].top_k

@@ -2773,11 +2773,11 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         sampled_rank_cuda = group_logprobs_cuda.sum(dim=-1).to(torch.int32)
 
         # Use a single D2H copy to reduce overheads
-        topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=False)
-        topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=False)
-        sampled_vals = torch.empty_like(sampled_vals_cuda, device="cpu", pin_memory=False)
-        sampled_indices = torch.empty_like(sampled_indices_cuda, device="cpu", pin_memory=False)
-        sampled_rank = torch.empty_like(sampled_rank_cuda, device="cpu", pin_memory=False)
+        topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
+        topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
+        sampled_vals = torch.empty_like(sampled_vals_cuda, device="cpu", pin_memory=True)
+        sampled_indices = torch.empty_like(sampled_indices_cuda, device="cpu", pin_memory=True)
+        sampled_rank = torch.empty_like(sampled_rank_cuda, device="cpu", pin_memory=True)
 
         topk_vals.copy_(topk_vals_cuda, non_blocking=True)
         topk_indices.copy_(topk_indices_cuda, non_blocking=True)
