@@ -37,6 +37,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -141,6 +142,44 @@ class DeepseekV3WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict):
+
+        def requantize_weight_with_new_scale(weight, weight_scale, old_scale_2,
+                                             new_scale_2, device):
+            """
+            Dequantize FP4 weights and requantize with a new scale.
+
+            Args:
+                weight: FP4 quantized weight tensor 2D [,]
+                weight_scale: FP8 per-block scaling factors
+                old_scale_2: original global scale (amax/(448*6))
+                new_scale_2: new global scale (amax/(448*6))
+                device: target device for computation
+
+            Returns:
+                (requantized_weight, new_weight_scale)
+            """
+            # Remember original dtype of weight_scale
+            original_scale_dtype = weight_scale.dtype
+            original_scale_shape = weight_scale.shape
+
+            # Dequantize
+            dequant_shape = (weight.shape[0], weight.shape[1] * 2)
+            weight_dequant = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+                weight.contiguous(),
+                weight_scale.flatten().view(
+                    fp4_utils.float4_sf_dtype).contiguous(), old_scale_2, 16, 1,
+                True).to(dtype=torch.bfloat16).reshape(dequant_shape)
+
+            # Requantize using the new_scale_2
+            weight_requant, weight_scale_requant = torch.ops.trtllm.fp4_quantize(
+                weight_dequant.to(device),
+                1.0 / new_scale_2.to(device),
+                16,  # scaling_vector_size
+                False)
+
+            # Ensure the returned scale has the same dtype as the input scale
+            return weight_requant.cpu(), weight_scale_requant.reshape(
+                original_scale_shape).view(original_scale_dtype).cpu()
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
@@ -353,27 +392,122 @@ class DeepseekV3WeightLoader:
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
                 elif names[-1] == "kv_a_proj_with_mqa":
-                    fused_a = weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
+                    nvfp4_fused_a = self.model_config.get_quant_config(
+                    ).layer_quant_mode.has_nvfp4() and weights[
+                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2
                     if not is_lite:
-                        q_a_proj = weights[
-                            f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
-                        fused_a = torch.cat([q_a_proj, fused_a], dim=0)
+                        nvfp4_fused_a &= weights[
+                            f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
 
-                    if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
-                        fused_a_scale = weights[
-                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
+                    if nvfp4_fused_a:
+                        ########### input_scale
+                        kv_a_proj_with_mqa_input_scale = weights[
+                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.input_scale"]
+                        if not is_lite:
+                            q_a_proj_input_scale = weights[
+                                f"{'.'.join(names[:-1])}.q_a_proj.input_scale"]
+                            assert kv_a_proj_with_mqa_input_scale == q_a_proj_input_scale, \
+                                "kv_a_proj_with_mqa.input_scale and q_a_proj.input_scale should be the same"
+
+                        # modelopt ckpt stores amax/(448*6), convert to (448*6)/amax
+                        shared_input_scale = kv_a_proj_with_mqa_input_scale
+                        module.input_scale.data.copy_(1.0 / shared_input_scale)
+                        E2M1_MAX = 6.0
+                        module.inv_input_scale.data.copy_(module.input_scale /
+                                                          E2M1_MAX)
+
+                        ########### weight_scale_2
+                        need_requant_kv_a_proj_with_mqa = False
+                        need_requant_q_a_proj = False
+                        kv_a_proj_with_mqa_scale_2 = weights[
+                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_2"]
+                        shared_weight_scale_2 = kv_a_proj_with_mqa_scale_2
+
+                        if not is_lite:
+                            q_a_proj_scale_2 = weights[
+                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_2"]
+                            if kv_a_proj_with_mqa_scale_2 < q_a_proj_scale_2:
+                                shared_weight_scale_2 = q_a_proj_scale_2
+                                need_requant_kv_a_proj_with_mqa = True
+                            elif q_a_proj_scale_2 < kv_a_proj_with_mqa_scale_2:
+                                need_requant_q_a_proj = True
+
+                        ########### alpha
+                        alpha = shared_input_scale.float(
+                        ) * shared_weight_scale_2.float()
+                        module.alpha.data.copy_(alpha)
+                        module.scalar_alpha = alpha.item()
+
+                        ########### weights
+                        kv_a_proj_with_mqa = weights[
+                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
+
+                        if not is_lite:
+                            q_a_proj = weights[
+                                f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
+
+                        ########### weight_scale
+                        kv_a_proj_with_mqa_scale = weights[
+                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale"][:]
+                        kv_a_proj_with_mqa_scale = torch.ops.trtllm.block_scale_interleave(
+                            kv_a_proj_with_mqa_scale.view(
+                                fp4_utils.float4_sf_dtype))
                         if not is_lite:
                             q_a_proj_scale = weights[
-                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_inv"][:]
-                            fused_a_scale = torch.cat(
-                                [q_a_proj_scale, fused_a_scale], dim=0)
+                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale"][:]
+                            q_a_proj_scale = torch.ops.trtllm.block_scale_interleave(
+                                q_a_proj_scale.view(fp4_utils.float4_sf_dtype))
 
-                        module.weight_scale.data[0:fused_a_scale.
-                                                 shape[0]].copy_(fused_a_scale)
-                    # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                    # to include indexer k weights, which is filled in post_load_weights.
-                    module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
+                        ########### requantize
+                        if need_requant_kv_a_proj_with_mqa:
+                            kv_a_proj_with_mqa, kv_a_proj_with_mqa_scale = requantize_weight_with_new_scale(
+                                kv_a_proj_with_mqa,
+                                kv_a_proj_with_mqa_scale,
+                                kv_a_proj_with_mqa_scale_2,
+                                shared_weight_scale_2,
+                                device=module.weight.device,
+                            )
+                        if need_requant_q_a_proj:
+                            q_a_proj, q_a_proj_scale = requantize_weight_with_new_scale(
+                                q_a_proj,
+                                q_a_proj_scale,
+                                q_a_proj_scale_2,
+                                shared_weight_scale_2,
+                                device=module.weight.device)
+
+                        ########### fuse and load weights (q_a_proj + kv_a_proj_with_mqa only)
+                        if not is_lite:
+                            fused_a = torch.cat([q_a_proj, kv_a_proj_with_mqa],
+                                                dim=0)
+                            fused_a_scale = torch.cat(
+                                [q_a_proj_scale, kv_a_proj_with_mqa_scale], dim=0)
+                        else:
+                            fused_a = kv_a_proj_with_mqa
+                            fused_a_scale = kv_a_proj_with_mqa_scale
+
+                        module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
+                        module.weight_scale.data[0:fused_a_scale.shape[0]].copy_(
+                            fused_a_scale)
+                    else:
+                        fused_a = weights[
+                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
+                        if not is_lite:
+                            q_a_proj = weights[
+                                f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
+                            fused_a = torch.cat([q_a_proj, fused_a], dim=0)
+
+                        if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
+                            fused_a_scale = weights[
+                                f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
+                            if not is_lite:
+                                q_a_proj_scale = weights[
+                                    f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_inv"][:]
+                                fused_a_scale = torch.cat(
+                                    [q_a_proj_scale, fused_a_scale], dim=0)
+
+                            module.weight_scale.data[0:fused_a_scale.
+                                                    shape[0]].copy_(fused_a_scale)
+                        module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                 elif names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -608,12 +742,9 @@ class DeepseekV32Attention(MLA):
 
         self.indexer = self.mqa.indexer
 
-        # For DeepseekV32, the kv_a_proj_with_mqa includes:
-        # q_a_proj + kv_a_proj_with_mqa + indexer.wk
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
-            self.indexer.head_dim,
+            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
             bias=False,
             dtype=config.torch_dtype,
             quant_config=model_config.get_quant_config(),
@@ -623,31 +754,10 @@ class DeepseekV32Attention(MLA):
 
     def post_load_weights(self):
         """
-        Concatenate indexer.wk weights into kv_a_proj_with_mqa's last dimension, to fuse indexer.wk projection with kv_a_proj_with_mqa GEMM.
+        No-op: indexer.wk stays as a dedicated Linear module
         """
-        assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
-        # Copy indexer weights into the fused kv_a_proj_with_mqa module
-        indexer_wk_weight = self.indexer.wk.weight.data
-        offset = self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank
-        self.kv_a_proj_with_mqa.weight.data[offset:offset +
-                                            self.indexer.head_dim].copy_(
-                                                indexer_wk_weight)
+        return
 
-        # Copy indexer scale data if it exists
-        if hasattr(self.indexer.wk,
-                   'weight_scale') and self.indexer.wk.weight_scale is not None:
-            indexer_wk_scale = self.indexer.wk.weight_scale.data
-            assert self.kv_a_proj_with_mqa.weight_scale.dim(
-            ) == 2, "weight_scale must be a 2D tensor"
-            group_size = self.kv_a_proj_with_mqa.weight.shape[
-                0] // self.kv_a_proj_with_mqa.weight_scale.shape[0]
-            scale_offset = offset // group_size
-            scale_size = indexer_wk_scale.shape[0]
-            # Copy indexer scale to the corresponding position in the fused module
-            self.kv_a_proj_with_mqa.weight_scale.data[
-                scale_offset:scale_offset + scale_size].copy_(indexer_wk_scale)
-
-        self.indexer.wk = None
 
 
 class DeepseekV3Gate(nn.Module):

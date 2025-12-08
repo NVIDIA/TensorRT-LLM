@@ -1253,11 +1253,15 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, compressed_kv, k_pe, indexer_k = self.kv_a_proj_with_mqa(
-            hidden_states).split([
-                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                self.indexer.head_dim
-            ], -1)
+        proj_qkv = self.kv_a_proj_with_mqa(hidden_states)
+        q, compressed_kv, k_pe = proj_qkv.split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
+
+        if self.indexer is None or not hasattr(self.indexer, "wk"):
+            raise RuntimeError(
+                "Sparse MLA indexer is not initialized; cannot generate indexer K projection."
+            )
+        indexer_k = self.indexer.wk(hidden_states)
 
         # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
