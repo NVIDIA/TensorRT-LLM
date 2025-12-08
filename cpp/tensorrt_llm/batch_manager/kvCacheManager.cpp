@@ -1031,42 +1031,6 @@ LookupResult KVCachePromptLookupNode::findMatchingNodes(
     return result;
 }
 
-/*
-std::tuple<bool, SizeType32, LookupNodePtr> KVCachePromptLookupNode::findMatchingNode(BlockKey const& blockKey, bool
-enablePartialReuse) const
-{
-    if (blockKey.uniqueTokens.size() == 0 || mNextNodes.size() == 0)
-    {
-        return {false, 0, nullptr};
-    }
-    auto itr = mNextNodes.find(blockKey);
-    if (itr == mNextNodes.end())
-    {
-        if (enablePartialReuse)
-        {
-            SizeType32 bestNumMatched{0};
-            LookupNodePtr bestNode{nullptr};
-            for (auto const& [key, node] : mNextNodes)
-            {
-                SizeType32 numMatched = key.partialMatch(blockKey);
-                if (numMatched > bestNumMatched)
-                {
-                    bestNumMatched = numMatched;
-                    bestNode = node;
-                }
-            }
-            if (bestNumMatched > 0)
-            {
-                return {true, bestNumMatched, bestNode};
-            }
-        }
-        return {false, 0, nullptr};
-    }
-    auto node = itr->second;
-    return {!node->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), node};
-}
-*/
-
 void KVCachePromptLookupNode::setBlock(SizeType32 windowSize, BlockPtr block)
 {
     if (block == nullptr)
