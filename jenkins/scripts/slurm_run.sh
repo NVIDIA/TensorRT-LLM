@@ -109,7 +109,7 @@ echo "Full Command: $pytestCommand"
 eval $pytestCommand
 echo "Rank${SLURM_PROCID} Pytest finished execution"
 
-if [ "$perfMode" = "true" ]; then
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
     if [[ "$stageName" == *PyTorch* ]]; then
         basePerfFilename="base_perf_pytorch.csv"
     else

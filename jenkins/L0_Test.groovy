@@ -1126,7 +1126,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
-  if(nodeCount > 1 || runWithSbatch) {
+  if (nodeCount > 1 || runWithSbatch) {
     runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
   } else {
     runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
@@ -2493,7 +2493,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (perfMode) {
+        if (perfMode && !stageName.contains("Perf-Sanity")) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
@@ -2909,9 +2909,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // Perf sanity post merge test
-        // Disable perf stages due to https://nvbugs/5643646
-        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
-        // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
+        // "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "l0_dgx_b200_perf_sanity", 1, 1, 4],
+        // "DGX_B200-8_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x8", "l0_dgx_b200_perf_sanity", 1, 1, 8],
+        // "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "l0_dgx_b300_perf_sanity", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -2939,6 +2939,8 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 2, 4],
         "GB200-4_GPUs-PyTorch-2": ["gb200-x4-oci", "l0_gb200_multi_gpus", 2, 2, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus", 1, 1, 4],
+        // Perf sanity post merge test
+        "GB200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-x4-oci", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
         // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
@@ -2953,6 +2955,8 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-oci-trtllm", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // Perf sanity post merge test
+        "GB200-8_GPUs-2_Nodes-PyTorch-Perf-Sanity-Post-Merge-1": ["gb200-oci-trtllm", "l0_gb200_multi_nodes_perf_sanity", 1, 1, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
