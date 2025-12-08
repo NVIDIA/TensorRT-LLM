@@ -1832,10 +1832,11 @@ class BaseLlmArgs(StrictBaseModel):
             "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub.",
             default=None)
 
-    tokenizer_mode: Literal['auto', 'slow'] = Field(
+    tokenizer_mode: Literal['auto', 'slow', 'deepseek_v32'] = Field(
         default='auto',
-        description="The mode to initialize the tokenizer.",
-        json_schema_extra={"type": "Literal['auto', 'slow']"})
+        description="The mode to initialize the tokenizer. "
+        "Use 'deepseek_v32' for DeepSeek V32 models with its own chat template.",
+        json_schema_extra={"type": "Literal['auto', 'slow', 'deepseek_v32']"})
 
     skip_tokenizer_init: bool = Field(
         default=False,
@@ -2186,6 +2187,12 @@ class BaseLlmArgs(StrictBaseModel):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
             self.tokenizer = None
+        elif self.tokenizer_mode == 'deepseek_v32':
+            from .tokenizer import DeepseekV32Tokenizer
+            self.tokenizer = DeepseekV32Tokenizer.from_pretrained(
+                self.tokenizer if self.tokenizer else self.model,
+                trust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,

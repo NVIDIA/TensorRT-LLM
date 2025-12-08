@@ -82,6 +82,7 @@ def _signal_handler_cleanup_child(signum, frame):
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
+        tokenizer_mode: str = "auto",
         backend: str = "pytorch",
         max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
     default,
@@ -137,6 +138,7 @@ def get_llm_args(
         "model": model,
         "scheduler_config": scheduler_config,
         "tokenizer": tokenizer,
+        "tokenizer_mode": tokenizer_mode,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "context_parallel_size": context_parallel_size,
@@ -262,6 +264,11 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
+@click.option("--tokenizer_mode",
+              type=click.Choice(["auto", "slow", "deepseek_v32"]),
+              default="auto",
+              help="Tokenizer mode. Use 'deepseek_v32' for DeepSeek V32 models "
+              "with custom chat template support.")
 @click.option("--host",
               type=str,
               default="localhost",
@@ -418,8 +425,8 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="[Experimental] Specify a custom chat template. "
               "Can be a file path or one-liner template string")
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
+def serve(model: str, tokenizer: Optional[str], tokenizer_mode: str, host: str,
+          port: int, log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
           tensor_parallel_size: int, pipeline_parallel_size: int,
           context_parallel_size: int, moe_expert_parallel_size: Optional[int],
@@ -450,6 +457,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
+        tokenizer_mode=tokenizer_mode,
         backend=backend,
         max_beam_width=max_beam_width,
         max_batch_size=max_batch_size,

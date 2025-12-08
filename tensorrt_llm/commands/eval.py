@@ -39,6 +39,11 @@ from ..logger import logger, severity_map
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
+@click.option("--tokenizer_mode",
+              type=click.Choice(["auto", "slow", "deepseek_v32"]),
+              default="auto",
+              help="Tokenizer mode. Use 'deepseek_v32' for DeepSeek V32 models "
+              "with custom chat template support.")
 @click.option(
     "--backend",
     type=click.Choice(["pytorch", "tensorrt"]),
@@ -109,8 +114,8 @@ from ..logger import logger, severity_map
               default=False,
               help="Flag for disabling KV cache reuse.")
 @click.pass_context
-def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
-         backend: str, max_beam_width: int, max_batch_size: int,
+def main(ctx, model: str, tokenizer: Optional[str], tokenizer_mode: str,
+         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
          max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
@@ -125,6 +130,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     llm_args = {
         "model": model,
         "tokenizer": tokenizer,
+        "tokenizer_mode": tokenizer_mode,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "moe_expert_parallel_size": ep_size,
