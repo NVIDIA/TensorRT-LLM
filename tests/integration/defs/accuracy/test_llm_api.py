@@ -496,7 +496,8 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
 
     speculative_config = EagleDecodingConfig(
-        max_draft_len=63,
+        max_draft_len=4,
+        max_total_draft_tokens=63,
         speculative_model_dir=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
