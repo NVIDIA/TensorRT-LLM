@@ -433,6 +433,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backe
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/5715568)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm] SKIP (https://nvbugs/5721672)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4a8_nvfp4_fp8[CUTLASS] SKIP (https://nvbugs/5721912)
+disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5661926)
 unittest/_torch/auto_deploy/unit/singlegpu/custom_ops/test_flashinfer_attention_op.py::test_flashinfer_attention_op_context_input_pos[cuda-dtype0-4-8-seq6] SKIP (https://nvbugs/5721907)
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:None] SKIP (https://nvbugs/5721644)
 unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_correctness[Nemotron-Nano-3-30B-A3.5B-dev-1024-mamba_ssm_cache_dtype:float32] SKIP (https://nvbugs/5721644)
