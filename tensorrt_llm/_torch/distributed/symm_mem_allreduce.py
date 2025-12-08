@@ -44,16 +44,20 @@ class SymmetricMemoryAllReduce(nn.Module):
         "10.0": [6, 8],
     }
 
+    MiB = 1024 * 1024
     # Maximum buffer sizes for symmetric memory (bytes)
     _MAX_SIZES = {
         "9.0": {
-            4: 8 * 1024 * 1024,  # 8MB for 4 GPUs
-            6: 6 * 1024 * 1024,  # 6MB for 6 GPUs
-            8: 4 * 1024 * 1024,  # 4MB for 8 GPUs
+            2: 64 * MiB,  # 64 MB
+            4: 32 * MiB,  # 32 MB
+            6: 64 * MiB,  # 64 MB
+            8: 64 * MiB,  # 64 MB
         },
         "10.0": {
-            6: 8 * 1024 * 1024,
-            8: 6 * 1024 * 1024,
+            2: 8 * MiB,  # 8 MB
+            4: 32 * MiB,  # 32 MB
+            6: 128 * MiB,  # 128 MB
+            8: 128 * MiB,  # 128 MB
         },
     }
 
