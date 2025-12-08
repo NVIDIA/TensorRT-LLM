@@ -59,6 +59,15 @@ class EnvManager:
     @staticmethod
     def get_slurm_job_name() -> str:
         return os.getenv("SLURM_JOB_NAME", "unified-benchmark")
+    
+    @staticmethod
+    def get_slurm_pass_segment() -> bool:
+        gpu_type = EnvManager.get_gpu_type()
+        gpu_type_support_segment = {
+            "GB200": True,
+            "GB300": False
+        }
+        return gpu_type_support_segment.get(gpu_type, False)
 
     @staticmethod
     def get_container_image() -> str:
