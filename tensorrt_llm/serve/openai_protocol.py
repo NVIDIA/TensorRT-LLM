@@ -1004,3 +1004,7 @@ def to_llm_disaggregated_params(
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
         draft_tokens=disaggregated_params.draft_tokens)
+
+
+UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
+UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]

@@ -28,7 +28,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..utils import Fp4QuantizedTensor, unswizzle_sf
+from ..utils import Fp4QuantizedTensor, get_model_extra_attrs, unswizzle_sf
 
 
 class WeightMode(str, enum.Enum):
@@ -937,14 +937,17 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input, module.input_scale, module.scaling_vector_size, False)
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
-        output = torch.ops.trtllm.nvfp4_gemm(act_fp4,
-                                             module.weight,
-                                             act_sf,
-                                             module.weight_scale,
-                                             module.alpha,
-                                             module.dtype,
-                                             to_userbuffers=False,
-                                             backend=module.nvfp4_backend)
+        # Convert list to comma-separated string for torch.compile compatibility
+        allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        output = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4,
+            module.weight,
+            act_sf,
+            module.weight_scale,
+            module.alpha,
+            module.dtype,
+            to_userbuffers=False,
+            allowed_backends=allowed_backends_str)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -2054,14 +2057,15 @@ class Linear(nn.Module):
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
-        nvfp4_backend: str = "auto",
+        nvfp4_allowed_backends: Optional[List[str]] = None,
     ):
         """
         Args:
-            nvfp4_backend: Backend selection for NVFP4 GEMM operations.
-                Supported values: "auto", "cutlass", "cublaslt", "cutedsl".
-                Default is "auto" which automatically selects the best backend.
-                Can be overridden via TRTLLM_NVFP4_GEMM_BACKEND environment variable.
+            nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
+                Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
+                Add 'cutedsl' for extreme performance at the cost of longer build time.
+                Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+                Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
         """
         from ..distributed import AllReduce
 
@@ -2082,20 +2086,17 @@ class Linear(nn.Module):
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
 
-        # Support environment variable override for nvfp4_backend
-        nvfp4_backend_value = os.environ.get('TRTLLM_NVFP4_GEMM_BACKEND',
-                                             nvfp4_backend)
-
-        # Validate backend selection
-        valid_backends = {'auto', 'cutlass', 'cublaslt', 'cutedsl'}
-        if nvfp4_backend_value not in valid_backends:
-            raise ValueError(
-                f"Invalid nvfp4_backend: '{nvfp4_backend_value}'. "
-                f"Supported values are: {', '.join(sorted(valid_backends))}. "
-                f"Set via constructor argument or TRTLLM_NVFP4_GEMM_BACKEND environment variable."
-            )
-
-        self.nvfp4_backend = nvfp4_backend_value
+        # Store NVFP4 GEMM allowed backends configuration
+        # Read from model_extra_attrs if not explicitly provided (allows config via llm_api_options)
+        if nvfp4_allowed_backends is None:
+            model_attrs = get_model_extra_attrs()
+            if model_attrs:
+                nvfp4_allowed_backends = model_attrs.get(
+                    'nvfp4_gemm_allowed_backends')
+        # Default: exclude cutedsl for faster build time
+        self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
+            'cutlass', 'cublaslt', 'cuda_core'
+        ]
 
         local_in_features = in_features
         local_out_features = out_features
