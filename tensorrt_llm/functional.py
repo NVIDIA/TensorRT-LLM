@@ -3881,6 +3881,7 @@ class AllReduceStrategy(IntEnum):
     LOWPRECISION = 6
     MNNVL = 7
     NCCL_SYMMETRIC = 8
+    SYMM_MEM = 9  # PyTorch symmetric memory with MULTIMEM
 
 
 class AllReduceFusionOp(IntEnum):
