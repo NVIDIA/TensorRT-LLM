@@ -160,8 +160,8 @@
 
 .. _nvidia/DeepSeek-R1-0528-FP4-v2:
 
-`DeepSeek-R1 (NVFP4) <https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2>`_
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+`DeepSeek-R1 (NVFP4) <https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2>`_
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. list-table::
    :width: 100%

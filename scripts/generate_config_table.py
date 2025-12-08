@@ -28,7 +28,7 @@ MODEL_INFO = {
     },
     "nvidia/DeepSeek-R1-0528-FP4-v2": {
         "display_name": "DeepSeek-R1 (NVFP4)",
-        "url": "https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2",
+        "url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
     },
     "openai/gpt-oss-120b": {
         "display_name": "gpt-oss-120b",
