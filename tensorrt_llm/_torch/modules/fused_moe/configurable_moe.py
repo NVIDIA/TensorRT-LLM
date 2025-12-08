@@ -170,18 +170,23 @@ class ConfigurableMoE(MoE):
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
         # duplicate initialization. Now sync all attributes from ConfigurableMoE to backend.
-        self.backend.aux_stream_dict = self.aux_stream_dict
-        self.backend.layer_idx = self.layer_idx
-        self.backend.layer_idx_str = self.layer_idx_str
-        self.backend.num_slots = self.num_slots
-        self.backend.layer_load_balancer = self.layer_load_balancer
-        self.backend.repeat_count = self.repeat_count
-        self.backend.repeat_idx = self.repeat_idx
-        self.backend.initial_local_expert_ids = self.initial_local_expert_ids
-        self.backend.initial_global_assignments = self.initial_global_assignments
-        self.backend.slot_start = self.slot_start
-        self.backend.slot_end = self.slot_end
-        self.backend.expert_size_per_partition = self.expert_size_per_partition
+        if self.backend is not None:
+            # Add a check to WAR the issue that the backend is none during torch.compile
+            assert not torch.compiler.is_compiling(), (
+                "Backend should not be none if not in torch.compile"
+            )
+            self.backend.aux_stream_dict = self.aux_stream_dict
+            self.backend.layer_idx = self.layer_idx
+            self.backend.layer_idx_str = self.layer_idx_str
+            self.backend.num_slots = self.num_slots
+            self.backend.layer_load_balancer = self.layer_load_balancer
+            self.backend.repeat_count = self.repeat_count
+            self.backend.repeat_idx = self.repeat_idx
+            self.backend.initial_local_expert_ids = self.initial_local_expert_ids
+            self.backend.initial_global_assignments = self.initial_global_assignments
+            self.backend.slot_start = self.slot_start
+            self.backend.slot_end = self.slot_end
+            self.backend.expert_size_per_partition = self.expert_size_per_partition
 
         # Create weights here, because the backend needs the layer_load_balancer info to create weights
         model_config._frozen = False

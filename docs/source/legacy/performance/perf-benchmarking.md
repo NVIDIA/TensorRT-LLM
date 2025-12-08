@@ -662,7 +662,7 @@ checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkp
 - [`nvidia/Llama-3.1-405B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8)
 
 `trtllm-bench` utilizes the `hf_quant_config.json` file present in the pre-quantized checkpoints above. The configuration
-file is present in checkpoints quantized with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+file is present in checkpoints quantized with [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
 above:
 

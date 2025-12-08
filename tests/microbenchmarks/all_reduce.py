@@ -176,6 +176,7 @@ def allreduce_benchmark(
     ]
     strategies = [
         AllReduceStrategy.NCCL,
+        AllReduceStrategy.NCCL_SYMMETRIC,
         AllReduceStrategy.ONESHOT,
         AllReduceStrategy.TWOSHOT,
         AllReduceStrategy.AUTO,
@@ -242,6 +243,9 @@ def allreduce_benchmark(
     # print the dataframe
     if mapping.rank == 0:
         pd.set_option('display.max_rows', None)
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', None)
         print(df)
 
     # # save the dataframe to a csv file

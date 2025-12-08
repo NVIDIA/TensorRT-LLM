@@ -285,7 +285,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500-reqs:200-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000-reqs:200-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
-
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-tp:4-gpus:4] TIMEOUT(120)
 
 # 12: H100, H20, H200, B200, B300 test cases
 - condition:
