@@ -56,6 +56,7 @@ All published functionality in the Release Notes has been fully tested and verif
 - The dependent NVIDIA ModelOpt version is updated to 0.37.
 - The dependent xgrammar version is updated to 0.1.25.
 - The dependent transformers version is updated to 4.56.0.
+- The dependent NIXL version is updated to 0.5.0.
 
 ### API Changes
 
