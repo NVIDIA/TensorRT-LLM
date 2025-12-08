@@ -440,7 +440,6 @@ class Mistral3VLM(PreTrainedModel):
         vit_weights = filter_weights(weights=weights, prefix="vision_tower")
         logger.debug(f"Loading weights for {type(self._vision_tower)}")
 
-        # FIXME rename_weights_with_regex in _load_weights_impl breaks this, fall back to manual renaming
         if vit_params_map is not None:
             vit_weights = weight_mapper.rename_by_params_map(
                 weights=vit_weights, params_map=vit_params_map)

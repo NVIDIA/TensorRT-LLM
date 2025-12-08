@@ -340,3 +340,6 @@ mistralai/Mistral-Nemo-12b-Base:
   - accuracy: 69.66
   - quant_algo: FP8
     accuracy: 69.66
+mistral/Mistral-Large-3-675B:
+  - quant_algo: NVFP4
+    accuracy: 87.54
