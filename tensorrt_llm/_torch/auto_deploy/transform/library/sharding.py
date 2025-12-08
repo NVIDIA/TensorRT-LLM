@@ -1770,43 +1770,36 @@ def _insert_sharded_moe(
             "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
         )
 
-    # -- Shard expert weights --
-    def get_partition(lst, world_size, rank):
-        num_experts = len(lst)
-        expert_size_per_partition = num_experts // world_size
-        expert_start = rank * expert_size_per_partition
-        # For num_experts % world_size != 0 case,
-        # assign the last (num_experts % world_size) experts to the last rank
-        expert_end = (
-            num_experts if (rank == world_size - 1) else expert_start + expert_size_per_partition
-        )
-        return lst[expert_start:expert_end]
+    args[1] = selected_experts_local
+    args[2] = final_scales_local
 
     if is_stacked:
-        # _insert_sharded_moe_stacked(gm, node, ep_rank, ep_size, allreduce_strategy)
         # bmm-style stacked MoE: sharding is done by slicing the 1st dimension of the stacked weight tensor
         # if mlp_type == MLPType.FUSED_GATED_MLP:
         w_gate_up_stacked = flat_args[3]
         w_down_stacked = flat_args[4]
-        shard_weight_tensor(
-            gm=gm,
-            weight_tensor=gm.get_parameter(w_gate_up_stacked.target),
-            param_key=w_gate_up_stacked.target,
-            dim=0,
-            rank=ep_rank,
-            world_size=ep_size,
+        local_lo, local_hi = _split_range_last_remainder(num_experts, ep_size, ep_rank)
+        _transform_bmm_moe_weight_param(
+            gm, w_gate_up_stacked, local_lo, local_hi, swap_gate_up=True
         )
-        shard_weight_tensor(
-            gm=gm,
-            weight_tensor=gm.get_parameter(w_down_stacked.target),
-            param_key=w_down_stacked.target,
-            dim=0,
-            rank=ep_rank,
-            world_size=ep_size,
-        )
-        return
+        _transform_bmm_moe_weight_param(gm, w_down_stacked, local_lo, local_hi, swap_gate_up=False)
     else:
         # listed MoE: sharding is done by taking a range of the listed weight tensors
+
+        # -- Shard expert weights --
+        def get_partition(lst, world_size, rank):
+            num_experts = len(lst)
+            expert_size_per_partition = num_experts // world_size
+            expert_start = rank * expert_size_per_partition
+            # For num_experts % world_size != 0 case,
+            # assign the last (num_experts % world_size) experts to the last rank
+            expert_end = (
+                num_experts
+                if (rank == world_size - 1)
+                else expert_start + expert_size_per_partition
+            )
+            return lst[expert_start:expert_end]
+
         w_up_list_sharded = get_partition(args[3], ep_size, ep_rank)
         w_down_list_sharded = get_partition(args[4], ep_size, ep_rank)
         w_gate_list_sharded = get_partition(args[5], ep_size, ep_rank)
@@ -1835,8 +1828,6 @@ def _insert_sharded_moe(
             )
 
         # -- Update args --
-        args[1] = selected_experts_local
-        args[2] = final_scales_local
         args[3] = w_up_list_sharded
         args[4] = w_down_list_sharded
         args[5] = w_gate_list_sharded
@@ -1848,7 +1839,7 @@ def _insert_sharded_moe(
         ad_logger.debug(
             f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
         )
-        node.args = tuple(args)
+    node.args = tuple(args)
 
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
