@@ -15,7 +15,7 @@ if TEST_TOKENIZER:
     print(mtok.encode("Hello, world!"))
     print(mtok.decode([1, 22177, 1044, 4304, 1033]))
 
-if TEST_CONFIG_LOADER:
+if TEST_CONFIG_LOADER or True:
     ## Test config loader
     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
 
@@ -33,5 +33,5 @@ if TEST_CHECKPOINT_LOADER:
 
     weight_mapper = MistralLarge3WeightMapper()
     loader = MistralCheckpointLoader(weight_mapper=weight_mapper)
-    weights_dict = loader.load_weights(MODEL_DIR)
-    # print(f"weights_dict.keys(): {weights_dict.keys()}")
+    weights_dict = loader.load_weights(MODEL_DIR, model_config=config)
+    print(f"weights_dict.keys(): {weights_dict.keys()}")

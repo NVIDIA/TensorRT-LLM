@@ -8,6 +8,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import Mistral
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+
 @register_checkpoint_loader("mistral")
 class MistralCheckpointLoader(HfCheckpointLoader):
     def __init__(
@@ -65,8 +66,10 @@ class MistralCheckpointLoader(HfCheckpointLoader):
                 weights[key] = 1.0 / weights[key]
 
     def load_weights(self, checkpoint_dir: str, **kwargs):
+        model_config = kwargs.pop("model_config", None)
+        assert model_config is not None, "model_config is required"
         weights = super().weight_loader.load_weights(checkpoint_dir, mapping=None, **kwargs)
-        model_config = kwargs.get("model_config", None)
+        params_map = self.weight_mapper.mistral_llm_mapping.copy()
         if model_config is not None:
             if model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
                 quantization_weights_map = {
@@ -78,8 +81,7 @@ class MistralCheckpointLoader(HfCheckpointLoader):
                 quantization_weights_map = {
                     "weight_scale": "weight_scale_inv",
                 }
-        params_map = self.weight_mapper.mistral_llm_mapping.copy()
-        params_map.update(quantization_weights_map)
+            params_map.update(quantization_weights_map)
         weights = self.preprocess_weights(weights)
         weights = self.weight_mapper.rename_by_params_map(weights=weights, params_map=params_map)
 
