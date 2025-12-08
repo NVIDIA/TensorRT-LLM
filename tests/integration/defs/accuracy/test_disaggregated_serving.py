@@ -13,8 +13,8 @@ import openai
 import pytest
 import requests
 import yaml
+from defs.common import revise_disaggregated_server_config_urls_with_free_ports
 
-from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
@@ -66,23 +66,6 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
             future.cancel()
         self.shutdown(wait=True, cancel_futures=True)
         return False
-
-
-def revise_disaggregated_server_config_urls_with_free_ports(
-        disaggregated_server_config: Dict[str, Any]) -> Dict[str, Any]:
-    num_ctx_ports = len(disaggregated_server_config["context_servers"]["urls"])
-    num_gen_ports = len(
-        disaggregated_server_config["generation_servers"]["urls"])
-
-    disaggregated_server_config['port'] = get_free_port()
-    disaggregated_server_config["context_servers"]["urls"] = [
-        f"localhost:{get_free_port()}" for _ in range(num_ctx_ports)
-    ]
-    disaggregated_server_config["generation_servers"]["urls"] = [
-        f"localhost:{get_free_port()}" for _ in range(num_gen_ports)
-    ]
-
-    return disaggregated_server_config
 
 
 @contextlib.contextmanager

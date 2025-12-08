@@ -332,17 +332,17 @@ class FusedMoEMethodBase(ABC):
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        additional_kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.load_expert_weights_to_dst).args:
+            additional_kargs["allow_partial_loading"] = allow_partial_loading
 
         self.load_expert_weights_to_dst(
-            module,
-            weights,
-            weight_loading_mode,
-            module.initial_local_expert_ids,
-            module.w3_w1_weight.data,
+            module, weights, weight_loading_mode,
+            module.initial_local_expert_ids, module.w3_w1_weight.data,
             module.w2_weight.data,
             module.w3_w1_bias.data if module.bias else None,
-            module.w2_bias.data if module.bias else None,
-            allow_partial_loading=allow_partial_loading)
+            module.w2_bias.data if module.bias else None, **additional_kargs)
 
         self.load_quant_scales(module, weights)
 
@@ -397,15 +397,12 @@ class FusedMoEMethodBase(ABC):
                     setattr(module, 'local_shared_w2_bias_tensors',
                             local_shared_w2_bias_tensors)
             self.load_expert_weights_to_dst(
-                module,
-                weights,
-                weight_loading_mode,
-                local_shared_load_expert_ids,
-                local_shared_w3_w1_tensors,
+                module, weights, weight_loading_mode,
+                local_shared_load_expert_ids, local_shared_w3_w1_tensors,
                 local_shared_w2_tensors,
                 local_shared_w3_w1_bias_tensors if module.bias else None,
                 local_shared_w2_bias_tensors if module.bias else None,
-                allow_partial_loading=allow_partial_loading)
+                **additional_kargs)
 
     def post_load_weights(self, module: torch.nn.Module):
         if self.need_load_shared_weights(module):
@@ -2085,34 +2082,44 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
 class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
-    def post_load_weights(self, module: torch.nn.Module):
-        super().post_load_weights(module)
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                         dst_w3_w1_weight)
 
-        # Interleave FC1 weight and scales for GEMM1 + SwiGLU fusion.
-        w3_w1_weight = module.w3_w1_weight.data.view(float4_e2m1x2)
-        m = w3_w1_weight.size(1)
-        n = w3_w1_weight.size(2) * 2
+        # Interleave FC1 weight for GEMM1 + SwiGLU fusion.
+        w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
         w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
                                                               group_size=64,
-                                                              dim=1)
+                                                              dim=0)
         w3_w1_weight_interleaved = w3_w1_weight_interleaved.view(
-            module.w3_w1_weight.data.dtype)
-        module.w3_w1_weight.data.copy_(w3_w1_weight_interleaved)
+            dst_w3_w1_weight.dtype)
+        dst_w3_w1_weight.copy_(w3_w1_weight_interleaved)
 
-        w3_w1_weight_scale = module.quant_scales.fc1_weight_block.data.view(
-            float4_sf_dtype)
+    def load_expert_w3_w1_weight_scale_nvfp4(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        super().load_expert_w3_w1_weight_scale_nvfp4(module, w1_weight_scale,
+                                                     w3_weight_scale,
+                                                     dst_w3_w1_weight_scale)
+
+        # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
+        n = module.intermediate_size_per_partition * 2
+        k = module.hidden_size
+        w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
         w3_w1_weight_scale_unswizzled = unswizzle_sf(
-            w3_w1_weight_scale, m, n).view(-1, m,
-                                           n // module.scaling_vector_size)
+            w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
         w3_w1_weight_scale_unswizzled_interleaved = interleave_linear_and_gate(
-            w3_w1_weight_scale_unswizzled, group_size=64, dim=1)
+            w3_w1_weight_scale_unswizzled, group_size=64, dim=0)
         w3_w1_weight_scale_interleaved = swizzle_sf(
-            w3_w1_weight_scale_unswizzled_interleaved, m,
-            n).view(-1, m, n // module.scaling_vector_size)
+            w3_w1_weight_scale_unswizzled_interleaved, n,
+            k).view(n, k // module.scaling_vector_size)
         w3_w1_weight_scale_interleaved = w3_w1_weight_scale_interleaved.view(
-            module.quant_scales.fc1_weight_block.data.dtype)
-        module.quant_scales.fc1_weight_block.data.copy_(
-            w3_w1_weight_scale_interleaved)
+            dst_w3_w1_weight_scale.dtype)
+        dst_w3_w1_weight_scale.copy_(w3_w1_weight_scale_interleaved)
 
 
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
