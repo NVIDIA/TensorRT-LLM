@@ -2179,28 +2179,18 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_errors(self,
-                       error_msg: Optional[Union[str, List[str]]] = None,
+                       error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None):
         error_responses: Dict[int, LlmResponse] = {}
+        error_msg = error_msg or "error"
         failed_requests = requests if requests is not None else self.active_requests
-
-        error_msg = error_msg or ["error"] * len(failed_requests)
-        if isinstance(error_msg, str):
-            error_msg = [error_msg] * len(failed_requests)
-        elif len(error_msg) != len(failed_requests):
-            logger.warning(
-                f"Length mismatch: error_msg has {len(error_msg)} items, "
-                f"but there are {len(failed_requests)} requests. "
-                f"Falling back to default error message.")
-            error_msg = ["error"] * len(failed_requests)
-
-        for request, err_msg in zip(failed_requests, error_msg):
+        for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
-                error_msg=err_msg,
+                error_msg=error_msg,
                 client_id=request.py_client_id)
         if requests is None:
             self.active_requests.clear()
@@ -2636,17 +2626,12 @@ class PyExecutor:
             return
 
         failed_req_id_to_err = {req_id: err for req_id, err in failed_requests}
-        errors = []
-        failed_llm_requests = []
 
         for request in scheduled_batch.all_requests():
             if request.py_request_id not in failed_req_id_to_err:
                 continue
-            errors.append(failed_req_id_to_err[request.py_request_id])
-            failed_llm_requests.append(request)
-
-        if failed_llm_requests:
-            self._handle_errors(errors, requests=failed_llm_requests)
+            error_msg = failed_req_id_to_err[request.py_request_id]
+            self._handle_errors(error_msg, requests=[request])
 
 
 class DisaggPPTerminationHandler:

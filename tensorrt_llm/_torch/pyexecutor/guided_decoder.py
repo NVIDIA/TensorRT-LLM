@@ -248,7 +248,6 @@ class GuidedDecoder:
                                 f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
                             )
                             continue
-                        # TODO: Make this an error response.
                         raise ValueError(
                             f"Request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
                         )
@@ -279,8 +278,8 @@ class GuidedDecoder:
                 error_msg = f"Guided decoding error: {str(e)}"
                 failed_requests.append((req.request_id, error_msg))
                 logger.error(
-                    f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}",
-                    exc_info=True)
+                    f"Request {req.request_id} at slot {slot} failed during guided decoding: {error_msg}"
+                )
 
         return failed_requests
 
