@@ -2305,13 +2305,16 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             num_beams=torch.tensor(num_beams, dtype=torch.int32, pin_memory=True),
         )
 
-        indices_to_keep = torch_multi_arange(
-            starts=torch.tensor(logits_begin_indices),
-            ends=torch.tensor(logits_end_indices),
-            output_length=total_num_sampling_logits,
-        )
-        indices_to_keep_cuda = indices_to_keep.to(device="cuda", non_blocking=True)
-        logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
+        if len(sampling_requests) > 0:
+            indices_to_keep = torch_multi_arange(
+                starts=torch.tensor(logits_begin_indices),
+                ends=torch.tensor(logits_end_indices),
+                output_length=total_num_sampling_logits,
+            )
+            indices_to_keep_cuda = indices_to_keep.to(device="cuda", non_blocking=True)
+            logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
+        else:
+            logits_cuda = torch.empty(0, device=raw_logits_cuda.device, dtype=raw_logits_cuda.dtype)
 
         assert logits_cuda.size(0) == total_num_sampling_logits
 
@@ -2596,6 +2599,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             raw_logits_cuda,
             num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
+
+        if len(sampling_requests) == 0:
+            return new_tokens_cuda.to("cpu", non_blocking=True)
 
         # Handle embedding bias
         self._apply_embedding_bias(
