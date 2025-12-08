@@ -150,8 +150,6 @@ def submit_job(config, log_dir):
     save_worker_config(config, ctx_config_path, 'ctx')
     save_worker_config(config, gen_config_path, 'gen')
 
-
-
     # Prepare sbatch command
     # yapf: disable
     cmd = [
