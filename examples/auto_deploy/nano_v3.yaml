@@ -14,6 +14,7 @@ kv_cache_config:
 transforms:
   detect_sharding:
     sharding_dims: ['ep', 'bmm']
+    allreduce_strategy: 'AUTO'
     manual_config:
       head_dim: 128
       tp_plan:
