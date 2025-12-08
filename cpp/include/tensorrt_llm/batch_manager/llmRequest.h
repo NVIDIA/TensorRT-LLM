@@ -142,7 +142,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        bool usingKvConnector = false)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -206,7 +207,7 @@ public:
             mState = LlmRequestState::kENCODER_INIT;
         }
 
-        initialize(*inputTokens, returnLogProbs, arrivalTime);
+        initialize(*inputTokens, returnLogProbs, arrivalTime, usingKvConnector);
     }
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
@@ -2054,10 +2055,12 @@ protected:
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
 
 private:
-    void initialize(
-        VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
+    void initialize(VecTokens const& inputTokens, bool outputLogProbs,
+        std::optional<TimePoint> arrivalTime = std::nullopt, bool usingKvConnector = false)
     {
-        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        // If we're using the KV connector, we always want to mark it as a disaggregated generation request.
+        // If it later turns out that we don't want to use the connector, we move it to the context init state.
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY || usingKvConnector)
         {
             mState = LlmRequestState::kDISAGG_GENERATION_INIT;
         }
@@ -2245,7 +2248,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        bool usingKvConnector = false)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2276,7 +2280,7 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime)
+            arrivalTime, usingKvConnector)
     {
     }
 
