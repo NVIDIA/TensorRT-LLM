@@ -35,7 +35,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3-next.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -43,7 +43,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/qwen3-next.yaml
+```{literalinclude} ../../../examples/configs/curated/qwen3-next.yaml
 ---
 language: shell
 prepend: |
