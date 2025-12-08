@@ -1244,6 +1244,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype_vswa_chunked_prefill_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.5,
             enable_block_reuse=True,
             max_attention_window=[512, 512, 512, 512, 512, 32768],
         )
