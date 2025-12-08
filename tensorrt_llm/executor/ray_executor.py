@@ -13,7 +13,7 @@ from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
                                       placement_group)
 
 from tensorrt_llm._ray_utils import unwrap_ray_errors
-from tensorrt_llm._utils import get_free_port, nvtx_range_debug
+from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..llmapi.utils import logger_debug
@@ -76,7 +76,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.world_size = model_world_size
             self.tp_size = tp_size
             self.master_address = ray.util.get_node_ip_address()
-            self.master_port = get_free_port()
 
             self.worker_kwargs = dict(
                 **worker_kwargs,
@@ -126,7 +125,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         runtime_env["env_vars"].update({
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
-            "MASTER_PORT": str(self.master_port)
         })
 
         placement_groups, self.bundle_indices = self._get_placement_group(
