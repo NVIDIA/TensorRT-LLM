@@ -1774,6 +1774,18 @@ class TorchSampler(Sampler):
             tokens += d2t
 
     @staticmethod
+    @torch.compile(options={"max-autotune": True})
+    def _compute_topk_logprobs(
+        logits: torch.Tensor, logit_indices: torch.Tensor, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute top-k log probabilities.
+        """
+        selected_logits = logits[logit_indices].to(dtype=torch.float32, non_blocking=True)
+        logprobs = F.log_softmax(selected_logits, dim=-1)
+        return torch.topk(logprobs, k=k, dim=-1)
+
+    @staticmethod
     def _apply_embedding_bias(
         logits: torch.Tensor,
         requests: list[LlmRequest],
@@ -1877,12 +1889,10 @@ class TorchSampler(Sampler):
             logprobs_logit_indices_cuda = logprobs_logit_indices.to(
                 device=logits_cuda.device, non_blocking=True
             )
-            logprobs_cuda = F.log_softmax(
-                logits_cuda[logprobs_logit_indices_cuda].to(dtype=torch.float32, non_blocking=True),
-                dim=-1,
-            )
-            topk_vals_cuda, topk_indices_cuda = torch.topk(
-                logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
+            topk_vals_cuda, topk_indices_cuda = self._compute_topk_logprobs(
+                logits_cuda,
+                logprobs_logit_indices_cuda,
+                k=max(req.py_num_logprobs for req in requests),
             )
             # Use a single D2H copy to reduce overheads
             topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
