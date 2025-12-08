@@ -149,7 +149,7 @@ class GroupedGemmInputsHelper:
 
     def inputs_pre_hook_finalize_fusion(
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+        a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
         tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
@@ -184,7 +184,7 @@ class GroupedGemmInputsHelper:
             [num_non_exiting_tiles_val],
             dtype=num_non_exiting_tiles.dtype,
             device=num_non_exiting_tiles.device)
-        return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
+        return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
 
 class FusedMoEInputsHelper:
@@ -268,8 +268,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
-            sm_version = get_sm_version()
-            if sm_version not in [100, 103]:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
                     f"CuteDSL: SM version {sm_version} is not supported. "
                     f"CuteDSL NVFP4 only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
@@ -597,8 +596,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             for automatic backend selection with better performance.
         """
         # Validate SM version before attempting to use CuteDSL
-        sm_version = get_sm_version()
-        if sm_version not in [100, 103]:
+        if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
                 f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
@@ -660,9 +658,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -947,9 +945,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -1015,11 +1013,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         helper.map_to_tuning_buckets), ),
                     constraint_specs=(
                         ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                        ConstraintSpec(5, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                         ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(7, 0, helper.infer_shape_max_num_tiles),
                         ConstraintSpec(
-                            7, 0, helper.infer_shape_max_num_permuted_tokens),
-                        ConstraintSpec(9, 0, helper.infer_shape_num_tokens)),
+                            8, 0, helper.infer_shape_max_num_permuted_tokens),
+                        ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cuda_graph=True,
                 )
@@ -1027,7 +1026,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
             assert b.dtype == torch.float4_e2m1fn_x2
@@ -1051,6 +1050,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b_sf.size(2) == scale_k
             assert alpha.size(0) == l
 
+            assert c.dtype == self.output_dtype
+            assert c.dim() == 2
+            num_tokens = c.size(0)
+            assert c.size(1) == n
+
             num_tiles = m // self.tile_size
             assert tile_idx_to_group_idx.dtype == torch.int32
             assert tile_idx_to_group_idx.size() == (num_tiles, )
@@ -1062,14 +1066,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert num_non_exiting_tiles.numel() == 1
             assert token_final_scales.dtype == torch.float32
             assert token_final_scales.dim() == 2
-            num_tokens = token_final_scales.size(0)
-            assert token_final_scales.size(1) == self.top_k
-
-            # TODO: Overlap the memset
-            c = torch.zeros(num_tokens,
-                            n,
-                            dtype=self.output_dtype,
-                            device=a.device)
+            assert token_final_scales.size() == (num_tokens, self.top_k)
 
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
@@ -1183,6 +1180,51 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c
 
     @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+        mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, output_dtype, scaling_vector_size)
+
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha, output,
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+            token_final_scales
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
         mutates_args=(),
         device_types="cuda")
@@ -1205,25 +1247,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
-        tuner = AutoTuner.get()
-
-        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
-        inputs = [
-            input, weight, input_scale, weight_scale, alpha,
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
-            token_final_scales
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
+        num_tokens = token_final_scales.size(0)
+        n = weight.size(1)
+        output = torch.zeros(num_tokens,
+                             n,
+                             dtype=output_dtype,
+                             device=input.device)
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            input=input,
+            weight=weight,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            alpha=alpha,
+            output=output,
+            tile_idx_to_group_idx=tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_size,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
         )
-        output = runner(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake(
@@ -1275,9 +1324,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):

@@ -23,6 +23,7 @@ l0_a10:
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
+  - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
   - unittest/others/test_time_breakdown.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
@@ -79,6 +80,19 @@ l0_a10:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
+  - llmapi/test_llm_api_connector.py::test_connector_simple[True]
+  - llmapi/test_llm_api_connector.py::test_connector_simple[False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
+  - llmapi/test_llm_api_connector.py::test_connector_multi_request
 - condition:
     ranges:
       system_gpu_count:
@@ -120,18 +134,6 @@ l0_a10:
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
-  - llmapi/test_llm_api_connector.py::test_connector_simple[True]
-  - llmapi/test_llm_api_connector.py::test_connector_simple[False]
-  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
-  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[False]
-  - llmapi/test_llm_api_connector.py::test_connector_async_save[True]
-  - llmapi/test_llm_api_connector.py::test_connector_async_save[False]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[True]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[False]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[True]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[False]
-  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
-  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
