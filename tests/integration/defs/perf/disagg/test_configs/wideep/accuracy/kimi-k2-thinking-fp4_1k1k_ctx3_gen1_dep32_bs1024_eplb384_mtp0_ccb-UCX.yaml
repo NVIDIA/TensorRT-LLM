@@ -61,7 +61,7 @@ worker_config:
     pipeline_parallel_size: 1
     max_batch_size: 1024
     max_num_tokens: 1024
-    max_seq_len: 2068
+    max_seq_len: 5120
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -100,7 +100,7 @@ worker_config:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 8
     max_num_tokens: 8448
-    max_seq_len: 2068
+    max_seq_len: 5120
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: true
