@@ -1374,6 +1374,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.spec_decoding_generation_lengths[:self.max_num_requests].copy_(
             spec_decoding_generation_length, non_blocking=True)
 
+    # Check if the SM version is supported by the TRTLLM gen kernel
     def is_sm_version_trtllm_gen_kernel(self, sm):
         return not (sm < 100 or sm in [120, 121])
 
