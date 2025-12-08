@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager, Indexer, compute_cu_seqlen_kv_bounds_with_cache,
     split_prefill_chunks)
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -407,6 +408,7 @@ def _create_mock_metadata(request_ids,
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
+            self.seq_lens_cuda = seq_lens.cuda()
             self.kv_lens = kv_lens
             self.kv_cache_params = MockKVCacheParams()
             self.kv_cache_manager = cache_manager
@@ -515,21 +517,72 @@ def _create_mock_metadata(request_ids,
 
             self.runtime_features = RuntimeFeatures()
 
+            # Add expanded buffers for MTP>1 support
+            self.kv_lens_expanded_cuda = torch.zeros(
+                (self.num_seqs * (1 + self.max_draft_tokens), ),
+                device='cuda',
+                dtype=torch.int32)
+            self.kv_lens_expanded_host = torch.zeros_like(
+                self.kv_lens_expanded_cuda, device='cpu', pin_memory=True)
+            self.block_table_expanded = torch.zeros(
+                (self.num_seqs * (1 + self.max_draft_tokens),
+                 self.kv_cache_manager.max_blocks_per_seq),
+                device='cuda',
+                dtype=torch.int32)
+            self.host_block_table_expanded = torch.zeros_like(
+                self.block_table_expanded, device='cpu', pin_memory=True)
+            self.scheduler_metadata_buffer_expanded = torch.zeros(
+                (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
+            if self.max_draft_tokens > 1:
+                gen_kv_lens = kv_lens[num_contexts:self.num_seqs]
+                gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
+                                                   (1 + self.max_draft_tokens),
+                                                   dim=0)
+                gen_kv_lens_expanded = gen_kv_lens_expanded.transpose(
+                    0, 1).contiguous().flatten()
+                self.kv_lens_expanded_host[:self.num_gen_tokens].copy_(
+                    gen_kv_lens_expanded)
+                self.kv_lens_expanded_cuda[:self.num_gen_tokens].copy_(
+                    self.kv_lens_expanded_host[:self.num_gen_tokens],
+                    non_blocking=True)
+
+                if self.kv_cache_manager is not None:
+                    block_ids = self.kv_cache_manager.get_batch_cache_indices(
+                        self.request_ids)
+                    gen_block_ids = block_ids[self.num_contexts:]
+                    if len(gen_block_ids) > 0:
+                        # Find max length and create padded tensor
+                        max_len = max(len(bid) for bid in gen_block_ids)
+                        gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+                            self.num_contexts:self.num_seqs, :max_len]
+                        expanded_blocks = gen_block_tensor.repeat_interleave(
+                            1 + self.max_draft_tokens, dim=0)
+                        self.host_block_table_expanded[:self.num_gen_tokens, :
+                                                       max_len].copy_(
+                                                           expanded_blocks,
+                                                           non_blocking=True)
+                        self.block_table_expanded[:self.num_gen_tokens].copy_(
+                            self.host_block_table_expanded[:self.
+                                                           num_gen_tokens],
+                            non_blocking=True)
+
             # Add skip indexer attributes
-            def get_dense_topk_indices(seq_lens, kv_lens, num_tokens):
+            @maybe_compile(dynamic=True)
+            def _get_dense_topk_indices(seq_lens, kv_lens, num_tokens):
+                device = kv_lens.device
                 past_kv_lens = kv_lens - seq_lens
                 # get position ids
                 seq_ends = torch.cumsum(seq_lens, dim=0)
                 seq_starts = seq_ends - seq_lens
                 per_seq_offsets = past_kv_lens - seq_starts  # Shape: [batch_size]
-                global_indices = torch.arange(num_tokens)
+                global_indices = torch.arange(num_tokens, device=device)
                 batch_indices = torch.searchsorted(seq_ends,
                                                    global_indices,
                                                    side='right')
                 repeated_offsets = per_seq_offsets[batch_indices]
                 position_ids = global_indices + repeated_offsets
                 # get the dense topk indices with causal mask
-                range_row = torch.arange(self.sparse_mla_topk)
+                range_row = torch.arange(self.sparse_mla_topk, device=device)
                 mask = range_row <= position_ids.unsqueeze(1)
                 return torch.where(mask, range_row, -1)
 
@@ -542,11 +595,12 @@ def _create_mock_metadata(request_ids,
                 ).item() <= self.sparse_mla_topk
                 if self.skip_indexer_for_ctx_reqs:
                     ctx_range = slice(self.num_ctx_tokens)
-                    host_topk_indices_buffer = get_dense_topk_indices(
-                        self.seq_lens[:self.num_contexts],
-                        kv_lens[:self.num_contexts], self.num_ctx_tokens)
                     self.topk_indices_buffer[ctx_range, :].copy_(
-                        host_topk_indices_buffer, non_blocking=True)
+                        _get_dense_topk_indices(
+                            self.seq_lens_cuda[:self.num_contexts],
+                            self.kv_lens_cuda_runtime[:self.num_contexts],
+                            self.num_ctx_tokens),
+                        non_blocking=True)
             else:
                 self.skip_indexer_for_ctx_reqs = False
 
@@ -557,12 +611,13 @@ def _create_mock_metadata(request_ids,
                     ) <= self.sparse_mla_topk
                 if self.skip_indexer_for_gen_reqs:
                     gen_range = slice(self.num_ctx_tokens, self.num_tokens)
-                    host_topk_indices_buffer = get_dense_topk_indices(
-                        self.seq_lens[self.num_contexts:self.num_seqs],
-                        kv_lens[self.num_contexts:self.num_seqs],
-                        self.num_gen_tokens)
                     self.topk_indices_buffer[gen_range, :].copy_(
-                        host_topk_indices_buffer, non_blocking=True)
+                        _get_dense_topk_indices(
+                            self.seq_lens_cuda[self.num_contexts:self.num_seqs],
+                            self.kv_lens_cuda_runtime[self.num_contexts:self.
+                                                      num_seqs],
+                            self.num_tokens - self.num_ctx_tokens),
+                        non_blocking=True)
             else:
                 self.skip_indexer_for_gen_reqs = False
 
@@ -858,7 +913,7 @@ def test_fp8_k_cache_roundtrip():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2)])
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 4)])
 def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
@@ -986,11 +1041,21 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     kv_cache_fp8_pool = cache_manager.get_indexer_k_cache_buffers(layer_idx)
     q_fp8 = q.to(torch.float8_e4m3fn)
 
-    logits = fp8_paged_mqa_logits(
-        q_fp8, kv_cache_fp8_pool, weights,
-        metadata_gen.kv_lens_cuda_runtime[0:batch_size],
-        metadata_gen.indexer_k_cache_block_offsets,
-        metadata_gen.scheduler_metadata_buffer, max_model_len)
+    if next_n <= 2:
+        q_fp8 = q_fp8
+        context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
+        block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
+        scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
+    else:
+        q_fp8 = q_fp8.view(-1, 1, *q_fp8.shape[2:])
+        num_tokens = batch_size * next_n
+        context_lens = metadata_gen.kv_lens_expanded_cuda[:num_tokens]
+        block_table = metadata_gen.block_table_expanded[:num_tokens]
+        scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_expanded
+
+    logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
+                                  context_lens, block_table,
+                                  scheduler_metadata_buffer, max_model_len)
     print(f"✓ Kernel output shape: {logits.shape}")
 
     # Reference: Reconstruct BF16 cache from original values
@@ -1655,7 +1720,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("batch_size", [1, 16, 64])
-@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
 def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,

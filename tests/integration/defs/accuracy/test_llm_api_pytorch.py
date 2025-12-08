@@ -51,6 +51,7 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
+                                 DeepSeekSparseAttentionConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  RocketSparseAttentionConfig, SamplingParams,
@@ -2644,19 +2645,20 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
-            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT"),
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "latency_default"
+            "latency_default", "skip_indexer"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size, moe_backend):
+                            max_batch_size, moe_backend, skip_indexer):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -2682,6 +2684,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 )
             kv_cache_config.dtype = "fp8"
 
+        dsa_config = None
+        if skip_indexer:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                skip_indexer_for_short_seqs=True)
+
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -2693,7 +2700,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
+                 speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
@@ -2714,15 +2722,19 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
+        ids=[
+            "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
+            "skip_indexer"
+        ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
-                              max_batch_size, moe_backend):
+                              max_batch_size, moe_backend, skip_indexer):
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
@@ -2742,6 +2754,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
         if fp8kv:
             kv_cache_config.dtype = "fp8"
+
+        dsa_config = None
+        if skip_indexer:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                skip_indexer_for_short_seqs=True)
+
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -2753,7 +2771,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
+                 speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
