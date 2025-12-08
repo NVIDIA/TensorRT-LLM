@@ -17,7 +17,6 @@
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
-import pandas as pd
 import yaml
 from pydantic import BaseModel, Field, RootModel
 
@@ -35,18 +34,11 @@ class RecipeConstraints(BaseModel):
     config_path: str = Field(description="Configuration path")
     num_gpus: int = Field(description="Number of GPUs")
 
-    def to_pandas_row(self) -> pd.Series:
-        """Convert recipe record to pandas Series.
-
-        Returns:
-            pd.Series: Pandas Series containing the recipe record.
-        """
-        return pd.Series(self.model_dump())
-
     def load_config(self) -> Dict[str, Any]:
-        """Load configuration from the configuration path."""
-        with open(self.config_path, "r") as f:
-            return Recipe(**yaml.safe_load(f, Loader=yaml.FullLoader))
+        """Load and return the YAML config at config_path."""
+        with open(self.config_path) as f:
+            data = yaml.safe_load(f)
+        return data if data is not None else {}
 
 
 class Recipe(BaseModel):
@@ -60,39 +52,13 @@ class Recipe(BaseModel):
 class RecipeList(RootModel[List[RecipeConstraints]]):
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "RecipeList":
-        """Load recipe list from YAML file and validate the data.
-
-        Args:
-            yaml_path (Path): Path to the YAML file containing the recipe list.
-
-        Returns:
-            RecipeList: Recipe list object.
-        """
-        with open(yaml_path, "r") as f:
-            data = yaml.safe_load(f, Loader=yaml.FullLoader)
+        """Load and validate recipe list from YAML file."""
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
         return cls(data)
 
-    def to_pandas_dataframe(self) -> pd.DataFrame:
-        """Convert recipe list to pandas DataFrame.
-
-        Returns:
-            pd.DataFrame: Pandas DataFrame where each row contains a recipe record.
-        """
-        return pd.DataFrame([record.to_pandas_row() for record in self.root])
-
     def __iter__(self) -> Iterator[RecipeConstraints]:
-        """Iterate over the recipe list.
-
-        Returns:
-            Iterator[RecipeRecord]: Iterator over the recipe list.
-        """
-        for record in self.root:
-            yield record
+        return iter(self.root)
 
     def __len__(self) -> int:
-        """Get the number of recipes in the list.
-
-        Returns:
-            int: Number of recipes in the list.
-        """
         return len(self.root)
