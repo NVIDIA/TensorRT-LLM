@@ -1217,6 +1217,9 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mCacheType{cacheType}
     , mEnablePartialReuse{enablePartialReuse}
     , mLookup{std::make_shared<KVCachePromptLookup>(cacheType, tokensPerBlock)}
+    , mIsEnableIndexerKCache{enableIndexerKCache}
+    , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
+    , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
 {
     if (agentConfig.has_value())
         mLoopbackAgent = makeLoopbackAgent("nixl", &agentConfig.value());
@@ -1537,14 +1540,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
         }
 
         nvinfer1::Dims cacheShape;
-        if (pool.containsIndexerKCache)
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, blockSize});
-        }
-        else
-        {
-            cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        }
+        cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
 
         TLLM_LOG_DEBUG("[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads", mLogPrefix.c_str(),
             mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads);
@@ -2751,7 +2747,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             return 0;
         }
 
-        auto const numCurrTokens = mSequences.at(req.mRequestId).getNumTokens();
+        auto const numCurrTokens = getSequence(req.mRequestId).getNumTokens();
         auto const generatedTokens = numCurrTokens - req.getPromptLen();
         auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens;
         auto const tokensPerStep = req.getNumDraftTokens() + 1;
@@ -3003,7 +2999,13 @@ void KVCacheManager::addSequence(
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
-    if (mSequences.find(requestId) != mSequences.end())
+    bool found = false;
+    {
+        // protect the mSequences
+        std::scoped_lock lock(mSequencesMtx);
+        found = mSequences.find(requestId) != mSequences.end();
+    }
+    if (found)
     {
         auto& sequence = getSequence(requestId);
         if (mEnableBlockReuse && !llmRequest.isDummyRequest())

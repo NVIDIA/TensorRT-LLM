@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,15 +50,18 @@ struct XQAParams
     int32_t sink_token_length = 0;
     int max_past_kv_length = 0;
     void const* qkv_bias;
-    int32_t const* sequence_lengths;                  //
-    int32_t const* context_lengths;                   // maybe not used now
-    void const* alibi_slopes;                         // maybe not used now
-    float const* rotary_embedding_inv_freq_cache;     // precomputed rotary inv freq
+    int32_t const* sequence_lengths;                   //
+    int32_t const* context_lengths;                    // maybe not used now
+    void const* alibi_slopes;                          // maybe not used now
+    float const* rotary_embedding_inv_freq_cache;      // precomputed rotary inv freq
     int32_t const* spec_decoding_packed_mask;
-    int const* spec_decoding_position_offsets;        // for position embedding.
-    int const* spec_decoding_generation_lengths;      // variable input lengths.
-    bool spec_decoding_is_generation_length_variable; // whether the generation lengths actually vary
-    int32_t spec_decoding_max_generation_length;      // max possible input length
+    int const* spec_decoding_position_offsets;         // for position embedding.
+    int const* spec_decoding_generation_lengths;       // variable input lengths.
+    bool spec_decoding_is_generation_length_variable;  // whether the generation lengths actually vary
+    int32_t spec_decoding_max_generation_length;       // max possible input length
+    int64_t* spec_decoding_bl_tree_mask_offset;        // for blackwell spec-dec tree mask offset
+    uint32_t* spec_decoding_bl_tree_mask;              // for blackwell spec-dec tree mask
+    int32_t* spec_bl_tree_first_sparse_mask_offset_kv; // for blackwell spec-dec tree first sparse mask offset kv
     int32_t const* mrope_position_deltas = nullptr;
 
     // almost copy from GPTAttentionPluginCommon.
@@ -115,6 +118,8 @@ struct XQAParams
     bool use_sparse_attention = false;
 
     cudaStream_t stream = 0;
+    // layer index
+    int32_t layer_idx = 0;
 
     std::string toString() const
     {
@@ -149,6 +154,9 @@ struct XQAParams
            << "spec_decoding_is_generation_length_variable: "
            << (spec_decoding_is_generation_length_variable ? "true" : "false") << std::endl
            << "spec_decoding_max_generation_length: " << spec_decoding_max_generation_length << std::endl
+           << "spec_decoding_bl_tree_mask_offset: " << spec_decoding_bl_tree_mask_offset << std::endl
+           << "spec_decoding_bl_tree_mask: " << spec_decoding_bl_tree_mask << std::endl
+           << "spec_bl_tree_first_sparse_mask_offset_kv: " << spec_bl_tree_first_sparse_mask_offset_kv << std::endl
            << "mrope_position_deltas: " << mrope_position_deltas << std::endl
            << "generation_input_length: " << generation_input_length << std::endl
            << "num_q_heads: " << num_q_heads << std::endl

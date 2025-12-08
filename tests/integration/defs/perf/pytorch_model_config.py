@@ -79,6 +79,35 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-gpus:4'
+            ],
+            'config': {
+                'enable_iter_perf_stats': True,
+                'print_iter_log': False,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                    'enable_padding': False
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'max_num_tokens': 32768
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3
+                },
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.6,
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': False
+                },
+                'enable_chunked_prefill': True
+            }
+        },
         # DeepSeek R1 models with large batch sizes and cuda graph padding
         {
             'patterns': [
@@ -117,6 +146,27 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'enable_attention_dp': True,
                 'enable_chunked_prefill': True,
+            }
+        },
+        # Deepseek R1 model with CUTLASS backend
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                    'max_num_tokens': 3072,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64],
+                },
             }
         },
         # Deepseek_v3_lite_cases

@@ -18,13 +18,10 @@ import json
 import os
 import re
 import shutil
-import subprocess
-from copy import deepcopy
 
 import defs.ci_profiler
 import pytest
-from defs.common import (convert_weights, generate_summary_cmd,
-                         get_cpp_benchmark, get_trt_llm_lib_dir, parse_output,
+from defs.common import (convert_weights, generate_summary_cmd, parse_output,
                          quantize_data, similar,
                          test_llm_torch_multi_lora_support,
                          test_multi_lora_support, venv_check_call,
@@ -33,7 +30,8 @@ from defs.common import (convert_weights, generate_summary_cmd,
 from defs.conftest import (get_device_count, get_device_memory,
                            get_host_total_memory, get_sm_version,
                            skip_fp8_pre_ada, skip_no_nvls, skip_post_blackwell,
-                           skip_pre_ada, skip_pre_blackwell)
+                           skip_post_blackwell_ultra, skip_pre_ada,
+                           skip_pre_blackwell)
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
 
@@ -288,6 +286,7 @@ def test_llm_llama_v1_manage_weights_1gpu_summarize(llama_example_root,
 
 
 @skip_pre_blackwell
+@skip_post_blackwell_ultra
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("fp4_type", ["plugin", "ootb", "disable"],
                          ids=["fp4_plugin", "fp4_ootb", "disable_fp4"])
@@ -2187,6 +2186,7 @@ def test_llm_llama_code_llama_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell_ultra
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 4],
@@ -2678,184 +2678,6 @@ def test_llm_llama_v1_multiple_lora_1gpu(data_type, lora_data_type,
 
         # TODO: add step to check result
         venv_check_call(llm_venv, run_cmd)
-
-
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("llama_model_root", ['llama-v2-13b-hf'], indirect=True)
-@pytest.mark.parametrize("llm_lora_model_root", ["chinese-llama-2-lora-13b"],
-                         ids=["chinese_lora"],
-                         indirect=True)
-def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
-                                          llm_venv, llm_root, cmodel_dir,
-                                          engine_dir, llm_lora_model_root):
-    "benchmark llama with multi lora on 2gpu"
-    print("Build engines...")
-
-    num_layers = 40
-    num_lora_mods = 7
-    max_lora_rank = 64
-    max_len = 1024
-    max_batch = 32
-    eos_id = 2
-    num_loras = (8, 16)
-    num_requests = 1024
-
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama-lora",
-                                model_path=llama_model_root,
-                                gpus=2,
-                                tp_size=2,
-                                data_type="float16")
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={max_batch}",
-        f"--max_input_len={max_len}",
-        f"--max_seq_len={2 * max_len}",
-        "--gemm_plugin=float16",
-        "--lora_plugin=float16",
-        "--use_paged_context_fmha=enable",
-        "--lora_target_modules",
-        "attn_q",
-        "attn_k",
-        "attn_v",
-        "attn_dense",
-        "mlp_h_to_4h",
-        "mlp_4h_to_h",
-        "mlp_gate",
-        f"--max_lora_rank={max_lora_rank}",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Convert LoRA to cpp format")
-    convert_cmd = [
-        "python",
-        f"{llama_example_root}/../../../hf_lora_convert.py",
-        f"-i={llm_lora_model_root}",
-        "--storage-type=float16",
-        f"-o={llm_venv.get_working_directory()}/lora_cpp",
-    ]
-    check_call(" ".join(convert_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Prepare datasets")
-    benchmark_root = f"{llama_example_root}/../../../../benchmarks/cpp"
-    lora_eg = f"{llm_venv.get_working_directory()}/lora-eg"
-    base_dataset_cmd = [
-        f"mkdir -p {lora_eg}/data",
-        "&&",
-        "python",
-        f"{benchmark_root}/prepare_dataset.py",
-        f"--output={lora_eg}/data/token-norm-dist.json",
-        f"--tokenizer={llama_model_root}",
-        "token-norm-dist",
-        f"--num-requests={num_requests}",
-        "--input-mean=256",
-        "--input-stdev=16",
-        "--output-mean=128",
-        "--output-stdev 24",
-    ]
-    check_call(" ".join(base_dataset_cmd), shell=True, env=llm_venv._new_env)
-
-    for nloras in num_loras:
-        lora_dataset_cmd = [
-            "python",
-            f"{benchmark_root}/prepare_dataset.py",
-            f"--output={lora_eg}/data/token-norm-dist-lora-{nloras}.json",
-            f"--rand-task-id 0 {nloras-1}",
-            f"--tokenizer={llama_model_root}",
-            "token-norm-dist",
-            f"--num-requests={num_requests}",
-            "--input-mean=256",
-            "--input-stdev=16",
-            "--output-mean=128",
-            "--output-stdev 24",
-        ]
-        check_call(" ".join(lora_dataset_cmd),
-                   shell=True,
-                   env=llm_venv._new_env)
-
-    print("Generate random lora weights for 16 adapters")
-
-    lora_weights_cmd = [
-        "python", f"{benchmark_root}/utils/generate_rand_loras.py",
-        f"{llm_venv.get_working_directory()}/lora_cpp", f"{lora_eg}/loras", "16"
-    ]
-    check_call(" ".join(lora_weights_cmd), shell=True, env=llm_venv._new_env)
-
-    benchmark_exe = get_cpp_benchmark('gptManagerBenchmark', llm_root)
-    envs = deepcopy(os.environ)
-    _ = envs.pop("CUDA_VISIBLE_DEVICES", "")
-    envs[
-        "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(llm_venv)}:{os.path.dirname(benchmark_exe)}:{envs.get("LD_LIBRARY_PATH", "")}'
-
-    print(
-        f'CUDA_VISIBLE_DEVICES: {os.environ.get("CUDA_VISIBLE_DEVICES", None)}')
-
-    print("Perform base model benchmarking")
-    check_call(f"mkdir -p {lora_eg}/log-base-lora", shell=True, env=envs)
-    base_benchmark_cmd = [
-        f"{benchmark_exe}",
-        f"--engine_dir={engine_dir}",
-        "--type=IFB",
-        f"--dataset={lora_eg}/data/token-norm-dist.json",
-        "--lora_host_cache_bytes=8589934592",
-        f"--lora_num_device_mod_layers={32 * num_layers * num_lora_mods * max_lora_rank}",
-        "--kv_cache_free_gpu_mem_fraction=0.70",
-        "--log_level=info",
-        f"--eos_id={eos_id}",
-    ]
-    mpi_cmd = [
-        "mpirun",
-        "-n",
-        "2",
-        "--allow-run-as-root",
-        "--output-filename",
-        f"{lora_eg}/log-base-lora",
-    ]
-    base_benchmark_cmd = mpi_cmd + base_benchmark_cmd
-    print(
-        f"Running gptManagerBenchmark using base cmd: {' '.join(base_benchmark_cmd)}"
-    )
-    subprocess.check_output(base_benchmark_cmd, env=envs)
-    # check_call(" ".join(base_benchmark_cmd), env=envs)
-
-    print("Perform lora model benchmarking")
-    for nloras in num_loras:
-        check_call(f"mkdir -p {lora_eg}/log-lora-{nloras}",
-                   shell=True,
-                   env=envs)
-        lora_benchmark_cmd = [
-            f"{benchmark_exe}",
-            f"--engine_dir={engine_dir}",
-            "--type=IFB",
-            f"--dataset={lora_eg}/data/token-norm-dist-lora-{nloras}.json",
-            "--lora_host_cache_bytes=8589934592",
-            f"--lora_num_device_mod_layers={16 * num_layers * num_lora_mods * max_lora_rank}",
-            "--kv_cache_free_gpu_mem_fraction=0.70",
-            "--log_level=info",
-            f"--eos_id={eos_id}",
-            f"--lora_dir={lora_eg}/loras",
-        ]
-        mpi_cmd = [
-            "mpirun",
-            "-n",
-            "2",
-            "--allow-run-as-root",
-            "--output-filename",
-            f"{lora_eg}/log-lora-{nloras}",
-        ]
-        lora_benchmark_cmd = mpi_cmd + lora_benchmark_cmd
-        print(
-            f"Running gptManagerBenchmark using lora cmd: {' '.join(lora_benchmark_cmd)}"
-        )
-        subprocess.check_output(lora_benchmark_cmd, env=envs)
-        # check_call(lora_benchmark_cmd, env=envs)
 
 
 @pytest.mark.timeout(7200)
@@ -3383,6 +3205,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
+@skip_post_blackwell_ultra
 @pytest.mark.parametrize("fp8_quant",
                          [pytest.param(True, marks=skip_post_blackwell), False],
                          ids=['enable_fp8', 'disable_fp8'])

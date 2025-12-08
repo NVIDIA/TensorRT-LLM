@@ -15,11 +15,12 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     SplitDimension,
-    TPShardingInfo,
+    WeightShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
+from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo, LayerType
+from tensorrt_llm.functional import AllReduceStrategy
 
 base_model_tp_plan = {
     "q_proj": "colwise",
@@ -122,7 +123,7 @@ class FP8MLP(nn.Module):
         return self.linear2(y)
 
 
-def _run_job(
+def _run_sharding_execution_job(
     model_cls: nn.Module,
     dist_op_expected: str,
     bias: bool,
@@ -211,7 +212,6 @@ def _run_job(
         has_expected_dist_ops = any(is_op(n, op_expected) for n in gm.graph.nodes) == (
             world_size > 1
         )
-        # Check weight size constraints
         weight_sizes_valid = verify_local_weight_sizes(gm)
         return has_expected_dist_ops and weight_sizes_valid
 
@@ -272,13 +272,16 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.COLUMN
                         dist_op = None
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
+                            layer_type=LayerType.ATTENTION,
                         )
                     )
         elif model_cls == MLP:
@@ -293,13 +296,15 @@ def _run_pattern_detection_job(
                         dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=dim,
                             rank=rank,
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == nn.Linear:
@@ -307,13 +312,15 @@ def _run_pattern_detection_job(
             for node in gm.graph.nodes:
                 if is_linear_op(node):
                     expected_transformations.append(
-                        TPShardingInfo(
+                        WeightShardingInfo(
                             target_node=node.name,
                             split_dim=SplitDimension.COLUMN,  # Simple shard uses dim=0
                             rank=rank,
                             world_size=world_size,
                             dist_op="all_gather",
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
         elif model_cls == FP8MLP:
@@ -335,6 +342,8 @@ def _run_pattern_detection_job(
                             world_size=world_size,
                             dist_op=dist_op,
                             min_local_shape=1,
+                            allreduce_strategy=AllReduceStrategy.AUTO,
+                            dist_backend="auto",
                         )
                     )
 
@@ -351,7 +360,9 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
+    detected_transformations = (
+        optimizer.shared_config.sharding_transform_container.weight_sharding_transforms
+    )
 
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")
@@ -379,7 +390,7 @@ def test_sharding(
     from_config: bool,
 ):
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_job, model_cls, dist_op_expected, bias, from_config),
+        job=partial(_run_sharding_execution_job, model_cls, dist_op_expected, bias, from_config),
         size=device_count,
     )
 
@@ -409,7 +420,3 @@ def test_sharding_pattern_detection(
     No need to run distributed job, can be run on single process.
     """
     _run_pattern_detection_job(model_cls, bias, 0, world_size, from_config)
-
-
-if __name__ == "__main__":
-    _run_pattern_detection_job(nn.Linear, False, 0, 8, False)

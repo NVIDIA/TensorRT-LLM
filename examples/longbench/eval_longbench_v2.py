@@ -28,7 +28,8 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 RocketSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
 # Chat templates mapping
@@ -120,10 +121,15 @@ def parse_arguments() -> argparse.Namespace:
                         type=int,
                         default=63,
                         help='Kernel size for RocketKV')
-    parser.add_argument('--topr',
+    parser.add_argument('--topk',
                         type=int,
-                        default=90,
-                        help='Top-r for RocketKV')
+                        default=64,
+                        help='Top-k for RocketKV')
+    parser.add_argument('--kt_cache_dtype',
+                        type=str,
+                        default='float8_e5m2',
+                        choices=['bfloat16', 'float8_e5m2'],
+                        help='KT cache data type')
 
     # KV cache configuration
     parser.add_argument('--kv_cache_dtype',
@@ -355,12 +361,17 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
                 window_size=args.window_size,
                 kernel_size=args.kernel_size,
                 prompt_budget=args.token_budget,
-                topr=args.topr,
+                topk=args.topk,
+                kt_cache_dtype=args.kt_cache_dtype,
             )
             logger.info(f"Using RocketKV sparse attention")
         else:
             sparse_attention_config = None
             logger.info("Using standard attention")
+
+        cuda_graph_config = CudaGraphConfig(
+            max_batch_size=args.max_batch_size
+        ) if args.attention_backend == "TRTLLM" else None
 
         # Initialize LLM
         llm = LLM(
@@ -372,8 +383,7 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             tensor_parallel_size=args.tensor_parallel_size,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
-            cuda_graph_config=None,
-            torch_compile_config=None,
+            cuda_graph_config=cuda_graph_config,
         )
 
         # Initialize tokenizer

@@ -37,7 +37,6 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "cutlass/array.h"
-#include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
 
@@ -52,6 +51,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"
 #include "tensorrt_llm/kernels/moe_utils.cuh"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
@@ -1344,7 +1344,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
     return converter(input);
 }
 
-// Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with finalizing routing.
+// Duplicated and permutes rows for MoE.
 
 // "expanded_x_row" simply means that the number of values is num_rows x k. It is "expanded" since we will have to
 // duplicate some rows in the input matrix to match the dimensions. Duplicates will always get routed to separate
@@ -1587,11 +1587,6 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     int64_t num_padding_tokens = 0;
 #endif
 
-    static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-    int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
-    int64_t const threads = EXPAND_THREADS_PER_BLOCK;
-
     auto func = [&]()
     {
 #ifdef ENABLE_FP8
@@ -1636,6 +1631,12 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
                 TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false>;
         }
     }();
+
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, EXPAND_THREADS_PER_BLOCK, 0);
+    int32_t const blocks
+        = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(std::max(num_rows * k, num_padding_tokens)));
+    int32_t const threads = EXPAND_THREADS_PER_BLOCK;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
@@ -1891,15 +1892,18 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     if (parallelism_config.ep_size > 1 && enable_alltoall)
     {
         // If all-to-all comm is enabled, finalizeMoeRouting doesn't need to fill the invalid output tokens with zeros.
-        static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-        // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-        int64_t const blocks = smCount * 8;
-        int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
-        config.gridDim = blocks;
-        config.blockDim = threads;
         auto func = final_scales
             ? &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT>
             : &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
+
+        static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        int32_t const maxBlocksPerSM
+            = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, FINALIZE_THREADS_PER_BLOCK, 0);
+        int32_t const blocks = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(num_rows * experts_per_token));
+        int32_t const threads = FINALIZE_THREADS_PER_BLOCK;
+
+        config.gridDim = blocks;
+        config.blockDim = threads;
         cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
             unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
             expert_first_token_offset, num_rows, padded_cols, unpadded_cols, experts_per_token, num_experts_per_node,
@@ -1936,56 +1940,6 @@ INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
 #ifdef ENABLE_BF16
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
 #endif
-
-// ============================== Activation Adaptors =================================
-template <template <class> class ActFn>
-struct IdentityAdaptor
-{
-    constexpr static bool IS_GLU = false;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& x) const
-    {
-        ActFn<T> fn{};
-        return fn(x);
-    }
-};
-
-template <template <class> class ActFn>
-struct GLUAdaptor
-{
-    constexpr static bool IS_GLU = true;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& gate, T const& linear) const
-    {
-        ActFn<T> fn{};
-        return fn(gate) * linear;
-    }
-};
-
-struct SwigluBiasAdaptor
-{
-    constexpr static bool IS_GLU = true;
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    float limit = std::numeric_limits<float>::infinity();
-
-    template <class T>
-    __device__ T operator()(T const& gate, T const& linear) const
-    {
-        cutlass::epilogue::thread::Sigmoid<T> fn{};
-        T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
-        T gate_clamped = cutlass::minimum<T>{}(gate, limit);
-        return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
-    }
-};
 
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
@@ -2285,33 +2239,43 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
     int64_t num_padding_tokens = 0;
 #endif
 
-    static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-    int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
-    int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
-
     auto fn = [&]()
     {
-        auto fn = [&](auto block_scaling_type)
+        // IMPORTANT: Keep the order of the activation functions in the same order as the ActivationType enum in
+        // common.h
+        auto fn
+            = [&](auto block_scaling_type) -> void (*)(T*, GemmOutputType const*, float const*, ScaleBiasType const*,
+                                               bool, int64_t const*, int, int64_t, float const*, bool,
+                                               TmaWarpSpecializedGroupedGemmInput::ElementSF*, ActivationParams)
         {
-            auto fn_list = std::array{
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::GELU>,
-                    decltype(block_scaling_type)::value>, // Gelu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-                    decltype(block_scaling_type)::value>, // Relu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
-                    decltype(block_scaling_type)::value>, // Silu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-                    decltype(block_scaling_type)::value>, // Swiglu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::GELU>,
-                    decltype(block_scaling_type)::value>, // Geglu
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                    decltype(block_scaling_type)::value>, // SwigluBias
-                &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                    IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                    decltype(block_scaling_type)::value> // Identity
-            };
-            return fn_list[static_cast<int>(activation_type.activation_type)];
+            switch (activation_type.activation_type)
+            {
+            case ActivationType::Identity:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::Identity>, decltype(block_scaling_type)::value>;
+            case ActivationType::Gelu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value>;
+            case ActivationType::Relu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::ReLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Silu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Swiglu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    GLUAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value>;
+            case ActivationType::Geglu:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    GLUAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value>;
+            case ActivationType::SwigluBias:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
+                    decltype(block_scaling_type)::value>;
+            case ActivationType::Relu2:
+                return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                    IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value>;
+            default: TLLM_CHECK_WITH_INFO(false, "Invalid activation type"); return nullptr;
+            }
         };
         auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
             TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
@@ -2336,6 +2300,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             return fn(NONE);
         }
     }();
+
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, ACTIVATION_THREADS_PER_BLOCK, 0);
+    int32_t const blocks
+        = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(std::max(expanded_num_tokens, num_padding_tokens)));
+    int32_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;

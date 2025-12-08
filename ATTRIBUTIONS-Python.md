@@ -25250,7 +25250,7 @@ License: `NVIDIA Proprietary Software`
   - `Homepage`: https://developer.nvidia.com/cusparselt
 
 
-## nvidia-cutlass-dsl (4.2.1)
+## nvidia-cutlass-dsl (4.3.1)
 
 ### Licenses
 License: `None`
@@ -25486,7 +25486,7 @@ limitations under the License.
 ```
 
 ### URLs
-  - `Homepage`: https://github.com/NVIDIA/TensorRT-Model-Optimizer
+  - `Homepage`: https://github.com/NVIDIA/Model-Optimizer
 
 
 ## nvidia-modelopt-core (0.33.1)
@@ -25513,7 +25513,7 @@ limitations under the License.
 ```
 
 ### URLs
-  - `Homepage`: https://github.com/NVIDIA/TensorRT-Model-Optimizer
+  - `Homepage`: https://github.com/NVIDIA/Model-Optimizer
 
 
 ## nvidia-nccl-cu12 (2.27.3)

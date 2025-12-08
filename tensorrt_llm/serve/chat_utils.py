@@ -1,5 +1,7 @@
+import json
 import uuid
-from functools import partial
+from functools import lru_cache, partial
+from pathlib import Path
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
 
@@ -185,6 +187,36 @@ def parse_chat_message_content(
         content,
         mm_data_tracker,
     )
+    if role == "assistant":
+        result.update(_parse_assistant_message_content(message))
+    elif role == "tool":
+        result.update(_parse_tool_message_content(message))
+    return result
+
+
+# Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
+def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+    result = {}
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        result["tool_calls"] = []
+        for item in tool_calls:
+            if content := item["function"].get("arguments"):
+                if isinstance(content, str):
+                    item["function"]["arguments"] = json.loads(content)
+                else:
+                    item["function"]["arguments"] = content
+            else:
+                item["function"]["arguments"] = {}
+            result["tool_calls"].append(item)
+
+    return result
+
+
+def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+    result = {}
+    if "tool_call_id" in message:
+        result["tool_call_id"] = message["tool_call_id"]
     return result
 
 
@@ -217,15 +249,46 @@ def parse_chat_messages_coroutines(
     ), mm_placeholder_counts
 
 
-def check_multiple_response(n: int, backend: Optional[str]):
-    if n > 1 and backend == "pytorch":
-        raise ValueError(
-            "Multiple response is not supported in PyTorch workflow")
-
-
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
     if id_type == "kimi_k2":
         return f"functions.{func_name}:{idx}"
     else:
         # by default return random
         return f"chatcmpl-tool-{uuid.uuid4().hex}"
+
+
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/44b5ce956d3cf28841615a58c1c0873af87bcfe2/vllm/entrypoints/chat_utils.py
+@lru_cache
+def load_chat_template(
+    chat_template: Path | str | None,
+    *,
+    is_literal: bool = False,
+) -> str | None:
+    if chat_template is None:
+        return None
+
+    if is_literal:
+        if isinstance(chat_template, Path):
+            raise TypeError(
+                "chat_template is expected to be read directly from its value")
+
+        return chat_template
+
+    try:
+        with open(chat_template) as f:
+            return f.read()
+    except OSError as e:
+        if isinstance(chat_template, Path):
+            raise
+
+        JINJA_CHARS = "{}\n"
+        if not any(c in chat_template for c in JINJA_CHARS):
+            msg = (f"The supplied chat template ({chat_template}) "
+                   f"looks like a file path, but it failed to be "
+                   f"opened. Reason: {e}")
+            raise ValueError(msg) from e
+
+        # If opening a file fails, set chat template to be args to
+        # ensure we decode so our escape are interpreted correctly
+        return load_chat_template(chat_template, is_literal=True)

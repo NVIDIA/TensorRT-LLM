@@ -87,16 +87,16 @@ class MetadataServerConfig():
     refresh_interval: float = 10.0
 
 
-def get_ctx_gen_server_urls(
+def get_ctx_gen_server_addrs(
         server_configs: list[CtxGenServerConfig]
 ) -> tuple[list[str], list[str]]:
     ctx_server_urls = []
     gen_server_urls = []
     for cfg in server_configs:
         if cfg.type == "ctx":
-            ctx_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+            ctx_server_urls.append(f"{cfg.hostname}:{cfg.port}")
         else:
-            gen_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+            gen_server_urls.append(f"{cfg.hostname}:{cfg.port}")
 
     return ctx_server_urls, gen_server_urls
 
@@ -198,7 +198,7 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 
     # Compute the number of ranks per instance
     instance_num_ranks = kwargs.get('tensor_parallel_size', 1) * kwargs.get(
-        'pipeline_parallel_size', 1)
+        'pipeline_parallel_size', 1) * kwargs.get('context_parallel_size', 1)
 
     cfgs = []
     for hostname, port in zip(hostnames, ports):

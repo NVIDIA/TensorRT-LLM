@@ -186,9 +186,16 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
+        (
+            "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024",
+            {
+                "transforms": {
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                },
+            },
+        ),
     ],
 )
-@pytest.mark.skip(reason="https://nvbugs/5625972")
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm

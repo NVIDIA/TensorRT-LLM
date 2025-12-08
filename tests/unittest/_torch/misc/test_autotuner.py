@@ -57,19 +57,19 @@ M = 32
 # add sleep to simulate bad perf
 def gemm_0(x, w):
     if x.shape[0] > M // 2:
-        delay_kernel(10000, torch.cuda.current_stream())
+        delay_kernel(100, torch.cuda.current_stream())
     return x @ w
 
 
 def gemm_1(x, w):
     if x.shape[0] <= M // 2:
-        delay_kernel(10000, torch.cuda.current_stream())
+        delay_kernel(100, torch.cuda.current_stream())
     return x @ w
 
 
 def gemm_fallback(x, w) -> torch.Tensor:
     # always the slowest
-    delay_kernel(100000, torch.cuda.current_stream())
+    delay_kernel(500, torch.cuda.current_stream())
     return x @ w
 
 
@@ -112,13 +112,13 @@ class GemmRunner(TunableRunner):
                          mutates_args=())
 def get_best_gemm_tactic(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     runners = [GemmRunner()]
-    tunner = AutoTuner.get()
+    tuner = AutoTuner.get()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         input_idx=0,
         dim_idx=0,
         gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
         map_to_tuning_buckets=next_positive_power_of_2), ), )
-    runner, tactic = tunner.choose_one(
+    runner, tactic = tuner.choose_one(
         "autotuner_test::get_best_gemm_tactic",
         runners,
         tuning_config,
@@ -139,6 +139,10 @@ def test_autotuner_cache_basic():
     AutoTuner.get().clear_cache()
     with autotune():
         torch.ops.autotuner_test.get_best_gemm_tactic(torch.randn(M, 64), w)
+
+    # This tests the logic of print_profiling_cache and print_statistics
+    AutoTuner.get().print_profiling_cache()
+    AutoTuner.get().print_statistics()
 
     m = M * 2
     while m >= 1:
@@ -171,20 +175,20 @@ def test_autotuner_try_block():
 
     x, w = torch.randn(M, 64), torch.randn(64, 128)
     runners = [PartialCrashedRunner()]
-    tunner = AutoTuner.get()
+    tuner = AutoTuner.get()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         input_idx=0,
         dim_idx=0,
         gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
         map_to_tuning_buckets=next_positive_power_of_2), ), )
     with autotune():
-        runner, tactic = tunner.choose_one("test_autotuner_try_block", runners,
-                                           tuning_config, [x, w])
+        runner, tactic = tuner.choose_one("test_autotuner_try_block", runners,
+                                          tuning_config, [x, w])
 
     m = M // 2
     while m >= 1:
-        _, tactic = tunner.choose_one("test_autotuner_try_block", runners,
-                                      tuning_config, [torch.randn(m, 64), w])
+        _, tactic = tuner.choose_one("test_autotuner_try_block", runners,
+                                     tuning_config, [torch.randn(m, 64), w])
         assert tactic in [
             -1, 0
         ], f"Expect only tactic -1, 0 being chosen, but got tactic {tactic}."

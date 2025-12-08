@@ -3,8 +3,10 @@ import gc
 import json
 import os
 import signal  # Added import
+import socket
 import subprocess  # nosec B404
 import sys
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import click
@@ -16,7 +18,6 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -29,11 +30,13 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
-from tensorrt_llm.llmapi.mpi_session import find_free_port
+from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -89,11 +92,14 @@ def get_llm_args(
         max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
+        context_parallel_size: int = 1,
+        cp_config: Optional[dict] = None,
         moe_expert_parallel_size: Optional[int] = None,
         gpus_per_node: Optional[int] = None,
         free_gpu_memory_fraction: float = 0.9,
         num_postprocess_workers: int = 0,
         trust_remote_code: bool = False,
+        revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
         fail_fast_on_attention_window_too_large: bool = False,
         otlp_traces_endpoint: Optional[str] = None,
@@ -119,15 +125,26 @@ def get_llm_args(
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
+    if cp_config is not None and "cp_type" in cp_config:
+        cp_config = cp_config.copy()
+        try:
+            cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+        except KeyError:
+            raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                             f"Must be one of: {', '.join([t.name for t in CpType])}")
+
     llm_args = {
         "model": model,
         "scheduler_config": scheduler_config,
         "tokenizer": tokenizer,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
+        "context_parallel_size": context_parallel_size,
+        "cp_config": cp_config if cp_config is not None else {},
         "moe_expert_parallel_size": moe_expert_parallel_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
+        "revision": revision,
         "build_config": build_config,
         "max_batch_size": max_batch_size,
         "max_num_tokens": max_num_tokens,
@@ -152,6 +169,7 @@ def launch_server(
         port: int,
         llm_args: dict,
         tool_parser: Optional[str] = None,
+        chat_template: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
@@ -159,33 +177,43 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    if backend == 'pytorch':
-        llm = PyTorchLLM(**llm_args)
-    elif backend == '_autodeploy':
-        # AutoDeploy does not support build_config
-        llm_args.pop("build_config", None)
-        llm = AutoDeployLLM(**llm_args)
-    elif backend == 'tensorrt' or backend == 'trt':
-        llm_args.pop("backend")
-        llm = LLM(**llm_args)
-    else:
-        raise click.BadParameter(
-            f"{backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-    server = OpenAIServer(llm=llm,
-                          model=model,
-                          tool_parser=tool_parser,
-                          server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg,
-                          disagg_cluster_config=disagg_cluster_config,
-                          multimodal_server_config=multimodal_server_config)
+        if backend == 'pytorch':
+            llm_args.pop("build_config", None)
+            llm = PyTorchLLM(**llm_args)
+        elif backend == '_autodeploy':
+            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-    # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-        gc.disable()
+            # AutoDeploy does not support build_config
+            llm_args.pop("build_config", None)
+            llm = AutoDeployLLM(**llm_args)
+        elif backend == 'tensorrt' or backend == 'trt':
+            llm_args.pop("backend")
+            llm = LLM(**llm_args)
+        else:
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
 
-    asyncio.run(server(host, port))
+        server = OpenAIServer(llm=llm,
+                              model=model,
+                              tool_parser=tool_parser,
+                              server_role=server_role,
+                              metadata_server_cfg=metadata_server_cfg,
+                              disagg_cluster_config=disagg_cluster_config,
+                              multimodal_server_config=multimodal_server_config,
+                              chat_template=chat_template)
+
+        # Optionally disable GC (default: not disabled)
+        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+            gc.disable()
+
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 def launch_mm_encoder_server(
@@ -195,12 +223,14 @@ def launch_mm_encoder_server(
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     model = encoder_args["model"]
+    encoder_args.pop("build_config")
     mm_encoder = MultimodalEncoder(**encoder_args)
 
     server = OpenAIServer(llm=mm_encoder,
                           model=model,
                           server_role=ServerRole.MM_ENCODER,
-                          metadata_server_cfg=metadata_server_cfg)
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None)
     asyncio.run(server(host, port))
 
 
@@ -243,6 +273,16 @@ class ChoiceWithAlias(click.Choice):
                          {"trt": "tensorrt"}),
     default="pytorch",
     help="The backend to use to serve the model. Default is pytorch backend.")
+@click.option(
+    "--custom_module_dirs",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    multiple=True,
+    help="Paths to custom module directories to import.",
+)
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -268,16 +308,28 @@ class ChoiceWithAlias(click.Choice):
     default=BuildConfig.model_fields["max_seq_len"].default,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
-@click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
-@click.option("--pp_size",
+@click.option("--tensor_parallel_size",
+              "--tp_size",
+              type=int,
+              default=1,
+              help='Tensor parallelism size.')
+@click.option("--pipeline_parallel_size",
+              "--pp_size",
               type=int,
               default=1,
               help='Pipeline parallelism size.')
-@click.option("--ep_size",
+@click.option("--context_parallel_size",
+              "--cp_size",
+              type=int,
+              default=1,
+              help='Context parallelism size.')
+@click.option("--moe_expert_parallel_size",
+              "--ep_size",
               type=int,
               default=None,
               help="expert parallelism size")
-@click.option("--cluster_size",
+@click.option("--moe_cluster_parallel_size",
+              "--cluster_size",
               type=int,
               default=None,
               help="expert cluster parallelism size")
@@ -286,7 +338,8 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help="Number of GPUs per node. Default to None, and it will be "
               "detected automatically.")
-@click.option("--kv_cache_free_gpu_memory_fraction",
+@click.option("--free_gpu_memory_fraction",
+              "--kv_cache_free_gpu_memory_fraction",
               type=float,
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
@@ -301,13 +354,20 @@ class ChoiceWithAlias(click.Choice):
               is_flag=True,
               default=False,
               help="Flag for HF transformers.")
+@click.option("--revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
 @click.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @click.option(
     "--reasoning_parser",
     type=click.Choice(ReasoningParserFactory.parsers.keys()),
@@ -353,25 +413,40 @@ class ChoiceWithAlias(click.Choice):
               type=str,
               default=None,
               help="Keyword arguments for media I/O.")
-def serve(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
+@click.option("--chat_template",
+              type=str,
+              default=None,
+              help="[Experimental] Specify a custom chat template. "
+              "Can be a file path or one-liner template string")
+def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tensor_parallel_size: int, pipeline_parallel_size: int,
+          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          moe_cluster_parallel_size: Optional[int],
+          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          revision: Optional[str], extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool,
+          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+          disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+          custom_module_dirs: list[Path], chat_template: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
 
+    for custom_module_dir in custom_module_dirs:
+        try:
+            import_custom_module_from_dir(custom_module_dir)
+        except Exception as e:
+            logger.error(
+                f"Failed to import custom module from {custom_module_dir}: {e}")
+            raise e
     llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
@@ -380,14 +455,16 @@ def serve(
         max_batch_size=max_batch_size,
         max_num_tokens=max_num_tokens,
         max_seq_len=max_seq_len,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        moe_expert_parallel_size=ep_size,
-        moe_cluster_parallel_size=cluster_size,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        context_parallel_size=context_parallel_size,
+        moe_expert_parallel_size=moe_expert_parallel_size,
+        moe_cluster_parallel_size=moe_cluster_parallel_size,
         gpus_per_node=gpus_per_node,
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
+        revision=revision,
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
@@ -433,8 +510,9 @@ def serve(
 
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
-    launch_server(host, port, llm_args, tool_parser, metadata_server_cfg,
-                  server_role, disagg_cluster_config, multimodal_server_config)
+    launch_server(host, port, llm_args, tool_parser, chat_template,
+                  metadata_server_cfg, server_role, disagg_cluster_config,
+                  multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
@@ -699,10 +777,10 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     # This mimics the behavior of trtllm-llmapi-launch
     # TODO: Make the port allocation atomic
-    free_port = find_free_port()
+    free_ipc_addr = find_free_ipc_addr()
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
-    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.
-               value] = f"tcp://127.0.0.1:{free_port}"
+    os.environ[
+        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)

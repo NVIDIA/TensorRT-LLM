@@ -81,6 +81,8 @@ def trimForStageList(stageNameList)
 }
 
 @Field
+def REUSE_TEST = "reuse_test"   // Determine if the pipeline should reuse test results in a stage from the previous pipelines.
+@Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
 def ENABLE_SKIP_TEST = "skip_test"
@@ -114,6 +116,7 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 
 def testFilter = [
+    (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
     (TEST_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((TEST_STAGE_LIST), null)?.tokenize(',')),
@@ -155,6 +158,8 @@ def globalVars = [
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
+    !testFilter[DISABLE_MULTI_GPU_TEST] &&
+    !testFilter[DEBUG_MODE] &&
     testFilter[GPU_TYPE_LIST] == null &&
     testFilter[TEST_STAGE_LIST] == null &&
     testFilter[TEST_BACKEND] == null
@@ -335,33 +340,43 @@ def mergeWaiveList(pipeline, globalVars)
     sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
     sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
 
-    // Get TOT waive list
-    LLM_TOT_ROOT = "llm-tot"
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
-    echo "Target branch: ${targetBranch}"
-    withCredentials([string(credentialsId: 'default-sync-llm-repo', variable: 'DEFAULT_SYNC_LLM_REPO')]) {
-        trtllm_utils.checkoutSource(DEFAULT_SYNC_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
+    try {
+        // Get TOT waive list
+        LLM_TOT_ROOT = "llm-tot"
+        targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        echo "Target branch: ${targetBranch}"
+        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+            trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
+        }
+        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+        sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+
+        // Get waive list diff in current MR
+        def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+        // Write diff to a temporary file to avoid shell escaping issues
+        writeFile file: 'diff_content.txt', text: diff
+
+        // Merge waive lists
+        sh """
+            python3 mergeWaiveList.py \
+            --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
+            --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+            --diff-file=diff_content.txt \
+            --output-file=waives.txt
+        """
+        trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+        echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Merge test waive list failed. Fallback to use the default test waive list from the PR. Error: ${e.toString()}"
+        }
     }
-    targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
-    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-    sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
-
-    // Get waive list diff in current MR
-    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
-
-    // Write diff to a temporary file to avoid shell escaping issues
-    writeFile file: 'diff_content.txt', text: diff
-
-    // Merge waive lists
-    sh """
-        python3 mergeWaiveList.py \
-        --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
-        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
-        --diff-file=diff_content.txt \
-        --output-file=waives.txt
-    """
-    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
-    echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
 }
 
 def preparation(pipeline, testFilter, globalVars)
@@ -514,16 +529,17 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
     def result = null
     def pageId = 0
     withCredentials([
-        string(
-            credentialsId: 'github-token-trtllm-ci',
-            variable: 'GITHUB_API_TOKEN'
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'
         ),
     ]) {
         while(true) {
             pageId += 1
             def rawDataJson = pipeline.sh(
                 script: """
-                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
                 """,
                 returnStdout: true
@@ -627,6 +643,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     }
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "tests/integration/defs/triton_server/": ["-Triton-"],
+        "triton_backend/": ["-Triton-"],
         "cpp/kernels/fmha_v2/": ["-FMHA-"],
         "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
     ]
@@ -697,6 +715,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
+        "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/modules/fused_moe/",

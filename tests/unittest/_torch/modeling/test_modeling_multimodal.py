@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from utils.llm_data import llm_models_root
 
@@ -17,7 +17,6 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -49,7 +48,14 @@ class MultimodalScenario:
 
     def __post_init__(self):
         """Validate scenario configuration."""
-        valid_modalities = ["image", "video", "text", "multiple_image", "mixture_text_image"]
+        valid_modalities = [
+            "image",
+            "video",
+            "text",
+            "multiple_image",
+            "mixture_text_image",
+            "audio",
+        ]
         if self.modality not in valid_modalities:
             raise ValueError(
                 f"Invalid modality '{self.modality}'. "
@@ -94,6 +100,19 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
     def get_model_config_class(self) -> Type:
         """Return the model configuration class."""
 
+    @property
+    def trust_remote_code(self) -> bool:
+        """Return whether to trust remote code. Will override when using custom config and model classes."""
+        return False
+
+    @property
+    def skip_hf_inference(self) -> bool:
+        """Return whether to skip HuggingFace inference."""
+        # There are some cases which we want to skip HF inference:
+        # 1. The transformer version required by HF inference is not compatible with the one used in TRTLLM.
+        # 2. We need to add more codes to support features required by the HF model.
+        return False
+
     def get_dtype(self) -> torch.dtype:
         """Return the model data type (default: from config's torch_dtype field)."""
         config = self.get_model_config()
@@ -126,6 +145,14 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         elif modality == "text":
             prompts = ["Who invented the internet?"]
             media = []
+        elif modality == "audio":
+            prompts = ["What is the audio content?"]
+            audio_data_root = Path(
+                os.path.join(
+                    llm_models_root(), "multimodals", "Phi-4-multimodal-instruct", "examples"
+                )
+            )
+            media = [str(audio_data_root / "what_is_shown_in_this_image.wav")]
         else:
             raise ValueError(
                 f"Invalid modality: {modality}. "
@@ -425,8 +452,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             trtllm_inputs["attn_metadata"].prepare()
             return self.trtllm_model.forward(**trtllm_inputs)
         else:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+            graph_runner = create_mock_cuda_graph_runner(1)
             trtllm_inputs["attn_metadata"] = trtllm_inputs[
                 "attn_metadata"
             ].create_cuda_graph_metadata(1)
@@ -545,38 +571,49 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
             # Compare context outputs
             hf_inputs = self.get_hf_inputs(scenario.modality, prompts, media)
-            ref = self.hf_model.forward(**hf_inputs, use_cache=True)
+            if self.skip_hf_inference:
+                ref = None
+            else:
+                ref = self.hf_model.forward(**hf_inputs, use_cache=True)
 
-            try:
-                self.compare_outputs(logits, ref.logits[:, -1].float())
-                print("  ✓ Context phase passed")
-            except AssertionError:
-                print("  ✗ Context phase failed")
-                result = False
+            if not self.skip_hf_inference:
+                try:
+                    self.compare_outputs(logits, ref.logits[:, -1].float())
+                    print("  ✓ Context phase passed")
+                except AssertionError:
+                    print("  ✗ Context phase failed")
+                    result = False
+            else:
+                print("  ✓ Context phase passed (skipped HF inference)")
 
         # Generation Phase
         print("  Running generation phase...")
         gen_trtllm_inputs = self.get_trtllm_inputs(
             trtllm_input_ids, multimodal_params_list, is_gen=True
         )
+        past_key_values = ref.past_key_values if not self.skip_hf_inference else None
         gen_hf_inputs = {
             "input_ids": gen_trtllm_inputs["input_ids"].unsqueeze(0),
             "position_ids": gen_trtllm_inputs["position_ids"],
-            "past_key_values": ref.past_key_values,
+            "past_key_values": past_key_values,
             "use_cache": True,
         }
 
         with torch.inference_mode():
             logits = self.run_trtllm_forward(gen_trtllm_inputs, scenario.use_cuda_graph)
-            ref = self.hf_model.forward(**gen_hf_inputs)
-
-            try:
-                self.compare_outputs(logits, ref.logits[:, -1].float())
-                print("  ✓ Generation phase passed")
-            except AssertionError:
-                print("  ✗ Generation phase failed")
-                result = False
-
+            if self.skip_hf_inference:
+                ref = None
+            else:
+                ref = self.hf_model.forward(**gen_hf_inputs)
+            if not self.skip_hf_inference:
+                try:
+                    self.compare_outputs(logits, ref.logits[:, -1].float())
+                    print("  ✓ Generation phase passed")
+                except AssertionError:
+                    print("  ✗ Generation phase failed")
+                    result = False
+            else:
+                print("  ✓ Generation phase passed (skipped HF inference)")
         self.kv_cache_manager.shutdown()
         self.attn_metadata = None
 
@@ -621,10 +658,19 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         self.device = torch.device("cuda:0")
 
         self.hf_config = self.create_hf_config()
-        self.hf_model = self.create_hf_model(self.hf_config)
-        self.trtllm_model, self.model_config = self.create_trtllm_model(
-            load_weights=True, hf_model_state_dict=self.hf_model.state_dict()
-        )
+        if self.skip_hf_inference:
+            # Create a dummy torch module if skipping HF inference.
+            # `hf_config` is saved into the module and will be used later.
+            self.hf_model = torch.nn.Module()
+            self.hf_model.config = self.hf_config
+            self.trtllm_model, self.model_config = self.create_trtllm_model(
+                load_weights=False, hf_model_state_dict=self.hf_model.state_dict()
+            )
+        else:
+            self.hf_model = self.create_hf_model(self.hf_config)
+            self.trtllm_model, self.model_config = self.create_trtllm_model(
+                load_weights=True, hf_model_state_dict=self.hf_model.state_dict()
+            )
         self.runtime_features = AttentionRuntimeFeatures()
 
     def tearDown(self):

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "prepareCustomMask.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 namespace tc = tensorrt_llm::common;
@@ -203,6 +204,11 @@ public:
             {
                 selectKernelIter++;
                 continue;
+            }
+            // Prepare custom mask for spec-decoding generation kernels.
+            if (params.mLayerIdx == 0 && params.mIsSpecDecTree)
+            {
+                runPrepareCustomMask(kernelMeta, params, params.stream);
             }
 
             // Prepare the kernel parameters.
@@ -382,7 +388,7 @@ private:
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
             }
-            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
+            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseMla
                 && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
             {
                 // Use smaller tileSizeKv to fully utilize the SMs.
@@ -484,12 +490,14 @@ private:
             // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
             // conditions are met:
             // 1. The number of headsQPerKv is <= 32.
-            // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
+            // 2. The number of headsQPerKv is < 128 for sparseMla.
+            // 3. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
             //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
             // The sparseMla kernel will always use the 2CTA high-throughput kernel.
 
             // Check the conditions.
-            if ((params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params)) && !params.mSparseMla)
+            if (params.mNumHeadsQPerKv <= 32 || (params.mSparseMla && params.mNumHeadsQPerKv < 128)
+                || useSwapsMmaAbMlaGenKernel(params))
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
@@ -502,9 +510,10 @@ private:
                 {
                     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
                 }
-                // The sparseMla only supports numHeadsQPerKv = 128.
+                // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
                 TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
-                    "The sparseMla only supports numHeadsQPerKv = 128");
+                    "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
+                    params.mNumHeadsQPerKv);
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {
@@ -516,9 +525,29 @@ private:
         }
         else if (isGenerationKernel(params.mKernelType))
         {
-            kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
-                ? FmhaKernelType::SwapsMmaAbForGeneration
-                : FmhaKernelType::KeepsMmaAbForGeneration;
+            if (params.mIsSpecDecTree)
+            {
+
+                bool isSupported
+                    = params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128);
+                if (isSupported)
+                {
+                    kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+                }
+                else
+                {
+                    TLLM_LOG_ERROR(
+                        "Tree-based speculative decoding is not supported with numHeadsQPerKv = %d and headDimQk = %d "
+                        "by TRTLLM-GEN",
+                        params.mNumHeadsQPerKv, params.mHeadDimQk);
+                }
+            }
+            else
+            {
+                kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
+                    ? FmhaKernelType::SwapsMmaAbForGeneration
+                    : FmhaKernelType::KeepsMmaAbForGeneration;
+            }
         }
 
         // The maximum number of headsQPerKv that the kernel can support in one Cta.
@@ -536,6 +565,10 @@ private:
         {
             // Use the maxNumHeadsQPerKvInCta (tileSizeQ) = 64 for MLA high-throughput generation kernels.
             maxNumHeadsQPerKvInCta = isMlaGenKernel(params) ? 64 : 32;
+            if (params.mIsSpecDecTree)
+            {
+                maxNumHeadsQPerKvInCta = 128;
+            }
             TLLM_CHECK_WITH_INFO((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
                                      || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
                 "Not supported");

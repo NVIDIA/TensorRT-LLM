@@ -798,6 +798,21 @@ public:
 
     ~WindowBlockManager();
 
+    [[nodiscard]] bool isEnableIndexerKCache() const
+    {
+        return mEnableIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
+    {
+        return mIndexerKCacheIndexHeadDim;
+    }
+
     void allocatePools(bool useUvm);
 
     void releasePools();
@@ -1053,6 +1068,13 @@ public:
 
     [[nodiscard]] std::string printFreeQueues() const;
 
+    void resetReuseState()
+    {
+        std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+        mCachedBlocksRoot
+            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
+    }
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -1178,6 +1200,21 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+
+    [[nodiscard]] bool isEnableIndexerKCache() const
+    {
+        return mIsEnableIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
+    {
+        return mIndexerKCacheIndexHeadDim;
+    }
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -1483,6 +1520,14 @@ public:
         return mLookup->printSearchTree();
     }
 
+    void resetReuseState()
+    {
+        for (auto& [windowSize, manager] : mWindowBlockManagers)
+        {
+            manager.resetReuseState();
+        }
+    }
+
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1525,6 +1570,13 @@ private:
     // Mutex for the cached blocks root
     mutable std::mutex mCachedBlocksRootMutex;
     LookupPtr mLookup;
+
+    // Record what sequences are currently managed by the block manager
+    std::set<LlmRequest::RequestIdType> mManagedSequences;
+
+    bool mIsEnableIndexerKCache{false};
+    SizeType32 mIndexerKCacheQuantBlockSize{0};
+    SizeType32 mIndexerKCacheIndexHeadDim{0};
 };
 
 struct OffsetTableDimensions
@@ -1627,6 +1679,10 @@ public:
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
+    [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
+    [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
+    [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
+
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
 
@@ -1676,6 +1732,7 @@ public:
     virtual void syncTransferManagerWithBufferManager() = 0;
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
+    virtual void resetReuseState() = 0;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
@@ -1961,6 +2018,21 @@ public:
         return mEnableBlockReuse;
     }
 
+    [[nodiscard]] bool isEnableIndexerKCache() const override
+    {
+        return mBlockManager.isEnableIndexerKCache();
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const override
+    {
+        return mBlockManager.getIndexerKCacheIndexHeadDim();
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const override
+    {
+        return mBlockManager.getIndexerKCacheQuantBlockSize();
+    }
+
     void removeToken(LlmRequest::RequestIdType requestId);
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
@@ -2059,6 +2131,11 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+    }
+
+    void resetReuseState() override
+    {
+        mBlockManager.resetReuseState();
     }
 
     /// @brief Finds the maximum attention window that can be used on a sequence, given some kv-cache block capacity.

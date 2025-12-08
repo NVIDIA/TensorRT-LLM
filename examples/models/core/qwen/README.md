@@ -663,19 +663,19 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
 
 ```bash
-# Clone the TensorRT Model Optimizer (ModelOpt)
-git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
-pushd TensorRT-Model-Optimizer
+# Clone the Model Optimizer (ModelOpt)
+git clone https://github.com/NVIDIA/Model-Optimizer.git
+pushd Model-Optimizer
 
 # install the ModelOpt
 pip install -e .
 
 # Quantize the Qwen3-235B-A22B model by nvfp4
-# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
+# By default, the checkpoint would be stored in `Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 ./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
 
 # Quantize the Qwen3-32B model by fp8_pc_pt
-# By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
+# By default, the checkpoint would be stored in `Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
 ./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-32B/ --quant fp8_pc_pt --export_fmt hf
 popd
 ```
@@ -687,7 +687,7 @@ To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to 
 ```bash
 #!/bin/bash
 
-folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
 path_config=extra-llm-api-config.yml
 num_gpus=8
 ep_size=8
@@ -727,7 +727,7 @@ trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
 We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or an other) and you want to run the benchmark, you can use the following command to generate a random dataset:
 
 ```bash
-folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
 min_input_len=1024
 min_output_len=2048
 concurrency=128
@@ -875,6 +875,15 @@ Below is the command to run the Qwen3-Next model.
 
 ```bash
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir /Qwen3-Next-80B-A3B-Thinking --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 4
+
+```
+
+### NVFP4 quantization
+
+TRTLLM supports NVFP4 precision with blocksize=16 for both activations and GEMM weights.
+To run the Qwen3-Next model on NVFP4 precision, use the following command
+```bash
+mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 2 --trust_remote_code
 
 ```
 

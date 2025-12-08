@@ -2,8 +2,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.10-py3
-# [TODO] Update to NVIDIA Triton 25.10 when it's available
-ARG TRITON_BASE_TAG=25.09-py3
+ARG TRITON_BASE_TAG=25.10-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -13,9 +12,10 @@ LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-softwa
 LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/"
 
 # https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
-# The default values come from `nvcr.io/nvidia/pytorch`
-ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
-ENV ENV=${ENV:-/etc/shinit_v2}
+ARG SH_ENV="/etc/shinit_v2"
+ENV ENV=${SH_ENV}
+ARG BASH_ENV="/etc/bash.bashrc"
+ENV BASH_ENV=${BASH_ENV}
 
 ARG GITHUB_MIRROR=""
 RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
@@ -29,7 +29,7 @@ FROM base AS devel
 
 #
 # NB: PyTorch requires this to be < 1.0
-ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
+ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 # Copy all installation scripts at once to reduce layers
 COPY docker/common/install.sh \
@@ -46,50 +46,52 @@ COPY docker/common/install.sh \
      docker/common/install_etcd.sh \
      ./
 
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
-    PYTHON_VERSION=${PYTHON_VERSION} \
-    bash ./install.sh --base && rm install_base.sh
-
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --cmake && rm install_cmake.sh
-
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --ccache && rm install_ccache.sh
-
-RUN bash ./install.sh --cuda_toolkit && rm install_cuda_toolkit.sh
-
 ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
-RUN TRT_VER=${TRT_VER} \
+ARG TORCH_INSTALL_TYPE="skip"
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
+    PYTHON_VERSION=${PYTHON_VERSION} \
+    TRT_VER=${TRT_VER} \
     CUDA_VER=${CUDA_VER} \
     CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} \
     CUBLAS_VER=${CUBLAS_VER} \
-    bash ./install.sh --tensorrt && rm install_tensorrt.sh
+    TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
+    bash ./install.sh --base --cmake --ccache --cuda_toolkit --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
+    rm install_base.sh && \
+    rm install_cmake.sh && \
+    rm install_ccache.sh && \
+    rm install_cuda_toolkit.sh && \
+    rm install_tensorrt.sh && \
+    rm install_polygraphy.sh && \
+    rm install_mpi4py.sh && \
+    rm install_pytorch.sh && \
+    rm install.sh
 
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --polygraphy && rm install_polygraphy.sh
+# Install UCX, NIXL, etcd
+# TODO: Combine these into the main install.sh script
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && \
+    bash ./install_etcd.sh && \
+    rm install_ucx.sh && \
+    rm install_nixl.sh && \
+    rm install_etcd.sh
 
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && rm install_mpi4py.sh
-
-ARG TORCH_INSTALL_TYPE="skip"
-RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch && rm install_pytorch.sh
-
-RUN bash ./install.sh --opencv && rm install.sh
-
-# Install UCX first
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && rm install_ucx.sh
-
-# Install NIXL
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && rm install_nixl.sh
-
-# Install etcd
-RUN bash ./install_etcd.sh && rm install_etcd.sh
+# Generate OSS attribution file for devel image
+ARG TRT_LLM_VER
+ARG TARGETARCH
+COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
+RUN bash /tmp/generate_container_oss_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}" && \
+    rm /tmp/generate_container_oss_attribution.sh
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
 
+ARG GITHUB_MIRROR=""
 COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
 COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
 COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
@@ -98,9 +100,18 @@ COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 
 # Copy all installation scripts at once to reduce layers
 COPY docker/common/install_triton.sh \
+     docker/common/install_mooncake.sh \
      ./
 
-RUN bash ./install_triton.sh && rm install_triton.sh
+# Install Mooncake, after triton handles boost requirement
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && \
+    if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping mooncake installation"; \
+    else \
+        bash ./install_mooncake.sh; \
+    fi && \
+    rm install_triton.sh && \
+    rm install_mooncake.sh
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
@@ -163,8 +174,13 @@ RUN chmod -R a+w examples && \
 
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
+ARG TARGETARCH
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Generate OSS attribution file for release image
+COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
+RUN bash /tmp/generate_container_oss_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}" && rm /tmp/generate_container_oss_attribution.sh
 
 FROM wheel AS tritonbuild
 

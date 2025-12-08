@@ -182,7 +182,7 @@ void GuidedDecoder::execute(DecoderInputBuffers const& decoderInputBuffers, Buff
             {
                 auto const seqSlot = llmReq->mSeqSlot.value();
 
-                auto const& logits = decoderInputBuffers.logits.at(requestIdx);
+                auto const& logits = decoderInputBuffers.decoderLogits.at(requestIdx);
                 auto const logitsBitmask = ITensor::at(mLogitsBitmask, {seqSlot});
 
                 // Use void* to unify the code for different mLogitsDtype

@@ -5,6 +5,7 @@ slurm:
   account: "<account>"
   job_time: "02:00:00"
   job_name: "<job_name>"
+  extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
   numa_bind: true # Only enable for GB200 NVL72
 
 # Benchmark Mode
@@ -15,17 +16,15 @@ benchmark:
   benchmark_ratio: 0.8  # Benchmark ratio
   streaming: true  # Enable streaming mode
   concurrency_list: "16"
+  input_length: 1024  # Input sequence length
+  output_length: 1024  # Output sequence length
+  dataset_file: "<dataset_file>"
 
 # Hardware Configuration
 hardware:
   gpus_per_node: 4  # Modify this with your hardware configuration
   num_ctx_servers: 1  # Number of context servers
   num_gen_servers: 1  # Number of generation servers
-
-# Sequence Configuration
-sequence:
-  input_length: 1024  # Input sequence length
-  output_length: 1024  # Output sequence length
 
 # Environment Configuration
 environment:
@@ -34,12 +33,23 @@ environment:
   model_path: "<model_path>"
   trtllm_repo: "<trtllm_repo>"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
-  dataset_file: "<dataset_file>"
+  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "<full_path_to_work_dir>"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 
 # Profiling Configuration
 profiling:
   nsys_on: false  # Set to true to enable profiling
+  ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
+  gen_profile_range: "200-250"  # Set TLLM_PROFILE_START_STOP for gen workers
+
+# Accuracy Configuration
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  model: "local-completions"  # Model type for lm_eval
+  tasks: "gsm8k"  # Evaluation tasks (comma-separated)
+  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"  # Extra model arguments for lm_eval
 
 worker_config:
   gen:
@@ -69,6 +79,7 @@ worker_config:
       - 2048
       - 256
     print_iter_log: true
+    trust_remote_code: true
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
@@ -95,6 +106,7 @@ worker_config:
     enable_attention_dp: true
     pipeline_parallel_size: 1
     print_iter_log: true
+    trust_remote_code: true
     cuda_graph_config: null
     disable_overlap_scheduler: true
     kv_cache_config:

@@ -6,6 +6,8 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
+    AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
@@ -14,13 +16,14 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
+from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import MetaInitMode, timing
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+                                     timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
-from .config import LoadFormat
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -63,7 +66,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if not valid_pyt_quant:
         raise ValueError(
             "Overriding KV cache quantization with an invalid type "
-            f'"PyTorchConfig.kv_cache_dtype="{pyt_kv_cache_dtype}" '
+            f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
     # If we get to this point we have a valid quantization setting, but if
@@ -71,7 +74,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
         raise RuntimeError(
             "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with PyTorchConfig.kv_cache_dtype='
+            f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
             f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
             "pre-quantized KV cache that doesn't match.")
 
@@ -149,6 +152,31 @@ def get_rank_model_storage(model):
         ):
             total_bytes += buf.element_size() * buf.nelement()
     return total_bytes
+
+
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader
 
 
 class ModelLoader:
@@ -237,23 +265,35 @@ class ModelLoader:
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir)
+                        model.llm_checkpoint_dir, mapping=self.mapping)
                 else:
-                    weights = checkpoint_loader.load_weights(checkpoint_dir)
+                    weights = checkpoint_loader.load_weights(
+                        checkpoint_dir, mapping=self.mapping)
 
-                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 self._call_load_weights(model.load_weights, weights,
-                                        weight_mapper)
+                                        self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model_dir)
+                        self.spec_config.speculative_model_dir,
+                        mapping=self.mapping)
+
+                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                        0]
+                    draft_weight_mapper = AutoCheckpointMapper.get(
+                        checkpoint_loader.checkpoint_format, draft_model_arch)
+                    draft_weight_mapper.init_model_and_config(
+                        model.draft_model, model.draft_config)
+
                     self._call_load_weights(model.load_draft_weights, weights,
-                                            weight_mapper)
+                                            draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
                 initialize_dummy_weights(model)
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -284,6 +324,16 @@ class ModelLoader:
 
         return model, moe_load_balancer
 
+    def reload(self,
+               model: DecoderModelForCausalLM,
+               weights: dict,
+               allow_partial_loading: bool = False):
+        self._call_load_weights(model.load_weights,
+                                weights,
+                                self.weight_mapper,
+                                allow_partial_loading=allow_partial_loading)
+        torch.cuda.current_stream().synchronize()
+
     def _load_and_validate_config(
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
@@ -309,7 +359,13 @@ class ModelLoader:
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
-            use_low_precision_moe_combine)
+            use_low_precision_moe_combine,
+            nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
+            allowed_backends)
+
+        # Store nvfp4 config in extra_attrs for Linear layer access
+        config.extra_attrs[
+            'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
@@ -327,10 +383,18 @@ class ModelLoader:
                             sub_config).num_hidden_layers = num_layers_override
         return config
 
-    def _call_load_weights(self, load_method: Callable, weights, weight_mapper):
+    def _call_load_weights(self,
+                           load_method: Callable,
+                           weights,
+                           weight_mapper,
+                           allow_partial_loading: bool = False):
         """Calls the model's weight loading method with the correct arguments."""
         args = inspect.getfullargspec(load_method).args
+        kargs = {}
         if "weight_mapper" in args:
-            load_method(weights, weight_mapper=weight_mapper)
+            kargs["weight_mapper"] = weight_mapper
+        if "allow_partial_loading" in args:
+            kargs["allow_partial_loading"] = allow_partial_loading
         else:
-            load_method(weights)
+            assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"
+        load_method(weights, **kargs)

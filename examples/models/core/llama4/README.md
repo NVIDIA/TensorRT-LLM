@@ -27,7 +27,7 @@ This section provides the steps to launch TensorRT LLM server and run performanc
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 enable_attention_dp: true
-stream_interval: 2
+stream_interval: 10
 cuda_graph_config:
   max_batch_size: 512
   enable_padding: true
@@ -42,7 +42,7 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --max_batch_size 512 \
@@ -78,7 +78,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 cat >./extra-llm-api-config.yml <<EOF
 enable_attention_dp: false
 enable_min_latency: true
-stream_interval: 2
+stream_interval: 10
 cuda_graph_config:
   max_batch_size: 8
   enable_padding: true
@@ -94,7 +94,7 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint.
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --max_batch_size 8 \
@@ -126,7 +126,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 #### 1. Prepare TensorRT LLM extra configs
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-stream_interval: 2
+stream_interval: 10
 cuda_graph_config:
   max_batch_size: 1024
   enable_padding: true
@@ -140,7 +140,7 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint.
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --tp_size 8 \

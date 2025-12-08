@@ -11,6 +11,8 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     from ..speculative.utils import SpecDecodingTensor
+    from ..speculative.interface import SpecMetadata
+    from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
@@ -145,6 +147,8 @@ class AttentionMetadata:
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    # The number of heads per kv head.
+    num_heads_per_kv: Optional[int] = 1
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -336,10 +340,15 @@ class AttentionMetadata:
 
     def update_spec_dec_param(
             self,
+            batch_size,
             is_spec_decoding_enabled,
             is_spec_dec_tree,
             is_spec_dec_dynamic_tree,
-            max_draft_tokens,
+            max_draft_len,
+            max_total_draft_tokens,
+            model_is_wrapped: bool = False,
+            spec_metadata: Optional['SpecMetadata'] = None,
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
             spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.

@@ -89,22 +89,24 @@ class DeepGemmMoEOp(MoEOp):
         # Workspace for FP8 activations
         capture_graph = torch.cuda.is_current_stream_capturing()
         workspace["workspace_0"] = DeepGemmMoEOp.buffers.get_buffer(
-            (expert_size_per_partition * m_max * fp8_dim),
+            [expert_size_per_partition, m_max, fp8_dim],
             dtype=torch.float8_e4m3fn,
             buffer_name='workspace_0',
             reserve_buffer=capture_graph)
 
         # Workspace for intermediate results
         workspace["workspace_1"] = DeepGemmMoEOp.buffers.get_buffer(
-            (expert_size_per_partition * m_max *
-             max(intermediate_size * 2, hidden_size)),
+            [
+                expert_size_per_partition, m_max,
+                max(intermediate_size * 2, hidden_size)
+            ],
             dtype=torch.bfloat16,
             buffer_name='workspace_1',
             reserve_buffer=capture_graph)
 
         # Workspace for scaling factors
         workspace["workspace_sf"] = DeepGemmMoEOp.buffers.get_buffer(
-            expert_size_per_partition * (scale_k_padded // 4) * m_padded,
+            [expert_size_per_partition, (scale_k_padded // 4), m_padded],
             dtype=torch.int32,
             buffer_name='workspace_sf',
             reserve_buffer=capture_graph)
