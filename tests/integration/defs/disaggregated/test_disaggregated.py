@@ -972,6 +972,7 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
 def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
                                            disaggregated_example_root,
                                            llama_model_root):
+    time.sleep(60 * 60)
     src_dst_dict = {
         llama_model_root:
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
