@@ -795,6 +795,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
         self.max_gen_seq_len = 1
+        # disable skip indexer for the n-th mtp layers, where n > 1.
+        # TODO: fix the accuracy issue of MTP (>1) + skip indexer and then enable it.
+        self.skip_indexer_for_ctx_reqs = False
+        self.skip_indexer_for_gen_reqs = False
 
         # device
         self.on_update_kv_lens()
