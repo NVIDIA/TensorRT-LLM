@@ -90,29 +90,32 @@ class RayWorkerWrapper:
                                              store=self.store,
                                              world_size=self.work_size,
                                              rank=self.rank)
-        self.has_setup_distributed_env_and_worker = True
         logger.info(
             f"[Rank {self.rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {self.local_gpu}"
         )
 
         self.worker = self.worker_cls(device_id=self.local_gpu,
                                       **self.worker_kwargs)
+        self.has_setup_distributed_env_and_worker = True
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError("Distributed environment and worker not setup")
+            raise RuntimeError(
+                "Have not setup distributed environment and worker yet")
         return self.worker.submit(request)
 
     def enqueue_request(self,
                         request: GenerationRequest,
                         result_wait_queue: Queue | None = None) -> int:
         if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError("Distributed environment and worker not setup")
+            raise RuntimeError(
+                "Have not setup distributed environment and worker yet")
         return self.worker.enqueue_request(request, result_wait_queue)
 
     def abort_request(self, request_id: int) -> None:
         if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError("Distributed environment and worker not setup")
+            raise RuntimeError(
+                "Have not setup distributed environment and worker yet")
         self.worker.abort_request(request_id)
 
     def report_device_id(self) -> str:
@@ -122,7 +125,8 @@ class RayWorkerWrapper:
     def call_worker_method(self, method_name: str, *args, **kwargs):
         """Generic method to call any method on the underlying worker."""
         if not getattr(self, 'has_setup_distributed_env_and_worker', False):
-            raise RuntimeError("Distributed environment and worker not setup")
+            raise RuntimeError(
+                "Have not setup distributed environment and worker yet")
         if hasattr(self.worker, method_name):
             method = getattr(self.worker, method_name)
             if callable(method):
