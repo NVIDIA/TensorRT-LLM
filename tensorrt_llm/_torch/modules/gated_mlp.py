@@ -175,14 +175,21 @@ class GatedMLP(nn.Module):
         assert lora_params is not None
         assert self.layer_idx is not None, "layer_idx is required for lora"
 
+        # TODO: Remove this path when LoRA grouped_gemm supports FP8
+        x_for_lora = x
+        if isinstance(x, torch.Tensor) and x.dtype == torch.float8_e4m3fn:
+            x_for_lora = x.to(torch.bfloat16)
+
         h1 = self.gate_up_proj(x)
 
-        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
+        h1_lora = self.splitted_gate_up_lora(x_for_lora, lora_params,
+                                             self.layer_idx)
 
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
+        h1_lora = self.fused_gate_up_lora(x_for_lora, lora_params,
+                                          self.layer_idx)
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
