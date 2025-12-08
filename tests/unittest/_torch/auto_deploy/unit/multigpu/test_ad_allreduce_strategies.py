@@ -115,6 +115,7 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
         "TWOSHOT",
         "MIN_LATENCY",
         "NCCL",
+        "NCCL_SYMMETRIC",
     ],
 )
 def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # noqa: F811

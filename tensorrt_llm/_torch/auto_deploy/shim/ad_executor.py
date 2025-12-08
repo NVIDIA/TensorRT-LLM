@@ -18,6 +18,7 @@ import torch
 from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
+import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -29,6 +30,7 @@ from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
+from ...modules.linear import AllReduceStrategy
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
@@ -333,6 +335,70 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
+def _init_userbuffers_for_autodeploy(ad_config: LlmArgs, mapping: Mapping) -> bool:
+    """Initialize userbuffers manager for NCCL_SYMMETRIC allreduce strategy.
+
+    This is required for NCCL symmetric memory allreduce to work properly.
+    """
+    if mapping.tp_size <= 1:
+        return False
+
+    # Check if userbuffers are supported
+    if not ub.ub_supported():
+        return False
+
+    # Get allreduce strategy from transforms config
+    # The strategy can be set in either "detect_sharding" or "sharding_transform_executor"
+    allreduce_strategy = AllReduceStrategy.AUTO
+    strategy_val = None
+
+    for config_key in ["detect_sharding", "sharding_transform_executor"]:
+        sharding_config = ad_config.transforms.get(config_key, {})
+        if isinstance(sharding_config, dict):
+            strategy_val = sharding_config.get("allreduce_strategy")
+        else:
+            strategy_val = getattr(sharding_config, "allreduce_strategy", None)
+        if strategy_val is not None:
+            break
+
+    if strategy_val is None:
+        strategy_val = "AUTO"
+
+    if isinstance(strategy_val, str):
+        try:
+            allreduce_strategy = AllReduceStrategy[strategy_val]
+        except KeyError:
+            allreduce_strategy = AllReduceStrategy.AUTO
+    elif isinstance(strategy_val, AllReduceStrategy):
+        allreduce_strategy = strategy_val
+
+    use_nccl_symmetric = allreduce_strategy == AllReduceStrategy.NCCL_SYMMETRIC
+
+    if not use_nccl_symmetric:
+        return False
+
+    # Get hidden_size from model config via factory
+    factory = ad_config.create_factory()
+    model_config, _ = factory._get_model_config()
+    hidden_size = getattr(model_config, "hidden_size", 4096)
+
+    # Initialize userbuffers manager
+    buffer_size = hidden_size * ad_config.max_num_tokens * 2
+    ub.initialize_userbuffers_manager(
+        mapping.tp_size,
+        mapping.pp_size,
+        mapping.cp_size,
+        mapping.rank,
+        mapping.gpus_per_node,
+        buffer_size,
+        use_nccl_symmetric,
+    )
+    ad_logger.info(
+        f"Initialized userbuffers manager for NCCL_SYMMETRIC with buffer_size={buffer_size}"
+    )
+    return True
+
+
 def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
     The tokenizer is required for guided decoding.
@@ -364,6 +430,9 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
 
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
+
+    # Initialize userbuffers manager for NCCL_SYMMETRIC allreduce strategy
+    _init_userbuffers_for_autodeploy(ad_config, dist_mapping)
 
     # check kvcache config for partial block reuse
     # TODO: copy_on_partial_reuse is not supported yet, see
