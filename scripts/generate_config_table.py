@@ -4,22 +4,19 @@ from collections import defaultdict
 
 import yaml
 
-# Mapping for model display names, URLs, and filename shortening prefixes
+# Mapping for model display names and URLs
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
         "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
-        "prefix_to_strip": "deepseek_r1_0528_",
     },
     "nvidia/DeepSeek-R1-0528-FP4-v2": {
         "display_name": "DeepSeek-R1 (NVFP4)",
         "url": "https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2",
-        "prefix_to_strip": "deepseek_r1_0528_fp4_v2_",
     },
     "openai/gpt-oss-120b": {
         "display_name": "gpt-oss-120b",
         "url": "https://huggingface.co/openai/gpt-oss-120b",
-        "prefix_to_strip": "gpt_oss_120b_",
     },
 }
 
@@ -162,12 +159,6 @@ def generate_rst(yaml_path, output_file=None):
                 command = f"trtllm-serve {model} --extra_llm_api_options ${{TRTLLM_DIR}}/{full_config_path}"
 
                 config_filename = os.path.basename(full_config_path)
-
-                # Shorten config filename if applicable
-                if model in MODEL_INFO:
-                    prefix = MODEL_INFO[model].get("prefix_to_strip", "")
-                    if config_filename.startswith(prefix):
-                        config_filename = config_filename[len(prefix) :]
 
                 github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{full_config_path}"
                 config_link = f"`{config_filename} <{github_url}>`_"
