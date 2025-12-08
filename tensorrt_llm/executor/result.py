@@ -653,6 +653,10 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
 
+                # Update _last_token_ids_len after detokenization to prevent
+                # re-decoding the same tokens in subsequent responses when n > 1.
+                beam_output._last_token_ids_len = len(beam_output.token_ids)
+
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
                     beam_output.finish_reason == 'stop'
