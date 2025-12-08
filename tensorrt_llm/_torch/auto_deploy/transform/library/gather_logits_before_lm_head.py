@@ -103,7 +103,7 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
         # Add logits_gather_mask as input in the graph and the sequence info interface
         logits_gather_mask_node = add_graph_input(gm, "logits_gather_mask")
         cm.info.register_arg(
-            "logits_gather_mask", torch.zeros(cm.info.max_num_tokens, dtype=torch.bool)
+            "logits_gather_mask", torch.ones(cm.info.max_num_tokens, dtype=torch.bool)
         )
         with gm.graph.inserting_after(node_to_gather):
             gathered_node = gm.graph.call_function(

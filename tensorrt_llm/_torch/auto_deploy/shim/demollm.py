@@ -133,10 +133,16 @@ class DemoEngine(ADEngine):
 
         def _generate_single_step(idx: int):
             logits = self._compute_logits()
-            logits_last = torch.stack([l_one_seq[-1] for l_one_seq in logits]).float().unsqueeze(1)
 
+            # if the gather_logits_before_lm_head transform is not applied, the logits will be 3D.
+            if logits.ndim == 3:
+                if logits.shape[1] == 1:
+                    logits = logits.squeeze(1)
+                else:
+                    logits = logits.squeeze(0)
+            output_pos = torch.cumsum(torch.tensor(sequence_info.seq_len, dtype=torch.int), 0) - 1
+            logits_last = logits[output_pos].unsqueeze(1)
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]
-
             # update sequence info accordingly for next step (generate phase)
             input_pos_next = sequence_info.input_pos
             seq_lens_current = sequence_info.seq_len
