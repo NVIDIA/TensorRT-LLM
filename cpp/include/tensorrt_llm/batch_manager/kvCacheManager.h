@@ -295,7 +295,7 @@ public:
 
     [[nodiscard]] bool isRoot() const;
 
-    LookupNodePtr const& getPrevNode() const;
+    [[nodiscard]] LookupNodePtr const& getPrevNode() const;
 
     void setPrevNode(LookupNodePtr prevNode);
 
