@@ -511,6 +511,11 @@ class AutoTunerProfilingCache:
         cache = {}
         cache_data = serializable_cache["cache_data"]
 
+        def lists_to_tuples(obj):
+            if isinstance(obj, list):
+                return tuple(lists_to_tuples(x) for x in obj)
+            return obj
+
         for key_str, value in cache_data.items():
             # Reconstruct the tuple key safely
             try:
@@ -521,7 +526,7 @@ class AutoTunerProfilingCache:
                 continue
 
             runner_id = value["runner_id"]
-            tactic = value["tactic"]
+            tactic = lists_to_tuples(value["tactic"])
             min_time = value["min_time"]
 
             cache[key] = (runner_id, tactic, min_time)

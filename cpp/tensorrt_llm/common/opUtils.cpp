@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -112,7 +113,29 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
         [](ncclComm_t* comm)
         {
-            ncclCommDestroy(*comm);
+            if (!comm)
+            {
+                return;
+            }
+
+            // STEP 1: Clean up resources and destroy NCCL communicator if it's valid
+            if (*comm)
+            {
+                // Clean up all registered resources FIRST
+                tensorrt_llm::common::nccl_util::NcclCommResourceManager::getInstance().cleanupResources(*comm);
+
+                // Now destroy the NCCL communicator
+                ncclResult_t result = ncclCommDestroy(*comm);
+                if (result != ncclSuccess)
+                {
+                    TLLM_LOG_WARNING("ncclCommDestroy failed with error: %d", result);
+                }
+
+                // Clear the communicator value before freeing the pointer
+                *comm = nullptr;
+            }
+
+            // STEP 2: Always free the pointer memory (regardless of whether *comm was valid)
             delete comm;
         });
 #if defined(_WIN32)
