@@ -14,6 +14,13 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.auto_deploy.enums import (
+    ActivationFunction,
+    MLPStyle,
+    act_fn_from_str,
+    mlp_style_from_str,
+)
+
 from ...utils.logger import ad_logger
 
 
@@ -605,11 +612,12 @@ def triton_fused_moe(
     act_fn: str = "relu2",
 ) -> torch.Tensor:
     """Triton unquantized MoE with 2-layer MLP and ReLU^2 activation."""
+    # Convert string parameters to enums
+    mlp_style_enum = mlp_style_from_str(mlp_style)
+    act_fn_enum = act_fn_from_str(act_fn)
 
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
-    assert mlp_style == "mlp", "Triton backend only supports mlp style."
-    assert act_fn == "relu2", "Triton backend only supports relu2 activation."
+    assert mlp_style_enum == MLPStyle.MLP, "Triton backend only supports mlp style."
+    assert act_fn_enum == ActivationFunction.RELU2, "Triton backend only supports relu2 activation."
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
@@ -665,8 +673,15 @@ def triton_quant_fp8_moe(
     act_fn: str = "silu",
 ) -> torch.Tensor:
     """Triton FP8 W8A8 MoE with 2-layer MLP and ReLU^2 activation."""
-    if mlp_style != "mlp":
+    # Convert string parameters to enums
+    mlp_style_enum = mlp_style_from_str(mlp_style)
+    act_fn_enum = act_fn_from_str(act_fn)
+
+    if mlp_style_enum != MLPStyle.MLP:
         raise NotImplementedError("triton_quant_fp8_moe currently supports mlp_style=='mlp' only")
+
+    if act_fn_enum != ActivationFunction.RELU2:
+        raise NotImplementedError("triton_quant_fp8_moe currently supports act_fn=='relu2' only")
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])

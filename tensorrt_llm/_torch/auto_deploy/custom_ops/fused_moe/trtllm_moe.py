@@ -16,6 +16,12 @@
 
 import torch
 
+from tensorrt_llm._torch.auto_deploy.enums import (
+    ActivationFunction,
+    MLPStyle,
+    act_fn_from_str,
+    mlp_style_from_str,
+)
 from tensorrt_llm._torch.utils import ActivationType
 
 
@@ -36,25 +42,26 @@ def trtllm_moe_fused(
     selected_experts = selected_experts.to(torch.int32)
     quant_scales = []
 
-    # Determine activation type
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
+    # Convert string parameters to enums
+    mlp_style_enum = mlp_style_from_str(mlp_style)
+    act_fn_enum = act_fn_from_str(act_fn)
 
+    # Determine activation type
     activation_type = ActivationType.Swiglu
-    if mlp_style == "gated_mlp":
+    if mlp_style_enum == MLPStyle.GATED_MLP:
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
-        if act_fn == "silu":
+        if act_fn_enum == ActivationFunction.SILU:
             activation_type = ActivationType.Swiglu
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
-    elif mlp_style == "mlp":
+            raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for gated_mlp.")
+    elif mlp_style_enum == MLPStyle.MLP:
         # For non-gated MLP with ReLU^2
-        if act_fn == "relu2":
+        if act_fn_enum == ActivationFunction.RELU2:
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
+            raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for mlp.")
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+        raise ValueError(f"Unknown mlp_style '{mlp_style}'.")
 
     return torch.ops.trtllm.fused_moe(
         x,
@@ -93,22 +100,19 @@ def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-def _validate_mlp_style_and_act_fn(mlp_style: str, act_fn: str) -> None:
+def _validate_mlp_style_and_act_fn(mlp_style: MLPStyle, act_fn: ActivationFunction) -> None:
+    """Validate that mlp_style and act_fn combination is supported for TRT-LLM."""
     supported_combinations = {
-        "gated_mlp": ["silu"],
-        "mlp": ["relu2"],
+        MLPStyle.GATED_MLP: [ActivationFunction.SILU],
+        MLPStyle.MLP: [ActivationFunction.RELU2],
     }
-    supported_act_fns = [
-        act_fn for act_fn_list in supported_combinations.values() for act_fn in act_fn_list
-    ]
-    assert mlp_style in supported_combinations.keys(), (
-        f"Unknown mlp_style '{mlp_style}'. Use {supported_combinations.keys()}."
-    )
-    assert act_fn in supported_act_fns, f"Unknown act_fn '{act_fn}'. Use {supported_act_fns}."
-    assert act_fn in supported_combinations[mlp_style], (
-        f"Unsupported combination: mlp_style='{mlp_style}', act_fn='{act_fn}'. "
-        f"Supported combinations: {supported_combinations}"
-    )
+
+    if act_fn not in supported_combinations[mlp_style]:
+        supported = [a.value for a in supported_combinations[mlp_style]]
+        raise ValueError(
+            f"Unsupported combination: mlp_style='{mlp_style.value}', act_fn='{act_fn.value}'. "
+            f"Supported activations for {mlp_style.value}: {supported}"
+        )
 
 
 @torch.library.custom_op("auto_deploy::trtllm_quant_fp8_moe_fused", mutates_args=())
@@ -158,8 +162,12 @@ def trtllm_quant_fp8_moe_fused(
     Gated MLP:
         activation_fn(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t()) @ w2_expert.t()
     """
+    # Convert string parameters to enums
+    mlp_style_enum = mlp_style_from_str(mlp_style)
+    act_fn_enum = act_fn_from_str(act_fn)
 
-    _validate_mlp_style_and_act_fn(mlp_style, act_fn)
+    # Validate supported combinations
+    _validate_mlp_style_and_act_fn(mlp_style_enum, act_fn_enum)
 
     # Store original shape and flatten to 2D
     x_shape = x.shape
@@ -187,31 +195,26 @@ def trtllm_quant_fp8_moe_fused(
     selected_experts = selected_experts.int().contiguous()
     routing_weights = routing_weights.contiguous()
 
-    # Todo: refactor this repeating code block
-
     # Determine activation type
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
-
     activation_type = ActivationType.Swiglu
-    if mlp_style == "gated_mlp":
+    if mlp_style_enum == MLPStyle.GATED_MLP:
         # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
         # For gated MLP, concatenate w1 and w3 as [w3, w1]
         w3_w1_stacked = torch.cat([w3_weight, w1_weight], dim=1).contiguous()  # [E, 2*I, H]
         fc1_expert_weights = w3_w1_stacked
-        if act_fn == "silu":
+        if act_fn_enum == ActivationFunction.SILU:
             activation_type = ActivationType.Swiglu
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
-    elif mlp_style == "mlp":
+            raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for gated_mlp.")
+    elif mlp_style_enum == MLPStyle.MLP:
         # For non-gated MLP with ReLU^2
         fc1_expert_weights = w1_weight.contiguous()
-        if act_fn == "relu2":
+        if act_fn_enum == ActivationFunction.RELU2:
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
+            raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for mlp.")
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+        raise ValueError(f"Unknown mlp_style '{mlp_style}'.")
 
     # Note! Outputting Float8_e4m3fn directly is not currently supported
     output = torch.ops.trtllm.fused_moe(
@@ -285,22 +288,24 @@ def trtllm_quant_nvfp4_moe_fused(
 
     """
     NVFP4_BLOCK_SIZE = 16
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
+
+    # Convert string parameters to enums
+    mlp_style_enum = mlp_style_from_str(mlp_style)
+    act_fn_enum = act_fn_from_str(act_fn)
 
     activation_type = ActivationType.Swiglu
-    if mlp_style == "gated_mlp":
-        if act_fn == "silu":
+    if mlp_style_enum == MLPStyle.GATED_MLP:
+        if act_fn_enum == ActivationFunction.SILU:
             activation_type = ActivationType.Swiglu
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for gated_mlp. Use 'silu'.")
-    elif mlp_style == "mlp":
-        if act_fn == "relu2":
+            raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for gated_mlp.")
+    elif mlp_style_enum == MLPStyle.MLP:
+        if act_fn_enum == ActivationFunction.RELU2:
             activation_type = ActivationType.Relu2
         else:
-            raise ValueError(f"Unsupported activation '{act_fn}' for mlp. Use 'relu2'.")
+            raise ValueError(f"Unsupported activation '{act_fn_enum.value}' for mlp.")
     else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+        raise ValueError(f"Unknown mlp_style '{mlp_style}'.")
 
     # quant_scales is described by this code:
     # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015

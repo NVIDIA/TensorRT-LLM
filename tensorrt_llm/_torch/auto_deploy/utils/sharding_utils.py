@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from ....functional import AllReduceStrategy
+from ..enums import WeightsFusion, weights_fusion_from_str
 from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import (
@@ -1298,7 +1299,7 @@ def _transform_bmm_moe_weight_param(
         param_node: The get_attr node for the parameter
         lo: Start index for expert slicing
         hi: End index for expert slicing
-        swap_gate_up: If True, swap W1 and W3 (Llama4 -> TRT-LLM format)
+        swap_gate_up: If True, swap from [W1, W3] (GATEUP_DOWN) to [W3, W1] (UPGATE_DOWN/TRT-LLM)
     """
     if param_node.op != "get_attr":
         return  # Only works on parameters
@@ -1312,7 +1313,7 @@ def _transform_bmm_moe_weight_param(
     sliced_param = full_param[lo:hi].detach().clone()
 
     # Swap W1 and W3 if needed (for gate_up weights)
-    # Llama4: (E, H, 2*I) with [W1, W3], TRT-LLM wants [W3, W1]
+    # Convert GATEUP_DOWN (E, H, 2*I) with [W1, W3] -> UPGATE_DOWN with [W3, W1] for TRT-LLM
     if swap_gate_up and sliced_param.ndim == 3:
         intermediate_size = sliced_param.shape[2] // 2
         w1 = sliced_param[:, :, :intermediate_size]
@@ -1434,10 +1435,17 @@ def _insert_sharded_moe_stacked(
     # -- Transform expert weight parameters --
     local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
 
-    # Transform w3_w1_stacked: slice experts, swap [W1,W3]->[W3,W1], transpose (E,H,2I)->(E,2I,H)
+    weights_fusion_enum = weights_fusion_from_str(args[7])
+    # Transform gate_up_stacked: slice experts, swap [W1,W3]->[W3,W1] if GATEUP_DOWN, transpose (E,H,2I)->(E,2I,H)
+    # GATEUP_DOWN means [w1, w3] order -> swap to TRT-LLM [w3, w1]
+    # UPGATE_DOWN means [w3, w1] order -> already in TRT-LLM format, no swap needed
     if isinstance(w3_w1_tensor_node, Node):
         _transform_bmm_moe_weight_param(
-            gm, w3_w1_tensor_node, local_lo, local_hi, swap_gate_up=True
+            gm,
+            w3_w1_tensor_node,
+            local_lo,
+            local_hi,
+            swap_gate_up=weights_fusion_enum == WeightsFusion.GATEUP_DOWN,
         )
 
     # Transform w2_stacked: slice experts, transpose (E,I,H)->(E,H,I)

@@ -1,3 +1,4 @@
+import operator
 from collections import defaultdict
 from typing import Dict, List, Literal, Optional, Tuple, Type
 
@@ -5,9 +6,19 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from ...enums import (
+    ActivationFunction,
+    MLPStyle,
+    WeightsFormat,
+    WeightsFusion,
+    mlp_style_from_str,
+    weights_format_from_str,
+    weights_fusion_from_str,
+)
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
 from ..interface import (
     BaseTransform,
@@ -42,44 +53,22 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
-        # Detect if this is a stacked MoE (Llama4 pattern) or per-expert list (standard pattern)
-        (apply_routing_val, w1_weight_list) = extract_op_args(
-            node, "apply_routing_on_input", "w1_weight"
+        is_stacked_moe = (
+            weights_format_from_str(extract_op_args(node, "weights_format")[0])
+            == WeightsFormat.STACKED
         )
-
-        # Check if it's stacked format: single-element list with 3D tensor
-        is_stacked_moe = False
-        if apply_routing_val:
-            # In FX graphs, w1_weight_list might be a Node representing a list() call
-            list_content = None
-            if isinstance(w1_weight_list, Node) and w1_weight_list.target is list:
-                # Extract from list() call node
-                if w1_weight_list.args:
-                    list_content = w1_weight_list.args[0]
-            elif isinstance(w1_weight_list, (list, tuple)):
-                # Direct Python list
-                list_content = w1_weight_list
-
-            # Check if it's a single-element list with a 3D tensor
-            if list_content is not None and len(list_content) == 1:
-                w1_node = list_content[0]
-                if isinstance(w1_node, Node) and w1_node.op == "get_attr":
-                    try:
-                        w1_tensor = gm.get_parameter(w1_node.target)
-                        is_stacked_moe = w1_tensor.ndim == 3
-                    except (AttributeError, KeyError):
-                        pass
-
         if is_stacked_moe:
-            # Stacked MoE (Llama4 pattern): only supports gated MLP
-            (act_fn_val,) = extract_op_args(node, "act_fn")
+            # Stacked MoE: supports both GATEUP_DOWN [w1,w3] and UPGATE_DOWN [w3,w1] formats
+            (act_fn_val, weights_fusion_val) = extract_op_args(node, "act_fn", "weights_fusion")
+            weights_fusion_enum = weights_fusion_from_str(weights_fusion_val)
             _process_llama4_stacked_moe_node(
-                gm, graph, node, replacement_op, act_fn_val, fused_key_counter
+                gm, graph, node, replacement_op, act_fn_val, fused_key_counter, weights_fusion_enum
             )
         else:
             # Standard MoE with per-expert weight lists
             (mlp_style_val, act_fn_val) = extract_op_args(node, "mlp_style", "act_fn")
-            assert backend != "triton" or mlp_style_val == "mlp", (
+            mlp_style_enum = mlp_style_from_str(mlp_style_val)
+            assert backend != "triton" or mlp_style_enum == MLPStyle.MLP, (
                 "Triton backend only supports mlp style."
             )
             _process_regular_moe_node(
@@ -111,31 +100,50 @@ def _process_regular_moe_node(
     Stacks weight parameters and creates a fused MoE node.
     The kernel applies routing weights to the output.
     """
-    hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = extract_op_args(
+    (
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        w1_list,
+        w2_list,
+        w3_list,
+        weights_fusion_val,
+    ) = extract_op_args(
         node,
         "x",
         "selected_experts",
         "routing_weights",
-        "w1_weight",
-        "w2_weight",
-        "w3_weight",
+        "weights_1",
+        "weights_2",
+        "weights_3",
+        "weights_fusion",
     )
 
-    # Stack weights based on MLP style
-    if mlp_style_val == "gated_mlp":
-        # For gated MLP, concatenate w3 and w1 then stack across experts
-        fused_w_up_experts = torch.stack(
-            [
-                torch.cat(
-                    [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)],
-                    dim=-2,
-                )
-                for w1_node, w3_node in zip(w1_list, w3_list)
-            ],
-            dim=0,
-        )
-        new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
-    elif mlp_style_val == "mlp":
+    # Stack weights based on MLP style and fusion strategy
+    mlp_style_enum = mlp_style_from_str(mlp_style_val)
+    weights_fusion_enum = weights_fusion_from_str(weights_fusion_val)
+
+    if mlp_style_enum == MLPStyle.GATED_MLP:
+        if weights_fusion_enum == WeightsFusion.UPGATE_DOWN:
+            # Weights already fused as [w3, w1] - just stack them
+            fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
+            new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
+        elif weights_fusion_enum == WeightsFusion.GATE_UP_DOWN:
+            # Weights separate - concatenate w3 and w1 then stack across experts
+            fused_w_up_experts = torch.stack(
+                [
+                    torch.cat(
+                        [gm.get_parameter(w3_node.target), gm.get_parameter(w1_node.target)],
+                        dim=-2,
+                    )
+                    for w1_node, w3_node in zip(w1_list, w3_list)
+                ],
+                dim=0,
+            )
+            new_key_w_up = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
+        else:
+            raise ValueError(f"Unsupported weights_fusion for gated_mlp: {weights_fusion_val}")
+    elif mlp_style_enum == MLPStyle.MLP:
         # For regular MLP, just stack w1
         fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
         new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
@@ -193,9 +201,31 @@ def _process_llama4_stacked_moe_node(
         "x",
         "selected_experts",
         "routing_weights",
-        "w1_weight",
-        "w2_weight",
+        "weights_1",
+        "weights_2",
     )
+
+    # Handle case where lists are represented as Node objects in FX graphs
+    def unwrap_list(lst):
+        if isinstance(lst, Node):
+            if lst.target is list:
+                # Extract from list() call node
+                if lst.args:
+                    result = lst.args[0]
+                    # If it's a tuple, convert to list
+                    if isinstance(result, tuple):
+                        return list(result)
+                    return result
+            # If it's already a tuple/list stored in the node, return it
+            elif isinstance(lst.args, (list, tuple)) and len(lst.args) > 0:
+                return list(lst.args)
+        # If already a list or tuple, ensure it's a list
+        if isinstance(lst, tuple):
+            return list(lst)
+        return lst if lst else []
+
+    w1_list = unwrap_list(w1_list)
+    w2_list = unwrap_list(w2_list)
 
     # Extract the single stacked tensor from each list
     # Handle both FX graph Nodes (list() calls) and direct Python lists
@@ -812,13 +842,14 @@ class MatchBmmMoePattern(BaseTransform):
         return MatchBmmMoePatternConfig
 
     @staticmethod
-    def _find_gate_up_bmm(final_bmm: Node) -> Optional[Tuple[Node, Node]]:
+    def _find_gate_up_bmm(final_bmm: Node) -> Optional[Tuple[Node, Node, WeightsFusion]]:
         """Find the MoE gate_up BMM and chunk node from the final BMM.
 
         BMM MoE pattern traces back: final_bmm <- mul(up, silu(gate)) <- chunk <- first_bmm (gate_up)
 
         Returns:
-            Tuple of (first_bmm, gate_up_weight) or None if not found
+            Tuple of (first_bmm, gate_up_weight, fusion_type) or None if not found
+            fusion_type: GATEUP_DOWN if [w1, w3] (Llama4 native), UPGATE_DOWN if [w3, w1] (TRT-LLM)
         """
         # Input to final bmm should be mul(up, silu(gate))
         mul_node = final_bmm.args[0]
@@ -863,6 +894,23 @@ class MatchBmmMoePattern(BaseTransform):
         if chunk_node is None or not chunk_node.args or chunk_node.args[1] != 2:
             return None
 
+        # Detect weight order by checking which chunk index goes to silu (gate)
+        # gate_node should be a getitem that extracts from chunk
+        gate_chunk_idx = None
+        if gate_node.target == operator.getitem and len(gate_node.args) >= 2:
+            # args are (chunk_node, index)
+            gate_chunk_idx = gate_node.args[1]
+
+        # Determine weight order:
+        # - If chunk[0] → silu (gate), then order is [gate, up] = [w1, w3] (Llama4 native)
+        # - If chunk[1] → silu (gate), then order is [up, gate] = [w3, w1] (TRT-LLM)
+        if gate_chunk_idx is not None:
+            fusion_type = (
+                WeightsFusion.GATEUP_DOWN if gate_chunk_idx == 0 else WeightsFusion.UPGATE_DOWN
+            )
+        else:
+            fusion_type = None
+
         # chunk input is the first batched BMM for Llama4 (gate_up_proj)
         first_bmm = chunk_node.args[0]
         if not isinstance(first_bmm, Node) or not is_op(first_bmm, torch.ops.aten.bmm):
@@ -871,12 +919,12 @@ class MatchBmmMoePattern(BaseTransform):
         if not first_bmm.args or len(first_bmm.args) < 2:
             return None
 
-        # Llama4: gate_up_weight is pre-stacked [num_experts, hidden, 2*intermediate]
+        # gate_up_weight is pre-stacked [num_experts, hidden, 2*intermediate]
         gate_up_weight = first_bmm.args[1]
         if not isinstance(gate_up_weight, Node) or gate_up_weight.op != "get_attr":
             return None
 
-        return (first_bmm, gate_up_weight)
+        return (first_bmm, gate_up_weight, fusion_type)
 
     @staticmethod
     def _find_input_and_routing(batched_input: Node) -> Optional[Tuple[Node, Node]]:
@@ -1067,7 +1115,15 @@ class MatchBmmMoePattern(BaseTransform):
             result = MatchBmmMoePattern._find_gate_up_bmm(final_bmm)
             if result is None:
                 continue
-            first_bmm, gate_up_weight = result
+            first_bmm, gate_up_weight, fusion_type = result
+
+            # Validate weight order detection
+            if fusion_type is None:
+                ad_logger.warning(
+                    f"Could not detect weight order (w1w3 vs w3w1) for gate_up_weight {gate_up_weight.target}. "
+                    "Assuming TRT-LLM format [w3, w1]."
+                )
+                fusion_type = WeightsFusion.UPGATE_DOWN  # Default to TRT-LLM format
 
             # Step 3: Get batched input and trace back to original input and routing
             batched_input = first_bmm.args[0]
@@ -1100,6 +1156,7 @@ class MatchBmmMoePattern(BaseTransform):
                     "output": output_node,
                     "topk": topk_node,
                     "apply_routing_on_input": apply_routing_on_input,
+                    "fusion_type": fusion_type,
                 }
             )
 
@@ -1136,6 +1193,7 @@ class MatchBmmMoePattern(BaseTransform):
                 # Get routing application method from pattern matcher
                 # Default to True (apply on input) which is the common Llama4 pattern
                 input_routing = layer_info.get("apply_routing_on_input", True)
+                fusion_type = layer_info.get("fusion_type", WeightsFusion.UPGATE_DOWN)
 
                 # Step 2: Extract routing information
                 # selected_experts: topk indices [tokens, top_k]
@@ -1213,6 +1271,19 @@ class MatchBmmMoePattern(BaseTransform):
                 # If input_routing is False: kernel applies routing to output
                 apply_routing_on_input = input_routing
 
+                # Log detected fusion type
+                # Don't swap weights here - that will be handled by fuse_moe transform
+                if fusion_type == WeightsFusion.GATEUP_DOWN:
+                    ad_logger.debug(
+                        f"Detected [w1, w3] (gate, up) weight order for {gate_up_weight.target}, "
+                        f"using fusion type: {fusion_type.value}"
+                    )
+                else:
+                    ad_logger.debug(
+                        f"Detected [w3, w1] (up, gate) weight order for {gate_up_weight.target}, "
+                        f"using fusion type: {fusion_type.value}"
+                    )
+
                 # Wrap stacked tensors in single-element lists for torch_moe unified interface
                 with graph.inserting_before(output_node):
                     # Create list nodes for stacked weights
@@ -1238,11 +1309,12 @@ class MatchBmmMoePattern(BaseTransform):
                             w1_list_node,
                             w2_list_node,
                             w3_list_node,
+                            WeightsFormat.STACKED.value,
+                            fusion_type.value,
+                            MLPStyle.GATED_MLP.value,
+                            ActivationFunction.SILU.value,
+                            apply_routing_on_input,
                         ),
-                        kwargs={
-                            "mlp_style": "gated_mlp",
-                            "apply_routing_on_input": apply_routing_on_input,
-                        },
                     )
 
                 # Replace the output node with fused MoE

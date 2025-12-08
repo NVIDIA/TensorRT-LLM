@@ -5,6 +5,12 @@ from _torch.helpers import reference_bmm_moe_torch, reference_moe_torch
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.enums import (
+    ActivationFunction,
+    MLPStyle,
+    WeightsFormat,
+    WeightsFusion,
+)
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
 from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
 
@@ -127,6 +133,10 @@ def test_moe_op_run(dtype):
             w1_weight,
             w2_weight,
             w3_weight,
+            weights_format=WeightsFormat.PER_EXPERT.value,
+            weights_fusion=WeightsFusion.GATE_UP_DOWN.value,
+            mlp_style=MLPStyle.GATED_MLP.value,
+            act_fn=ActivationFunction.SILU.value,
         )
         output_torch_fused_moe = torch.ops.auto_deploy.torch_moe_fused(
             x,
@@ -165,16 +175,18 @@ def test_bmm_based_moe_op_run(dtype):
     with torch.inference_mode():
         x = final_scales * x
         selected_experts = torch.ones_like(selected_experts)
-        # Use torch_moe with stacked tensor format (single-element lists)
+        # Use torch_moe with stacked+fused tensor format
         output_torch_moe = torch.ops.auto_deploy.torch_moe(
             x,
             selected_experts,
             final_scales,
-            [fused_w3_w1_stacked_weight],  # Wrap in list for unified interface
-            [fused_w2_weight],  # Wrap in list for unified interface
-            [],  # Empty w3_weight list for stacked gated MLP
-            mlp_style="gated_mlp",
-            act_fn="silu",
+            [fused_w3_w1_stacked_weight],  # weights_1
+            [fused_w2_weight],  # weights_2
+            [],  # weights_3
+            weights_format=WeightsFormat.STACKED.value,
+            weights_fusion=WeightsFusion.UPGATE_DOWN.value,
+            mlp_style=MLPStyle.GATED_MLP.value,
+            act_fn=ActivationFunction.SILU.value,
             apply_routing_on_input=True,
         )
         output_torch_fused_moe = torch.ops.auto_deploy.torch_moe_fused(
@@ -231,6 +243,10 @@ def test_fp8_moe_op_run(dtype):
             w1_weight,
             w2_weight,
             w3_weight,
+            weights_format=WeightsFormat.PER_EXPERT.value,
+            weights_fusion=WeightsFusion.GATE_UP_DOWN.value,
+            mlp_style=MLPStyle.GATED_MLP.value,
+            act_fn=ActivationFunction.SILU.value,
         )
 
     w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
@@ -305,6 +321,10 @@ def test_fp4_moe_op_run(dtype):
             w1_weight,
             w2_weight,
             w3_weight,
+            weights_format=WeightsFormat.PER_EXPERT.value,
+            weights_fusion=WeightsFusion.GATE_UP_DOWN.value,
+            mlp_style=MLPStyle.GATED_MLP.value,
+            act_fn=ActivationFunction.SILU.value,
         )
 
     # prepare FP4 scales and quantized weights
@@ -369,3 +389,239 @@ def test_fp4_moe_op_run(dtype):
     rtol, atol = 1.5, 1.0
     torch.testing.assert_close(output_torch_fp4_moe, output_torch_moe, rtol=rtol, atol=atol)
     torch.testing.assert_close(output_torch_fp4_moe, ref_output, rtol=rtol, atol=atol)
+
+
+# ============================================================================
+# Negative Tests for MoE Enum-Based API Configuration Validation
+# ============================================================================
+
+
+class TestEnumStringConversion:
+    """Test that invalid enum string values are rejected."""
+
+    def test_invalid_mlp_style(self):
+        from tensorrt_llm._torch.auto_deploy.enums import mlp_style_from_str
+
+        with pytest.raises(ValueError, match="Unknown mlp_style.*invalid_style"):
+            mlp_style_from_str("invalid_style")
+
+    def test_invalid_activation_function(self):
+        from tensorrt_llm._torch.auto_deploy.enums import act_fn_from_str
+
+        with pytest.raises(ValueError, match="Unknown act_fn.*invalid_act"):
+            act_fn_from_str("invalid_act")
+
+    def test_invalid_weights_format(self):
+        from tensorrt_llm._torch.auto_deploy.enums import weights_format_from_str
+
+        with pytest.raises(ValueError, match="Unknown weights_format.*invalid_format"):
+            weights_format_from_str("invalid_format")
+
+    def test_invalid_weights_fusion(self):
+        from tensorrt_llm._torch.auto_deploy.enums import weights_fusion_from_str
+
+        with pytest.raises(ValueError, match="Unknown weights_fusion.*invalid_fusion"):
+            weights_fusion_from_str("invalid_fusion")
+
+
+class TestTorchMoeConfigValidation:
+    """Negative tests for torch_moe parameter validation."""
+
+    @pytest.fixture
+    def base_inputs(self):
+        """Create base input tensors for testing."""
+        batch_size, hidden_size = 4, 64
+        intermediate_size = 128
+        num_experts = 8
+        top_k = 2
+
+        return {
+            "x": torch.randn(batch_size, hidden_size).cuda(),
+            "selected_experts": torch.randint(0, num_experts, (batch_size, top_k)).cuda(),
+            "routing_weights": torch.rand(batch_size, top_k).cuda(),
+            "num_experts": num_experts,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+        }
+
+    def test_fusion_not_applicable_to_mlp_style(self, base_inputs):
+        """Test that fusion parameter is rejected for mlp style."""
+
+        weights_1 = [
+            torch.randn(base_inputs["intermediate_size"], base_inputs["hidden_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+        weights_2 = [
+            torch.randn(base_inputs["hidden_size"], base_inputs["intermediate_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+
+        with pytest.raises(ValueError, match="weights_fusion.*only applies to gated_mlp"):
+            torch.ops.auto_deploy.torch_moe(
+                base_inputs["x"],
+                base_inputs["selected_experts"],
+                base_inputs["routing_weights"],
+                weights_1=weights_1,
+                weights_2=weights_2,
+                weights_3=[],
+                weights_format=WeightsFormat.PER_EXPERT.value,
+                weights_fusion=WeightsFusion.UPGATE_DOWN.value,
+                mlp_style=MLPStyle.MLP.value,
+                act_fn=ActivationFunction.RELU2.value,
+            )
+
+    def test_per_expert_separate_missing_weights_3(self, base_inputs):
+        """Test that per_expert+separate+gated_mlp requires weights_3."""
+        weights_1 = [
+            torch.randn(base_inputs["intermediate_size"], base_inputs["hidden_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+        weights_2 = [
+            torch.randn(base_inputs["hidden_size"], base_inputs["intermediate_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+
+        with pytest.raises(
+            ValueError, match="per_expert.*w1_w2_w3_separate.*gated_mlp.*weights_3 must have"
+        ):
+            torch.ops.auto_deploy.torch_moe(
+                base_inputs["x"],
+                base_inputs["selected_experts"],
+                base_inputs["routing_weights"],
+                weights_1=weights_1,
+                weights_2=weights_2,
+                weights_3=[],
+                weights_format=WeightsFormat.PER_EXPERT.value,
+                weights_fusion=WeightsFusion.GATE_UP_DOWN.value,
+                mlp_style=MLPStyle.GATED_MLP.value,
+                act_fn=ActivationFunction.SILU.value,
+            )
+
+    def test_per_expert_fused_has_weights_3(self, base_inputs):
+        """Test that per_expert+fused rejects non-empty weights_3."""
+        weights_1 = [
+            torch.randn(2 * base_inputs["intermediate_size"], base_inputs["hidden_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+        weights_2 = [
+            torch.randn(base_inputs["hidden_size"], base_inputs["intermediate_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+        weights_3 = [
+            torch.randn(base_inputs["intermediate_size"], base_inputs["hidden_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+
+        with pytest.raises(ValueError, match="per_expert.*w3w1_w2.*weights_3 must be empty"):
+            torch.ops.auto_deploy.torch_moe(
+                base_inputs["x"],
+                base_inputs["selected_experts"],
+                base_inputs["routing_weights"],
+                weights_1=weights_1,
+                weights_2=weights_2,
+                weights_3=weights_3,
+                weights_format=WeightsFormat.PER_EXPERT.value,
+                weights_fusion=WeightsFusion.UPGATE_DOWN.value,
+                mlp_style=MLPStyle.GATED_MLP.value,
+                act_fn=ActivationFunction.SILU.value,
+            )
+
+    def test_mismatched_expert_counts(self, base_inputs):
+        """Test that mismatched weight list lengths are rejected."""
+        weights_1 = [
+            torch.randn(base_inputs["intermediate_size"], base_inputs["hidden_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+        weights_2 = [
+            torch.randn(base_inputs["hidden_size"], base_inputs["intermediate_size"]).cuda()
+            for _ in range(base_inputs["num_experts"] + 2)
+        ]
+        weights_3 = [
+            torch.randn(base_inputs["intermediate_size"], base_inputs["hidden_size"]).cuda()
+            for _ in range(base_inputs["num_experts"])
+        ]
+
+        with pytest.raises(ValueError, match="weights_1 and weights_2 must have same length"):
+            torch.ops.auto_deploy.torch_moe(
+                base_inputs["x"],
+                base_inputs["selected_experts"],
+                base_inputs["routing_weights"],
+                weights_1=weights_1,
+                weights_2=weights_2,
+                weights_3=weights_3,
+                weights_format=WeightsFormat.PER_EXPERT.value,
+                weights_fusion=WeightsFusion.GATE_UP_DOWN.value,
+                mlp_style=MLPStyle.GATED_MLP.value,
+                act_fn=ActivationFunction.SILU.value,
+            )
+
+    def test_stacked_expert_count_mismatch(self, base_inputs):
+        """Test that stacked weights must have matching expert counts."""
+        weights_1 = [
+            torch.randn(
+                base_inputs["num_experts"],
+                2 * base_inputs["intermediate_size"],
+                base_inputs["hidden_size"],
+            ).cuda()
+        ]
+        weights_2 = [
+            torch.randn(
+                base_inputs["num_experts"] + 2,
+                base_inputs["hidden_size"],
+                base_inputs["intermediate_size"],
+            ).cuda()
+        ]
+
+        with pytest.raises(ValueError, match="Expert count mismatch"):
+            torch.ops.auto_deploy.torch_moe(
+                base_inputs["x"],
+                base_inputs["selected_experts"],
+                base_inputs["routing_weights"],
+                weights_1=weights_1,
+                weights_2=weights_2,
+                weights_3=[],
+                weights_format=WeightsFormat.STACKED.value,
+                weights_fusion=WeightsFusion.UPGATE_DOWN.value,
+                mlp_style=MLPStyle.GATED_MLP.value,
+                act_fn=ActivationFunction.SILU.value,
+            )
+
+    def test_empty_weights_1(self, base_inputs):
+        """Test that empty weights_1 is rejected for per_expert."""
+        with pytest.raises(ValueError, match="per_expert format.*weights_1 cannot be empty"):
+            torch.ops.auto_deploy.torch_moe(
+                base_inputs["x"],
+                base_inputs["selected_experts"],
+                base_inputs["routing_weights"],
+                weights_1=[],
+                weights_2=[],
+                weights_3=[],
+                weights_format=WeightsFormat.PER_EXPERT.value,
+                weights_fusion=WeightsFusion.GATE_UP_DOWN.value,
+                mlp_style=MLPStyle.MLP.value,
+                act_fn=ActivationFunction.RELU2.value,
+            )
+
+
+class TestTRTLLMMoeEnumValidation:
+    """Test TRT-LLM MoE enum-based validation."""
+
+    def test_unsupported_gated_mlp_relu2_combination(self):
+        """Test that gated_mlp + relu2 is rejected."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.trtllm_moe import (
+            _validate_mlp_style_and_act_fn,
+        )
+        from tensorrt_llm._torch.auto_deploy.enums import ActivationFunction, MLPStyle
+
+        with pytest.raises(ValueError, match="Unsupported combination.*gated_mlp.*relu2"):
+            _validate_mlp_style_and_act_fn(MLPStyle.GATED_MLP, ActivationFunction.RELU2)
+
+    def test_unsupported_mlp_silu_combination(self):
+        """Test that mlp + silu is rejected."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.trtllm_moe import (
+            _validate_mlp_style_and_act_fn,
+        )
+        from tensorrt_llm._torch.auto_deploy.enums import ActivationFunction, MLPStyle
+
+        with pytest.raises(ValueError, match="Unsupported combination.*mlp.*silu"):
+            _validate_mlp_style_and_act_fn(MLPStyle.MLP, ActivationFunction.SILU)
