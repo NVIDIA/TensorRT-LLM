@@ -3279,8 +3279,6 @@ def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.
 
-    TODO: Document why it can be done using a plugin!!!
-
     Parameters:
         input : Tensor
             The input tensor.
@@ -4022,7 +4020,10 @@ def create_allreduce_plugin(
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+    if all_reduce_params.strategy not in {
+            AllReduceStrategy.NCCL, AllReduceStrategy.UB,
+            AllReduceStrategy.NCCL_SYMMETRIC
+    }:
         plug_inputs.append(workspace)
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
@@ -4094,7 +4095,7 @@ def allreduce(
     workspace = None
     if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         if current_all_reduce_helper().workspace is None:
-            all_reduce_params.strategy = AllReduceStrategy.NCCL
+            all_reduce_params.strategy = AllReduceStrategy.NCCL_SYMMETRIC
         else:
             workspace = current_all_reduce_helper().workspace.trt_tensor
     if all_reduce_params.strategy == AllReduceStrategy.UB:

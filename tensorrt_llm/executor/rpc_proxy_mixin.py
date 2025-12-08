@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import json
+import os
 import threading
 from typing import Callable, List, Optional
 
@@ -29,7 +30,8 @@ class RpcExecutorMixin:
 
     def init_rpc_executor(self):
         self.rpc_addr = get_unique_ipc_addr()
-        self.rpc_client = RPCClient(self.rpc_addr)
+        self.hmac_key = os.urandom(32)
+        self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
 
         self._results = {}
         self._shutdown_event = threading.Event()
