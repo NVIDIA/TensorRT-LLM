@@ -40,6 +40,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import is_power_of_2
 
 
@@ -951,13 +952,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             ),  # 4 warps * 32 threads per warp = 128 threads
         )
 
-        a_pipeline = pipeline.PipelineAsyncUmma.create(
+        a_pipeline = PipelineCpAsyncUmma.create(
             barrier_storage=storage.a_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=a_pipeline_producer_group,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
+            enable_cp_async=(not self.use_2cta_instrs),
         )
 
         # Pipeline Init: Initialize B pipeline for TMA operations
@@ -1441,8 +1443,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         )
 
                     # Signal the completion of async
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
+                    if cutlass.const_expr(self.use_2cta_instrs):
+                        cute.arch.cp_async_commit_group()
+                        cute.arch.cp_async_wait_group(0)
                     a_pipeline.producer_commit(a_producer_state)
 
                     # Peek (try_wait) A buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
