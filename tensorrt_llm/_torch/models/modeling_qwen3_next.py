@@ -399,6 +399,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
             moe_backend=model_config.moe_backend,
         )
+        self.debug_gate = self.gate
 
         self.experts = create_moe(
             num_experts=self.num_experts,
