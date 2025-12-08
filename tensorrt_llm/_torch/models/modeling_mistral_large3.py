@@ -11,6 +11,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import (
     MistralLarge3WeightMapper,
 )
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 class Mistral3Gate(nn.Module):

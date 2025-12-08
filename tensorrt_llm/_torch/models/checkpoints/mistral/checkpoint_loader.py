@@ -6,7 +6,6 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeight
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
-from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 @register_checkpoint_loader("mistral")

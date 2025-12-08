@@ -445,7 +445,7 @@ class Mistral3VLM(PreTrainedModel):
             vit_weights = weight_mapper.rename_by_params_map(
                 weights=vit_weights, params_map=vit_params_map)
 
-        self._vision_tower.load_weights(vit_weights, params_map=vit_params_map)
+        self._vision_tower.load_weights(vit_weights)
         logger.debug(
             f"Successfully loaded weights for {type(self._vision_tower)}")
 
