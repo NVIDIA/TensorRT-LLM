@@ -315,7 +315,7 @@ struct QuantParams
     {
         struct GroupwiseGemmInputs
         {
-            void const* act_scales = nullptr;
+            void const* act_scales = nullptr; // (num_experts_per_node, hidden_size if fc1 else intermediate_size)
             void const* weight_scales = nullptr;
             void const* weight_zeros = nullptr;
             float const* alpha = nullptr;
@@ -646,7 +646,7 @@ public:
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array, bool bias_is_broadcast,
         cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-        int* num_active_experts_per, int* active_expert_global_ids);
+        int* num_active_experts_per, int* active_expert_global_ids, void const* fc2_prequant_scale = nullptr);
 
     static void gemm2(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
         DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, void* const gemm_output,
@@ -803,6 +803,16 @@ private:
         bool min_latency_mode, bool use_awq);
 
 private:
+    bool useAwq(cutlass_kernels::QuantParams const& quant_params)
+    {
+        return quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales && !use_wfp4a16;
+    }
+
+    bool usePrequantScaleKernel(cutlass_kernels::QuantParams const& quant_params)
+    {
+        return useAwq(quant_params) && !std::is_same_v<T, WeightType>;
+    }
+
     bool mayHaveDifferentGEMMOutputType() const
     {
         // We just check if its supported because we need to know when calculating workspace size
@@ -866,7 +876,8 @@ private:
 
     T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
         int64_t const* num_valid_tokens_ptr, int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq,
-        cudaStream_t stream, int64_t* expert_first_token_offset = nullptr, int const num_experts_per_node = 0);
+        cudaStream_t stream, QuantParams const& quant_params, int64_t* expert_first_token_offset = nullptr,
+        int const num_experts_per_node = 0);
 
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
     std::unique_ptr<DeepSeekBlockScaleGemmRunner> blockscale_gemm_runner_;
