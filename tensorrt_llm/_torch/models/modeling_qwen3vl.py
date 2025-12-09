@@ -1,5 +1,4 @@
 import copy
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -14,6 +13,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
 )
 
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..._utils import nvtx_range, nvtx_range_debug
@@ -41,8 +41,6 @@ from .modeling_multimodal_utils import (
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
 from .modeling_utils import ModelConfig, _load_weights_impl, filter_weights
-
-DISAGG = os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
 def process_weights(
@@ -844,7 +842,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        if not DISAGG:
+        if not _is_disagg():
             self.mm_encoder = Qwen3VisionModelBase(
                 model_config, kwargs.get("vision_model_class", None)
             ).eval()
@@ -978,7 +976,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             is not None
         ]
         if len(mm_multimodal_params) > 0:
-            if not DISAGG:
+            if not _is_disagg():
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
@@ -1005,7 +1003,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
-            deepstack_embeds=deepstack_embeds,
+            extra_embeds=deepstack_embeds,
             **kwargs,
         )
         if len(deepstack_embeds) > 0:
@@ -1019,7 +1017,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             position_ids=position_ids,
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
-            deepstack_visual_embeds=deepstack_embeds,
+            deepstack_embeds=deepstack_embeds,
             mrope_config=mrope_config,
         )
         logger.debug(f"output shape: {output_prob.shape}")

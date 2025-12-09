@@ -1,5 +1,4 @@
 import copy
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -21,6 +20,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -47,7 +47,6 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
 
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
@@ -435,7 +434,13 @@ class Qwen2VisionModelBase(nn.Module):
 
     def load_weights(self, weights: Dict):
         visual_weights = filter_weights("visual", weights)
-        converted_weights = {}
+        converted_weights = dict()
+        if isinstance(self.visual,
+                      Qwen2VisionTransformerPretrainedModel) or isinstance(
+                          self.visual,
+                          Qwen2_5_VisionTransformerPretrainedModel):
+            self.visual.load_state_dict(visual_weights, strict=True)
+            return
 
         qkv_pattern = re.compile(r'(.*?)attn\.qkv\.(.*)')
         for name in visual_weights:
@@ -526,6 +531,7 @@ class Qwen2VisionModelBase(nn.Module):
         embeds = []
         if pixel_values is not None:
             embed = self.visual(pixel_values, grid_thw=image_grid_thw)
+            # print(f"embed: {embed}")
             embeds.append(embed)
 
         if pixel_values_videos is not None:
@@ -613,23 +619,21 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int):
         super().__init__()
-        self.model_config = model_config
-        config = self.model_config.pretrained_config.vision_config
-        self.norm1 = RMSNorm(
-            hidden_size=config.hidden_size,
-            eps=self.model_config.pretrained_config.rms_norm_eps,
-            dtype=self.model_config.pretrained_config.torch_dtype)
-        self.norm2 = RMSNorm(
-            hidden_size=config.hidden_size,
-            eps=self.model_config.pretrained_config.rms_norm_eps,
-            dtype=self.model_config.pretrained_config.torch_dtype)
-        self.attn = Qwen2_5_VLVisionAttention(self.model_config, layer_idx)
-        self.mlp = Qwen2_5_VLMLP(self.model_config, layer_idx)
+        config = model_config.pretrained_config.vision_config
+        self.norm1 = RMSNorm(hidden_size=config.hidden_size,
+                             eps=model_config.pretrained_config.rms_norm_eps,
+                             dtype=model_config.pretrained_config.torch_dtype)
+        self.norm2 = RMSNorm(hidden_size=config.hidden_size,
+                             eps=model_config.pretrained_config.rms_norm_eps,
+                             dtype=model_config.pretrained_config.torch_dtype)
+        self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
+        self.mlp = Qwen2_5_VLMLP(model_config, layer_idx)
 
     @torch.inference_mode()
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
@@ -639,6 +643,7 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         hidden_states = self.norm1(hidden_states)
         hidden_states = residual + self.attn(
             hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -806,12 +811,12 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
-        batch_size = len(seq_lens)
+        batch_size = 1
         prompt_lens = seq_lens
         seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
         request_ids = list(range(1, batch_size + 1))
 
-        attn_metadata.num_contexts = batch_size
+        attn_metadata.num_contexts = len(seq_lens)
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lens
         attn_metadata.seq_lens = seq_lens
@@ -856,7 +861,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
                 attn_metadata = full_attn_metadata
             else:
                 attn_metadata = window_attn_metadata
-
             hidden_states = block(
                 hidden_states,
                 attn_metadata=attn_metadata,
@@ -899,7 +903,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        if not DISAGG:
+        if not _is_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Qwen2VisionModelBase(
                 mm_encoder_config, kwargs.get('vision_model_class', None))
@@ -1004,7 +1008,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             get("video", {}).get("pixel_values_videos") is not None
         ]
         if len(mm_multimodal_params) > 0:
-            if not DISAGG:
+            if not _is_disagg():
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params)
@@ -1064,7 +1068,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
-        if not DISAGG:
+        if not _is_disagg():
             vision_encoder_weights = process_weights(weights, "visual")
             self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
 
@@ -1105,7 +1109,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
         if isinstance(weight_mapper, Qwen2VLHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        if not DISAGG:
+        if not _is_disagg():
             self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights)

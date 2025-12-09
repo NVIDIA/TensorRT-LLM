@@ -76,4 +76,4 @@ partial_json_parser
 apache-tvm-ffi==0.1.4 # used for reduce nvidia-cutlass-dsl host overhead
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
 mistral-common==1.8.6
-torchao==0.14.1
+torchao>=0.14.1

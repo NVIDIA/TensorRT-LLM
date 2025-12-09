@@ -224,7 +224,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Dict[str, torch.Tensor]] = None,
-        deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
+        deepstack_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -274,9 +274,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             do_finalize=do_finalize,
         )
 
-        if deepstack_visual_embeds is not None and self.layer_idx in range(
-                len(deepstack_visual_embeds)):
-            residual = residual + deepstack_visual_embeds[self.layer_idx]
+        if deepstack_embeds is not None and self.layer_idx in range(
+                len(deepstack_embeds)):
+            residual = residual + deepstack_embeds[self.layer_idx]
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -375,7 +375,7 @@ class Qwen3MoEModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Dict[str, torch.Tensor]] = None,
-        deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
+        deepstack_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -397,7 +397,7 @@ class Qwen3MoEModel(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 mrope_config=mrope_config,
-                deepstack_visual_embeds=deepstack_visual_embeds)
+                deepstack_embeds=deepstack_embeds)
         return hidden_states
 
 

@@ -143,7 +143,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.mrope_interleaved = mrope_interleaved
 
     def apply_interleaved_rope(self, x: torch.Tensor) -> torch.Tensor:
-        # copied from vllm
+        # referenced from https://github.com/vllm-project/vllm/blob/aeb82b1930454498fccc7e91f7c4e0f360cf658a/vllm/model_executor/layers/rotary_embedding/mrope.py#L191
         x_t = x[0].clone()
         x_t[...,
             1:self.mrope_section[1] * 3:3] = x[1, ...,

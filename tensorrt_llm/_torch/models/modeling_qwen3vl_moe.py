@@ -1,7 +1,8 @@
-import os
 from typing import List
 
 from transformers import PretrainedConfig
+
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 
 from ...inputs import (
     MultimodalPlaceholderMetadata,
@@ -17,8 +18,6 @@ from .modeling_qwen3vl import (
     Qwen3VLModelBase,
 )
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
-
-DISAGG = os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
@@ -47,9 +46,7 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
     def multimodal_data_device_paths(self) -> List[str]:
         return [
             "image.pixel_values",
-            # "image.image_grid_thw", # TODO: Remove this once we have TRT-LLM module
             "video.pixel_values_videos",
-            # "video.video_grid_thw", # TODO: Remove this once we have TRT-LLM module
             "multimodal_embedding",
         ]
 
@@ -57,7 +54,7 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
         weight_mapper = Qwen3VLMoeHfWeightMapper()
         weight_mapper.init_model_and_config(self.llm, self.model_config)
 
-        if not DISAGG:
+        if not _is_disagg():
             self.mm_encoder.load_weights(weights)
 
         transformed_weights = {}
