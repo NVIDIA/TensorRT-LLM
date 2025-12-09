@@ -62,7 +62,11 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 ## Units
 
-All performance values are measured in **output tokens per second per GPU**.
+All performance values are measured in `output tokens per second per GPU`, where `output tokens` includes the first and all subsequent generated tokens (input tokens are not included).
+
+Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`. 
+The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188)
+
 
 ## Table of Contents
 
@@ -91,6 +95,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 1024/32768 | 1,451 | 1,465 | 438 |
 | 8192/1024 | 1,168 | 1,192 | |
 
+unit: `output tokens per second per GPU`
+
 ---
 
 <a id="gpt-oss-120b"></a>
@@ -105,6 +111,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 1024/32768 | 6,279 | 5,556 | | 1,177 |
 | 8192/1024 | 6,111 | 6,835 | 1,828 | 1,169 |
 | 32768/1024 | 1,392 | 1,645 | 519 | 333 |
+
+unit: `output tokens per second per GPU`
 
 ---
 
@@ -121,6 +129,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 8192/1024 | 11,904 | 12,941 | 4,015 | 3,366 |
 | 32768/1024 | 2,645 | 2,905 | 915 | 785 |
 
+unit: `output tokens per second per GPU`
+
 ---
 
 <a id="llama-v33-70b"></a>
@@ -134,6 +144,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 1024/8192 | 3,242 | 3,805 | 2,009 | |
 | 8192/1024 | 1,362 | 1,491 | 537 | 398 |
 | 32768/1024 | 274 | 302 | 120 | |
+
+unit: `output tokens per second per GPU`
 
 ---
 
@@ -150,6 +162,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 8192/1024 | 296 | 327 |
 | 32768/1024 | | 67 |
 
+unit: `output tokens per second per GPU`
+
 ---
 
 <a id="llama-v4-maverick"></a>
@@ -164,6 +178,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 1024/32768 | 2,204 | 2,300 | 679 |
 | 8192/1024 | 3,279 | 3,444 | 1,276 |
 | 32768/1024 | 859 | 963 | |
+
+unit: `output tokens per second per GPU`
 
 ---
 
@@ -180,6 +196,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 8192/1024 | 1,410 | 1,464 | 627 | |
 | 32768/1024 | 319 | 333 | 134 | |
 
+unit: `output tokens per second per GPU`
+
 ---
 
 <a id="qwen3-235b-a22b-rtx-configurations"></a>
@@ -194,6 +212,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 1024/1024 | 1,732 | 963 |
 | 1024/8192 | 644 | 711 |
 | 32768/1024 | 70 | |
+
+unit: `output tokens per second per GPU`
 
 ---
 
@@ -210,6 +230,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 8192/1024 | 5,735 | 6,201 |
 | 32768/1024 | 1,265 | 1,380 |
 
+unit: `output tokens per second per GPU`
+
 ---
 
 <a id="qwen3-30b-a3b-rtx-configurations"></a>
@@ -225,6 +247,8 @@ All performance values are measured in **output tokens per second per GPU**.
 | 1024/8192 | 3,577 | | 2,406 | 3,621 |
 | 8192/1024 | | 1,416 | | 1,914 |
 | 32768/1024 | | | 180 | 374 |
+
+unit: `output tokens per second per GPU`
 
 ---
 
