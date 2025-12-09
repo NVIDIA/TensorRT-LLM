@@ -104,6 +104,9 @@ class DisaggClusterManager:
         workers = []
         self._watch_handle = await self._cluster_storage.watch(
             self.worker_key_prefix)
+
+        assert self._watch_handle is not None, "failed to watch workers"
+
         if get_existing_first:
             # There is a tiny gap between getting existing workers and watching the key,
             # which may cause we missing some workers registered in between.
