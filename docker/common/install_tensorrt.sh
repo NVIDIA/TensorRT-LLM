@@ -2,7 +2,7 @@
 
 set -ex
 
-TRT_VER="10.14.1"
+TRT_VER="10.14.1.48"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-12.html#rel-25-12
 CUDA_VER="13.1" # 13.1.0
