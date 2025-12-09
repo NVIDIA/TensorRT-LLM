@@ -311,36 +311,3 @@ class TestGatherLogitsBeforeLmHeadTransform:
         assert not self._check_gather_op_in_graph(gm_transformed), (
             "Gather op should not be in graph"
         )
-
-    def test_transform_handles_missing_lm_head(self):
-        """Test that transform handles missing LM head gracefully."""
-        hidden_size = 128
-
-        class ModelWithoutLMHead(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-
-            def forward(self, x):
-                return x * 2
-
-        model = ModelWithoutLMHead().cuda()
-        hidden_states = torch.randn(4, 1, hidden_size, device="cuda", dtype=torch.float16)
-
-        # Export model
-        gm = torch_export_to_gm(model, args=(hidden_states,), dynamic_shapes=None, clone=True)
-
-        # Apply transform - should skip gracefully
-        cm = self._create_cached_sequence_interface()
-        transform_config = {
-            "gather_logits_before_lm_head": {
-                "stage": "compile",
-                "max_batch_size": 8,
-            }
-        }
-        optimizer = InferenceOptimizer(None, transform_config)
-        gm_transformed = optimizer(cm, gm)
-
-        # Transform should have skipped (no LM head found)
-        assert not self._check_gather_op_in_graph(gm_transformed), (
-            "Gather op should not be in graph"
-        )

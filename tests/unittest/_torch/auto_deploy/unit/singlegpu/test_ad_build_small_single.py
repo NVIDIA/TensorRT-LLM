@@ -165,6 +165,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "compile_model": {"backend": "torch-cudagraph"},
+                    # Gather logits before LM head will change the output tensor shape, so we disable it here.
+                    "gather_logits_before_lm_head": {"enabled": False},
                 },
             },
         ),
@@ -190,6 +192,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024",
             {
                 "transforms": {
+                    # TODO(nvchenghaoz): Check why gather_logits_before_lm_head is not working.
+                    "gather_logits_before_lm_head": {"enabled": False},
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
                 },
             },

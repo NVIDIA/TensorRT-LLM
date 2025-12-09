@@ -61,7 +61,13 @@ def gather_logits_before_lm_head_fake(
 ) -> torch.Tensor:
     is_decode_only = hidden_states.shape[1] == 1
     hidden_states = hidden_states.squeeze(int(is_decode_only))
-    return torch.empty_like(hidden_states)
+
+    if is_decode_only:
+        return torch.empty_like(hidden_states)
+    else:
+        # Match the real kernel: hidden_states[logits_gather_mask[:n], :]
+        num_gathered = logits_gather_mask[: hidden_states.shape[0]].sum()
+        return hidden_states.new_empty((num_gathered, hidden_states.shape[-1]))
 
 
 @TransformRegistry.register("gather_logits_before_lm_head")
