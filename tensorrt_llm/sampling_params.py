@@ -6,6 +6,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
+from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
@@ -44,6 +45,11 @@ class LogprobParams(NamedTuple):
     drop_context_logits: bool = False
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
+
+
+class LogprobMode(StrEnum):
+    RAW = "raw"
+    PROCESSED = "processed"
 
 
 class LogitsProcessor(ABC):
@@ -174,7 +180,7 @@ class SamplingParams:
 
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
                                   When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
-        logprobs_mode (Literal["raw", "processed"]): The mode of log probabilities to return. Defaults to "raw".
+        logprobs_mode (Literal["raw", "processed"]): The mode of log probabilities to return. Valid modes are "raw" and "processed". Defaults to "raw".
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
@@ -324,9 +330,10 @@ class SamplingParams:
                 f"under the greedy decoding."
             )
 
-        if self.logprobs_mode not in ["raw", "processed"]:
+        if self.logprobs_mode not in [LogprobMode.RAW, LogprobMode.PROCESSED]:
             raise ValueError(
-                f"logprobs_mode must be one of ['raw', 'processed'], got {self.logprobs_mode}"
+                f"logprobs_mode must be one of {LogprobMode.RAW.value}, {LogprobMode.PROCESSED.value}. "
+                f"Got {self.logprobs_mode} instead."
             )
 
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:

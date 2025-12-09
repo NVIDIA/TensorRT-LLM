@@ -1899,6 +1899,8 @@ class PyExecutor:
                     f"Request beam width {sampling_config.beam_width} "
                     f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
                 )
+        # Validate logprobs mode
+        request.validate_logprobs_mode()
 
         # Check token ID ranges
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
