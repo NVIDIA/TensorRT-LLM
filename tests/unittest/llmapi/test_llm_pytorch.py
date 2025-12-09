@@ -7,7 +7,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.executor import GenerationExecutorWorker
+from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
@@ -803,10 +803,13 @@ class TestLlmError:
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
 
-        with pytest.raises(ValueError,
-                           match="should not exceed max_num_tokens"):
-            ids = [random.randint(10, 100) for _ in range(101)]
-            llm.generate([ids])
+        try:
+            with pytest.raises(RequestError,
+                               match="should not exceed max_num_tokens"):
+                ids = [random.randint(10, 100) for _ in range(101)]
+                llm.generate([ids])
+        finally:
+            llm.shutdown()
 
 
 class FailingExecutorWorker(GenerationExecutorWorker):
@@ -933,10 +936,13 @@ class TestLlmError:
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
 
-        with pytest.raises(ValueError,
-                           match="should not exceed max_num_tokens"):
-            ids = [random.randint(10, 100) for _ in range(101)]
-            llm.generate([ids])
+        try:
+            with pytest.raises(RequestError,
+                               match="should not exceed max_num_tokens"):
+                ids = [random.randint(10, 100) for _ in range(101)]
+                llm.generate([ids])
+        finally:
+            llm.shutdown()
 
 
 @skip_ray
