@@ -1,14 +1,14 @@
 metadata:
   model_name: deepseek-r1-fp4
   precision: fp4
-  model_dir_name: DeepSeek-R1-0528-FP4-V2
+  model_dir_name: DeepSeek-R1-0528-FP4-v2
   supported_gpus:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
   config_index: 0
-  dataset_file: datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
+  dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
   accuracy:
     datasets:
     - dataset_name: gsm8k

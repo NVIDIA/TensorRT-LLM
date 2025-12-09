@@ -62,7 +62,7 @@ llguidance = "0.7.29"
 jsonschema = "^4.25.1"
 backoff = "^2.2.1"
 nvtx = "^0.2.14"
-meson = "^1.9.2"
+meson = "^1.10.0"
 ninja = "^1.13.0"
 etcd3 = {git = "https://github.com/kragniz/python-etcd3.git", rev = "e58a899579ba416449c4e225b61f039457c8072a"}
 blake3 = "^1.0.8"
