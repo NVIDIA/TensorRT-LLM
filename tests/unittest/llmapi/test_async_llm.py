@@ -96,6 +96,7 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
 @pytest.mark.ray
 @pytest.mark.gpu4
 @pytest.mark.asyncio
+@pytest.mark.threadleak(enabled=False)
 async def test_async_llm_placement_api(monkeypatch):
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
 

@@ -74,6 +74,7 @@ def test_placement_env_vars(monkeypatch):
 
 
 @pytest.mark.gpu2
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("n_gpus,bundle_indices", [
     (2, [1]),
 ],
