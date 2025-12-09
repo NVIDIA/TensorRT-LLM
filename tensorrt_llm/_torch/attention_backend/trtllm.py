@@ -84,12 +84,9 @@ class TrtllmAttentionWrapper:
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor]
     spec_decoding_bl_tree_mask: Optional[torch.Tensor]
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor]
-<<<<<<< HEAD
     helix_position_offsets: Optional[torch.Tensor]
     helix_is_inactive_rank: Optional[torch.Tensor]
-=======
     attention_input_type: Optional[torch.Tensor]
->>>>>>> e414a9cb90 ([TRTLLM-7735][feat] Attention NVFP4 out support for torch compile)
     kwargs: dict
 
     def __init__(
