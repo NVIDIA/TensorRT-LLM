@@ -314,7 +314,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     Configuration for skip softmax attention.
     """
     algorithm: ClassVar[str] = "skip_softmax"
-    threshold_scale_factor: Optional[float] = Field(
+    threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
 
@@ -324,6 +324,18 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    @property
+    def threshold_scale_factor_prefill(self) -> Optional[float]:
+        if isinstance(self.threshold_scale_factor, dict):
+            return self.threshold_scale_factor.get('prefill', None)
+        return self.threshold_scale_factor
+
+    @property
+    def threshold_scale_factor_decode(self) -> Optional[float]:
+        if isinstance(self.threshold_scale_factor, dict):
+            return self.threshold_scale_factor.get('decode', None)
+        return self.threshold_scale_factor
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):

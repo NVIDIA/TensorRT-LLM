@@ -297,7 +297,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.sparse_params = mRuntimeSparseAttentionParams;
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
     // Skip softmax threshold.
-    xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactor;
+    xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactorDecode;
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
 
@@ -1889,7 +1889,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         // Skip-softmax attention parameters
-        fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactor;
+        fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactorPrefill;
 #ifdef SKIP_SOFTMAX_STAT
         fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
         fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;
