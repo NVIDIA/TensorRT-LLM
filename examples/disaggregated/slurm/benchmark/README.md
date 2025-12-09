@@ -30,7 +30,7 @@ slurm:
   job_time: "02:00:00"
   job_name: "<job_name>"
   extra_args: ""  # Additional SLURM arguments (e.g., "--gres=gpu:4 --exclude=node1")
-  pass_segment: true # Optional: whether to pass the segment to the job
+  set_segment: true # Optional: whether to set the segment for the job
   numa_bind: true  # Enable NUMA binding for GB200 NVL72
 ```
 
