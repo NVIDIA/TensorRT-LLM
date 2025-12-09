@@ -41,6 +41,6 @@ else
 fi
 
 set -x
-$PROFILE_CMD bash -c \
+$PROFILE_CMD bash -o pipefail -c \
     "python3 -u run.py \"\$@\" 2>&1 | tee \"$PROFILE_DIR/report_np${WORLD_SIZE}_rank${RANK}.log\"" \
     bash "$@"
