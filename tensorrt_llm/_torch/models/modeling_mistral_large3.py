@@ -5,11 +5,10 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import MistralLarge3WeightMapper
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import register_auto_model
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-from ..model_config import ModelConfig
-from ..models.modeling_deepseekv3 import DeepseekV3ForCausalLM
-from .modeling_utils import register_auto_model
 
 
 class Mistral3Gate(nn.Module):
@@ -53,20 +52,19 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
     def load_weights(self, weights: Dict):
         assert self.model_config is not None, "self.model_config is required"
         params_map = self.weight_mapper.mistral_llm_mapping.copy()
-        if self.model_config is not None:
-            quantization_weights_map: Dict[str, str] = {}
-            if self.model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
-                quantization_weights_map = {
-                    "weight_packed": "weight",
-                    "input_global_scale": "input_scale",
-                    "weight_global_scale": "weight_scale_2",
-                }
-            elif self.model_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-                quantization_weights_map = {
-                    "weight_scale": "weight_scale_inv",
-                }
-            if quantization_weights_map:
-                params_map.update(quantization_weights_map)
+        quantization_weights_map: Dict[str, str] = {}
+        if self.model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
+            quantization_weights_map = {
+                "weight_packed": "weight",
+                "input_global_scale": "input_scale",
+                "weight_global_scale": "weight_scale_2",
+            }
+        elif self.model_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            quantization_weights_map = {
+                "weight_scale": "weight_scale_inv",
+            }
+        if quantization_weights_map:
+            params_map.update(quantization_weights_map)
         weights = self.weight_mapper.rename_by_params_map(weights=weights, params_map=params_map)
 
         super().load_weights(weights)
