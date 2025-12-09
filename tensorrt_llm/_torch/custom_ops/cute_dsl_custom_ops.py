@@ -10,7 +10,7 @@ from ...math_utils import pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (fp4_scale_infer_shape, fp4_unswizzled_scale_infer_shape,
+from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
@@ -221,8 +221,8 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
     def generate_permuted_idx_to_expanded_idx(
-            self, num_tokens: int,
-            num_tokens_per_expert: List[int]) -> List[int]:
+            self, num_tokens: int, num_tokens_per_expert: List[int],
+            max_num_permuted_tokens: int) -> List[int]:
         """Generate permuted_idx_to_expanded_idx for gather operation.
 
         Maps permuted index to expanded index (token_idx * top_k + topk_idx).
@@ -230,14 +230,14 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
         Args:
             num_tokens: Total number of input tokens
             num_tokens_per_expert: List of token counts per expert
+            max_num_permuted_tokens: Target size of the output list
 
         Returns:
             List of expanded IDs with length = max_num_permuted_tokens,
             where permuted_idx_to_expanded_idx[permuted_idx] = expanded_idx
-            Padding tokens are marked with -1
+            Padding tokens are marked with pad_val
             Note: In kernel, use expanded_idx // top_k to get original token_idx
         """
-        max_num_permuted_tokens = self.get_max_num_permuted_tokens(num_tokens)
         permuted_idx_to_expanded_idx = []
         colmajor_expanded_idx = 0
         for i, curr_num_tokens in enumerate(num_tokens_per_expert):
@@ -274,22 +274,23 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             self.
             IDX_PERMUTED_IDX_TO_EXPANDED_IDX] is permuted_idx_to_expanded_idx
 
-        num_tokens = self.infer_num_tokens(permuted_idx_to_expanded_idx.size(0))
+        max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+        max_num_tiles = max_num_permuted_tokens // self.tile_size
+
+        num_tokens = self.infer_num_tokens(max_num_permuted_tokens)
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
         tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
             num_tokens_per_expert)
         tile_idx_to_mn_limit_list = self.generate_tile_idx_to_mn_limit(
             num_tokens_per_expert)
         permuted_idx_to_expanded_idx_list = self.generate_permuted_idx_to_expanded_idx(
-            num_tokens, num_tokens_per_expert)
+            num_tokens, num_tokens_per_expert, max_num_permuted_tokens)
         num_non_exiting_tiles_val = len(tile_idx_to_group_idx_list)
-        num_padding_tiles_val = tile_idx_to_group_idx.size(
-            0) - num_non_exiting_tiles_val
+        num_padding_tiles_val = max_num_tiles - num_non_exiting_tiles_val
         assert num_non_exiting_tiles_val > 0
         assert num_padding_tiles_val >= 0
         assert len(tile_idx_to_mn_limit_list) == num_non_exiting_tiles_val
-        assert len(permuted_idx_to_expanded_idx_list
-                   ) == tile_idx_to_group_idx.size(0) * self.tile_size
+        assert len(permuted_idx_to_expanded_idx_list) == max_num_permuted_tokens
 
         tile_idx_to_group_idx = torch.tensor(
             tile_idx_to_group_idx_list + [self.pad_val] * num_padding_tiles_val,
@@ -300,8 +301,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             dtype=tile_idx_to_mn_limit.dtype,
             device=tile_idx_to_mn_limit.device)
         permuted_idx_to_expanded_idx = torch.tensor(
-            permuted_idx_to_expanded_idx_list + [self.pad_val] *
-            (num_padding_tiles_val * self.tile_size),
+            permuted_idx_to_expanded_idx_list,
             dtype=permuted_idx_to_expanded_idx.dtype,
             device=permuted_idx_to_expanded_idx.device)
         num_non_exiting_tiles = torch.tensor(
@@ -1842,8 +1842,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     constraint_specs=(ConstraintSpec(
                         0, 0, helper.infer_shape_num_tokens),
                                       ConstraintSpec(
-                                          2, 0,
-                                          fp4_unswizzled_scale_infer_shape),
+                                          2, 0, helper.infer_shape_num_tokens),
                                       ConstraintSpec(
                                           5, 0,
                                           helper.infer_shape_max_num_tiles),
@@ -1867,6 +1866,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b.dtype == torch.float4_e2m1fn_x2
             assert b.dim() == 3
             assert a_sf.dtype == torch.uint8
+            assert a_sf.dim() == 2
             assert b_sf.dtype == torch.uint8
             assert b_sf.dim() == 3
             assert alpha.dtype == torch.float32
@@ -1883,7 +1883,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert k % (self.scaling_vector_size * 4) == 0
             assert n % (self.scaling_vector_size * 4 * 2) == 0
             assert b.size(2) * 2 == k
-            assert a_sf.numel() == orig_m * scale_k
+            assert a_sf.size(0) == orig_m
+            assert a_sf.size(1) == scale_k
             assert b_sf.size(0) == l
             assert b_sf.size(1) == n
             assert b_sf.size(2) == scale_k

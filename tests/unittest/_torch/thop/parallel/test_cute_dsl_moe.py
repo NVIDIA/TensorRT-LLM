@@ -783,7 +783,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
 
     # Generate permuted_idx_to_expanded_idx for gather operation
     permuted_idx_to_expanded_idx_list = helper.generate_permuted_idx_to_expanded_idx(
-        num_tokens, num_tokens_per_expert.tolist()
+        num_tokens, num_tokens_per_expert.tolist(), max_num_permuted_tokens
     )
     permuted_idx_to_expanded_idx = torch.tensor(
         permuted_idx_to_expanded_idx_list, dtype=torch.int32, device="cuda"
