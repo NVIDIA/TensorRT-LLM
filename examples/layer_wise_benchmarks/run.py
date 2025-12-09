@@ -109,13 +109,18 @@ if args.enable_attention_dp is None:
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
     if args.run_type == "GEN":
-        ctx_batch_size = max(1, max(20480, args.max_num_tokens) // max(args.seq_len_kv_cache_list))
+        ctx_batch_size = min(
+            args.max_batch_size,
+            max(1, max(20480, args.max_num_tokens) // max(args.seq_len_kv_cache_list)),
+        )
         args.max_num_tokens = max(
             args.max_num_tokens, ctx_batch_size * max(args.seq_len_kv_cache_list)
         )
 else:
     if args.run_type == "GEN":
-        ctx_batch_size = max(1, args.max_num_tokens // max(args.seq_len_kv_cache_list))
+        ctx_batch_size = min(
+            args.max_batch_size, max(1, args.max_num_tokens // max(args.seq_len_kv_cache_list))
+        )
         assert args.max_num_tokens >= ctx_batch_size * max(args.seq_len_kv_cache_list), (
             "Max_num_tokens is too small to prefill KV cache"
         )
@@ -270,7 +275,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
                 with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
                     run_pack()
 
-        balance_ratio_str = "" if balance_ratio is None else f"  balance={balance_ratio:.2g}"
+        balance_ratio_str = "" if balance_ratio is None else f" balance={balance_ratio:.2g}"
         nvtx_message = f"b={batch_size} s={seq_len_q} past={seq_len_kv_cache}{balance_ratio_str} NP{world_size}"
         for i in range(args.warmup_times + args.run_times):
             events[i].record()
