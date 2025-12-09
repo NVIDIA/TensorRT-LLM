@@ -2895,7 +2895,6 @@ def launchTestJobs(pipeline, testFilter)
 
     x86SlurmTestConfigs = [
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-2_GPUs-PyTorch-Ray-1": ["dgx-h100-x2-oci", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4-oci", "l0_dgx_h100", 1, 1, 4],

@@ -48,25 +48,6 @@ l0_dgx_h100:
 - condition:
     ranges:
       system_gpu_count:
-        gte: 2
-        lte: 2
-    wildcards:
-      gpu:
-      - '*h100*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: pytorch
-      auto_trigger: gpt_oss
-      orchestrator: mpi
-  tests:
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-two_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-two_model-overlap_scheduler]
-- condition:
-    ranges:
-      system_gpu_count:
         gte: 4
         lte: 4
     wildcards:
@@ -205,6 +186,14 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[triton-two_model-no_overlap_scheduler]
 - condition:
     ranges:
       system_gpu_count:
