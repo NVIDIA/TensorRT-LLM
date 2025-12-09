@@ -371,8 +371,11 @@ def mergeWaiveList(pipeline, globalVars)
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "Merge test waive list failed. Error: ${e.toString()}"
-        echo "Fallback to use the default test waive list from the PR"
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Merge test waive list failed. Fallback to use the default test waive list from the PR. Error: ${e.toString()}"
+        }
     }
 }
 
@@ -640,6 +643,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     }
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "tests/integration/defs/triton_server/": ["-Triton-"],
+        "triton_backend/": ["-Triton-"],
         "cpp/kernels/fmha_v2/": ["-FMHA-"],
         "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
     ]
@@ -735,6 +740,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+        "tests/integration/defs/accuracy/test_disaggregated_serving.py",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)

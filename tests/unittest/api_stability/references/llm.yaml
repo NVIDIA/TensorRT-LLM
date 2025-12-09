@@ -115,6 +115,10 @@ methods:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
         default: null
+      nvfp4_gemm_config:
+        annotation: tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig
+        status: beta
+        default: null
       attn_backend:
         annotation: str
         default: TRTLLM

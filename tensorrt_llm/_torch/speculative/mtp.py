@@ -908,9 +908,10 @@ class MTPWorker(nn.Module):
 
         # Check for environment variable override
         if self.force_num_accepted_tokens != 0:
-            force_num_accepted_tokens = min(self.force_num_accepted_tokens,
-                                            mtp_num_modules + 1)
-            num_accepted_tokens[num_contexts:] = force_num_accepted_tokens
+            # total tokens per iteration = accepted draft tokens + 1 target token
+            force_total_tokens = min(self.force_num_accepted_tokens + 1,
+                                     mtp_num_modules + 1)
+            num_accepted_tokens[num_contexts:] = force_total_tokens
 
         return accepted_tokens, num_accepted_tokens
 
