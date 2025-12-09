@@ -1435,6 +1435,8 @@ def _insert_sharded_moe_stacked(
     # -- Transform expert weight parameters --
     local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
 
+    if len(args) <= 7:
+        raise ValueError(f"Expected at least 8 args for stacked MoE sharding, got {len(args)}")
     weights_fusion_enum = weights_fusion_from_str(args[7])
     # Transform gate_up_stacked: slice experts, swap [W1,W3]->[W3,W1] if GATEUP_DOWN, transpose (E,H,2I)->(E,2I,H)
     # GATEUP_DOWN means [w1, w3] order -> swap to TRT-LLM [w3, w1]
