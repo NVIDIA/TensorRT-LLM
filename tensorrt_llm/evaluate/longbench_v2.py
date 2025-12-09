@@ -759,9 +759,11 @@ class LongBenchV2(Evaluator):
                 chat_template_kwargs: Optional[dict[str, Any]]) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
-        sampling_params = SamplingParams(max_tokens=max_output_length,
-                                         temperature=0.6,
-                                         top_p=0.95)
+        # TODO: Should control SamplingParams from the command line.
+        sampling_params = SamplingParams(
+            max_tokens=max_output_length,
+            temperature=0,
+        )
 
         evaluator = LongBenchV2(dataset_path=dataset_path,
                                 prompts_dir=prompts_dir,
