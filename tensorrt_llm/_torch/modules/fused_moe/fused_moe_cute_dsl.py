@@ -438,8 +438,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_selected_experts,
             expert_first_token_offset,
             enable_alltoall,
-            x.shape[0],  # num_rows
-            x.shape[1],  # (possibly padded) hidden_size
+            token_final_scales.size(0),  # num_rows
+            self.hidden_size,  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
             self.routing_method.top_k,
             self.expert_size_per_partition,  # num_experts_per_node
