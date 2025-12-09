@@ -2541,7 +2541,8 @@ class PyExecutor:
             r for r in
             previous_batch.sample_state.scheduled_requests.all_requests()
             if r.state == LlmRequestState.GENERATION_COMPLETE and (
-                r.py_return_context_logits or r.py_return_generation_logits)
+                r.py_return_context_logits or r.py_return_generation_logits
+                or r.py_additional_outputs is not None)
         ]
         if self.dist.is_first_pp_rank and len(finished_reqs):
             finished_reqs_py_results = [r.py_result for r in finished_reqs]
