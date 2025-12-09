@@ -2,6 +2,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import traceback
 import uuid
@@ -65,7 +66,7 @@ def service_discovery(request, disagg_port, work_dir):
             etcd.wait(timeout=10)
             shutil.rmtree(data_dir)
         except Exception:
-            pass
+            print(f"Failed to kill etcd: {traceback.format_exc()}")
     else:
         yield None, f"http://localhost:{disagg_port}"
 
@@ -131,7 +132,13 @@ class ProcessWrapper:
         self.port = port
 
 
-def _run_worker(model_name, worker_config, role, port, work_dir, device=-1):
+def _run_worker(model_name,
+                worker_config,
+                role,
+                port,
+                work_dir,
+                device=-1,
+                save_log=False):
     if port == 0:
         port = get_free_unused_port()
     worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
@@ -152,15 +159,23 @@ def _run_worker(model_name, worker_config, role, port, work_dir, device=-1):
             "context" if role.startswith("ctx") else "generation",
         ]
         env = os.environ.copy()
+        log_file = None
+        log_path = None
+        if save_log:
+            log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
+            log_file = open(log_path, "w+")
+            stdout = log_file
+            stderr = log_file
+        else:
+            stdout = sys.stdout
+            stderr = sys.stderr
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        log_path = os.path.join(work_dir, f"output_{role}.log")
-        log_file = open(log_path, "w+")
         print(f"Running {role} on port {port}")
         return ProcessWrapper(subprocess.Popen(cmd,
                                                env=env,
-                                               stdout=log_file,
-                                               stderr=log_file),
+                                               stdout=stdout,
+                                               stderr=stderr),
                               log_file=log_file,
                               log_path=log_path,
                               port=port)
@@ -176,16 +191,24 @@ def run_gen_worker(model_name, gen_worker_config, work_dir, port=0, device=1):
                        device)
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0):
+def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
     disagg_server_config_path = os.path.join(work_dir,
                                              "disagg_server_config.yaml")
     disagg_cluster_config["port"] = port
     with open(disagg_server_config_path, "w+") as f:
         yaml.dump(disagg_cluster_config, f)
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
-    log_path = os.path.join(work_dir, "disagg_server.log")
-    log_file = open(log_path, "w+")
-    p = subprocess.Popen(cmds, stdout=log_file, stderr=log_file)
+    log_file = None
+    log_path = None
+    if save_log:
+        log_path = os.path.join(work_dir, "disagg_server.log")
+        log_file = open(log_path, "w+")
+        stdout = log_file
+        stderr = log_file
+    else:
+        stdout = sys.stdout
+        stderr = sys.stderr
+    p = subprocess.Popen(cmds, stdout=stdout, stderr=stderr)
     return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
 
 
