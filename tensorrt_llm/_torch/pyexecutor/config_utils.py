@@ -48,7 +48,7 @@ def load_pretrained_config(model_name_or_path: str,
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
-    elif checkpoint_format == "mistral_large_3":
+    elif checkpoint_format in ("mistral", "mistral_large_3"):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         model_config = getattr(

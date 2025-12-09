@@ -108,10 +108,6 @@ from ..logger import logger, severity_map
               is_flag=True,
               default=False,
               help="Flag for disabling KV cache reuse.")
-@click.option("--checkpoint_format",
-              type=click.Choice(["hf", "mistral"]),
-              default=None,
-              help="Checkpoint format.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          backend: str, max_beam_width: int, max_batch_size: int,
@@ -119,7 +115,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
          revision: Optional[str], extra_llm_api_options: Optional[str],
-         disable_kv_cache_reuse: bool, checkpoint_format: Optional[str]):
+         disable_kv_cache_reuse: bool): 
     logger.set_level(log_level)
 
     kv_cache_config = KvCacheConfig(
@@ -136,7 +132,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "trust_remote_code": trust_remote_code,
         "revision": revision,
         "kv_cache_config": kv_cache_config,
-        "checkpoint_format": checkpoint_format,
     }
 
     if extra_llm_api_options is not None:
