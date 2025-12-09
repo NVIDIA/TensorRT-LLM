@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -381,7 +382,7 @@ def parse_kernel_name(demangledName):
         if all(keyword in name for keyword in src):
             return dst
     if name not in warned_names:
-        print(f"Unknown kernel name: {name}")
+        print(f"Unknown kernel name: {name}", file=sys.stderr)
         warned_names.add(name)
         if args.error_on_unknown_kernel:
             raise NotImplementedError(f"Unknown kernel name: {name}")
