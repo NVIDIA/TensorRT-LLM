@@ -27,7 +27,7 @@ async def main():
     await mcp_worker.init_in_asyncio_event_loop()
 
     llm = create_open_deep_research_scaffolding_llm(
-        generation_worker, mcp_worker, args.enable_statistics, args.enable_query_collector
+        generation_worker, mcp_worker, max_tokens=4096, enable_statistics=args.enable_statistics, enable_query_collector=args.enable_query_collector
     )
 
     prompt = """
