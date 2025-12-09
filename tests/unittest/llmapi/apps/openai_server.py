@@ -97,6 +97,8 @@ class RemoteOpenAIServer:
 
                 time.sleep(0.5)
                 if time.time() - start > timeout:
+                    # Terminate the server to avoid the process keeping running in background after timeout
+                    self.terminate()
                     raise RuntimeError(
                         "Server failed to start in time.") from err
 
