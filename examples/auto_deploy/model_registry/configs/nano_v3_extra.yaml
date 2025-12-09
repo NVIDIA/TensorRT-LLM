@@ -1,0 +1,3 @@
+# Additional configuration for Nano V3 model
+# Used in combination with nano_v3.yaml
+free_mem_ratio: 0.0

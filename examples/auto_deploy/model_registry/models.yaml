@@ -1,0 +1,209 @@
+version: '2.0'
+description: AutoDeploy Model Registry - Flat format with composable configs
+models:
+- name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: Qwen/Qwen2.5-0.5B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: Qwen/Qwen3-0.6B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: apple/OpenELM-270M-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-1_1B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: microsoft/Phi-4-mini-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: microsoft/Phi-4-mini-reasoning
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: google/gemma-3-1b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3_1b.yaml']
+- name: meta-llama/Llama-3.1-8B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/Llama-3.2-1B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/Llama-3.2-3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen2.5-1.5B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen2.5-3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen2.5-7B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen3-4B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen3-8B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: microsoft/phi-4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: microsoft/Phi-4-reasoning
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: microsoft/Phi-4-reasoning-plus
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: google/gemma-1.1-7b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: google/gemma-2-2b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: google/gemma-2-9b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: google/codegemma-7b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: mistralai/Mistral-7B-Instruct-v0.2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: mistralai/Mistral-7B-Instruct-v0.3
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: bigcode/starcoder2-7b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: bigcode/starcoder2-15b-instruct-v0.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: deepseek-ai/DeepSeek-Prover-V1.5-SFT
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: deepseek-ai/DeepSeek-Prover-V2-7B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'demollm_triton.yaml']
+- name: ibm-granite/granite-3.1-2b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-3.1-8b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-3.3-2b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-3.3-8b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-guardian-3.1-2b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-guardian-3.2-5b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/CodeLlama-7b-Instruct-hf
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/CodeLlama-7b-Python-hf
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/Llama-2-7b-chat-hf
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-8B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-Minitron-4B-Width-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Mistral-NeMo-Minitron-8B-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: openai/gpt-oss-20b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: bigcode/starcoder2-15b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ibm-granite/granite-3.0-8b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/Llama-4-17b-scout
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: microsoft/Phi-4-mini-4k-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: mistralai/Ministral-8B-Instruct-2410
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: mistralai/Codestral-2501-v0.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: mistralai/Magistral-Medium-1.2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: mistralai/Pixtral-12B-2409
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: nvidia/Nemotron-Nano-4B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Nemotron-Nano-2-VL
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: google/gemma-3-27b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: google/gemma-3-2b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: deepseek-ai/DeepSeek-V2.5
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: ai21labs/AI21-Jamba-1.5-Mini
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: THUDM/glm-4v-9b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: meta-llama/Llama-3.2-11B-Vision-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: meta-llama/Llama-3.3-70B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama-3.3-70b.yaml']
+- name: meta-llama/CodeLlama-34b-Instruct-hf
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: meta-llama/Llama-2-13b-chat-hf
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: microsoft/Phi-3-medium-128k-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: microsoft/Phi-3-medium-4k-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: mistralai/Codestral-22B-v0.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: Qwen/QwQ-32B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: google/gemma-2-27b-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: perplexity-ai/r1-1776-distill-llama-70b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'nano_v3_extra.yaml']
+- name: Qwen/QwQ-32B-Preview
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: Qwen/Qwen3-Coder-32B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: Qwen/Qwen3-MoE-A22B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: ai21labs/AI21-Jamba-1.5-Large
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: nvidia/OpenReasoning-Nemotron-32B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: mistralai/Mistral-Large-Instruct-v2.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: mistralai/Pixtral-Large-Instruct-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: mistralai/Mixtral-8x22B-Instruct-v0.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-70B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-405B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-Nemotron-70B-Instruct-HF
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3_1-Nemotron-51B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: Qwen/Qwen3-30B-A3B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: Qwen/Qwen3-235B-A22B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: deepseek-ai/DeepSeek-R1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v3_lite.yaml']
+- name: deepseek-ai/DeepSeek-V3
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v3_lite.yaml']
+- name: deepseek-ai/DeepSeek-Coder-V3-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: Qwen/Qwen3-72B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: Qwen/Qwen3-VL-72B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+- name: codellama/CodeLlama-70b-Instruct-hf
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: meta-llama/Llama-4-70b-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: meta-llama/Llama-3.2-90B-Vision-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+- name: nvidia/Nemotron-4-340B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: openai/gpt-oss-120b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: meta-llama/Llama-4-Scout-17B-16E-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'llama-4-scout.yaml', 'multimodal.yaml']
+- name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'llama4_maverick_lite.yaml']

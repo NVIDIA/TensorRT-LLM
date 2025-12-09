@@ -1,0 +1,2 @@
+# Disable benchmarking for models with specific issues or requirements
+benchmark_enabled: false

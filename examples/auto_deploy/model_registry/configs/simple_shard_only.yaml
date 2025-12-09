@@ -1,0 +1,3 @@
+# Configuration for models that require simple sharding only
+# Used for very large models with specific sharding requirements
+simple_shard_only: true

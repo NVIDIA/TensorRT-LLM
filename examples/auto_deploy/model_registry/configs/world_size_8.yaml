@@ -1,0 +1,2 @@
+# Configuration for 8 GPU models
+tensor_parallel_size: 8

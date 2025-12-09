@@ -1,0 +1,4 @@
+# Configuration for Gemma 3 1B model
+# Specific sequence length requirement
+benchmark_enabled: false
+max_seq_len: 511
