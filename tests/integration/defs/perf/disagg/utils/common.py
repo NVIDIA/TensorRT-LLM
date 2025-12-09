@@ -82,7 +82,11 @@ class EnvManager:
 
     @staticmethod
     def get_model_dir() -> str:
-        return os.getenv("MODEL_DIR", "<Your model and dataset directory>")
+        return os.getenv("MODEL_DIR", "<Your model directory>")
+
+    @staticmethod
+    def get_dataset_dir() -> str:
+        return os.getenv("DATASET_DIR", "<Your dataset directory>")
 
     @staticmethod
     def get_output_path() -> str:
@@ -99,10 +103,11 @@ class EnvManager:
         return os.getenv("INSTALL_MODE", "none")
 
     @staticmethod
-    def get_container_mount() -> str:
+    def get_container_mount(model_name: str = "") -> str:
         work_dir = EnvManager.get_work_dir()
         script_dir = EnvManager.get_script_dir()
         model_dir = EnvManager.get_model_dir()
+        dataset_dir = EnvManager.get_dataset_dir()
         output_path = EnvManager.get_output_path()
         repo_dir = EnvManager.get_repo_dir()
         trtllm_wheel_path = EnvManager.get_trtllm_wheel_path()
@@ -114,10 +119,16 @@ class EnvManager:
             f"{output_path}:{output_path}",
         ]
 
+        # Kimi-K2 needs 640G of shared memory, otherwise will cause host memory OOM.
+        if model_name.find("kimi-k2") != -1:
+            mounts.append("tmpfs:/dev/shm:size=640G")
+
+        if dataset_dir and not dataset_dir.startswith("<"):
+            mounts.append(f"{dataset_dir}:{dataset_dir}")
         # Add repo_dir if available
-        if repo_dir:
+        if repo_dir and not repo_dir.startswith("<"):
             mounts.append(f"{repo_dir}:{repo_dir}")
-        if trtllm_wheel_path:
+        if trtllm_wheel_path and not trtllm_wheel_path.startswith("<"):
             trtllm_wheel_dir = os.path.dirname(trtllm_wheel_path)
             mounts.append(f"{trtllm_wheel_dir}:{trtllm_wheel_dir}")
         return ",".join(mounts)

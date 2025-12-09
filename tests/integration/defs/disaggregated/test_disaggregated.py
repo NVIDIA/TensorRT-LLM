@@ -1594,9 +1594,8 @@ def run_disaggregated_benchmark(example_dir,
             # Ensure the sever has started
             client_dir = f"{example_dir}/clients"
             client_cmd = [
-                'python3', f'{client_dir}/disagg_client.py', '-c',
-                f'{example_dir}/disagg_config.yaml', '-p',
-                f'{client_dir}/prompts.json', '--ignore-eos',
+                'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
+                '-p', f'{client_dir}/prompts.json', '--ignore-eos',
                 '--server-start-timeout',
                 str(server_start_timeout)
             ]
