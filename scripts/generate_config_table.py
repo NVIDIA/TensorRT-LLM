@@ -14,23 +14,15 @@
 # limitations under the License.
 
 
-import importlib.util
 import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+from examples.configs.database.database import DATABASE_LIST_PATH, RecipeList
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
-
-# Load database module directly to avoid tensorrt_llm.__init__ (requires torch)
-_spec = importlib.util.spec_from_file_location(
-    "database", REPO_ROOT / "examples" / "configs" / "database" / "database.py"
-)
-_db = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_db)
-DATABASE_LIST_PATH, RecipeList = _db.DATABASE_LIST_PATH, _db.RecipeList
-
 MODEL_INFO = {
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
