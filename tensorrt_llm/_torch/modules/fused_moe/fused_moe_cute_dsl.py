@@ -258,6 +258,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_nvfp4
@@ -291,12 +292,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
         )
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_final_scales.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+        else:
+            assert moe_output.size() == (token_final_scales.size(0),
+                                         self.hidden_size)
+            assert moe_output.dtype == output_dtype
+
         if self.use_fused_finalize:
-            output = torch.empty((token_final_scales.size(0), self.hidden_size),
-                                 dtype=output_dtype,
-                                 device=x.device)
             torch.ops.trtllm.moe_output_memset_inplace(
-                input=output,
+                input=moe_output,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -313,7 +322,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 weight_scale=self.quant_scales.fc2_weight_block.view(
                     torch.uint8),
                 alpha=self.quant_scales.fc2_global,
-                output=output,
+                output=moe_output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -326,7 +335,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
-            x = output
         else:
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
@@ -344,12 +352,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
+            # TODO: Make moe_unpermute inplace
             x = torch.ops.trtllm.moe_unpermute(
                 permuted_input=x,
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 topk_scales=token_final_scales,
             )
-        return x
+            moe_output.copy_(x, non_blocking=True)
+        return moe_output
 
     def run_moe_fp8_block_scales(
         self,
@@ -357,19 +367,21 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
         weight_dtype = self.w3_w1_weight.dtype
+        output_dtype = x.dtype
 
         (
-            permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
-            permuted_data_tensor,
-            expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
-            unpermuted_row_to_permuted_row_tensor,
+            permuted_row_to_unpermuted_row,
+            permuted_token_selected_experts,
+            x,
+            expert_first_token_offset,
+            permuted_token_final_scales,
+            unpermuted_row_to_permuted_row,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
             token_selected_experts,
@@ -388,32 +400,43 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             min_latency_mode=False,
             use_fp8_block_scaling=True,
         )
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-            permuted_data_tensor)
-        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
+        x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
+        x = cute_dsl_fp8_group_blockwise_gemm_ref(
+            a=x,
             b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=act_input_sf,
+            a_sf=x_sf,
             b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset_tensor,
+            offset_array=expert_first_token_offset,
         )
-        h2 = swiglu_fused_moe(h1)
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
-        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
+        x = swiglu_fused_moe(x)
+        x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
+        x = cute_dsl_fp8_group_blockwise_gemm_ref(
+            a=x,
             b=self.w2_weight.view(weight_dtype),
-            a_sf=act_input_sf,
+            a_sf=x_sf,
             b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset_tensor,
+            offset_array=expert_first_token_offset,
         )
-        h4 = torch.ops.trtllm.moe_finalize_scale_op(
-            h3,
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_final_scales.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+        else:
+            assert moe_output.size() == (token_final_scales.size(0),
+                                         self.hidden_size)
+            assert moe_output.dtype == output_dtype
+
+        # TODO: Make moe_finalize_scale_op inplace
+        x = torch.ops.trtllm.moe_finalize_scale_op(
+            x,
             None,  # biases
             token_final_scales,
-            unpermuted_row_to_permuted_row_tensor,
-            permuted_row_to_unpermuted_row_tensor,
+            unpermuted_row_to_permuted_row,
+            permuted_row_to_unpermuted_row,
             token_selected_experts,
-            expert_first_token_offset_tensor,
+            expert_first_token_offset,
             enable_alltoall,
             x.shape[0],  # num_rows
             x.shape[1],  # (possibly padded) hidden_size
@@ -425,7 +448,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self.ep_size,
             self.ep_rank,
         )
-        return h4
+        moe_output.copy_(x, non_blocking=True)
+        return moe_output
 
     def run_moe(
         self,
@@ -433,6 +457,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
         """
@@ -448,6 +473,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                     this represents expert slots [num_tokens, top_k] instead.
             token_final_scales: Final scaling factors for each token
             x_sf: Input scale factors (optional, for certain quantization schemes)
+            moe_output: Pre-allocated MoE output buffer (optional, for NVLINK one-sided backend).
             enable_alltoall: Whether alltoall communication is enabled.
 
         Returns:
@@ -459,6 +485,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
                 x_sf=x_sf,
+                moe_output=moe_output,
                 enable_alltoall=enable_alltoall)
         elif self.has_deepseek_fp8_block_scales:
             return self.run_moe_fp8_block_scales(
@@ -466,6 +493,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
                 x_sf=x_sf,
+                moe_output=moe_output,
                 enable_alltoall=enable_alltoall)
         else:
             raise ValueError(

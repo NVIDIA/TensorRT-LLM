@@ -1096,12 +1096,17 @@ class ConfigurableMoE(MoE):
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens, output_dtype
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
         # CuteDSL-specific parameters
         elif self.backend.__class__ == CuteDslFusedMoE:
             kwargs["enable_alltoall"] = self.enable_alltoall
+
+            # Get moe_output for NVLinkOneSided backend
+            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            )
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:
@@ -1123,7 +1128,7 @@ class ConfigurableMoE(MoE):
 
             # Get moe_output for NVLinkOneSided backend
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens, output_dtype
+                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
         return kwargs
