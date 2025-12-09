@@ -749,17 +749,16 @@ class Deepseekv3MoE(nn.Module):
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
-        self.gate = gate_cls(
-            hidden_size,
-            num_experts,
-            top_k=top_k,
-            n_group=config.n_group,
-            topk_group=config.topk_group,
-            routed_scaling_factor=config.routed_scaling_factor,
-            dtype=dtype,
-            fuse_routing_kernel=True,
-            apply_routing=False,
-            moe_backend=model_config.moe_backend)
+        self.gate = gate_cls(hidden_size,
+                             num_experts,
+                             top_k=top_k,
+                             n_group=config.n_group,
+                             topk_group=config.topk_group,
+                             routed_scaling_factor=config.routed_scaling_factor,
+                             dtype=dtype,
+                             fuse_routing_kernel=True,
+                             apply_routing=False,
+                             moe_backend=model_config.moe_backend)
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,

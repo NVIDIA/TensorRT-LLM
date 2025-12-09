@@ -230,9 +230,7 @@ def _remap_moe_args(config: dict) -> dict:
 @register_config_loader("mistral")
 @register_config_loader("mistral_large_3")
 class MistralConfigLoader(BaseConfigLoader):
-    def _load_mistral_config_dict(
-        self, checkpoint_dir: str, config_file_name: str
-    ) -> dict | None:
+    def _load_mistral_config_dict(self, checkpoint_dir: str, config_file_name: str) -> dict | None:
         file_path = Path(checkpoint_dir) / Path(config_file_name)
 
         if file_path.exists() and file_path.is_file():
@@ -285,11 +283,10 @@ class MistralConfigLoader(BaseConfigLoader):
         pretrained_config.torch_dtype = getattr(pretrained_config, "dtype", None)
         quant_config = QuantConfig()
         layer_quant_config = None
-        moe_backend = kwargs.get("moe_backend", "CUTLASS")
 
         hf_quant_config = pretrained_config.quantization_config
         if hf_quant_config.get("quant_method") == "compressed-tensors":
-            if 'NVFP4' in hf_quant_config.get("config_groups"):
+            if "NVFP4" in hf_quant_config.get("config_groups"):
                 quant_config.quant_algo = QuantAlgo.NVFP4
                 quant_config.group_size = 16
                 ignore_list = hf_quant_config.get("ignore", [])
@@ -300,15 +297,13 @@ class MistralConfigLoader(BaseConfigLoader):
                     quant_config.exclude_modules.append("vision_encoder*")
                 if "re:vision_language_adapter.*" in ignore_list:
                     quant_config.exclude_modules.append("vision_language_adapter*")
-                
-            elif 'FP8_BLOCK' in hf_quant_config.get("config_groups"):
+
+            elif "FP8_BLOCK" in hf_quant_config.get("config_groups"):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.group_size = 128
-                quant_config.exclude_modules = [
-                    "*q_a_proj*", "*kv_a_proj_with_mqa*"
-                ]
+                quant_config.exclude_modules = ["*q_a_proj*", "*kv_a_proj_with_mqa*"]
 
-        kwargs.pop("trust_remote_code", None) # ModelConfig does not have this input parameter
+        kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
         model_config = ModelConfig(
             pretrained_config=pretrained_config,
             quant_config=quant_config,

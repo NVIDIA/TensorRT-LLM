@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 import torchvision
-from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
@@ -18,7 +17,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_pixtral
 from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
     MistralWeightMapper
-from tensorrt_llm._torch.models.modeling_mistral_large3 import MistralLarge3ForCausalLM, Mistral3Gate
+from tensorrt_llm._torch.models.modeling_mistral_large3 import (
+    Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds, fuse_input_embeds, get_multimodal_embeddings)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -413,7 +413,8 @@ class Mistral3VLM(PreTrainedModel):
 
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
-        self._multi_modal_projector = Mistral3MultiModalProjector(model_config).eval().to(self._device)
+        self._multi_modal_projector = Mistral3MultiModalProjector(
+            model_config).eval().to(self._device)
         self._post_config()
         self.is_loaded = True
 

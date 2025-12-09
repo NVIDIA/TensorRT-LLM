@@ -4867,11 +4867,11 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             "latency_moe_deepgemm",
         ],
     )
-    def test_fp8(self, tp_size, pp_size, ep_size, attention_dp,
-                         cuda_graph, overlap_scheduler, moe_backend, eagle3):
+    def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                 overlap_scheduler, moe_backend, eagle3):
 
         if moe_backend == "DEEPGEMM" and (get_sm_version() == 120
-                                        or get_sm_version() == 121):
+                                          or get_sm_version() == 121):
             pytest.skip(
                 "MOE DEEPGEMM backend does not support SM version 120 or 121")
 
