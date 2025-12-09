@@ -49,7 +49,7 @@ class RootArgs(BaseModel):
         return self
 
 
-@click.group()
+@click.group(deprecated=True)
 @click.option(
     "--tokenizer",
     required=True,

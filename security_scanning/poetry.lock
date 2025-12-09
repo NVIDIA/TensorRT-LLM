@@ -885,18 +885,19 @@ vision = ["Pillow (>=9.4.0)"]
 
 [[package]]
 name = "diffusers"
-version = "0.35.2"
+version = "0.36.0"
 description = "State-of-the-art diffusion in PyTorch and JAX."
 optional = false
 python-versions = ">=3.8.0"
 files = [
-    {file = "diffusers-0.35.2-py3-none-any.whl", hash = "sha256:d50d5e74fdd6dcf55e5c1d304bc52cc7c2659abd1752740d736d7b54078b4db5"},
-    {file = "diffusers-0.35.2.tar.gz", hash = "sha256:30ecd552303edfcfe1724573c3918a8462ee3ab4d529bdbd4c0045f763affded"},
+    {file = "diffusers-0.36.0-py3-none-any.whl", hash = "sha256:525d42abc74bfc3b2db594999961295c054b48ef40a11724dacf50e6abd1af98"},
+    {file = "diffusers-0.36.0.tar.gz", hash = "sha256:a9cde8721b415bde6a678f2d02abb85396487e1b0e0d2b4abb462d14a9825ab0"},
 ]
 
 [package.dependencies]
 filelock = "*"
-huggingface-hub = ">=0.34.0"
+httpx = "<1.0.0"
+huggingface-hub = ">=0.34.0,<2.0"
 importlib_metadata = "*"
 numpy = "*"
 Pillow = "*"
@@ -906,16 +907,17 @@ safetensors = ">=0.3.1"
 
 [package.extras]
 bitsandbytes = ["accelerate (>=0.31.0)", "bitsandbytes (>=0.43.3)"]
-dev = ["GitPython (<3.1.19)", "Jinja2", "Jinja2", "accelerate (>=0.31.0)", "accelerate (>=0.31.0)", "compel (==0.1.8)", "datasets", "datasets", "flax (>=0.4.1)", "hf-doc-builder (>=0.3.0)", "hf-doc-builder (>=0.3.0)", "invisible-watermark (>=0.2.0)", "isort (>=5.5.4)", "jax (>=0.4.1)", "jaxlib (>=0.4.1)", "k-diffusion (==0.0.12)", "librosa", "parameterized", "peft (>=0.17.0)", "phonemizer", "protobuf (>=3.20.3,<4)", "pytest", "pytest-timeout", "pytest-xdist", "requests-mock (==1.10.0)", "ruff (==0.9.10)", "safetensors (>=0.3.1)", "scipy", "sentencepiece (>=0.1.91,!=0.1.92)", "tensorboard", "tiktoken (>=0.7.0)", "torch (>=1.4)", "torchvision", "transformers (>=4.41.2)", "urllib3 (<=2.0.0)"]
+dev = ["GitPython (<3.1.19)", "Jinja2", "Jinja2", "accelerate (>=0.31.0)", "accelerate (>=0.31.0)", "compel (==0.1.8)", "datasets", "datasets", "flax (>=0.4.1)", "hf-doc-builder (>=0.3.0)", "hf-doc-builder (>=0.3.0)", "invisible-watermark (>=0.2.0)", "isort (>=5.5.4)", "jax (>=0.4.1)", "jaxlib (>=0.4.1)", "k-diffusion (==0.0.12)", "librosa", "parameterized", "peft (>=0.17.0)", "phonemizer", "protobuf (>=3.20.3,<4)", "pytest", "pytest-timeout", "pytest-xdist", "requests-mock (==1.10.0)", "ruff (==0.9.10)", "safetensors (>=0.3.1)", "scipy", "sentencepiece (>=0.1.91,!=0.1.92)", "tensorboard", "tiktoken (>=0.7.0)", "timm", "torch (>=1.4)", "torchvision", "transformers (>=4.41.2)", "urllib3 (<=2.0.0)"]
 docs = ["hf-doc-builder (>=0.3.0)"]
 flax = ["flax (>=0.4.1)", "jax (>=0.4.1)", "jaxlib (>=0.4.1)"]
 gguf = ["accelerate (>=0.31.0)", "gguf (>=0.10.0)"]
+nvidia-modelopt = ["nvidia_modelopt[hf] (>=0.33.1)"]
 optimum-quanto = ["accelerate (>=0.31.0)", "optimum_quanto (>=0.2.6)"]
 quality = ["hf-doc-builder (>=0.3.0)", "isort (>=5.5.4)", "ruff (==0.9.10)", "urllib3 (<=2.0.0)"]
 test = ["GitPython (<3.1.19)", "Jinja2", "compel (==0.1.8)", "datasets", "invisible-watermark (>=0.2.0)", "k-diffusion (==0.0.12)", "librosa", "parameterized", "phonemizer", "pytest", "pytest-timeout", "pytest-xdist", "requests-mock (==1.10.0)", "safetensors (>=0.3.1)", "scipy", "sentencepiece (>=0.1.91,!=0.1.92)", "tiktoken (>=0.7.0)", "torchvision", "transformers (>=4.41.2)"]
 torch = ["accelerate (>=0.31.0)", "torch (>=1.4)"]
 torchao = ["accelerate (>=0.31.0)", "torchao (>=0.7.0)"]
-training = ["Jinja2", "accelerate (>=0.31.0)", "datasets", "peft (>=0.17.0)", "protobuf (>=3.20.3,<4)", "tensorboard"]
+training = ["Jinja2", "accelerate (>=0.31.0)", "datasets", "peft (>=0.17.0)", "protobuf (>=3.20.3,<4)", "tensorboard", "timm"]
 
 [[package]]
 name = "dill"
@@ -2028,13 +2030,13 @@ files = [
 
 [[package]]
 name = "meson"
-version = "1.9.2"
+version = "1.10.0"
 description = "A high performance build system"
 optional = false
 python-versions = ">=3.7"
 files = [
-    {file = "meson-1.9.2-py3-none-any.whl", hash = "sha256:1a284dc1912929098a6462401af58dc49ae3f324e94814a38a8f1020cee07cba"},
-    {file = "meson-1.9.2.tar.gz", hash = "sha256:3499b59bb23982496e01e57b4103ac2f826f9c3a3f59e507a0a832487fe55e3d"},
+    {file = "meson-1.10.0-py3-none-any.whl", hash = "sha256:4b27aafce281e652dcb437b28007457411245d975c48b5db3a797d3e93ae1585"},
+    {file = "meson-1.10.0.tar.gz", hash = "sha256:8071860c1f46a75ea34801490fd1c445c9d75147a65508cd3a10366a7006cc1c"},
 ]
 
 [package.extras]
@@ -2781,13 +2783,13 @@ typing-extensions = "*"
 
 [[package]]
 name = "nvidia-ml-py"
-version = "13.580.82"
+version = "13.590.44"
 description = "Python Bindings for the NVIDIA Management Library"
 optional = false
 python-versions = "*"
 files = [
-    {file = "nvidia_ml_py-13.580.82-py3-none-any.whl", hash = "sha256:4361db337b0c551e2d101936dae2e9a60f957af26818e8c0c3a1f32b8db8d0a7"},
-    {file = "nvidia_ml_py-13.580.82.tar.gz", hash = "sha256:0c028805dc53a0e2a6985ea801888197765ac2ef8f1c9e29a7bf0d3616a5efc7"},
+    {file = "nvidia_ml_py-13.590.44-py3-none-any.whl", hash = "sha256:18feb54eca7d0e3cdc8d1a040a771eda72d9ec3148e5443087970dbfd7377ecc"},
+    {file = "nvidia_ml_py-13.590.44.tar.gz", hash = "sha256:b358c7614b0fdeea4b95f046f1c90123bfe25d148ab93bb1c00248b834703373"},
 ]
 
 [[package]]
@@ -5362,13 +5364,13 @@ files = [
 
 [[package]]
 name = "urllib3"
-version = "2.6.0"
+version = "2.6.1"
 description = "HTTP library with thread-safe connection pooling, file post, and more."
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "urllib3-2.6.0-py3-none-any.whl", hash = "sha256:c90f7a39f716c572c4e3e58509581ebd83f9b59cced005b7db7ad2d22b0db99f"},
-    {file = "urllib3-2.6.0.tar.gz", hash = "sha256:cb9bcef5a4b345d5da5d145dc3e30834f58e8018828cbc724d30b4cb7d4d49f1"},
+    {file = "urllib3-2.6.1-py3-none-any.whl", hash = "sha256:e67d06fe947c36a7ca39f4994b08d73922d40e6cca949907be05efa6fd75110b"},
+    {file = "urllib3-2.6.1.tar.gz", hash = "sha256:5379eb6e1aba4088bae84f8242960017ec8d8e3decf30480b3a1abdaa9671a3f"},
 ]
 
 [package.extras]
@@ -5771,4 +5773,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "d139908ab9a0e12fb01f83db076f4e2154879d6f215b808f864103a4a57aea75"
+content-hash = "3ec3d9eabf7664da1722a32823997c383d7eab2dc54fa2c10e67849245300beb"

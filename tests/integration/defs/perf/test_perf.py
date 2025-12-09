@@ -1933,6 +1933,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                          "llama-7b-hf")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
+
         if self._config.num_loras > 0:
             istdev = 16
             ostdev = 24
@@ -1958,14 +1959,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "python3", prepare_data_script, f"--stdout",
-                    f"--rand-task-id 0 {nloras-1}",
-                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    f"--rand-task-id 0 {nloras-1}", f"--lora-dir={lora_dir}",
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
 
             else:
@@ -1978,12 +1978,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             if self._build_script == 'trtllm-bench':
                 data_cmd += [
-                    "python3", prepare_data_script, "--stdout",
-                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    "token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
             else:
                 data_cmd += [
