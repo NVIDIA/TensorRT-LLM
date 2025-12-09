@@ -87,8 +87,7 @@ class InsertCachedAttention(BaseTransform):
         node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
         with gm.graph.inserting_before(node_last_input.next):
             ret_node = gm.graph.call_function(
-                prep_meta_op,
-                args=tuple(*inputs_for_prep_meta, *const_args),
+                prep_meta_op, args=(*inputs_for_prep_meta, *const_args)
             )
             for idx in range(num_meta_out):
                 meta_extra_node = gm.graph.call_function(operator.getitem, args=(ret_node, idx))

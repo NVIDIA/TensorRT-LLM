@@ -26,7 +26,6 @@ from ..attention_interface import (
     CacheInitializerDict,
     Constant,
     MHACallable,
-    PrepareMetadataCallable,
     SequenceInfo,
 )
 
@@ -138,58 +137,23 @@ def _torch_causal_conv1d_decode(
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_causal_conv_prepare_metadata", mutates_args=())
-def torch_causal_conv_prepare_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for cached causal conv.
-
-    Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
-    """
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
-    slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-    use_initial_states = input_pos > 0
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
-
-
-@torch_causal_conv_prepare_metadata.register_fake
-def torch_causal_conv_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
-):
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-    return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
-    )
-
-
+# TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+# reference implementation to support chunked prefill.
+# Returns (seq_len, seq_start, slot_idx)
 @torch.library.custom_op("auto_deploy::torch_cached_causal_conv1d", mutates_args={})
 def _torch_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k]
     bias: Optional[torch.Tensor],
-    # METADATA
-    seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
-    slot_idx: torch.Tensor,  # [num_seq]
-    use_initial_states: torch.Tensor,  # [num_seq]
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
     # CONSTANTS
@@ -208,6 +172,14 @@ def _torch_cached_causal_conv1d(
     """
     b, s = input.shape[:2]
     num_seq = seq_len.shape[0]
+
+    # get cleaned up metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+    slot_idx = slot_idx[:num_seq].to(torch.long)
+    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         # Generate-only batch
@@ -270,17 +242,20 @@ def _torch_cached_causal_conv1d(
 
 @_torch_cached_causal_conv1d.register_fake
 def _torch_cached_causal_conv1d_fake(
-    # INPUTS
-    input: torch.Tensor,
-    weight: torch.Tensor,
+    # INPUTS (dense but may be flattened across sequences)
+    input: torch.Tensor,  # [b, s, c_in]
+    weight: torch.Tensor,  # [c_out, c_in/groups, k]
     bias: Optional[torch.Tensor],
-    # METADATA
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
-    use_initial_states: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
-    conv_state_cache: torch.Tensor,
+    conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -317,14 +292,11 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_causal_conv1d
+        return torch.ops.auto_deploy.torch_cached_causal_conv1d.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
-        # reference implementation to support chunked prefill.
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_causal_conv_prepare_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(
