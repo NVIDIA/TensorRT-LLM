@@ -42,7 +42,17 @@ Similar to the quickstart example, you can use the same CLI argument with `trtll
 
 Prepare the dataset:
 ```
-python ./benchmarks/cpp/prepare_dataset.py --tokenizer ./model_ckpt --stdout dataset --dataset-name lmms-lab/MMMU --dataset-split test --dataset-image-key image --dataset-prompt-key "question" --num-requests 100 --output-len-dist 128,5 > mm_data.jsonl
+trtllm-bench \
+  --model ./model_ckpt  \
+  prepare-dataset \
+  --output mm_data.jsonl
+  real-dataset
+  --dataset-name lmms-lab/MMMU \
+  --dataset-split test \
+  --dataset-image-key image \
+  --dataset-prompt-key question \
+  --num-requests 10 \
+  --output-len-dist 128,5
 ```
 
 Run the benchmark:
