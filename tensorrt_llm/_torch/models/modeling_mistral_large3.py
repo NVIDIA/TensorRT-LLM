@@ -3,11 +3,11 @@ from typing import Dict, List
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import MistralLarge3WeightMapper
-from tensorrt_llm._torch.modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import MistralLarge3WeightMapper
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import register_auto_model
+from tensorrt_llm._torch.modules.fused_moe import RenormalizeNaiveMoeRoutingMethod
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
