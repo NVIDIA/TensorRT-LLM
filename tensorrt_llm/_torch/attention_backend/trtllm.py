@@ -604,9 +604,6 @@ class TrtllmAttentionWrapper:
             is_mla_enable,
         )
 
-    def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
-
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
