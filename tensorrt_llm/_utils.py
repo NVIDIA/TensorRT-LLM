@@ -561,6 +561,12 @@ def mpi_world_size():
 
 
 def local_mpi_rank():
+    if mpi_disabled():
+        try:
+            return torch.distributed.get_node_local_rank()
+        except ValueError:
+            # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+            return 0
     return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
