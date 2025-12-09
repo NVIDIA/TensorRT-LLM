@@ -358,15 +358,15 @@ def buildImage(config, imageKeyToTag)
             def randomSleep = (Math.random() * 600 + 600).toInteger()
             trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             try {
-                // trtllm_utils.llmExecStepWithRetry(this, script: """
-                // cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                // BASE_IMAGE=${BASE_IMAGE} \
-                // TRITON_IMAGE=${TRITON_IMAGE} \
-                // TORCH_INSTALL_TYPE=${torchInstallType} \
-                // IMAGE_WITH_TAG=${imageWithTag} \
-                // STAGE=${dockerfileStage} \
-                // BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                // """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                trtllm_utils.llmExecStepWithRetry(this, script: """
+                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
+                TORCH_INSTALL_TYPE=${torchInstallType} \
+                IMAGE_WITH_TAG=${imageWithTag} \
+                STAGE=${dockerfileStage} \
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 if (MODE == "build_for_ci") {
                     imageKeyToTag[config.stageName] = imageWithTag
                 }
