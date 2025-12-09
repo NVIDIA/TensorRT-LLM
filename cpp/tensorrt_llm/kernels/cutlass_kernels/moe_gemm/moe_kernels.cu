@@ -1587,11 +1587,6 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     int64_t num_padding_tokens = 0;
 #endif
 
-    static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-    int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
-    int64_t const threads = EXPAND_THREADS_PER_BLOCK;
-
     auto func = [&]()
     {
 #ifdef ENABLE_FP8
@@ -1636,6 +1631,12 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
                 TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false>;
         }
     }();
+
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, EXPAND_THREADS_PER_BLOCK, 0);
+    int32_t const blocks
+        = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(std::max(num_rows * k, num_padding_tokens)));
+    int32_t const threads = EXPAND_THREADS_PER_BLOCK;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;
@@ -1891,15 +1892,18 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     if (parallelism_config.ep_size > 1 && enable_alltoall)
     {
         // If all-to-all comm is enabled, finalizeMoeRouting doesn't need to fill the invalid output tokens with zeros.
-        static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-        // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-        int64_t const blocks = smCount * 8;
-        int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
-        config.gridDim = blocks;
-        config.blockDim = threads;
         auto func = final_scales
             ? &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT>
             : &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
+
+        static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        int32_t const maxBlocksPerSM
+            = tensorrt_llm::common::getMaxActiveBlocksPerSM(func, FINALIZE_THREADS_PER_BLOCK, 0);
+        int32_t const blocks = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(num_rows * experts_per_token));
+        int32_t const threads = FINALIZE_THREADS_PER_BLOCK;
+
+        config.gridDim = blocks;
+        config.blockDim = threads;
         cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
             unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
             expert_first_token_offset, num_rows, padded_cols, unpadded_cols, experts_per_token, num_experts_per_node,
@@ -2235,11 +2239,6 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
     int64_t num_padding_tokens = 0;
 #endif
 
-    static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-    int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
-    int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
-
     auto fn = [&]()
     {
         // IMPORTANT: Keep the order of the activation functions in the same order as the ActivationType enum in
@@ -2301,6 +2300,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             return fn(NONE);
         }
     }();
+
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, ACTIVATION_THREADS_PER_BLOCK, 0);
+    int32_t const blocks
+        = std::min(smCount * maxBlocksPerSM, static_cast<int32_t>(std::max(expanded_num_tokens, num_padding_tokens)));
+    int32_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
     cudaLaunchConfig_t config;
     config.gridDim = blocks;

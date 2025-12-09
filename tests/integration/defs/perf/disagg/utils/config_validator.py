@@ -83,5 +83,5 @@ class ConfigValidator:
         osl = extracted_config["osl"]
         ctx_max_seq_len = extracted_config["ctx_max_seq_len"]
         gen_max_seq_len = extracted_config["gen_max_seq_len"]
-        assert ctx_max_seq_len > (isl + osl), "config error: ctx_max_seq_len <= (isl + osl)"
+        assert ctx_max_seq_len > isl, "config error: ctx_max_seq_len > isl"
         assert gen_max_seq_len > (isl + osl), "config error: gen_max_seq_len <= (isl + osl)"
