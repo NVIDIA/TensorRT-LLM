@@ -12,7 +12,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -855,7 +855,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     }
 
     def load_single_module(name, module):
-        torch.cuda.set_device(mpi_rank())
+        torch.cuda.set_device(local_mpi_rank())
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
@@ -981,7 +981,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
         logger.info(f"Renamed weights with params_map: {params_map}")
 
     def load_single_module(name, module):
-        torch.cuda.set_device(mpi_rank())
+        torch.cuda.set_device(local_mpi_rank())
         if len(module._parameters) > 0:
             if weight_mapper.should_skip_module(name):
                 return
