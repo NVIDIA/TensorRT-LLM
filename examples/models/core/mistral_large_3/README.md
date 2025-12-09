@@ -29,7 +29,6 @@ tensor_parallel_size: 4
 moe_expert_parallel_size: 4
 enable_attention_dp: false
 kv_cache_config:
-  free_gpu_memory_fraction: 0.25
   enable_block_reuse: true
 checkpoint_format: mistral
 " > serve.yml
