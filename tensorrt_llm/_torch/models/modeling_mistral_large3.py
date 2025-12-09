@@ -50,10 +50,11 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
     def forward(self, *args, **kwargs):
         return super().forward(*args, **kwargs)
 
-    def load_weights(self, weights: Dict, *args, **kwargs):
+    def load_weights(self, weights: Dict):
         assert self.model_config is not None, "self.model_config is required"
         params_map = self.weight_mapper.mistral_llm_mapping.copy()
         if self.model_config is not None:
+            quantization_weights_map: Dict[str, str] = {}
             if self.model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
                 quantization_weights_map = {
                     "weight_packed": "weight",
@@ -64,7 +65,8 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
                 quantization_weights_map = {
                     "weight_scale": "weight_scale_inv",
                 }
-            params_map.update(quantization_weights_map)
+            if quantization_weights_map:
+                params_map.update(quantization_weights_map)
         weights = self.weight_mapper.rename_by_params_map(weights=weights, params_map=params_map)
 
         super().load_weights(weights)

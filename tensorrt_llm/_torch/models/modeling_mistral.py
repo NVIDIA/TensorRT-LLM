@@ -432,10 +432,10 @@ class Mistral3VLM(PreTrainedModel):
 
         llm_weights = filter_weights(weights=weights, prefix="language_model")
         logger.debug(f"Loading weights for {type(self.llm)}")
+        all_kwargs = {'weight_mapper': weight_mapper, **kwargs}
         self.llm.load_weights(llm_weights,
-                              weight_mapper=weight_mapper,
                               *args,
-                              **kwargs)
+                              **all_kwargs)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
 
         vit_weights = filter_weights(weights=weights, prefix="vision_tower")
