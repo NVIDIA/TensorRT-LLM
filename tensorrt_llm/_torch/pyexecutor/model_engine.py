@@ -2643,7 +2643,7 @@ class PyTorchModelEngine(ModelEngine):
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
+                self.model_is_wrapped)
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
