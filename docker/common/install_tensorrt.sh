@@ -8,7 +8,7 @@ TRT_VER="10.14.1.48"
 CUDA_VER="13.1" # 13.1.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.17.0.21-1"
+CUDNN_VER="9.17.0.27-1"
 NCCL_VER="2.28.9-1+cuda13.0"
 CUBLAS_VER="13.2.0.9-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
