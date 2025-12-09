@@ -362,87 +362,90 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
-    if (local_token_idx >= local_num_tokens)
+    if (local_token_idx >= local_num_tokens && local_num_tokens != 0)
     {
         return;
     }
 
-    // Prepare per-policy shared-memory tiles for this token
-    extern __shared__ int smem[];
-    int* smem_topk_target_ranks;
-    int* smem_topk_send_indices;
-    int warps_per_block = blockDim.x / warpSize;
-    if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value)
+    if (local_num_tokens != 0)
     {
-        int lane_id = threadIdx.x / warpSize;
-        smem_topk_target_ranks = smem + lane_id * TOP_K;
-        smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
-    }
-    else
-    {
-        smem_topk_target_ranks = smem;
-        smem_topk_send_indices = smem + TOP_K;
-    }
-
-    uint64_t already_copied = 0;
-    for (int k = 0; k < TOP_K; k++)
-    {
-        int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-        // Use contiguous partitioning to determine target rank
-        int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
-
-        if (already_copied & (1ULL << target_rank))
+        // Prepare per-policy shared-memory tiles for this token
+        extern __shared__ int smem[];
+        int* smem_topk_target_ranks;
+        int* smem_topk_send_indices;
+        int warps_per_block = blockDim.x / warpSize;
+        if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value)
         {
+            int lane_id = threadIdx.x / warpSize;
+            smem_topk_target_ranks = smem + lane_id * TOP_K;
+            smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
+        }
+        else
+        {
+            smem_topk_target_ranks = smem;
+            smem_topk_send_indices = smem + TOP_K;
+        }
+
+        uint64_t already_copied = 0;
+        for (int k = 0; k < TOP_K; k++)
+        {
+            int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+            // Use contiguous partitioning to determine target rank
+            int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+
+            if (already_copied & (1ULL << target_rank))
+            {
+                if (thread_idx == 0)
+                {
+                    ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
+                    ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
+                    // Mirror to shared memory immediately
+                    smem_topk_target_ranks[k] = -1;
+                    smem_topk_send_indices[k] = -1;
+                }
+                continue;
+            }
+
+            // Only one thread per warp should increment the counter
+            int dst_token_idx;
             if (thread_idx == 0)
             {
-                ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
-                ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
+                dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+
+                ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
+                ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
                 // Mirror to shared memory immediately
-                smem_topk_target_ranks[k] = -1;
-                smem_topk_send_indices[k] = -1;
+                smem_topk_target_ranks[k] = target_rank;
+                smem_topk_send_indices[k] = dst_token_idx;
             }
-            continue;
+            already_copied |= 1ULL << target_rank;
         }
+        // Sync before dispatching data
+        ThreadingPolicy::sync();
 
-        // Only one thread per warp should increment the counter
-        int dst_token_idx;
-        if (thread_idx == 0)
-        {
-            dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
-
-            ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
-            ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-            // Mirror to shared memory immediately
-            smem_topk_target_ranks[k] = target_rank;
-            smem_topk_send_indices[k] = dst_token_idx;
-        }
-        already_copied |= 1ULL << target_rank;
-    }
-    // Sync before dispatching data
-    ThreadingPolicy::sync();
-
-    // Read staged routing once into registers per thread
-    int topk_target_ranks[TOP_K];
-    int topk_send_indices[TOP_K];
+        // Read staged routing once into registers per thread
+        int topk_target_ranks[TOP_K];
+        int topk_send_indices[TOP_K];
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k)
-    {
-        topk_target_ranks[k] = smem_topk_target_ranks[k];
-        topk_send_indices[k] = smem_topk_send_indices[k];
+        for (int k = 0; k < TOP_K; ++k)
+        {
+            topk_target_ranks[k] = smem_topk_target_ranks[k];
+            topk_send_indices[k] = smem_topk_send_indices[k];
+        }
+
+        // Perform a single source load and TOP_K fanout per payload
+        for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
+        {
+            uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+            int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+            uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+
+            vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+        }
+
+        ThreadingPolicy::sync();
     }
-
-    // Perform a single source load and TOP_K fanout per payload
-    for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
-    {
-        uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
-        int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-        uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
-
-        vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx,
-            ptrs, topk_target_ranks, topk_send_indices);
-    }
-
-    ThreadingPolicy::sync();
 
     bool is_first_warp = threadIdx.x / warpSize == 0;
     if (is_first_warp)
@@ -452,8 +455,15 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         bool is_last_token = false;
         if (lane_id == 0)
         {
-            int cnt = atomicAdd(ptrs.local_token_counter, 1);
-            is_last_token = cnt + 1 == local_num_tokens;
+            if (local_num_tokens != 0)
+            {
+                int cnt = atomicAdd(ptrs.local_token_counter, 1);
+                is_last_token = cnt + 1 == local_num_tokens;
+            }
+            else
+            {
+                is_last_token = true;
+            }
         }
         is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
 
@@ -523,7 +533,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
-    TLLM_CHECK(params.local_num_tokens > 0);
+    TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
 
     // Prepare kernel pointers struct
@@ -568,6 +578,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     if (params.one_block_per_token)
     {
         int grid_size = params.local_num_tokens;
+        // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the synchronization.
+        if (grid_size == 0)
+        {
+            grid_size = 1;
+        }
         int shared_bytes = 2 * params.top_k * (int) sizeof(int);
         SWITCH_TOP_K(params.top_k, TOP_K,
             moeA2ADispatchKernel<BlockPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
@@ -577,6 +592,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     else
     {
         int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
+        // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the synchronization.
+        if (grid_size == 0)
+        {
+            grid_size = 1;
+        }
         int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int) sizeof(int);
         SWITCH_TOP_K(params.top_k, TOP_K,
             moeA2ADispatchKernel<WarpPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
@@ -897,7 +917,7 @@ __global__ void moeA2ACombineKernel(
     int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * sizeof(T);
 
-    if (local_token_idx >= local_num_tokens)
+    if (local_token_idx >= local_num_tokens && local_num_tokens != 0)
     {
         return;
     }
@@ -951,6 +971,9 @@ __global__ void moeA2ACombineKernel(
     __syncthreads();
 #endif
 
+    if (local_num_tokens == 0)
+        return;
+
     // Get output location for this token (using src_data_ptrs[0] as output)
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
@@ -1003,7 +1026,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
-    TLLM_CHECK(params.local_num_tokens > 0);
+    TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
 
     // Configure kernel launch
@@ -1011,6 +1034,15 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     int const kWarpsPerBlock = kBlockSize / 32; // warpSize
     int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
     int grid_size_block = params.local_num_tokens;
+    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the synchronization.
+    if (grid_size_warp == 0)
+    {
+        grid_size_warp = 1;
+    }
+    if (grid_size_block == 0)
+    {
+        grid_size_block = 1;
+    }
 
     // Prepare kernel pointers struct for combine
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
