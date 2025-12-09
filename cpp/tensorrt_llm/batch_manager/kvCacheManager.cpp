@@ -930,13 +930,11 @@ std::unordered_map<SizeType32, BlockKey> KVCachePromptLookup::findNewContextBloc
     return results;
 }
 
-KVCachePromptLookupNode::KVCachePromptLookupNode(BlockKey blockKey, bool isFull, bool isRoot)
+KVCachePromptLookupNode::KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull, bool isRoot)
     : mBlockKey{std::move(blockKey)}
     , mIsFull{isFull}
     , mIsRoot{isRoot}
     , mPrevNode{nullptr}
-    , mNextNodes{}
-    , mBlocks{}
 {
 }
 

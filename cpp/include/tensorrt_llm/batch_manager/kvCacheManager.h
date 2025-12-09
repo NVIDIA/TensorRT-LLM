@@ -1070,9 +1070,10 @@ public:
 
     void resetReuseState()
     {
-        std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-        mCachedBlocksRoot
-            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
+        for (auto const& block : mAllBlocksById)
+        {
+            block->detachFromLookupNode();
+        }
     }
 
 private:
