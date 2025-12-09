@@ -157,12 +157,13 @@ struct alignas(128) SharedMem
     using OutSwizzleBuf = Array2D<Vec<Vec<InputElem, 4>, 4>, ctaNbQHeads, exactDiv(headElems, 4 * 4)>;
 #endif
 
-    static constexpr uint32_t nbKBuf = 2;
 #if SKIP_SOFTMAX_ATTN
+    static constexpr uint32_t nbKBuf = 2;
     static constexpr uint32_t nbVBuf = 3; // @fixme: skip_softmax_attn: for skip softmax attn, an extra VBuffer is used
     static constexpr uint32_t nbXBuf
         = 3 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
 #else
+    static constexpr uint32_t nbKBuf = 2;
     static constexpr uint32_t nbVBuf = 2;
     static constexpr uint32_t nbXBuf
         = 2 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
@@ -815,8 +816,9 @@ CUBIN_EXPORT __global__
     assert(dynamicSmemSize() >= sizeof(SharedMem));
     SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
-    constexpr uint32_t maxNbBuffers = SharedMem::nbXBuf;
-    static_assert(maxNbBuffers >= SharedMem::nbKBuf && maxNbBuffers == SharedMem::nbVBuf);
+    constexpr uint32_t maxNbBuffers = (SharedMem::nbXBuf > SharedMem::nbVBuf) ? SharedMem::nbXBuf : SharedMem::nbVBuf;
+    static_assert(
+        maxNbBuffers >= SharedMem::nbKBuf && maxNbBuffers >= SharedMem::nbVBuf && maxNbBuffers >= SharedMem::nbXBuf);
     if (wid < maxNbBuffers)
     {
         if (warpElectSync())
@@ -825,15 +827,20 @@ CUBIN_EXPORT __global__
             {
                 smem.kBar[wid].initialize(gemm0NbThrds, gemm0NbThrds + warp_size);
             }
-
-            smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
-#if !SWAP_AB
-            smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
-#endif
-            smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
+            if (wid < SharedMem::nbXBuf)
+            {
 #if SKIP_SOFTMAX_ATTN
-            smem.skipSoftmaxXBar[wid].initialize(gemm0NbThrds + warp_size, gemm0NbThrds + warp_size);
+                smem.skipSoftmaxXBar[wid].initialize(gemm0NbThrds + warp_size, gemm0NbThrds + warp_size);
+                smem.vBar[wid].initialize(gemm1NbThrds + warp_size, gemm1NbThrds + warp_size);
+#else
+                smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #endif
+
+#if !SWAP_AB
+                smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
+#endif
+                smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
+            }
         }
     }
     else if (wid == maxNbBuffers)
@@ -1594,13 +1601,6 @@ CUBIN_EXPORT __global__
                 skipSoftmaxXBar.produced.arrive_and_wait();
                 bool shouldSkipSoftmaxAttn = smem.skipSoftmaxVotesGemm0ToV[idxXBuf];
                 skipSoftmaxXBar.consumed.arrive();
-                if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
-                {
-                    vBar.consumed.arrive_and_wait();
-                    vBar.produced.arrive_tx(0, 0);
-                    // GEMM1 Warp Group will wait on vBar.produced with no tx_count
-                    continue;
-                }
 #endif
 
                 uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
@@ -1636,6 +1636,20 @@ CUBIN_EXPORT __global__
                 }
 #endif
 
+#if SKIP_SOFTMAX_ATTN
+                if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
+                {
+                    vBar.consumed.arrive_and_wait();
+                    // compared to non-skip softmax attn, we need to increase vBar.produced count to avoid race
+                    // condition where vBar.consumed is arrived again without wait without skip softmax attn, XVGemm
+                    // will wait for tx_count, so its progress won't go ahead of vload warp with skip softmax attn,
+                    // XVGemm WG may go ahead of vload warp, as previous vBar only have XVGemm WG threads and a tx_count
+                    // (now = 0). Then it may arrive vBar.consumed before it is arrive_and_wait-ed
+                    vBar.produced.arrive();
+                    continue;
+                }
+#endif
+
                 vBar.consumed.arrive_and_wait();
                 if (warpElectSync())
                 {
@@ -1645,6 +1659,9 @@ CUBIN_EXPORT __global__
                         vTileLoader.loadData(smem.vBuf(idxVBuf)[idxPart], idxVTile, idxPart, vBar.produced);
                     }
                 }
+#if SKIP_SOFTMAX_ATTN
+                vBar.produced.arrive();
+#endif
                 __syncwarp();
             }
         }
