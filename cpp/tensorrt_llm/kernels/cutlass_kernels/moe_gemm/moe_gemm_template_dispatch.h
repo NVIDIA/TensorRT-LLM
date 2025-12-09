@@ -794,18 +794,51 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             // EpilogueTag is ignored
             if (inputs.k % 512 == 0)
             {
-                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                    cutlass_extensions::EpilogueOpDefault, 4>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                if (hopper_inputs.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
+                {
+                    cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault,
+                        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, 4>(
+                        inputs, hopper_inputs, multi_processor_count_, nullptr);
+                }
+                else
+                {
+                    cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                        4>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                }
             }
             else if (inputs.k % 256 == 0)
             {
-                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                    cutlass_extensions::EpilogueOpDefault, 2>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                if (hopper_inputs.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
+                {
+                    cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault,
+                        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, 2>(
+                        inputs, hopper_inputs, multi_processor_count_, nullptr);
+                }
+                else
+                {
+                    cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                        2>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                }
             }
             else if (inputs.k % 128 == 0)
             {
-                cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                    cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                if (hopper_inputs.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
+                {
+                    cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault,
+                        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, 1>(
+                        inputs, hopper_inputs, multi_processor_count_, nullptr);
+                }
+                else
+                {
+                    cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                        1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                }
             }
             else
             {
@@ -820,7 +853,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                 inputs.gemm_config.is_tma_warp_specialized, "wfp4a16 is only supported for TMA warp specialization");
             // EpilogueTag is ignored
             cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
-                cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                cutlass_extensions::EpilogueOpDefault, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, 1>(
+                inputs, hopper_inputs, multi_processor_count_, nullptr);
             return;
         }
 #endif

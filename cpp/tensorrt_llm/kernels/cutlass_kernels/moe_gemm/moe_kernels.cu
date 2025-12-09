@@ -3621,7 +3621,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     else
     {
         bool fused_prologue_result = false;
-        if (!use_w4_groupwise)
+        if (!use_wfp4a16)
         {
             // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for W4AFP8
             fused_prologue_result = fusedBuildExpertMapsSortFirstToken(token_selected_experts,
@@ -3755,10 +3755,12 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     }
 
     auto alpha_scale_flat1 = use_fp4 ? quant_params.fp4.fc1.global_scale
+        : use_w4afp8                 ? quant_params.groupwise.fc1.alpha
         : use_wfp4afp8               ? quant_params.fp8_mxfp4.fc1.global_scale
         : use_fp8                    ? fp8_dequant1
                                      : nullptr;
     auto alpha_scale_flat2 = use_fp4 ? quant_params.fp4.fc2.global_scale
+        : use_w4afp8                 ? quant_params.groupwise.fc2.alpha
         : use_wfp4afp8               ? quant_params.fp8_mxfp4.fc2.global_scale
         : use_fp8                    ? fp8_dequant2
                                      : nullptr;
@@ -3880,8 +3882,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
         bool gemm2_using_finalize_fusion = gemm2_config_->epilogue_fusion_type
             == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
-        bool using_fused_finalize
-            = use_fused_finalize_ && gemm2_using_finalize_fusion && !use_w4_groupwise && !use_lora;
+        bool using_fused_finalize = use_fused_finalize_ && gemm2_using_finalize_fusion && !use_wfp4a16 && !use_lora;
         TLLM_CHECK_WITH_INFO(using_fused_finalize == gemm2_using_finalize_fusion,
             "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
         if (using_fused_finalize)
@@ -4120,7 +4121,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     size_t output_size1 = inter_size * num_expanded_tokens * dtype_bytes;
 
     size_t input_size2 = inter_size * num_expanded_tokens * dtype_bytes;
-    size_t output_size2 = hidden_size * output_bytes;
+    size_t output_size2 = hidden_size * num_expanded_tokens * output_bytes;
 
     size_t input_size = mGemmToProfile == GemmToProfile::GEMM_1 ? input_size1 : input_size2;
     size_t output_size = mGemmToProfile == GemmToProfile::GEMM_1 ? output_size1 : output_size2;
@@ -4439,14 +4440,14 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
         && mWType == nvinfer1::DataType::kUINT8);
     bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
     bool const use_finalize_fusion = fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
-    bool const finalize_fusion_not_supported = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_w4_groupwise
-        || mGemmToProfile != GemmToProfile::GEMM_2;
+    bool const finalize_fusion_not_supported
+        = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_wfp4a16 || mGemmToProfile != GemmToProfile::GEMM_2;
     if (use_finalize_fusion && finalize_fusion_not_supported)
     {
         return;
     }
 
-    if (use_w4_groupwise && !swap_ab)
+    if (use_wfp4a16 && !swap_ab)
     {
         return;
     }
@@ -4535,12 +4536,15 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
             }
             else
             {
+                auto fc1_alpha = use_w4afp8 ? mQuantParams.groupwise.fc1.alpha : mQuantParams.fp8.dequant_fc1;
+                auto fc2_alpha = use_w4afp8 ? mQuantParams.groupwise.fc2.alpha : mQuantParams.fp8.dequant_fc2;
+
                 std::tie(gemm1_tma_ws_input, gemm2_tma_ws_input) = mInterface->computeStridesTmaWarpSpecializedDispatch(
                     expert_first_token_offset, gemm1_tma_ws_input, gemm2_tma_ws_input, num_tokens, num_tokens * mK,
                     fc1_output_size, mExpertHiddenSize, mExpertHiddenSize, mExpertInterSize, mNumExpertsPerNode, input,
-                    input, weights_sel, weights_sel, mQuantParams.fp8.dequant_fc1, mQuantParams.fp8.dequant_fc2,
-                    fp4_act_scale_flat, fp4_act_scale_flat, mQuantParams, nullptr, nullptr, intermediate, intermediate,
-                    token_topk_unpermuted_scales, permuted_row_to_unpermuted_row, stream);
+                    input, weights_sel, weights_sel, fc1_alpha, fc2_alpha, fp4_act_scale_flat, fp4_act_scale_flat,
+                    mQuantParams, nullptr, nullptr, intermediate, intermediate, token_topk_unpermuted_scales,
+                    permuted_row_to_unpermuted_row, stream);
             }
             sync_check_cuda_error(stream);
         }

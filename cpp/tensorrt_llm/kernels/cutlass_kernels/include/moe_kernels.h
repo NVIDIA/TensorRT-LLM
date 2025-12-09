@@ -813,13 +813,13 @@ private:
     bool mayHaveFinalizeFused() const
     {
         return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() >= 90 && use_fused_finalize_
-            && !use_w4_groupwise;
+            && !use_wfp4a16;
     }
 
     static bool mayHaveFinalizeFused(int sm)
     {
         using RunnerType = decltype(moe_gemm_runner_);
-        return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_w4_groupwise;
+        return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_wfp4a16;
     }
 
     // TODO: This should eventually take the quant params to give more flexibility
