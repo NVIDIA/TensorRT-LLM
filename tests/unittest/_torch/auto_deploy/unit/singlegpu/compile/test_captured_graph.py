@@ -11,6 +11,7 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     _args_kwargs_flatten_spec,
 )
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 
 
 class ModelWithMultipleInputs(torch.nn.Module):
@@ -44,7 +45,7 @@ class ModelWithMultipleInputs(torch.nn.Module):
     ],
 )
 def test_round_up_to_closest(lst, value, expected):
-    assert CapturedGraph.round_up_to_closest(lst, value) == expected
+    assert _round_up_to_closest(lst, value) == expected
 
 
 @pytest.mark.parametrize("num_inputs", [1, 2, 3])

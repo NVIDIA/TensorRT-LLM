@@ -67,7 +67,7 @@ class SequenceEmbeddingInfo(SequenceInfo):
         self.hidden_size = hidden_size
         self.dtype = dtype
         self._args_device["input_ids"] = self._add_hidden_dim(self._args_device["input_ids"])
-        self._args_host["input_ids"] = self._args_device["input_ids"].cpu()
+        self._args_list["input_ids"] = self._args_device["input_ids"].cpu()
         self._initialized = True
         self.reset()
 
