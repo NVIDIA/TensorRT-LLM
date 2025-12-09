@@ -54,7 +54,7 @@ from tensorrt_llm.bindings.internal.runtime import (
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.sampling_params import LogprobMode, SamplingParams
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
@@ -216,11 +216,10 @@ class SampleStateWithMMResult:
 @dataclass(kw_only=True, frozen=True)
 class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy_key: GenericStrategyKeyType
-    speculation_needs_probs: bool
-    need_processed_logprobs: bool
+    needs_probs: bool
 
     def __iter__(self):
-        return iter((self.strategy_key, self.speculation_needs_probs, self.need_processed_logprobs))
+        return iter((self.strategy_key, self.needs_probs))
 
     def __len__(self):
         return 3
@@ -230,25 +229,45 @@ class RequestGroupKey(Generic[GenericStrategyKeyType]):
 class RequestGroupValue:
     indices: torch.Tensor
     strategies: list[Strategy]
+    speculation_needs_probs: torch.Tensor
+    need_processed_logprobs: torch.Tensor
+    need_raw_logprobs: torch.Tensor
 
     def __iter__(self):
-        return iter((self.indices, self.strategies))
+        return iter(
+            (
+                self.indices,
+                self.strategies,
+                self.speculation_needs_probs,
+                self.need_processed_logprobs,
+                self.need_raw_logprobs,
+            )
+        )
 
     def __len__(self):
-        return 2
+        return 5
 
 
 @dataclass(kw_only=True, frozen=True)
 class RequestGroupValueWithMetadata(RequestGroupValue):
-    metadata: StrategyMetadata
+    metadata: StrategyMetadata | None
 
     @override
     def __iter__(self):
-        return iter((self.indices, self.strategies, self.metadata))
+        return iter(
+            (
+                self.indices,
+                self.strategies,
+                self.speculation_needs_probs,
+                self.need_processed_logprobs,
+                self.need_raw_logprobs,
+                self.metadata,
+            )
+        )
 
     @override
     def __len__(self):
-        return 3
+        return 6
 
 
 class EarlyStopWithMMResult(Sampler):
@@ -371,9 +390,10 @@ def _group_requests_by_strategy_key(
     vocab_size: int,
 ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValue]:
     # NB: Client code relies on request indices in returned torch.Tensor being sorted.
-    group_dict: dict[tuple[GenericStrategyKeyType, bool], tuple[list[int], list[Strategy]]] = (
-        defaultdict(lambda: ([], []))
-    )
+    group_dict: dict[
+        tuple[GenericStrategyKeyType, bool],
+        tuple[list[int], list[Strategy], list[bool], list[bool], list[bool]],
+    ] = defaultdict(lambda: ([], [], [], [], []))
 
     for req_index, req in enumerate(requests):
         strategy = _request_strategy(req, vocab_size=vocab_size)
@@ -382,24 +402,42 @@ def _group_requests_by_strategy_key(
             #     process_draft_tokens.
             TorchSampler._speculation_could_use_rejection_sampling(req, strategy)
         )
-        need_processed_logprobs = req.py_logprobs_mode == "processed"
-        need_probs = speculation_needs_probs or need_processed_logprobs
-        strategy_key = strategy_to_key(strategy, need_probs)
-        group_dict_entry = group_dict[
-            (strategy_key, speculation_needs_probs, need_processed_logprobs)
-        ]
+        need_processed_logprobs = (
+            req.py_logprobs_mode == LogprobMode.PROCESSED and req.return_log_probs
+        )
+        need_raw_logprobs = req.py_logprobs_mode == LogprobMode.RAW and req.return_log_probs
+        needs_probs = speculation_needs_probs or need_processed_logprobs
+        strategy_key = strategy_to_key(strategy, needs_probs)
+        group_dict_entry = group_dict[(strategy_key, needs_probs)]
         group_dict_entry[0].append(req_index)
         group_dict_entry[1].append(strategy)
+        group_dict_entry[2].append(speculation_needs_probs)
+        group_dict_entry[3].append(need_processed_logprobs)
+        group_dict_entry[4].append(need_raw_logprobs)
     return {
         RequestGroupKey(
             strategy_key=group_key[0],
-            speculation_needs_probs=group_key[1],
-            need_processed_logprobs=group_key[2],
+            needs_probs=group_key[1],
         ): RequestGroupValue(
             indices=torch.tensor(indices, pin_memory=pin_memory, dtype=torch.int32),
             strategies=strategies,
+            speculation_needs_probs=torch.tensor(
+                speculation_needs_probs_list, pin_memory=pin_memory, dtype=torch.bool
+            ),
+            need_processed_logprobs=torch.tensor(
+                need_processed_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
+            ),
+            need_raw_logprobs=torch.tensor(
+                need_raw_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
+            ),
         )
-        for group_key, (indices, strategies) in group_dict.items()
+        for group_key, (
+            indices,
+            strategies,
+            speculation_needs_probs_list,
+            need_processed_logprobs_list,
+            need_raw_logprobs_list,
+        ) in group_dict.items()
     }
 
 
@@ -424,8 +462,8 @@ class _BatchedSamplingResult:
     batch_req_indices: torch.Tensor
     # Next tokens for all requests:
     batch_next_tokens_cuda_int: torch.Tensor
-    # Logits for all requests:
-    batch_logits_cuda: torch.Tensor | None = None
+    # Logits for all requests used for logprobs:
+    batch_logits_for_logprobs_cuda: torch.Tensor | None = None
 
 
 # Helper class for _PackedStepIndexer and _UnpackedStepIndexer, facilitating the
@@ -1145,26 +1183,35 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         )
 
         token_log_probs: list[list[dict[int, Logprob]]] = []
+        token_list = token_tensor.tolist()
+        logprobs_list = logprobs_tensor.tolist()
+        sampled_log_probs_indices_list: list[int] | None = None
+        sampled_log_probs_vals_list: list[float] | None = None
+        sampled_log_probs_rank_list: list[int] | None = None
+        if sampled_log_probs_indices is not None:
+            sampled_log_probs_indices_list = sampled_log_probs_indices.tolist()
+            assert sampled_log_probs_vals is not None, "sampled_log_probs_vals must be provided"
+            assert sampled_log_probs_rank is not None, "sampled_log_probs_rank must be provided"
+            sampled_log_probs_vals_list = sampled_log_probs_vals.tolist()
+            sampled_log_probs_rank_list = sampled_log_probs_rank.tolist()
         for beam_idx in range(token_tensor.shape[0]):
             beam_token_log_probs: list[dict[int, Logprob]] = []
             for step_idx, (topk_token, topk_logprob) in enumerate(
-                zip(token_tensor[beam_idx], logprobs_tensor[beam_idx])
+                zip(token_list[beam_idx], logprobs_list[beam_idx])
             ):
                 logprobs = {
                     token: Logprob(logprob=logprob, rank=rank + 1)
-                    for rank, (token, logprob) in enumerate(
-                        zip(topk_token.tolist(), topk_logprob.tolist())
-                    )
+                    for rank, (token, logprob) in enumerate(zip(topk_token, topk_logprob))
                 }
                 if sampled_log_probs_indices is not None:
-                    assert beam_idx == 0, (
+                    assert beam_idx == DEFAULT_BEAM_IDX, (
                         "beam search does not need to explicitly handle sampled log probs"
                     )
-                    if sampled_log_probs_indices[step_idx].item() not in logprobs:
-                        logprobs[sampled_log_probs_indices[step_idx].item()] = Logprob(
-                            logprob=sampled_log_probs_vals[step_idx].item(),
+                    if sampled_log_probs_indices_list[step_idx] not in logprobs:
+                        logprobs[sampled_log_probs_indices_list[step_idx]] = Logprob(
+                            logprob=sampled_log_probs_vals_list[step_idx],
                             rank=max(
-                                token_tensor.shape[2] + 1, sampled_log_probs_rank[step_idx].item()
+                                token_tensor.shape[2] + 1, sampled_log_probs_rank_list[step_idx]
                             ),
                         )
                 beam_token_log_probs.append(logprobs)
@@ -1688,6 +1735,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                             beam_idx : beam_idx + 1, : valid_tokens[beam_idx]
                         ],
                         beam_history.logprobs[beam_idx : beam_idx + 1, : valid_tokens[beam_idx]],
+                        None,
+                        None,
+                        None,
                     )[0]
                 )
         request.set_generated_tokens(gen_token_list)
@@ -1743,6 +1793,9 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             grouped_requests_with_metadata[key] = RequestGroupValueWithMetadata(
                 indices=value.indices,
                 strategies=value.strategies,
+                speculation_needs_probs=value.speculation_needs_probs,
+                need_processed_logprobs=value.need_processed_logprobs,
+                need_raw_logprobs=value.need_raw_logprobs,
                 metadata=metadata,
             )
         return grouped_requests_with_metadata
@@ -2172,7 +2225,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
         )
-        batch_logits_cuda = (
+        batch_logits_for_logprobs_cuda = (
             torch.empty(
                 (logits_cuda.size(0), logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
             )
@@ -2181,9 +2234,12 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         )
         batch_req_idx_offset_start = 0
         batch_next_tokens_offset_start = 0
-        for (strategy_key, speculation_needs_probs, need_processed_logprobs), (
+        for (strategy_key, needs_probs), (
             group_req_indices,
             group_strategies,
+            group_speculation_needs_probs,
+            group_need_processed_logprobs,
+            group_need_raw_logprobs,
             group_metadata,
         ) in grouped_requests_with_metadata.items():
             # group_req_indices: Indices of 'requests' entries having the same sampling
@@ -2191,6 +2247,35 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             batch_req_idx_offset_end = batch_req_idx_offset_start + group_req_indices.size(0)
             batch_req_indices[batch_req_idx_offset_start:batch_req_idx_offset_end] = (
                 group_req_indices
+            )
+
+            need_processed_logprobs_indices = torch.nonzero(group_need_processed_logprobs)
+            need_raw_logprobs_indices = torch.nonzero(group_need_raw_logprobs)
+            any_request_needs_processed_logprobs = need_processed_logprobs_indices.size(0) > 0
+            any_request_needs_raw_logprobs = need_raw_logprobs_indices.size(0) > 0
+            any_request_needs_logprobs = (
+                any_request_needs_processed_logprobs or any_request_needs_raw_logprobs
+            )
+
+            if any_request_needs_logprobs:
+                # indices for accessing logits within the current group
+                group_logit_indexer = _PackedStepIndexer(
+                    num_steps=req_num_generated_tokens[group_req_indices],
+                    max_steps=req_num_generated_tokens.max() * self.max_beam_width,
+                )
+            logit_indices_for_processed_logprobs_cuda = (
+                None
+                if not any_request_needs_processed_logprobs
+                else group_logit_indexer[need_processed_logprobs_indices].to(
+                    logits_cuda.device, non_blocking=True
+                )
+            )
+            logit_indices_for_raw_logprobs_cuda = (
+                None
+                if not any_request_needs_raw_logprobs
+                else group_logit_indexer[need_raw_logprobs_indices].to(
+                    logits_cuda.device, non_blocking=True
+                )
             )
 
             group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
@@ -2207,12 +2292,33 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 )
                 group_logits_cuda = logits_cuda[group_logits_cuda_indices_cuda]
                 logit_indices_for_sampler = None
+                # group_logits_cuda already contains only logits for the group
+                group_logits_indices_for_processed_logprobs_cuda = (
+                    logit_indices_for_processed_logprobs_cuda
+                )
+                group_logits_indices_for_raw_logprobs_cuda = logit_indices_for_raw_logprobs_cuda
             else:
                 group_logits_cuda_indices_cuda = group_logits_cuda_indices.to(
                     device=logits_cuda.device, non_blocking=True
                 )
                 group_logits_cuda = logits_cuda
                 logit_indices_for_sampler = group_logits_cuda_indices_cuda
+                # group_logits_cuda contains logits for the whole batch
+                # Therefore, we need indices corresponding to the whole batch
+                group_logits_indices_for_processed_logprobs_cuda = (
+                    None
+                    if not any_request_needs_processed_logprobs
+                    else logits_cuda_indexer[group_req_indices[group_need_processed_logprobs]].to(
+                        logits_cuda.device, non_blocking=True
+                    )
+                )
+                group_logits_indices_for_raw_logprobs_cuda = (
+                    None
+                    if not any_request_needs_raw_logprobs
+                    else logits_cuda_indexer[group_req_indices[group_need_raw_logprobs]].to(
+                        logits_cuda.device, non_blocking=True
+                    )
+                )
 
             group_strategies_per_step = [  # convert from per-request to per-step
                 strat
@@ -2226,7 +2332,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                     group_strategies_per_step,
                     group_logits_cuda,
                     generator=generator_cuda,
-                    return_probs=speculation_needs_probs or need_processed_logprobs,
+                    return_probs=needs_probs,
                     group_logit_indices=logit_indices_for_sampler,
                     group_metadata=group_metadata,
                 )
@@ -2241,38 +2347,52 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 batch_next_tokens_offset_start:batch_next_tokens_offset_end
             ].copy_(group_next_tokens_cuda, non_blocking=True)
 
-            if return_log_probs:
-                # select the logits for the current group
-                current_group_logits_cuda = (
-                    group_logits_cuda
-                    if logit_indices_for_sampler is None
-                    else group_logits_cuda[logit_indices_for_sampler]
+            if any_request_needs_processed_logprobs:
+                assert group_logits_indices_for_processed_logprobs_cuda is not None
+                assert logit_indices_for_processed_logprobs_cuda is not None
+                assert group_softmax_cuda is not None
+                assert batch_logits_for_logprobs_cuda is not None
+                current_logits_cuda = group_logits_cuda[
+                    group_logits_indices_for_processed_logprobs_cuda
+                ]
+                current_softmax_cuda = group_softmax_cuda[logit_indices_for_processed_logprobs_cuda]
+                processed_logits_cuda = torch.where(
+                    current_softmax_cuda > 0, current_logits_cuda, float("-inf")
                 )
-                if need_processed_logprobs:
-                    # if softmax is 0, then the logit was masked out => set to -inf
-                    # apply masking to the logits and store in batch_logits_cuda
-                    batch_logits_cuda[
-                        batch_next_tokens_offset_start:batch_next_tokens_offset_end
-                    ] = torch.where(
-                        group_softmax_cuda > 0, current_group_logits_cuda, float("-inf")
-                    )
-                    # apply temperature to the logits
-                    if group_temperature_cuda is not None:
-                        batch_logits_cuda[
-                            batch_next_tokens_offset_start:batch_next_tokens_offset_end
-                        ] /= group_temperature_cuda
-                else:
-                    batch_logits_cuda[
-                        batch_next_tokens_offset_start:batch_next_tokens_offset_end
-                    ].copy_(current_group_logits_cuda, non_blocking=True)
+                if group_temperature_cuda is not None:
+                    if isinstance(group_temperature_cuda, torch.Tensor):
+                        processed_logits_cuda /= group_temperature_cuda[
+                            logit_indices_for_processed_logprobs_cuda
+                        ]
+                    else:
+                        processed_logits_cuda /= group_temperature_cuda
+                logit_indices_for_processed_logprobs_cuda += batch_next_tokens_offset_start
+                batch_logits_for_logprobs_cuda[logit_indices_for_processed_logprobs_cuda] = (
+                    processed_logits_cuda
+                )
+
+            if any_request_needs_raw_logprobs:
+                assert group_logits_indices_for_raw_logprobs_cuda is not None
+                assert logit_indices_for_raw_logprobs_cuda is not None
+                assert batch_logits_for_logprobs_cuda is not None
+                raw_logits_cuda = group_logits_cuda[group_logits_indices_for_raw_logprobs_cuda]
+                logit_indices_for_raw_logprobs_cuda += batch_next_tokens_offset_start
+                batch_logits_for_logprobs_cuda[logit_indices_for_raw_logprobs_cuda] = (
+                    raw_logits_cuda
+                )
 
             # Set LlmRequest.py_target_probs
-            if speculation_needs_probs:
+            if needs_probs:
                 assert group_softmax_cuda is not None
                 current_offset = 0
-                for req_idx, steps in zip(
-                    group_req_indices, req_num_generated_tokens[group_req_indices].tolist()
-                ):
+                requests_with_speculation_need_probs = [
+                    (req_idx, steps)
+                    for local_req_idx, (req_idx, steps) in enumerate(
+                        zip(group_req_indices, req_num_generated_tokens[group_req_indices].tolist())
+                    )
+                    if group_speculation_needs_probs[local_req_idx]
+                ]
+                for req_idx, steps in requests_with_speculation_need_probs:
                     next_offset = current_offset + steps
                     # using view avoids copy
                     requests[req_idx].py_target_probs = group_softmax_cuda[
@@ -2294,7 +2414,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         return _BatchedSamplingResult(
             batch_req_indices=batch_req_indices,
             batch_next_tokens_cuda_int=batch_next_tokens_cuda_int,
-            batch_logits_cuda=batch_logits_cuda,
+            batch_logits_for_logprobs_cuda=batch_logits_for_logprobs_cuda,
         )
 
     def _unbatch_sampling_results(
@@ -2748,14 +2868,44 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         requests: list[LlmRequest],
         req_num_steps: torch.Tensor,
     ):
-        group_logprobs_cuda = F.log_softmax(batched_sampling_result.batch_logits_cuda, dim=-1)
-        all_req_indices = batched_sampling_result.batch_req_indices
-        group_next_tokens_cuda = batched_sampling_result.batch_next_tokens_cuda_int
-        group_req_indices = [
-            req_gid.item()
-            for req_gid in all_req_indices
+        assert not self._use_beam_search, "Beam search should not call _process_logprobs"
+        assert batched_sampling_result.batch_logits_for_logprobs_cuda is not None, (
+            "batch_logits_for_logprobs_cuda must be a Tensor for _process_logprobs"
+        )
+
+        all_req_indices = batched_sampling_result.batch_req_indices.tolist()
+        # The request indices in the shuffled batch after grouping
+        local_group_req_indices = [
+            req_id
+            for req_id, req_gid in enumerate(all_req_indices)
             if requests[req_gid].py_num_logprobs is not None
         ]
+        # indexer for shuffled logits after grouping
+        logits_cuda_indexer = _PackedStepIndexer(
+            num_steps=req_num_steps[all_req_indices],
+            max_steps=req_num_steps.max() * self.max_beam_width,
+        )
+        # get indices of the logits after grouping
+        group_logits_indices = logits_cuda_indexer[local_group_req_indices]
+        group_logits_indices_cuda = group_logits_indices.to(
+            device=batched_sampling_result.batch_logits_for_logprobs_cuda.device, non_blocking=True
+        )
+
+        # (batch_size, vocab_size)
+        group_logprobs_cuda = F.log_softmax(
+            batched_sampling_result.batch_logits_for_logprobs_cuda[group_logits_indices_cuda],
+            dim=-1,
+        )
+        # (batch_size, max_beam_width)
+        group_next_tokens_cuda = batched_sampling_result.batch_next_tokens_cuda_int[
+            group_logits_indices_cuda
+        ]
+
+        # The request indices in the batch
+        group_req_indices = [
+            req_gid for req_gid in all_req_indices if requests[req_gid].py_num_logprobs is not None
+        ]
+
         topk_vals_cuda, topk_indices_cuda = torch.topk(
             group_logprobs_cuda,
             k=max(requests[req_id].py_num_logprobs for req_id in group_req_indices),
@@ -2765,12 +2915,14 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         sampled_vals_cuda = torch.gather(
             group_logprobs_cuda, dim=-1, index=group_next_tokens_cuda.view(-1, 1)
         )
-        sampled_indices_cuda = group_next_tokens_cuda
+        sampled_indices_cuda = group_next_tokens_cuda.squeeze(1)
 
         # NB: we do not need group logprobs anymore, we can reuse the storage
         # We only provide 0 based rank, it will be corrected to 1-indexed in handle logprobs
         group_logprobs_cuda.greater_(sampled_vals_cuda)
         sampled_rank_cuda = group_logprobs_cuda.sum(dim=-1).to(torch.int32)
+
+        sampled_vals_cuda = sampled_vals_cuda.squeeze(1)
 
         # Use a single D2H copy to reduce overheads
         topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
@@ -2889,7 +3041,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             return_log_probs=return_log_probs,
         )
 
-        if return_log_probs:
+        if return_log_probs and not self._use_beam_search:
             self._process_logprobs(
                 batched_sampling_result, requests, sampling_requests_metadata.req_num_steps
             )

@@ -551,7 +551,7 @@ class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], float | torch.Tensor | None]:
         raise NotImplementedError
 
 
@@ -585,7 +585,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], float | None]:
         if group_key[0] == "beam_search":
             beam_width_in = group_key[1]
         else:

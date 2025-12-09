@@ -344,10 +344,11 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
         "The capital of France is",
         "The future of AI is",
         "Hello, my name is",
+        "Hello, my name is",
         "Write a short story about a cat",
     ]
 
-    # Causes reordering: [0,1,2,3] → [0,2,1,3]
+    # Causes reordering: [0,1,2,3,4] → [0,2,3,1,4]
     sampling_params_list = [
         SamplingParams(max_tokens=6,
                        temperature=0.8,
@@ -366,6 +367,11 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
                        return_generation_logits=True),
         SamplingParams(max_tokens=6,
                        temperature=0.8,
+                       top_k=50,
+                       logprobs=None,
+                       return_generation_logits=True),
+        SamplingParams(max_tokens=6,
+                       temperature=0.8,
                        top_p=0.9,
                        logprobs=logprobs_k,
                        return_generation_logits=True),
@@ -378,6 +384,9 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
         generation_logits = output.outputs[0].generation_logits
         token_ids = output.outputs[0].token_ids
         logprobs = output.outputs[0].logprobs
+        if sampling_params_list[req_idx].logprobs is None:
+            assert len(logprobs) == 0
+            continue
 
         assert generation_logits is not None
         assert len(logprobs) == len(token_ids), "Logprobs length mismatch"

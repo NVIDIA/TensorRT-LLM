@@ -635,7 +635,11 @@ def test_create_beam_history():
     # set the logprobs in the request:
     token_logprobs = sampler._convert_logprobs_tensor_to_list(
         original_logprob_indices[:beam_width, :num_generated_tokens - 1],
-        original_logprobs[:beam_width, :num_generated_tokens - 1])
+        original_logprobs[:beam_width, :num_generated_tokens - 1],
+        None,
+        None,
+        None,
+    )
     request.py_result.set_log_probs(
         token_logprobs,
         cum_log_probs=torch.zeros_like(
