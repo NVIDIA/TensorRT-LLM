@@ -118,7 +118,12 @@ install_rockylinux_requirements() {
 install_tensorrt() {
     PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
+
     TRT_CUDA_VERSION=${CUDA_VER}
+    # No cuda-13.1 version for TensorRT yet, use cuda-13.0 instead
+    if [ "$CUDA_VER" = "13.1" ]; then
+        TRT_CUDA_VERSION="13.0"
+    fi
     TRT_VER_SHORT=$(echo $TRT_VER | cut -d. -f1-3)
 
     if [ -z "$RELEASE_URL_TRT" ];then
