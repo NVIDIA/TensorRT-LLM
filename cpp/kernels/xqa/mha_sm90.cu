@@ -448,7 +448,7 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #if SWAP_AB
 #if SKIP_SOFTMAX_ATTN
 __device__ RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src,
-    float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool& shouldSkipSoftmaxAttn);
+    float skipSoftmaxThreshold, uint32_t* smemSkipVote);
 #else
 __device__ RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src);
@@ -788,7 +788,7 @@ CUBIN_EXPORT __global__
 #if SKIP_SOFTMAX_ATTN
     if (isMultiBlockMode)
     {
-        printf("MultiBlockMode is not implemented for skip softmax attention!\n");
+        // printf("MultiBlockMode is not implemented for skip softmax attention!\n");
         __trap();
     }
     float const skipSoftmaxThreshold = skipSoftmaxThresholdPtr == nullptr ? 0.0f : skipSoftmaxThresholdPtr[0];
@@ -1003,19 +1003,14 @@ CUBIN_EXPORT __global__
             // update colMax in shared mem and get a register copy
 #if SWAP_AB
 #if SKIP_SOFTMAX_ATTN
-            bool shouldSkipSoftmaxAttn = false;
             auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
             skipSoftmaxXBar.consumed.arrive_and_wait();
-            if (threadIdx.x == 0)
-            {
-                smem.skipSoftmaxVotesGemm0ToV[idxXBuf] = 1U;
-            }
-            smem.gemm0WarpGrpBar.arrive_and_wait();
 
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc,
-                idxIter == nbIters - 1 ? 0.0f : skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf],
-                shouldSkipSoftmaxAttn);
+                idxIter == nbIters - 1 ? 0.0f : skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf]);
+            bool const shouldSkipSoftmaxAttn = static_cast<bool>(smem.skipSoftmaxVotesGemm0ToV[idxXBuf]);
             unused(skipSoftmaxXBar.produced.arrive());
+            warpGrpOnlineSoftmax(acc, colMax);
             if (idxIter != nbIters - 1 && shouldSkipSoftmaxAttn)
             {
                 xBar.consumed.arrive_and_wait();
@@ -1032,8 +1027,8 @@ CUBIN_EXPORT __global__
             }
 #else
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
-#endif
             warpGrpOnlineSoftmax(acc, colMax);
+#endif
 #else
             RegRowWiseVec const rowMax = computeWarpGrpRowMax_sync(warpRank, smem.gemm0CurrentSeqMax, acc);
             warpGrpOnlineSoftmax(acc, rowMax);
@@ -1080,7 +1075,7 @@ CUBIN_EXPORT __global__
 #if SKIP_SOFTMAX_ATTN
             if (threadIdx.x == 0)
             {
-                smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = shouldSkipSoftmaxAttn;
+                smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = 0;
             }
 #endif
             __syncwarp();
@@ -2140,12 +2135,20 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 // smemColMax is persistent across multiple iterations
 #if SKIP_SOFTMAX_ATTN
 __device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax,
-    Gemm0Acc const& src, float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool& shouldSkipSoftmaxAttn)
+    Gemm0Acc const& src, float skipSoftmaxThreshold, uint32_t* smemSkipVote)
 #else
 __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src)
 #endif
 {
+#if SKIP_SOFTMAX_ATTN
+    if (threadIdx.x == 0)
+    {
+        *smemSkipVote = 1U; // will sync before vote
+    }
+    float const lnThreshold = log(skipSoftmaxThreshold);
+#endif
+
     auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
 #pragma unroll
     for (uint32_t n = 0; n < src.cols; n++)
@@ -2180,21 +2183,9 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     }
 
     uint32_t const lane = laneId();
-    if (lane < 4)
-    {
-#pragma unroll
-        for (uint32_t n = 0; n < src.cols; n++)
-        {
-#pragma unroll
-            for (uint32_t j = 0; j < 2; j++)
-            {
-                atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
-            }
-        }
-    }
-    warpGrpBar.arrive_and_wait();
 #if SKIP_SOFTMAX_ATTN
-    bool localShouldSkip = true;
+    auto prevOrCurrentMax = RegColWiseVec();
+#endif
     if (lane < 4)
     {
 #pragma unroll
@@ -2203,30 +2194,26 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
 #pragma unroll
             for (uint32_t j = 0; j < 2; j++)
             {
-                if (8 * n + 2 * lane + j < headGrpSize)
-                {
-                    localShouldSkip
-                        &= exp2f((colMax[n][j] - smemColMax[8 * n + 2 * lane + j]) * log2e) < skipSoftmaxThreshold;
-                }
+#if SKIP_SOFTMAX_ATTN
+                // prevOrCurrentMax <= actual smemColMax (after updates from all 4 warps done), but always >=
+                // smemColMax(Prev), the smemColMax value *before* this tile is computed.
+                // When determine whether to skip, it is safe to use prevOrCurrentMax: 1) all 4 warps' localmax <
+                // smemColMax(Prev), then prevOrCurrentMax == smemColMax(Prev), result not affected; 2) if some localmax
+                // > smemColMax(Prev), prevOrCurrentMax < actual smemColMax, some warps may incorrectly vote skip, but
+                // at least one warp whose localColMax is larger will not skip, then the tile is not skipped
+                prevOrCurrentMax[n][j] = atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+#else
+                atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+#endif
             }
         }
     }
-    localShouldSkip = __all_sync(0xffffffff, static_cast<int>(localShouldSkip));
-    if (warpElectSync())
-    {
-        atomicAnd(smemSkipVote, static_cast<uint32_t>(localShouldSkip));
-    }
     warpGrpBar.arrive_and_wait();
-
-    shouldSkipSoftmaxAttn = static_cast<bool>(smemSkipVote[0]);
-    if (shouldSkipSoftmaxAttn)
-    {
-        // todo: fixme: here we do not handle last block properly
-        return colMax;
-    }
-#endif
 
     uint32_t const idxInQuad = lane % 4;
+#if SKIP_SOFTMAX_ATTN
+    bool localShouldSkip = true;
+#endif
 
 #pragma unroll
     for (uint32_t n = 0; n < src.cols; n++)
@@ -2234,10 +2221,21 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
 #pragma unroll
         for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
         {
+#if SKIP_SOFTMAX_ATTN
+            if (lane < 4 && 8 * n + 2 * idxInQuad + j < headGrpSize)
+            {
+                localShouldSkip &= (colMax[n][j] - prevOrCurrentMax[n][j]) < lnThreshold;
+            }
+#endif
             assert(colMax[n][j] <= smemColMax[8 * n + 2 * idxInQuad + j]);
             colMax[n][j] = smemColMax[8 * n + 2 * idxInQuad + j];
         }
     }
+
+#if SKIP_SOFTMAX_ATTN
+    atomicAnd(smemSkipVote, static_cast<uint32_t>(localShouldSkip)); // this will be translated to redux and voteu
+#endif
+
     warpGrpBar.arrive_and_wait();
     return colMax;
 }
