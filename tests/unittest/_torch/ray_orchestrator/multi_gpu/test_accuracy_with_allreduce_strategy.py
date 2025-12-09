@@ -1,7 +1,7 @@
 import asyncio
 import os
 from functools import partial
-from typing import List
+from typing import List, Tuple
 
 import pytest
 import ray
@@ -155,7 +155,7 @@ def pad_data(
     prompt_max_len: int = 1024,
     response_max_len: int = 1024,
     pad_token_id: int = 0,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pad the data to the maximum length.
 
