@@ -13,6 +13,7 @@ from ...custom_ops.attention_interface import (
     AttentionRegistry,
     CacheConfig,
     Constant,
+    PrepareMetadataCallable,
 )
 from ...distributed.common import all_gather_object, get_world_size
 from ...distributed.common import is_initialized as is_distributed_initialized
@@ -73,6 +74,28 @@ class InsertCachedAttention(BaseTransform):
             for arg_name in self.attn_descriptor.get_standard_metadata_args()
         ]
 
+    def _insert_extra_metadata_op(
+        self,
+        gm: GraphModule,
+        prep_meta_op: PrepareMetadataCallable,
+        inputs_for_prep_meta: List[Node],
+        const_args: List[Constant],
+        num_meta_out: int,
+    ) -> List[Node]:
+        # add the computed extra metadata nodes to the graph and add to meta for cached attention op
+        meta_nodes_extra = []
+        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
+        with gm.graph.inserting_before(node_last_input.next):
+            ret_node = gm.graph.call_function(
+                prep_meta_op,
+                args=tuple(*inputs_for_prep_meta, *const_args),
+            )
+            for idx in range(num_meta_out):
+                meta_extra_node = gm.graph.call_function(operator.getitem, args=(ret_node, idx))
+                meta_nodes_extra.append(meta_extra_node)
+
+        return meta_nodes_extra
+
     def _process_metadata_extra(
         self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
     ) -> List[Node]:
@@ -92,18 +115,10 @@ class InsertCachedAttention(BaseTransform):
             for arg in prep_meta_op._schema.arguments
             if arg.name in cm.info.available_args
         ]
-        inputs_for_prep_meta.extend(const_args)
 
-        # add the computed extra metadata nodes to the graph and add to meta for cached attention op
-        meta_nodes_extra = []
-        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
-        with gm.graph.inserting_before(node_last_input.next):
-            ret_node = gm.graph.call_function(prep_meta_op, args=tuple(inputs_for_prep_meta))
-            for idx in range(num_meta_out):
-                meta_extra_node = gm.graph.call_function(operator.getitem, args=(ret_node, idx))
-                meta_nodes_extra.append(meta_extra_node)
-
-        return meta_nodes_extra
+        return self._insert_extra_metadata_op(
+            gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
+        )
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
