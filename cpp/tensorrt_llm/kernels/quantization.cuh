@@ -793,7 +793,7 @@ quantize_with_block_size(
     int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
     int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
     // Input tensor batch/row/col loops.
     // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
     // This improves performance for small batch sizes with swizzled layout
@@ -896,7 +896,7 @@ quantize_with_block_size(
             }
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

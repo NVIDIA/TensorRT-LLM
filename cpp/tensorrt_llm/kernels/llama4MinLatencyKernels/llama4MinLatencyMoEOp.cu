@@ -191,7 +191,7 @@ __global__ void llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens,
     }
 
 #if ENABLE_PREEXIT
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 #endif
 }
@@ -310,7 +310,7 @@ __global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
     }
 
 #if ENABLE_PREEXIT
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 #endif
 }

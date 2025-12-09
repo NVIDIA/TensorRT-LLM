@@ -276,7 +276,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_fp8_fp8_gemm_swiglu_per_blo
     }
 
 #if ENABLE_PREEXIT
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 #endif
 }
