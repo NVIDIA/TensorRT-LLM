@@ -296,7 +296,7 @@ public:
     __device__ void issue_mainloop()
     {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        asm volatile("griddepcontrol.wait;");
+        cudaGridDependencySynchronize();
 #pragma unroll 1
         for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++)
         {
@@ -601,8 +601,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
         }
     }
     __syncthreads();
-    asm volatile("griddepcontrol.wait;");
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
 
     if (warp_idx < 2)
     {

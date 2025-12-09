@@ -5,6 +5,7 @@ set -ex
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
+    export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
 MPI4PY_VERSION="3.1.5"

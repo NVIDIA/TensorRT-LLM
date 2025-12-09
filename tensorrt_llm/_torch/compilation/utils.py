@@ -77,6 +77,13 @@ def inplace_info():
         torch.ops.trtllm.logits_bitmask.default: {
             1: "logits"
         },
+        torch.ops.trtllm.moe_output_memset_inplace.default: {
+            1: "input"
+        },
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
+        {
+            6: "output"
+        },
         torch.ops.trtllm.pp_recv_tensors.default: {
             1: "tensors"
         },

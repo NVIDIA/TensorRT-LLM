@@ -149,7 +149,7 @@ class GroupedGemmInputsHelper:
 
     def inputs_pre_hook_finalize_fusion(
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+        a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
         num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(num_tokens)
         tile_idx_to_group_idx_list = self.generate_tile_idx_to_group_idx(
@@ -184,7 +184,7 @@ class GroupedGemmInputsHelper:
             [num_non_exiting_tiles_val],
             dtype=num_non_exiting_tiles.dtype,
             device=num_non_exiting_tiles.device)
-        return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
+        return a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales
 
 
 class FusedMoEInputsHelper:
@@ -240,7 +240,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def __init__(self,
                      output_dtype: torch.dtype,
-                     to_userbuffers: bool = False):
+                     to_userbuffers: bool = False,
+                     use_tvm_ffi: bool = True):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -249,17 +250,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
             self.to_userbuffers = to_userbuffers
+            self.use_tvm_ffi = use_tvm_ffi
 
         def unique_id(self):
-            return (self.output_dtype, self.to_userbuffers)
+            return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
 
         def __hash__(self):
-            return hash((self.output_dtype, self.to_userbuffers))
+            return hash(
+                (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi))
 
         def __eq__(self, other):
             if not isinstance(other, self.__class__):
                 return False
-            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers
+            return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -268,8 +271,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[Tuple[int, int]]:
             # Early exit: Check SM version - CuteDSL NVFP4 only supports SM 100 and SM 103
-            sm_version = get_sm_version()
-            if sm_version not in [100, 103]:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
                     f"CuteDSL: SM version {sm_version} is not supported. "
                     f"CuteDSL NVFP4 only supports SM 100 (B200) and SM 103 (B300). Skipping all tactics."
@@ -465,51 +467,94 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSL: weight scale factor size mismatch. "
                     f"Expected {expected_b_sf_size} (sf_n={sf_n} * sf_k={sf_k}), "
                     f"got {b_sf_tensor.numel()} for shape N={n}, K={real_k}")
+            if alpha_tensor.numel() != 1:
+                raise ValueError(f"CuteDSL: alpha size mismatch. "
+                                 f"Expected 1, got {alpha_tensor.numel()}")
 
             # Reshape to CuteDSL's expected format (just a view, no copy)
             a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
             b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
-            a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
-                                                      cutlass.Float4E2M1FN, 32)
-            b_ptr = self.make_cute_dsl_global_pointer(b_tensor,
-                                                      cutlass.Float4E2M1FN, 32)
-            a_sf_ptr = self.make_cute_dsl_global_pointer(
-                a_sf_tensor, cutlass.Float8E4M3FN, 16)
-            b_sf_ptr = self.make_cute_dsl_global_pointer(
-                b_sf_tensor, cutlass.Float8E4M3FN, 16)
-            c_ptr = self.make_cute_dsl_global_pointer(c_tensor,
-                                                      cutlass.BFloat16, 16)
-            # Create pointer to alpha on device
-            alpha_ptr = self.make_cute_dsl_global_pointer(
-                alpha_tensor, cutlass.Float32, 4)
+            if not self.use_tvm_ffi:
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, cutlass.Float4E2M1FN, 32)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, cutlass.Float4E2M1FN, 32)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.BFloat16, 16)
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
-            # get stream
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
+                # get stream
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
 
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
                          use_prefetch)
             if swap_ab:
-                kernel_a_ptr = b_ptr
-                kernel_a_sf_ptr = b_sf_ptr
-                kernel_b_ptr = a_ptr
-                kernel_b_sf_ptr = a_sf_ptr
                 kernel_m = n
                 kernel_n = m
                 kernel_sf_m = sf_n
                 kernel_sf_n = sf_m
+
+                kernel_a_tensor = b_tensor
+                kernel_a_sf_tensor = b_sf_tensor
+                kernel_b_tensor = a_tensor
+                kernel_b_sf_tensor = a_sf_tensor
+
+                if not self.use_tvm_ffi:
+                    kernel_a_ptr = b_ptr
+                    kernel_a_sf_ptr = b_sf_ptr
+                    kernel_b_ptr = a_ptr
+                    kernel_b_sf_ptr = a_sf_ptr
             else:
-                kernel_a_ptr = a_ptr
-                kernel_a_sf_ptr = a_sf_ptr
-                kernel_b_ptr = b_ptr
-                kernel_b_sf_ptr = b_sf_ptr
                 kernel_m = m
                 kernel_n = n
                 kernel_sf_m = sf_m
                 kernel_sf_n = sf_n
 
+                kernel_a_tensor = a_tensor
+                kernel_a_sf_tensor = a_sf_tensor
+                kernel_b_tensor = b_tensor
+                kernel_b_sf_tensor = b_sf_tensor
+
+                if not self.use_tvm_ffi:
+                    kernel_a_ptr = a_ptr
+                    kernel_a_sf_ptr = a_sf_ptr
+                    kernel_b_ptr = b_ptr
+                    kernel_b_sf_ptr = b_sf_ptr
+
             if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = self.make_cute_dsl_global_pointer(
+                        a_tensor, cutlass.Float4E2M1FN, 32)
+                    b_ptr = self.make_cute_dsl_global_pointer(
+                        b_tensor, cutlass.Float4E2M1FN, 32)
+                    a_sf_ptr = self.make_cute_dsl_global_pointer(
+                        a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                    b_sf_ptr = self.make_cute_dsl_global_pointer(
+                        b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                    c_ptr = self.make_cute_dsl_global_pointer(
+                        c_tensor, cutlass.BFloat16, 16)
+                    alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+                    # make faked stream
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                    if swap_ab:
+                        kernel_a_ptr = b_ptr
+                        kernel_a_sf_ptr = b_sf_ptr
+                        kernel_b_ptr = a_ptr
+                        kernel_b_sf_ptr = a_sf_ptr
+                    else:
+                        kernel_a_ptr = a_ptr
+                        kernel_a_sf_ptr = a_sf_ptr
+                        kernel_b_ptr = b_ptr
+                        kernel_b_sf_ptr = b_sf_ptr
+
                 gemm = self.__class__.kernel_class(
                     sf_vec_size,
                     mma_tiler_mn,
@@ -521,6 +566,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
+                # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
+                # so we make alpha as the cute.Tensor type in the jit func.
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
                     kernel_m,
@@ -529,17 +576,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_sf_m // 128,
                     kernel_sf_n // 128,
                     sf_k // 4,
-                    1,
+                    1,  # batch
                     kernel_a_ptr,
                     kernel_b_ptr,
                     kernel_a_sf_ptr,
                     kernel_b_sf_ptr,
                     c_ptr,
-                    alpha_ptr,  # Pass alpha as device pointer
+                    alpha_cute_tensor,
                     max_active_clusters,
                     stream,
                     swap_ab,
-                    options=f"--opt-level 2",
+                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
                 )
 
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -547,21 +595,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
             # launch gemm kernel
-            compiled_gemm(
-                kernel_m,
-                kernel_n,
-                real_k,
-                kernel_sf_m // 128,
-                kernel_sf_n // 128,
-                sf_k // 4,
-                kernel_a_ptr,
-                kernel_b_ptr,
-                kernel_a_sf_ptr,
-                kernel_b_sf_ptr,
-                c_ptr,
-                alpha_ptr,  # Pass alpha as device pointer
-                stream,
-            )
+            if self.use_tvm_ffi:
+                # call with torch pointer types and no need to pass stream.
+                compiled_gemm(
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    kernel_sf_m // 128,
+                    kernel_sf_n // 128,
+                    sf_k // 4,
+                    kernel_a_tensor.data_ptr(),
+                    kernel_b_tensor.data_ptr(),
+                    kernel_a_sf_tensor.data_ptr(),
+                    kernel_b_sf_tensor.data_ptr(),
+                    c_tensor.data_ptr(),
+                    alpha_tensor,
+                )
+            else:
+                # call with cute types and need to pass torch stream.
+                compiled_gemm(
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    kernel_sf_m // 128,
+                    kernel_sf_n // 128,
+                    sf_k // 4,
+                    kernel_a_ptr,
+                    kernel_b_ptr,
+                    kernel_a_sf_ptr,
+                    kernel_b_sf_ptr,
+                    c_ptr,
+                    alpha_cute_tensor,
+                    stream,
+                )
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
@@ -579,6 +645,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
+        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -590,6 +657,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             alpha: Scaling factor
             output_dtype: Output data type (must be bfloat16)
             to_userbuffers: Whether to allocate output from UserBuffers pool
+            use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
@@ -597,8 +665,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             for automatic backend selection with better performance.
         """
         # Validate SM version before attempting to use CuteDSL
-        sm_version = get_sm_version()
-        if sm_version not in [100, 103]:
+        if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
                 f"Please use nvfp4_gemm with backend='auto' for automatic backend selection."
@@ -606,7 +673,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers)
+        runner = CuteDSLNVFP4BlackwellLinear(output_dtype, to_userbuffers,
+                                             use_tvm_ffi)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
@@ -627,6 +695,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
+        use_tvm_ffi: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -660,9 +729,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -947,9 +1016,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):
@@ -1015,11 +1084,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         helper.map_to_tuning_buckets), ),
                     constraint_specs=(
                         ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                        ConstraintSpec(5, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                         ConstraintSpec(6, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(7, 0, helper.infer_shape_max_num_tiles),
                         ConstraintSpec(
-                            7, 0, helper.infer_shape_max_num_permuted_tokens),
-                        ConstraintSpec(9, 0, helper.infer_shape_num_tokens)),
+                            8, 0, helper.infer_shape_max_num_permuted_tokens),
+                        ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cuda_graph=True,
                 )
@@ -1027,7 +1097,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+            a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
             assert b.dtype == torch.float4_e2m1fn_x2
@@ -1051,6 +1121,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert b_sf.size(2) == scale_k
             assert alpha.size(0) == l
 
+            assert c.dtype == self.output_dtype
+            assert c.dim() == 2
+            num_tokens = c.size(0)
+            assert c.size(1) == n
+
             num_tiles = m // self.tile_size
             assert tile_idx_to_group_idx.dtype == torch.int32
             assert tile_idx_to_group_idx.size() == (num_tiles, )
@@ -1062,14 +1137,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert num_non_exiting_tiles.numel() == 1
             assert token_final_scales.dtype == torch.float32
             assert token_final_scales.dim() == 2
-            num_tokens = token_final_scales.size(0)
-            assert token_final_scales.size(1) == self.top_k
-
-            # TODO: Overlap the memset
-            c = torch.zeros(num_tokens,
-                            n,
-                            dtype=self.output_dtype,
-                            device=a.device)
+            assert token_final_scales.size() == (num_tokens, self.top_k)
 
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
@@ -1183,6 +1251,51 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c
 
     @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+        mutates_args=("output", ),
+        device_types="cuda")
+    def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+    ) -> None:
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, output_dtype, scaling_vector_size)
+
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha, output,
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+            token_final_scales
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
         mutates_args=(),
         device_types="cuda")
@@ -1205,25 +1318,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
-        tuner = AutoTuner.get()
-
-        runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
-        inputs = [
-            input, weight, input_scale, weight_scale, alpha,
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles,
-            token_final_scales
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
+        num_tokens = token_final_scales.size(0)
+        n = weight.size(1)
+        output = torch.zeros(num_tokens,
+                             n,
+                             dtype=output_dtype,
+                             device=input.device)
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            input=input,
+            weight=weight,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            alpha=alpha,
+            output=output,
+            tile_idx_to_group_idx=tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_size,
+            output_dtype=output_dtype,
+            scaling_vector_size=scaling_vector_size,
         )
-        output = runner(inputs, tactic=best_tactic)
         return output
 
     @torch.library.register_fake(
@@ -1275,9 +1395,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
 
-            if get_sm_version() != 100:
+            if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
-                    f"SM version {get_sm_version()} is not supported for {self.__class__.__name__}, it only supports SM 100"
+                    f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
 
         def unique_id(self):

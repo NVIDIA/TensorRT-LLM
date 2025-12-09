@@ -29,10 +29,14 @@ set_value_in_command() {
     echo "$result"
 }
 
-# Only the first process will save the job ID
+# Only the first process will save the job ID and set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
     # Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
     echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
+    # Update HOME/.gitconfig
+    if ! git config --global --get-all safe.directory | grep -Fxq "*"; then
+        git config --global --add safe.directory "*"
+    fi
 fi
 
 if [ $SLURM_LOCALID -eq 0 ]; then
@@ -47,7 +51,6 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     fi
     cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
     cd $resourcePathNode &&  pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
-    git config --global --add safe.directory "*"
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
     hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
     echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
@@ -106,7 +109,7 @@ echo "Full Command: $pytestCommand"
 eval $pytestCommand
 echo "Rank${SLURM_PROCID} Pytest finished execution"
 
-if [ "$perfMode" = "true" ]; then
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
     if [[ "$stageName" == *PyTorch* ]]; then
         basePerfFilename="base_perf_pytorch.csv"
     else
