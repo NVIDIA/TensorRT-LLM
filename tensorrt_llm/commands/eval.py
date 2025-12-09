@@ -115,7 +115,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
          revision: Optional[str], extra_llm_api_options: Optional[str],
-         disable_kv_cache_reuse: bool): 
+         disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
 
     kv_cache_config = KvCacheConfig(
