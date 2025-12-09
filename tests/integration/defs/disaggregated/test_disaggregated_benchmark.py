@@ -116,7 +116,7 @@ def run_disaggregated_benchmark(
                 "python3",
                 f"{client_dir}/disagg_client.py",
                 "-c",
-                f"{example_dir}/disagg_config.yaml",
+                config_file,
                 "-p",
                 f"{client_dir}/prompts.json",
                 "--ignore-eos",
