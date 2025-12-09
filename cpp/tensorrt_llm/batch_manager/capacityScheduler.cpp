@@ -247,7 +247,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         {
             break;
         }
-        else if (req->isGenerationInProgressState())
+
+        if (req->isGenerationInProgressState())
         {
             scheduledRequests.emplace_back(req);
             reservedBlocks.decrementReservedBlocks(*req);
@@ -296,7 +297,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 {
                     break;
                 }
-                else if (req->isContextInitState() || req->isDisaggGenerationInitState())
+
+                if (req->isContextInitState() || req->isDisaggGenerationInitState())
                 {
                     bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
                     bool enoughCrossBlocks
