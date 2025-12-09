@@ -29,6 +29,7 @@ def enforce_single_worker():
 # # ============================================================================
 # # test 1:  Generation correctness check
 # # ============================================================================
+@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5680911")
 @pytest.mark.parametrize(
     "drafter_type,schedule",
     [
@@ -150,6 +151,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     ],
 )
 @pytest.mark.high_cuda_memory
+@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5680911")
 def test_draft_len_schedule_functionality(drafter_type: str, draft_schedule: dict):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

@@ -724,7 +724,7 @@ trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
   --streaming
 ```
 
-We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or an other) and you want to run the benchmark, you can use the following command to generate a random dataset:
+We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or another) and you want to run the benchmark, you can use the following command to generate a random dataset:
 
 ```bash
 folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
@@ -733,10 +733,11 @@ min_output_len=2048
 concurrency=128
 path_data=random_data.txt
 
-python3 benchmarks/cpp/prepare_dataset.py \
-    --tokenizer=${folder_model} \
-    --stdout token-norm-dist --num-requests=$(( concurrency * 5 )) \
-    --input-mean=${min_input_len} --output-mean=${min_output_len} --input-stdev=0 --output-stdev=0 > ${path_data}
+trtllm-bench\
+    --model=${folder_model} \
+    prepare-dataset --output ${path_data} \
+    token-norm-dist --num-requests=$(( concurrency * 5 )) \
+    --input-mean=${min_input_len} --output-mean=${min_output_len} --input-stdev=0 --output-stdev=0
 ```
 
 ### Serving
