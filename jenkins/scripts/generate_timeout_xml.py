@@ -7,7 +7,7 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
 
     # Remove stage_name prefix if present
     if testname.startswith(stage_name + "/"):
-        testname = testname[len(stage_name) + 1:]
+        testname = testname[len(stage_name) + 1 :]
 
     # Get file name
     if testname.startswith("unittest/"):
