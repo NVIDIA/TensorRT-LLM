@@ -17,6 +17,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent import futures
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import repeat
@@ -97,13 +98,24 @@ class SampleStateTensors:
 
 
 @dataclass(kw_only=True)
+class SamplerEvent:
+    cuda_event: torch.cuda.Event
+    worker_futures: Optional[list[futures.Future[Any]]] = None
+
+    def synchronize(self):
+        if self.worker_futures:
+            futures.wait(self.worker_futures)
+        self.cuda_event.synchronize()
+
+
+@dataclass(kw_only=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
 
     device: Optional[SampleStateTensors] = None
     host: Optional[SampleStateTensors] = None
 
-    sampler_event: Optional[torch.cuda.Event] = None
+    sampler_event: Optional[SamplerEvent] = None
 
 
 class Sampler(ABC):
@@ -688,7 +700,108 @@ class SampleStateTorch(SampleState):
     beam_histories: list[BeamHistory | None] | None = None
 
 
-class TorchSampler(Sampler):
+class AsyncWorkerMixin:
+    """
+    Mixin that adds the ability to fork off operations to run on a worker
+    thread (particularly D2H copies). If the async worker isn't active,
+    operations will seamlessly run on the main thread.
+    """
+
+    MAX_WORKERS = 1
+
+    def _async_worker_active(self) -> bool:
+        return getattr(self, "_async_worker", None) is not None
+
+    def _async_worker_init(self, enable_async_worker: bool):
+        self._enable_async_worker = enable_async_worker
+        self._async_worker = None
+        self._async_worker_futures: list[futures.Future[any]] = []
+
+    def async_worker_enabled(self):
+        return getattr(self, "_enable_async_worker", False)
+
+    def async_worker_start(self):
+        assert self.async_worker_enabled()
+        if not self._async_worker_active():
+
+            def _async_worker_initializer(device_id):
+                # The current device is set per thread, so we need to set it
+                # again here
+                torch.cuda.set_device(device_id)
+                # Submit the host copies in a separate stream to prevent the
+                # blocking copies from gating subsequent async work
+                torch.cuda.set_stream(torch.cuda.Stream())
+
+            self._async_worker = futures.ThreadPoolExecutor(
+                max_workers=self.MAX_WORKERS,
+                initializer=_async_worker_initializer,
+                initargs=(torch.cuda.current_device(),),
+            )
+
+    def async_worker_stop(self):
+        assert self.async_worker_enabled()
+        if self._async_worker_active():
+            self._async_worker.shutdown(wait=True)
+            self._async_worker = None
+
+    @torch.inference_mode()
+    def _async_copy_to_host(
+        self, copy_ready: torch.cuda.Event, dest: torch.Tensor, src: torch.Tensor
+    ):
+        # Make sure the async work takes place after all prior operations on
+        # the primary stream. synchronize() is intentionally chosen instead of
+        # wait() here; otherwise, blocking copies will stall subsequent CUDA
+        # API calls on the main stream/thread
+        copy_ready.synchronize()
+
+        # Note that the omission of non_blocking=True here is intentional; Work
+        # submitted to the async worker is expected to block at the end,
+        # consistent with the semantics of futures
+        dest.copy_(src)
+
+    def _copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
+        dest = torch.empty_like(src, device="cpu", pin_memory=True)
+        if self._async_worker_active():
+            # Create a snapshot of the source on the main stream, so as to
+            # guarantee that the tensor data hasn't been modified before the
+            # copy. This precaution is only needed because the copy will
+            # execute on a side stream and thus there is no guarantee that
+            # future operations on the main stream won't race to modify the
+            # tensor data before we copy it.
+            src_snapshot = src.clone()
+
+            # Record an event on the main thread/stream that we will
+            # synchronize with on the worker thread/stream
+            copy_ready = torch.cuda.Event()
+            copy_ready.record()
+
+            # Submit the copy to the async worker thread
+            result = self._async_worker.submit(
+                self._async_copy_to_host, copy_ready, dest, src_snapshot
+            )
+
+            # Save the future, so that we can await it later
+            self._async_worker_futures.append(result)
+        else:
+            # If the async worker is not in use, just copy as usual
+            dest.copy_(src, non_blocking=True)
+        return dest
+
+    def _record_sampler_event(self) -> SamplerEvent:
+        cuda_event = torch.cuda.Event()
+        cuda_event.record()
+
+        # Transfer ownership to worker_futures and re-initialize
+        if self._async_worker_active():
+            worker_futures = self._async_worker_futures
+            self._async_worker_futures = []
+        else:
+            worker_futures = None
+
+        return SamplerEvent(cuda_event=cuda_event, worker_futures=worker_futures)
+
+
+class TorchSampler(Sampler, AsyncWorkerMixin):
     SampleState = SampleStateTorch
 
     @override
@@ -768,6 +881,7 @@ class TorchSampler(Sampler):
         max_total_draft_tokens: int
         disable_overlap_scheduler: bool = False
         disable_flashinfer_sampling: bool = False
+        enable_async_worker: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -819,6 +933,8 @@ class TorchSampler(Sampler):
 
         # Force number of accepted tokens for speculative decoding testing
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
+
+        self._async_worker_init(args.enable_async_worker)
 
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
@@ -1729,22 +1845,19 @@ class TorchSampler(Sampler):
             first_finish_reasons=first_finish_reasons,
             predecessor_beams=self.store.predecessor_beams,
         )
-        finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
+        finish_reasons_host = self._copy_to_host(finish_reasons)
 
         beam_histories = [None] * len(requests)
         if self._use_beam_search:
             assert seq_lens_host is not None, "seq_lens is required for beam search"
             seq_lens = seq_lens_host.to(device="cuda", non_blocking=True)
-            first_finish_reasons_host = self.store.first_finish_reasons.to(
-                device="cpu", non_blocking=True
-            )
+            first_finish_reasons_host = self._copy_to_host(self.store.first_finish_reasons)
             self._update_original_tokens(seq_slots, seq_lens, new_tokens)
             self._maybe_create_beam_histories(
                 requests, finish_reasons=first_finish_reasons, beam_histories=beam_histories
             )
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        sampler_event = self._record_sampler_event()
         return SampleStateTorch(
             scheduled_requests=scheduled_requests,
             device=SampleStateTensors(new_tokens=new_tokens),
@@ -1881,10 +1994,8 @@ class TorchSampler(Sampler):
                 logprobs_cuda, k=max(req.py_num_logprobs for req in requests), dim=-1
             )
             # Use a single D2H copy to reduce overheads
-            topk_vals = torch.empty_like(topk_vals_cuda, device="cpu", pin_memory=True)
-            topk_indices = torch.empty_like(topk_indices_cuda, device="cpu", pin_memory=True)
-            topk_vals.copy_(topk_vals_cuda, non_blocking=True)
-            topk_indices.copy_(topk_indices_cuda, non_blocking=True)
+            topk_vals = self._copy_to_host(topk_vals_cuda)
+            topk_indices = self._copy_to_host(topk_indices_cuda)
             current_offset = 0
             for req_id, steps in zip(
                 logprobs_req_indices, req_num_generated_tokens[logprobs_req_indices].tolist()
@@ -2090,7 +2201,7 @@ class TorchSampler(Sampler):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
-        new_tokens_host = new_tokens_cuda.to("cpu", non_blocking=True)
+        new_tokens_host = self._copy_to_host(new_tokens_cuda)
 
         return new_tokens_host
 
@@ -2604,7 +2715,7 @@ class SampleStateTRTLLM(SampleState):
     host: Optional[SampleStateTensorsHostTRTLLM] = None
 
 
-class TRTLLMSampler(Sampler):
+class TRTLLMSampler(Sampler, AsyncWorkerMixin):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
     SampleState = SampleStateTRTLLM
 
@@ -2624,6 +2735,7 @@ class TRTLLMSampler(Sampler):
         max_beam_width: int,
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
+        enable_async_worker: bool = False,
     ):
         vocab_size = model.config.vocab_size
         num_hidden_layers = model.config.num_hidden_layers
@@ -2673,6 +2785,8 @@ class TRTLLMSampler(Sampler):
 
         self._initialize_store()
         self._instantiate_algorithms()
+
+        self._async_worker_init(enable_async_worker)
 
     def _initialize_store(self):
         torch_stream = torch.cuda.current_stream().cuda_stream
@@ -2831,17 +2945,17 @@ class TRTLLMSampler(Sampler):
                     finalize_events[request.request_id] = self._finalize_request(request, False)
                 elif request.streaming:
                     finalize_events[request.request_id] = self._finalize_request(request, True)
-            gathered_ids = self.store["decoder_state"].gathered_ids.to("cpu", non_blocking=True)
-        new_output_tokens = self.store["decoder_state"].all_new_tokens.to("cpu", non_blocking=True)
-        finished_sum = self.store["decoder_state"].finished_sum.to("cpu", non_blocking=True)
-        finish_reasons = self.store["decoder_state"].finish_reasons.to("cpu", non_blocking=True)
-        sequence_lengths = self.store["decoder_state"].sequence_lengths.to("cpu", non_blocking=True)
+            gathered_ids = self._copy_to_host(self.store["decoder_state"].gathered_ids)
+        new_output_tokens = self._copy_to_host(self.store["decoder_state"].all_new_tokens)
+        finished_sum = self._copy_to_host(self.store["decoder_state"].finished_sum)
+        finish_reasons = self._copy_to_host(self.store["decoder_state"].finish_reasons)
+        sequence_lengths = self._copy_to_host(self.store["decoder_state"].sequence_lengths)
 
         log_probs = None
         cum_log_probs = None
         if any(request.py_return_log_probs for request in scheduled_requests.all_requests()):
-            log_probs = self.store["decoder_state"].log_probs.to("cpu", non_blocking=True)
-            cum_log_probs = self.store["decoder_state"].cum_log_probs.to("cpu", non_blocking=True)
+            log_probs = self._copy_to_host(self.store["decoder_state"].log_probs)
+            cum_log_probs = self._copy_to_host(self.store["decoder_state"].cum_log_probs)
 
         device = SampleStateTensors(new_tokens=self.store["decoder_state"].all_new_tokens)
 
@@ -2855,8 +2969,7 @@ class TRTLLMSampler(Sampler):
             gathered_ids=gathered_ids,
         )
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        sampler_event = self._record_sampler_event()
 
         self.micro_batch_idx = (self.micro_batch_idx + 1) % self.num_micro_batches
 
