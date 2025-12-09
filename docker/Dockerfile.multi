@@ -75,7 +75,7 @@ RUN bash ./install.sh --opencv && rm install.sh
 
 # Copy and install dependencies from constraints.txt
 COPY constraints.txt /tmp/constraints.txt
-RUN pip install --no-cache-dir --upgrade -r /tmp/constraints.txt && rm /tmp/constraints.txt
+RUN pip3 install --no-cache-dir --upgrade -r /tmp/constraints.txt && rm /tmp/constraints.txt
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
