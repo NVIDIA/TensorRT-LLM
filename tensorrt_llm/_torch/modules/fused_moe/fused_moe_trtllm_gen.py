@@ -199,9 +199,7 @@ class TRTLLMGenFusedMoE(MoE):
             topk_group = None
             routed_scaling_factor = None
 
-        # Don't support post-quant allgather for fp8 block scale and has_w4a16_mxfp4 for now.
-        is_post_quant_allgather_supported = self.has_nvfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8
-        run_post_quant_allgather = self.use_dp and self.parallel_size > 1 and is_post_quant_allgather_supported
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
 
         x_sf = None
         token_selected_experts = None
@@ -239,6 +237,11 @@ class TRTLLMGenFusedMoE(MoE):
                     x, False, alignment=self.quant_method.weight_alignment)
                 # Update x_row and x_col to the padded shape
                 x_row, x_col = x.shape[0], x.shape[1]
+            elif self.has_deepseek_fp8_block_scales:
+                pass
+            elif self.has_w4a16_mxfp4:
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
             else:
                 raise ValueError(
                     f"unsupported quantization mode with run_post_quant_allgather: {self.quant_config.quant_mode}"
@@ -266,8 +269,8 @@ class TRTLLMGenFusedMoE(MoE):
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
-                router_logits,
-                routing_bias,
+                router_logits if not run_post_quant_allgather else None,
+                routing_bias if not run_post_quant_allgather else None,
                 x_val,
                 x_scale,
                 self.w3_w1_weight,
@@ -284,6 +287,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
+                topk_weights=token_final_scales,
+                topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
             scale_factor_use_ue8m0 = False
@@ -324,8 +329,8 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
-                topk_ids=token_selected_experts,
                 topk_weights=token_final_scales,
+                topk_ids=token_selected_experts,
             )
 
             if not do_finalize:
@@ -335,14 +340,17 @@ class TRTLLMGenFusedMoE(MoE):
                 final_hidden_states = outputs[0]
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
+            if not run_post_quant_allgather:
+                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
+            else:
+                x = x
 
-            pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
-            x = torch.nn.functional.pad(x, (0, pad_size))
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
             final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
-                router_logits,
-                routing_bias,
+                router_logits if not run_post_quant_allgather else None,
+                routing_bias if not run_post_quant_allgather else None,
                 x,
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale,
