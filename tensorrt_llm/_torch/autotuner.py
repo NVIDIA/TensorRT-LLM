@@ -5,6 +5,7 @@ import inspect
 import itertools
 import json
 import os
+import pickle
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -475,14 +476,25 @@ class AutoTunerProfilingCache:
         }
 
         for key, value in self.cache.items():
-            # Convert tuple key to string for JSON compatibility
+            # Convert any simple object to string for JSON compatibility
             key_str = str(key)
 
             runner_id, tactic, min_time = value
 
+            # Serialize tactic using pickle + hex encoding for robust handling of any Python object
+            try:
+                serialized_tactic = pickle.dumps(tactic).hex()
+            except Exception as e:
+                # Fallback to string representation if pickle fails (shouldn't happen for most objects)
+                logger.warning(
+                    f"[AutoTuner] Failed to pickle tactic {tactic}: {e}, falling back to string"
+                )
+                serialized_tactic = str(tactic)
+
             serializable_cache["cache_data"][key_str] = {
                 "runner_id": runner_id,
-                "tactic": tactic,
+                "tactic": repr(tactic),
+                "tactic_pickle_hex": serialized_tactic,
                 "min_time": min_time,
             }
 
@@ -511,11 +523,6 @@ class AutoTunerProfilingCache:
         cache = {}
         cache_data = serializable_cache["cache_data"]
 
-        def lists_to_tuples(obj):
-            if isinstance(obj, list):
-                return tuple(lists_to_tuples(x) for x in obj)
-            return obj
-
         for key_str, value in cache_data.items():
             # Reconstruct the tuple key safely
             try:
@@ -526,7 +533,17 @@ class AutoTunerProfilingCache:
                 continue
 
             runner_id = value["runner_id"]
-            tactic = lists_to_tuples(value["tactic"])
+            tactic_pickle_hex = value["tactic_pickle_hex"]
+
+            # Deserialize tactic with backward compatibility
+            try:
+                # Try pickle deserialization first (hex-encoded)
+                tactic = pickle.loads(bytes.fromhex(tactic_pickle_hex))
+            except (ValueError, TypeError, pickle.PickleError):
+                raise ValueError(
+                    f"[AutoTuner] Could not deserialize tactic: {tactic_pickle_hex} for {key_str}"
+                )
+
             min_time = value["min_time"]
 
             cache[key] = (runner_id, tactic, min_time)

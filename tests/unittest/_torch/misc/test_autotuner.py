@@ -1,6 +1,7 @@
+import itertools
 import os
 import tempfile
-from typing import Dict, List
+from typing import Any, List
 
 import torch
 
@@ -327,7 +328,20 @@ def test_multiple_dynamic_shapes_cache():
 
 
 class GemmRunnerComplexTuningConfigs(TunableRunner):
+    from dataclasses import dataclass
+
+    @dataclass
+    class ClusterConfig:
+        cluster_size: tuple
+
+    # test serialization of different types of tactics
     valid_tactic_ids = [-1, 0, 1]
+    valid_tile_sizes = [(128, 128), (256, 256)]
+    valid_complex_configs = [
+        ClusterConfig(cluster_size=(1, 1, 1)),
+        ClusterConfig(cluster_size=(2, 2, 1)),
+    ]
+
     tune_max_num_tokens = 32
 
     def get_valid_tactics(
@@ -335,7 +349,7 @@ class GemmRunnerComplexTuningConfigs(TunableRunner):
         inputs: List[FakeTensor],
         profile: OptimizationProfile,
         **kwargs,
-    ) -> List[Dict[str, int]]:
+    ) -> List[Any]:
         # During the tuning process, we verify if the tuning config behaves as expected
 
         assert inputs[0].shape[0] <= self.tune_max_num_tokens, \
@@ -344,31 +358,40 @@ class GemmRunnerComplexTuningConfigs(TunableRunner):
         assert inputs[0][-1, 0] == inputs[0].shape[0], \
             f"Input shape {inputs[0].shape[0]} is not set through the pre_hook correctly"
 
-        # The simulated delay is not deterministic, so we need to return specific tactics here
         return [{
-            "block_size": block_size,
-            "tactic_id": tactic_id
-        } for tactic_id in self.valid_tactic_ids for block_size in [128, 256]]
+            "tile_size": tile_size,
+            "list_tactic_id": tactic_id,
+            "complex_config": complex_config,
+        } for tile_size, tactic_id, complex_config in itertools.product(
+            self.valid_tile_sizes,
+            self.valid_tactic_ids,
+            self.valid_complex_configs,
+        )]
 
     def forward(
         self,
         /,
         inputs: List[torch.Tensor],
         *,
-        tactic: dict = {},
+        tactic: Any = -1,
     ) -> torch.Tensor:
         # Notice that in fallback case tactic is -1
         if tactic == -1:
             # assign default configs for fallback case
-            block_size, tactic_id = 128, -1
+            tile_size, tactic_id, complex_config = (128, 256), -1, None
         else:
-            block_size, tactic_id = tactic["block_size"], tactic["tactic_id"]
-        assert tactic_id in self.valid_tactic_ids
+            tile_size, tactic_id, complex_config = tactic["tile_size"], tactic[
+                "list_tactic_id"], tactic["complex_config"]
+
+        assert isinstance(tactic_id, int) and tactic_id in self.valid_tactic_ids
+        assert isinstance(tile_size, tuple) and len(tile_size) == 2
+        assert isinstance(complex_config, self.__class__.ClusterConfig
+                          ) and complex_config in self.valid_complex_configs
         return [gemm_0, gemm_1, gemm_fallback][tactic_id](*inputs)
 
     @staticmethod
     def inputs_pre_hook(inputs: List[torch.Tensor]):
-        # always set the first element to bo iota in x
+        # always set the first element to be the number of tokens in x
         x, w = inputs
         x_hooked = torch.zeros_like(x)
         x_hooked[-1, 0] = x.shape[0]
@@ -389,13 +412,24 @@ def test_autotuner_tuning_configs():
         # Test if the number of tuning tokens is clipped to 32
         tune_max_num_tokens=GemmRunnerComplexTuningConfigs.tune_max_num_tokens,
         inputs_pre_hook=GemmRunnerComplexTuningConfigs.inputs_pre_hook,
+        use_cold_l2_cache=True,
+        use_cuda_graph=False,
     )
-    with autotune():
+    temp_dir = tempfile.TemporaryDirectory()
+    with autotune(cache_path=os.path.join(
+            temp_dir.name, "test_autotuner_tactic_configs.json")):
         tuner = AutoTuner.get()
-        runner, tactic = tuner.choose_one("test_autotuner_tactic_configs",
-                                          runners, tuning_config, [x, w])
+        runner, best_tactic = tuner.choose_one("test_autotuner_tactic_configs",
+                                               runners, tuning_config, [x, w])
 
-    runner_0.forward(inputs=[x, w], tactic=tactic)
+    runner_0([x, w], tactic=best_tactic)
+
+    AutoTuner.get().profiling_cache.clear()
+    AutoTuner.get().profiling_cache.load_cache(
+        os.path.join(temp_dir.name, "test_autotuner_tactic_configs.rank0.json"))
+    runner, deserialized_tactic = tuner.choose_one(
+        "test_autotuner_tactic_configs", runners, tuning_config, [x, w])
+    assert best_tactic == deserialized_tactic, "Tactic should be the same after deserialization"
 
 
 def test_kernel_testing_single_context():
