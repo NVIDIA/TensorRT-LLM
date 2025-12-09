@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/cacheTransferServer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -24,6 +25,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <array>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,7 @@
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -52,6 +55,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+class CacheTransferServer;
 
 class CacheTransceiverComm
 {
@@ -155,26 +159,7 @@ public:
         }
         else
         {
-            // // Broadcast size
-            // int64_t vecSize = (getRank() == root) ? static_cast<int64_t>(vec.size()) : 0;
-            // std::vector<at::Tensor> sizeTensor = {tensorrt_llm::pg_utils::wrap_tensor(vecSize)};
-            // c10d::BroadcastOptions opts;
-            // opts.rootRank = root;
-            // PGCHECK_THROW(mPgComm->broadcast(sizeTensor, opts)->wait());
-
-            // // Resize
-            // if (getRank() != root)
-            // {
-            //     vec.resize(vecSize);
-            // }
-            // if (vecSize == 0)
-            // {
-            //     return;
-            // }
-
-            // // Broadcast data
-            // std::vector<at::Tensor> dataTensor = {tensorrt_llm::pg_utils::wrap_tensor(vec)};
-            // PGCHECK_THROW(mPgComm->broadcast(dataTensor, opts)->wait());
+            // TODO: implement pg bcast
         }
     }
 
@@ -213,107 +198,32 @@ private:
     c10::intrusive_ptr<c10d::ProcessGroup> mPgComm;
 };
 
-struct UniqueIdSendMessage
+class UniqueIdClient
 {
 public:
-    UniqueIdSendMessage(RequestIdType generationRequestId, std::string const& serverUuid)
-        : mGenerationRequestId(generationRequestId)
-        , mServerUuid(serverUuid)
+    static UniqueIdClient& instance()
     {
+        static UniqueIdClient instance;
+        return instance;
     }
 
-    size_t serializedSize() const
-    {
-        return sizeof(RequestIdType) + sizeof(size_t) + mServerUuid.size();
-    }
-
-    void serialize(std::ostream& os) const
-    {
-        os.write(reinterpret_cast<char const*>(&mGenerationRequestId), sizeof(RequestIdType));
-        size_t size = mServerUuid.size();
-        os.write(reinterpret_cast<char const*>(&size), sizeof(size_t));
-        os.write(mServerUuid.c_str(), size);
-    }
-
-    static UniqueIdSendMessage deserialize(std::istream& is)
-    {
-        RequestIdType generationRequestId;
-        std::string serverUuid;
-        is.read(reinterpret_cast<char*>(&generationRequestId), sizeof(RequestIdType));
-        size_t size;
-        is.read(reinterpret_cast<char*>(&size), sizeof(size_t));
-        serverUuid.resize(size);
-        is.read(serverUuid.data(), size);
-        return UniqueIdSendMessage(generationRequestId, serverUuid);
-    }
-
-    RequestIdType mGenerationRequestId;
-    std::string mServerUuid;
-};
-
-class UniqueIdGenerator
-{
-public:
-    static int get()
-    {
-        std::lock_guard<std::mutex> lock(mMutex);
-        if (!mReleasedIds.empty())
-        {
-            int id = *mReleasedIds.begin();
-            mReleasedIds.erase(mReleasedIds.begin());
-            return id;
-        }
-        return mNextId++;
-    }
-
-    static void release(int id)
-    {
-        std::lock_guard<std::mutex> lock(mMutex);
-        if (id < mNextId)
-        {
-            mReleasedIds.insert(id);
-        }
-    }
+    int getUniqueId(
+        std::string const& serverEndpoint, RequestIdType const& generationRequestId, UuidType const& serverUuid);
+    void releaseUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
+        UuidType const& serverUuid, int uniqueId);
 
 private:
-    static int mNextId;
-    static std::set<int> mReleasedIds;
-    static std::mutex mMutex;
+    UniqueIdClient();
+    ~UniqueIdClient();
+
+    // Prevent copying
+    UniqueIdClient(UniqueIdClient const&) = delete;
+    UniqueIdClient& operator=(UniqueIdClient const&) = delete;
+
+    std::unique_ptr<zmq::context_t> mContext;
+    std::unordered_map<std::string, std::unique_ptr<zmq::socket_t>> mSockets;
+    std::mutex mMutex;
 };
-
-class UniqueIdServer
-{
-public:
-    UniqueIdServer()
-    {
-        mThread = std::thread(
-            [this]()
-            {
-                int id = UniqueIdGenerator::get();
-                while (true)
-                {
-                    int command;
-                    mpi::MpiComm::session().sendRecv(
-                        &id, &command, 1, 1, mpi::MpiType::kINT32, 0, mpi::MpiTag::kUNIQUE_ID_TAG);
-                    if (command != 0)
-                    {
-                        UniqueIdGenerator::release(command);
-                    }
-                    else
-                    {
-                        id = UniqueIdGenerator::get();
-                    }
-                }
-            });
-    }
-
-private:
-    std::thread mThread;
-};
-
-inline std::mutex UniqueIdGenerator::mMutex;
-inline int UniqueIdGenerator::mNextId = 1;
-inline std::set<int> UniqueIdGenerator::mReleasedIds;
 
 class CacheTransceiverFactory
 {
@@ -411,8 +321,9 @@ private:
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
-    std::string mUuid;
-    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
+    UuidType mUuid;
+    std::unique_ptr<CacheTransferServer> mCacheTransferServer;
+    std::string mCacheTransferServerEndpoint;
 };
 
 } // namespace tensorrt_llm::batch_manager

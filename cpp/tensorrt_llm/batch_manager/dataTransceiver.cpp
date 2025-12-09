@@ -211,23 +211,25 @@ struct ReceiveCacheResource
 };
 
 RequestInfo::RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
-    executor::DataTransceiverState transState, std::string const& serverUuid)
+    executor::DataTransceiverState transState, UuidType const& serverUuid, int32_t uniqueId)
     : mContextRequestId{contextRequestId}
     , mGenerationRequestId{generationRequestId}
     , mTransState{std::move(transState)}
     , mServerUuid{serverUuid}
+    , mUniqueId{uniqueId}
 {
 }
 
 RequestInfo::RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
     executor::DataTransceiverState transState, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-    std::string const& serverUuid)
+    UuidType const& serverUuid, int32_t uniqueId)
     : mContextRequestId{contextRequestId}
     , mGenerationRequestId{generationRequestId}
     , mIndexFromEnd{indexFromEnd}
     , mLastBlockKey{lastBlockKey}
     , mTransState{std::move(transState)}
     , mServerUuid{serverUuid}
+    , mUniqueId{uniqueId}
 {
 }
 
@@ -235,7 +237,7 @@ bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
     return mContextRequestId == rhs.mContextRequestId && mGenerationRequestId == rhs.mGenerationRequestId
         && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey && mTransState == rhs.mTransState
-        && mServerUuid == rhs.mServerUuid;
+        && mServerUuid == rhs.mServerUuid && mUniqueId == rhs.mUniqueId;
 }
 
 LlmRequest::RequestIdType RequestInfo::getContextRequestId() const noexcept
@@ -262,6 +264,7 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
     su::serialize(requestInfo.mLastBlockKey, os);
     su::serialize(requestInfo.mTransState, os);
     su::serialize(requestInfo.mServerUuid, os);
+    su::serialize(requestInfo.mUniqueId, os);
 }
 
 RequestInfo RequestInfo::deserialize(std::istream& is)
@@ -273,8 +276,9 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
     auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
     auto serverUuid = su::deserialize<decltype(mServerUuid)>(is);
+    auto uniqueId = su::deserialize<decltype(mUniqueId)>(is);
     return RequestInfo{
-        contextRequestId, generationRequestId, std::move(transState), indexFromEnd, lastBlockKey, serverUuid};
+        contextRequestId, generationRequestId, std::move(transState), indexFromEnd, lastBlockKey, serverUuid, uniqueId};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -287,6 +291,7 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
     totalSize += su::serializedSize(requestInfo.mServerUuid);
+    totalSize += su::serializedSize(requestInfo.mUniqueId);
     return totalSize;
 }
 
@@ -296,7 +301,7 @@ public:
     using RequestIdType = LlmRequest::RequestIdType;
 
     Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid)
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid)
         : mManager{manager}
         , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
         , mFormatter{std::move(formatter)}
@@ -422,10 +427,9 @@ public:
             auto it = mUniqueIdToSession.find(key);
             if (it == mUniqueIdToSession.end())
             {
-                // TODO: get the unique ID from the server.
-                int uniqueId = -1;
+                int uniqueId = info.getUniqueId();
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId), mTerminate}, mSelfState, info.getTransState(),
+                    DataContext{uniqueId, mTerminate}, mSelfState, info.getTransState(),
                     mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty(), uniqueId);
                 session.setTime(TransferSession::kTimeRequestInfo);
@@ -756,21 +760,21 @@ private:
     int mDeviceId{-1};
 
     executor::kv_cache::ConnectionManager* mManager;
-    std::map<std::pair<RequestIdType, std::string>, TransferSession> mUniqueIdToSession;
-    std::map<RequestIdType, std::pair<RequestIdType, std::string>> mRequestIdToUniqueId;
+    std::map<std::pair<RequestIdType, UuidType>, TransferSession> mUniqueIdToSession;
+    std::map<RequestIdType, std::pair<RequestIdType, UuidType>> mRequestIdToUniqueId;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
     std::ofstream mMeasuresFile;
-    std::string mServerUuid;
+    UuidType mServerUuid;
 };
 
 class CacheReceiver::Impl
 {
 public:
     Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid)
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid)
         : mManager{manager}
         , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
         , mFormatter{std::move(formatter)}
@@ -848,7 +852,11 @@ public:
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(mSelfState.getCacheState().value(), destCacheState),
             "Disagg server does not currently support these cacheState.");
 
-        RequestInfo requestInfo(requestId, llmRequest.mRequestId, mSelfState, mServerUuid);
+        auto endpoint = llmRequest.getContextPhaseParams().value().getCacheTransferServerEndpoint();
+        TLLM_CHECK_WITH_INFO(endpoint.has_value(), "CacheTransferServer endpoint not found in ContextPhaseParams");
+        int32_t uniqueId = UniqueIdClient::instance().getUniqueId(endpoint.value(), llmRequest.mRequestId, mServerUuid);
+
+        RequestInfo requestInfo(requestId, llmRequest.mRequestId, mSelfState, mServerUuid, uniqueId);
 
         if (!mFormatter->getCacheManager()->getBlockManager().isVariableWindow())
         {
@@ -874,8 +882,8 @@ public:
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             int32_t indexFromEnd = requestedBlockSize - 1;
 
-            requestInfo
-                = RequestInfo(requestId, llmRequest.mRequestId, mSelfState, indexFromEnd, lastBlockKey, mServerUuid);
+            requestInfo = RequestInfo(
+                requestId, llmRequest.mRequestId, mSelfState, indexFromEnd, lastBlockKey, mServerUuid, uniqueId);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -921,7 +929,7 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+        return TransferSession(std::move(counterPartConnections), DataContext{requestInfo.getUniqueId(), mTerminate},
             mSelfState, contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
             requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty());
     }
@@ -1171,7 +1179,7 @@ private:
     std::ofstream mMeasuresFile;
     std::mutex mMeasuresFileMutex;
     std::atomic<bool> mTerminate{false};
-    std::string mServerUuid;
+    UuidType mServerUuid;
 };
 
 void CacheSender::ImplDeleter::operator()(Impl* ptr)
@@ -1185,7 +1193,7 @@ void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
 }
 
 CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-    SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid)
+    SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid)
     : mImpl{std::unique_ptr<Impl, ImplDeleter>(
         new Impl(manager, selfCacheState, selfIndex, std::move(formatter), serverUuid))}
 {
@@ -1230,7 +1238,7 @@ void CacheSender::sendReadySignal(LlmRequest::RequestIdType requestId, bool isRe
 
 CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter,
-    std::string const& serverUuid)
+    UuidType const& serverUuid)
     : mImpl{std::unique_ptr<Impl, ImplDeleter>(
         new Impl(manager, selfCacheState, selfIndex, std::move(formatter), serverUuid))}
 {

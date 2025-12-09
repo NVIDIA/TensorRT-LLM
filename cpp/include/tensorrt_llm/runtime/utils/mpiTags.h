@@ -74,7 +74,7 @@ enum class MpiTag : int
     kKvCacheEvent = 1027,
 
     // UniqueId
-    kUNIQUE_ID_TAG = 1028
+    kUniqueId = 1028,
 };
 
 } // namespace tensorrt_llm::mpi

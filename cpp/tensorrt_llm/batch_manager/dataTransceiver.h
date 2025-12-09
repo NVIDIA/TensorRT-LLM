@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <array>
 #include <fstream>
 #include <future>
 #include <map>
@@ -173,7 +174,6 @@ struct TransceiverTag
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
     static constexpr int32_t kREADY_SIGNAL_TAG{42};
-    static constexpr int32_t kUNIQUE_ID_TAG{42};
 };
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
@@ -185,12 +185,13 @@ public:
     /// @param requestId The ID used in the generation phase of the current request.
     /// @param transState The state of the data transceiver.
     /// @param serverUuid The generation server UUID.
+    /// @param uniqueId The unique ID for the transfer session.
     RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
-        executor::DataTransceiverState transState, std::string const& serverUuid);
+        executor::DataTransceiverState transState, UuidType const& serverUuid, int32_t uniqueId);
 
     RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
         executor::DataTransceiverState transState, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        std::string const& serverUuid);
+        UuidType const& serverUuid, int32_t uniqueId);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -218,9 +219,16 @@ public:
 
     /// @brief Return the server UUID.
     /// @return The server UUID.
-    [[nodiscard]] std::string const& getServerUuid() const noexcept
+    [[nodiscard]] UuidType const& getServerUuid() const noexcept
     {
         return mServerUuid;
+    }
+
+    /// @brief Return the unique ID.
+    /// @return The unique ID.
+    [[nodiscard]] int32_t getUniqueId() const noexcept
+    {
+        return mUniqueId;
     }
 
     /// @brief Serialization.
@@ -251,7 +259,10 @@ private:
     executor::DataTransceiverState mTransState;
 
     // The server UUID.
-    std::string mServerUuid;
+    UuidType mServerUuid;
+
+    // The unique ID for the transfer session.
+    int32_t mUniqueId{-1};
 };
 
 class CacheSender
@@ -259,7 +270,7 @@ class CacheSender
 public:
     /// @brief Constructor.
     CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid);
 
     CacheSender() = default;
 
@@ -314,7 +325,7 @@ class CacheReceiver
 public:
     /// @brief Constructor.
     CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid);
 
     CacheReceiver() = default;
 

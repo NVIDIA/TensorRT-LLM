@@ -31,6 +31,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferServer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -41,20 +42,22 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "gtest/gtest.h"
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <gmock/gmock.h>
 #include <memory>
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
-
-#include "gtest/gtest.h"
-#include <gmock/gmock.h>
 
 namespace tr = tensorrt_llm::runtime;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -105,7 +108,12 @@ TEST_F(RequestInfoTest, Basic)
     auto state = std::make_unique<texec::DataTransceiverState>();
     state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
     state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, nvinfer1::DataType::kFLOAT});
-    RequestInfo info{1, *state};
+
+    boost::uuids::random_generator uuidGen;
+    std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+    UuidType uuid;
+    std::copy(serverUuidStr.begin(), serverUuidStr.end(), uuid.begin());
+    RequestInfo info{1, 1, *state, uuid, 123};
     auto info2 = serializeDeserialize(info);
     EXPECT_EQ(info, info2);
 }
@@ -157,6 +165,44 @@ TEST_F(CacheConfigTest, EqualTo)
         pipelineParallelism, contextParallelism, attentionLayerNumPerPP, dtype, attentionType, kvFactor, false, 0,
         tensorParallelism};
     EXPECT_EQ(state0, state1);
+}
+
+TEST(CacheTransferServerTest, BasicCommunication)
+{
+    CacheTransferServer server;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+
+    // Client logic
+    std::string endpoint = server.getEndpoint();
+    auto& client = UniqueIdClient::instance();
+
+    // Test GetUniqueId
+    {
+        CacheTransferRequest req;
+        req.type = CacheTransferRequestType::kGetUniqueId;
+        req.payload.getUniqueId.requestId = 123;
+        // Mock UUID
+        std::fill(req.payload.getUniqueId.serverUuid.begin(), req.payload.getUniqueId.serverUuid.end(), 0);
+
+        int uniqueId
+            = client.getUniqueId(endpoint, req.payload.getUniqueId.requestId, req.payload.getUniqueId.serverUuid);
+        EXPECT_GE(uniqueId, 0);
+    }
+
+    // // Test ReleaseUniqueId
+    // {
+    //     CacheTransferRequest req;
+    //     req.type = CacheTransferRequestType::kReleaseUniqueId;
+    //     req.payload.releaseUniqueId.requestId = 123;
+    //     std::fill(req.payload.releaseUniqueId.serverUuid.begin(), req.payload.releaseUniqueId.serverUuid.end(), 0);
+    //     req.payload.releaseUniqueId.uniqueId = 8192; // Dummy ID
+
+    //     client.releaseUniqueId(endpoint, req.payload.releaseUniqueId.requestId,
+    //     req.payload.releaseUniqueId.serverUuid, req.payload.releaseUniqueId.uniqueId);
+    // }
+
+    server.stop();
+    // Server thread join is handled in destructor
 }
 
 // TODO: Restore multi-rank tests.
@@ -302,15 +348,21 @@ protected:
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         std::vector<CacheTransBufferManager*> bufferManagers;
         bufferManagers.push_back(mCacheTransBufferManager.get());
+        boost::uuids::random_generator uuidGen;
+        UuidType uuid;
         if (isSender)
         {
+            std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+            std::copy(serverUuidStr.begin(), serverUuidStr.end(), uuid.begin());
             mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false), uuid);
         }
         else
         {
-            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+            std::copy(serverUuidStr.begin(), serverUuidStr.end(), uuid.begin());
+            mReceiver = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false), uuid);
         }
     }
 
@@ -322,7 +374,8 @@ protected:
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(*mContextCommState);
         state->setCacheState(*mCacheState);
-        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
+        auto stats
+            = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt, mCacheTransferServerEndpoint);
         request.setContextPhaseParams(std::move(stats));
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
@@ -349,7 +402,7 @@ protected:
         }
         else
         {
-            auto future = mRequester->receiveAsync(*llmRequest);
+            auto future = mReceiver->receiveAsync(*llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -376,7 +429,9 @@ protected:
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<CacheSender> mSender;
-    std::unique_ptr<CacheReceiver> mRequester;
+    std::unique_ptr<CacheReceiver> mReceiver;
+    std::unique_ptr<CacheTransferServer> mCacheTransferServer;
+    std::string mCacheTransferServerEndpoint;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
     std::vector<std::future<void>> mFutures;
@@ -389,6 +444,20 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     if (worldSize != 2)
     {
         GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
+    {
+        mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
+        std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+        tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
+        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+    }
+    else
+    {
+        std::vector<char> endpointVec;
+        tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
+        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
     }
     setUpCacheManager();
     setUpCacheTransceiver();
@@ -484,7 +553,11 @@ class AsymmetricalCacheTest : public ::testing::TestWithParam<AsymmetricTestPara
 protected:
     void SetUp() override {}
 
-    void TearDown() override {}
+    void TearDown() override
+    {
+        mCacheTransferServer.reset();
+        tensorrt_llm::mpi::MpiComm::world().barrier();
+    }
 
     void setUpCommunicator(int contextTp, int contextPp, int contextCp, int genTp, int genPp, int genCp,
         bool isMLA = false, bool contextDP = false, bool generationDP = false)
@@ -782,17 +855,21 @@ protected:
                 = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
 
+            boost::uuids::random_generator uuidGen;
+            UuidType serverUuid;
+            std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+            std::copy(serverUuidStr.begin(), serverUuidStr.end(), serverUuid.begin());
+
             if (mIsContext)
             {
                 mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(), serverUuid);
             }
             else
             {
-                mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                mReceiver = std::make_unique<CacheReceiver>(
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(), serverUuid);
             }
-            TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 
             std::vector<int> contextRankVec(mContextRankSize);
             std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
@@ -877,7 +954,8 @@ protected:
         TLLM_CHECK(mContextCommState);
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
         state->setCacheState(*mContextCacheState);
-        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
+        auto stats
+            = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt, mCacheTransferServerEndpoint);
         request.setContextPhaseParams(std::move(stats));
 
         auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
@@ -901,7 +979,8 @@ protected:
             mContextCacheState->getParallelConfig().mEnableAttentionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
-        auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
+        auto stats
+            = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt, mCacheTransferServerEndpoint);
         request.setContextPhaseParams(std::move(stats));
         auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
 
@@ -967,7 +1046,7 @@ protected:
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        return mRequester->receiveAsync(*llmRequest);
+        return mReceiver->receiveAsync(*llmRequest);
     }
 
     void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)
@@ -1258,7 +1337,9 @@ protected:
     std::unique_ptr<KVCacheManager> mManager;
     std::vector<std::unique_ptr<CacheTransBufferManager>> mCacheTransBufferManagers;
     std::unique_ptr<CacheSender> mSender;
-    std::unique_ptr<CacheReceiver> mRequester;
+    std::unique_ptr<CacheReceiver> mReceiver;
+    std::unique_ptr<CacheTransferServer> mCacheTransferServer;
+    std::string mCacheTransferServerEndpoint;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CacheState> mContextCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
@@ -1324,6 +1405,20 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+    int rank = tensorrt_llm::mpi::MpiComm::world().getRank();
+    if (rank == 0)
+    {
+        mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
+        std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+        tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
+    }
+    else
+    {
+        std::vector<char> endpointVec;
+        tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
+        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+    }
 
     if (mIsContext || mIsGeneration)
     {

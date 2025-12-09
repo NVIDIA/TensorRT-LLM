@@ -27,28 +27,32 @@ namespace su = tensorrt_llm::executor::serialize_utils;
 namespace tensorrt_llm::executor
 {
 
-ContextPhaseParams::ContextPhaseParams(
-    VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens)
+ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state,
+    std::optional<VecTokens> draftTokens, std::optional<std::string> cacheTransferServerEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mState{StatePtr{state, deleter}}
     , mDraftTokens{std::move(draftTokens)}
-{
-}
-
-ContextPhaseParams::ContextPhaseParams(
-    VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens)
-    : mReqId{reqId}
-    , mFirstGenTokens{std::move(firstGenTokens)}
-    , mDraftTokens{std::move(draftTokens)}
+    , mCacheTransferServerEndpoint{std::move(cacheTransferServerEndpoint)}
 {
 }
 
 ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
-    std::vector<char> const& serializedState, std::optional<VecTokens> draftTokens)
+    std::optional<VecTokens> draftTokens, std::optional<std::string> cacheTransferServerEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mDraftTokens{std::move(draftTokens)}
+    , mCacheTransferServerEndpoint{std::move(cacheTransferServerEndpoint)}
+{
+}
+
+ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
+    std::vector<char> const& serializedState, std::optional<VecTokens> draftTokens,
+    std::optional<std::string> cacheTransferServerEndpoint)
+    : mReqId{reqId}
+    , mFirstGenTokens{std::move(firstGenTokens)}
+    , mDraftTokens{std::move(draftTokens)}
+    , mCacheTransferServerEndpoint{std::move(cacheTransferServerEndpoint)}
 {
 
     su::VectorWrapBuf<char> strbuf(const_cast<std::vector<char>&>(serializedState));
@@ -66,6 +70,7 @@ ContextPhaseParams::ContextPhaseParams(ContextPhaseParams const& other)
     mReqId = other.mReqId;
     mFirstGenTokens = other.mFirstGenTokens;
     mDraftTokens = other.mDraftTokens;
+    mCacheTransferServerEndpoint = other.mCacheTransferServerEndpoint;
     if (other.mState)
     {
         auto* otherState = static_cast<DataTransceiverState*>(other.mState.get());
@@ -105,6 +110,11 @@ ContextPhaseParams::RequestIdType ContextPhaseParams::getReqId() const noexcept
     return mReqId;
 }
 
+std::optional<std::string> const& ContextPhaseParams::getCacheTransferServerEndpoint() const& noexcept
+{
+    return mCacheTransferServerEndpoint;
+}
+
 void const* ContextPhaseParams::getState() const noexcept
 {
     return mState.get();
@@ -134,6 +144,7 @@ void ContextPhaseParams::deleter(void const* data)
 bool ContextPhaseParams::operator==(ContextPhaseParams const& other) const noexcept
 {
     if (mFirstGenTokens != other.mFirstGenTokens || mReqId != other.mReqId || mDraftTokens != other.mDraftTokens
+        || mCacheTransferServerEndpoint != other.mCacheTransferServerEndpoint
         || static_cast<bool>(mState) != static_cast<bool>(other.mState))
     {
         return false;

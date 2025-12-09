@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/types.h"
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
@@ -35,6 +36,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferServer.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
@@ -60,6 +62,96 @@ namespace tensorrt_llm::batch_manager
 {
 
 std::mutex CacheTransceiver::mDllMutex;
+
+UniqueIdClient::UniqueIdClient()
+{
+    mContext = std::make_unique<zmq::context_t>(1);
+}
+
+int UniqueIdClient::getUniqueId(
+    std::string const& serverEndpoint, RequestIdType const& generationRequestId, UuidType const& serverUuid)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    // Get or create socket for this endpoint
+    zmq::socket_t* socket = nullptr;
+    // auto it = mSockets.find(serverEndpoint);
+    // if (it == mSockets.end())
+    // {
+    auto newSocket = std::make_unique<zmq::socket_t>(*mContext, zmq::socket_type::dealer);
+    newSocket->connect(serverEndpoint);
+    socket = newSocket.get();
+    // mSockets[serverEndpoint] = std::move(newSocket);
+    // }
+    // else
+    // {
+    // socket = it->second.get();
+    // }
+
+    CacheTransferRequest req;
+    std::memset(&req, 0, sizeof(req));
+    req.type = CacheTransferRequestType::kGetUniqueId;
+    req.payload.getUniqueId.requestId = generationRequestId;
+    req.payload.getUniqueId.serverUuid = serverUuid;
+
+    zmq::message_t requestMsg(&req, sizeof(req));
+    socket->send(requestMsg, zmq::send_flags::none);
+
+    zmq::message_t responseMsg;
+    (void) socket->recv(responseMsg, zmq::recv_flags::none);
+    if (responseMsg.size() != sizeof(int))
+    {
+        TLLM_THROW("UniqueIdClient received invalid response size: %zu", responseMsg.size());
+    }
+    int uniqueId;
+    std::memcpy(&uniqueId, responseMsg.data(), sizeof(int));
+    socket->close();
+    return uniqueId;
+}
+
+void UniqueIdClient::releaseUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
+    UuidType const& serverUuid, int uniqueId)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    // Get or create socket for this endpoint
+    zmq::socket_t* socket = nullptr;
+    // auto it = mSockets.find(serverEndpoint);
+    // if (it == mSockets.end())
+    // {
+    auto newSocket = std::make_unique<zmq::socket_t>(*mContext, zmq::socket_type::dealer);
+    newSocket->connect(serverEndpoint);
+    socket = newSocket.get();
+    // mSockets[serverEndpoint] = std::move(newSocket);
+    // }
+    // else
+    // {
+    // socket = it->second.get();
+    // }
+
+    CacheTransferRequest req;
+    std::memset(&req, 0, sizeof(req));
+    req.type = CacheTransferRequestType::kReleaseUniqueId;
+    req.payload.releaseUniqueId.requestId = generationRequestId;
+    req.payload.releaseUniqueId.serverUuid = serverUuid;
+    req.payload.releaseUniqueId.uniqueId = uniqueId;
+
+    zmq::message_t requestMsg(&req, sizeof(req));
+    socket->send(requestMsg, zmq::send_flags::none);
+
+    zmq::message_t responseMsg;
+    (void) socket->recv(responseMsg, zmq::recv_flags::none);
+    socket->close();
+}
+
+UniqueIdClient::~UniqueIdClient()
+{
+    for (auto& socket : mSockets)
+    {
+        socket.second->close();
+    }
+    mContext->close();
+}
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
     kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
@@ -137,17 +229,32 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     if (worldConfig.getRank() == 0)
     {
         boost::uuids::random_generator uuidGen;
-        mUuid = boost::uuids::to_string(uuidGen());
+        auto uuid = boost::uuids::to_string(uuidGen());
+        std::copy(uuid.begin(), uuid.end(), mUuid.begin());
         std::vector<char> uuidVec(mUuid.begin(), mUuid.end());
         mGroupComm->bcast(uuidVec, 0);
-        mUniqueIdServer = std::make_unique<UniqueIdServer>();
+        mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
     }
     else
     {
         std::vector<char> uuidVec;
         mGroupComm->bcast(uuidVec, 0);
-        mUuid.assign(uuidVec.begin(), uuidVec.end());
+        if (uuidVec.size() == mUuid.size())
+        {
+            std::copy(uuidVec.begin(), uuidVec.end(), mUuid.begin());
+        }
+        else
+        {
+            TLLM_THROW("Received UUID size mismatch");
+        }
     }
+    // Broadcast endpoint
+    std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+    mGroupComm->bcast(endpointVec, 0);
+    mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+
+    TLLM_LOG_INFO("CacheTransceiver UUID = %s", std::string(mUuid.begin(), mUuid.end()).c_str());
 
     if (worldConfig.isTensorParallel())
     {
@@ -279,13 +386,13 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     contextState->setCacheState(*mCacheState);
     if (!llmRequest->hasDraftTokens())
     {
-        llmRequest->setContextPhaseParams(
-            executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release(), std::nullopt});
+        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
+            {}, llmRequest->mRequestId, contextState.release(), std::nullopt, mCacheTransferServerEndpoint});
     }
     else
     {
-        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
-            {}, llmRequest->mRequestId, contextState.release(), *llmRequest->getDraftTokens()});
+        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{{}, llmRequest->mRequestId,
+            contextState.release(), *llmRequest->getDraftTokens(), mCacheTransferServerEndpoint});
     }
 }
 
