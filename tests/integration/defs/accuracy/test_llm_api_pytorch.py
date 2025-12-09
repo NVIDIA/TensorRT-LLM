@@ -2643,7 +2643,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False),
@@ -2720,7 +2720,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False),
             (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False),
