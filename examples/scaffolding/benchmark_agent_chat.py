@@ -111,9 +111,9 @@ async def async_agent_benchmark(args):
     llm = create_open_deep_research_scaffolding_llm(
         generation_worker,
         mcp_worker,
-        args.max_tokens,
-        args.max_parallel_requests,
-        args.enable_statistics,
+        max_tokens=args.max_tokens,
+        max_parallel_requests=args.max_parallel_requests,
+        enable_statistics=args.enable_statistics,
     )
 
     prompt = """

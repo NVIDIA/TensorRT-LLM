@@ -148,8 +148,6 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
-        add_param_if_not_none(params, "reasoning_effort",
-                              [task.reasoning_effort])
 
         # Override parameters for deterministic inference
         if is_deterministic_mode():
@@ -159,7 +157,7 @@ class OpenaiWorker(Worker):
             if "seed" not in params or params["seed"] is None:
                 params["seed"] = 42  # Fixed seed for reproducibility
 
-        if hasattr(task, "sub_request_markers"):
+        if hasattr(task, "sub_request_markers") and len(task.sub_request_markers) > 0:
             params["extra_body"]["agent_hierarchy"] = [
                 task.sub_request_markers[-1]
             ]
