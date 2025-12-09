@@ -46,6 +46,9 @@ MODEL_INFO = {
     },
 }
 
+LOW_LATENCY_CONCURRENCY_THRESHOLD = 8
+HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD = 32
+
 
 def generate_rst(yaml_path, output_file=None):
     """Generate RST table from YAML config database.
@@ -109,7 +112,6 @@ def generate_rst(yaml_path, output_file=None):
             entries = subgroups[key]
             entries.sort(key=lambda x: x.concurrency)
             n = len(entries)
-            mid = n // 2
 
             for idx, entry in enumerate(entries):
                 gpu = entry.gpu
@@ -121,9 +123,9 @@ def generate_rst(yaml_path, output_file=None):
                 config_path = entry.config_path
 
                 if n == 1:
-                    if conc <= 16:
+                    if conc <= LOW_LATENCY_CONCURRENCY_THRESHOLD:
                         profile = "Low Latency"
-                    elif conc >= 64:
+                    elif conc >= HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD:
                         profile = "High Throughput"
                     else:
                         profile = "Balanced"
@@ -131,9 +133,9 @@ def generate_rst(yaml_path, output_file=None):
                     profile = "Min Latency"
                 elif idx == n - 1:
                     profile = "Max Throughput"
-                elif n % 2 == 1 and idx == mid:
+                elif idx in ((n - 1) // 2, n // 2):
                     profile = "Balanced"
-                elif idx < mid:
+                elif idx < n // 2:
                     profile = "Low Latency"
                 else:
                     profile = "High Throughput"
