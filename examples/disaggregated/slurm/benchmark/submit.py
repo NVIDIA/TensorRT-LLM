@@ -54,7 +54,7 @@ def submit_job(config, log_dir):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
-    slurm_config.setdefault('pass_segment', True)
+    slurm_config.setdefault('set_segment', True)
 
     hw_config = config['hardware']
     env_config = config['environment']
