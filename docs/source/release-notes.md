@@ -96,7 +96,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Known Issues
 
-- **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release.
+- **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release. GB300 multi-node configurations have been validated in 1.2.0rc4+
 
 
 ## TensorRT-LLM Release 1.0
