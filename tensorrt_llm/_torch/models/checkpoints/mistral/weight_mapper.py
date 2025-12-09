@@ -12,7 +12,6 @@ class MistralWeightMapper(HfWeightMapper):
 
         self._callbacks.append(self._permute_qk)
 
-        # TODO move to registry
         self.pixtral_mapping = {
             "wq": "q_proj",
             "wk": "k_proj",

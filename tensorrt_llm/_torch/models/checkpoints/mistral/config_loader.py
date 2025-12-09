@@ -8,6 +8,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 ###################
 # vllm code here
@@ -287,11 +288,27 @@ class MistralConfigLoader(BaseConfigLoader):
         moe_backend = kwargs.get("moe_backend", "CUTLASS")
 
         hf_quant_config = pretrained_config.quantization_config
-        quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
-            hf_quant_config, moe_backend
-        )
+        if hf_quant_config.get("quant_method") == "compressed-tensors":
+            if 'NVFP4' in hf_quant_config.get("config_groups"):
+                quant_config.quant_algo = QuantAlgo.NVFP4
+                quant_config.group_size = 16
+                ignore_list = hf_quant_config.get("ignore", [])
+                quant_config.exclude_modules = []
+                if "re:.*attn.*" in ignore_list:
+                    quant_config.exclude_modules.append("model.layers.*.self_attn.*")
+                if "re:vision_encoder.*" in ignore_list:
+                    quant_config.exclude_modules.append("vision_encoder*")
+                if "re:vision_language_adapter.*" in ignore_list:
+                    quant_config.exclude_modules.append("vision_language_adapter*")
+                
+            elif 'FP8_BLOCK' in hf_quant_config.get("config_groups"):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.group_size = 128
+                quant_config.exclude_modules = [
+                    "*q_a_proj*", "*kv_a_proj_with_mqa*"
+                ]
 
-        kwargs.pop("trust_remote_code", None)
+        kwargs.pop("trust_remote_code", None) # ModelConfig does not have this input parameter
         model_config = ModelConfig(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
