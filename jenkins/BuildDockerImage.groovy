@@ -721,7 +721,7 @@ pipeline {
                         }
                         if (params.wait_success_seconds) {
                             cmd += "--check_launch_api "
-                            cmd += "--wait_success ${params.wait_success_seconds} "
+                            cmd += "--wait_success 1800 "
                         }
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
