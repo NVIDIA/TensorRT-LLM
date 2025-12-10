@@ -47,7 +47,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">Yes</td>
             <td align="center">Yes</td>
             <td align="center">Yes</td>
-            <td align="center">No</td>
+            <td align="center">Yes</td>
             <td align="center">StreamingLLM</td>
         </tr>
         <tr>
@@ -55,7 +55,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">No</td>
             <td align="center">Yes</td>
             <td align="center">Yes</td>
-            <td align="center">No</td>
+            <td align="center">Yes</td>
             <td align="center">H2O</td>
         </tr>
         <tr>
@@ -63,7 +63,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">Yes</td>
             <td align="center">No</td>
             <td align="center">No</td>
-            <td align="center">No</td>
+            <td align="center">Yes</td>
             <td align="center">Minference</td>
         </tr>
         <tr>
@@ -71,7 +71,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">No</td>
             <td align="center">Yes</td>
             <td align="center">No</td>
-            <td align="center">No</td>
+            <td align="center">Yes</td>
             <td align="center">Quest</td>
         </tr>
         <tr>
@@ -79,7 +79,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">No</td>
             <td align="center">Yes</td>
             <td align="center">No</td>
-            <td align="center">Yes</td>
+            <td align="center">No</td>
             <td align="center">NSA,DSA</td>
         </tr>
         <tr>
@@ -87,7 +87,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">No</td>
             <td align="center">No</td>
             <td align="center">No</td>
-            <td align="center">Yes</td>
+            <td align="center">No</td>
             <td align="center">MoBA</td>
         </tr>
         <tr>
@@ -95,7 +95,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">Yes</td>
             <td align="center">Yes</td>
             <td align="center">No</td>
-            <td align="center">No</td>
+            <td align="center">Yes</td>
             <td align="center">RocketKV</td>
         </tr>
     </tbody>
@@ -176,7 +176,7 @@ This section describes the sparse attention framework architecture and guides de
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/tree/user/yuhangh/add_sprase_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: The sparse attention framework in TensorRT LLM.</em></sub></p>
@@ -223,7 +223,7 @@ The key files located in `tensorrt_llm/_torch/attention_backend/sparse/` are:
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/tree/user/yuhangh/add_sprase_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
