@@ -3,38 +3,114 @@
 - [Motivation](#motivation)
 - [Quick Start](#quick-start)
   - [Python API](#python-api)
-  - [Usage with `trtllm-bench` or `trtllm-serve`](#usage-with-trtllm-bench-or-trtllm-serve)
+  - [Usage with trtllm-bench or trtllm-serve](#usage-with-trtllm-bench-or-trtllm-serve)
 - [Developer Guide](#developer-guide)
   - [Architecture Overview](#architecture-overview)
   - [Framework Implementation](#framework-implementation)
   - [Implementing a New Algorithm](#implementing-a-new-algorithm)
-    - [1. Implement the prediction module in Attention Backend](#1-implement-the-prediction-module-in-attention-backend)
-    - [2. Manage Auxiliary Memory Pool](#2-manage-auxiliary-memory-pool)
-    - [3. Configuration Class](#3-configuration-class)
+    - [1. Configuration Class](#1-configuration-class)
+    - [2. Implement the prediction module in Attention Backend](#2-implement-the-prediction-module-in-attention-backend)
+    - [3. Manage Auxiliary Memory Pool](#3-manage-auxiliary-memory-pool)
     - [4. Registration and Dispatch](#4-registration-and-dispatch)
-- [Future Work](#future-work)
+- [Summary and Future Work](#summary-and-future-work)
+    - [Current State](#current-state)
+    - [Future Work](#future-work)
 
 ## Motivation
 
-As Large Language Models (LLMs) are applied to increasingly complex tasks such as long-document summarization, code generation, and autonomous agents, the demand for processing long contexts and extended generation has surged. In Transformer-based models, the attention mechanism's computational complexity and memory usage grow quadratically and linearly with sequence length. This creates significant bottlenecks in both the **Context (Prefill)** and **Generation (Decode)** phases:
+As Large Language Models (LLMs) are applied to increasingly complex tasks such as long-document summarization, code generation, and autonomous agents, the demand for processing long contexts and extended generation has surged. In Transformer-based models, the attention mechanism's computational complexity and memory usage grow quadratically and linearly with sequence length, respectively. This creates significant bottlenecks in both the **Context (Prefill)** and **Generation (Decode)** phases:
 
 *   **Context Phase**: Processing long prompts requires substantial memory bandwidth and computation, affecting time-to-first-token (TTFT). Since the context phase is typically compute-bound, reducing the computational load here is critical.
 *   **Generation Phase**: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.
 
-Consequently, using sparse attention to reduce overhead in both context and generation phases has attracted significant research interest. Several state-of-the-art models and techniques, such as DeepSeek's NSA/DSA and RocketKV, are evolving to minimize these overheads. Sparse Attention addresses these challenges by selectively attending to the most important tokens rather than the entire history. By reducing the number of tokens involved in calculation and storage, Sparse Attention can:
+Consequently, using sparse attention to reduce overhead in both context and generation phases has attracted significant research interest. Several state-of-the-art models and techniques are evolving to minimize these overheads. Based on our research, we categorize sparse attention methods as follows:
 
-*   **Reduce Memory Footprint**: Allow for larger batch sizes or longer context windows. Saving memory is particularly beneficial in the memory-bound generation phase.
-*   **Lower Computation Overhead**: Decrease the FLOPs required for attention. This is especially important for the compute-intensive context phase.
+<div align="center">
+<table>
+    <thead>
+        <tr>
+            <th colspan="2" align="center">Context</th>
+            <th colspan="2" align="center">Generation</th>
+            <th rowspan="2" align="center">Training-Free</th>
+            <th rowspan="2" align="center">Methods</th>
+        </tr>
+        <tr>
+            <th align="center">Sparse Computation</th>
+            <th align="center">KV Cache Compression</th>
+            <th align="center">Sparse Computation</th>
+            <th align="center">KV Cache Compression</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">StreamingLLM</td>
+        </tr>
+        <tr>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">H2O</td>
+        </tr>
+        <tr>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">Minference</td>
+        </tr>
+        <tr>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">Quest</td>
+        </tr>
+        <tr>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">NSA,DSA</td>
+        </tr>
+        <tr>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">MoBA</td>
+        </tr>
+        <tr>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">RocketKV</td>
+        </tr>
+    </tbody>
+</table>
+</div>
 
-To support these emerging techniques, TensorRT LLM has designed a general, extensible Sparse Attention framework (which is continuously being optimized) to compatibly integrate advanced sparse algorithms.
+The table above summarizes several representative sparse attention algorithms. NSA and MoBA perform sparse computation in the context phase, but they require structural changes to the model and are therefore architecture-specific methods. For the other methods, we observe that most follow a pattern of performing KV cache compression in the context phase and sparse computation in the generation phase. Approaches such as StreamingLLM and H2O also dynamically compress (or evict) the KV cache during generation in addition to sparse computation, typically following a fixed pattern. Based on these observations, TensorRT LLM first focuses on supporting KV cache compression in the context phase and sparse computation in the generation phase, with RocketKV as the primary reference implementation. With the release of the DeepSeek V3.2 model that adopts sparse attention, we have also added support for this model. In the future, we plan to further explore and support sparse computation in the context phase and KV cache compression in the generation phase.
 
 ## Quick Start
 
-This section provides a brief guide on enabling Sparse Attention in TensorRT LLM. For a detailed walkthrough of a specific algorithm, please refer to [RocketKV Sparse Attention](../../examples/sparse_attention/RocketKV.md).
+This section provides a brief guide on enabling sparse attention in TensorRT LLM. For a detailed walkthrough of a specific algorithm, please refer to [RocketKV sparse attention](../../examples/sparse_attention/RocketKV.md).
 
 ### Python API
 
-To use Sparse Attention, you need to configure a specific `SparseAttentionConfig` (e.g., `RocketSparseAttentionConfig`) and pass it to the `LLM` constructor.
+To use sparse attention, you need to configure a specific `SparseAttentionConfig` (for example, `RocketSparseAttentionConfig`) and pass it to the `LLM` constructor.
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -66,7 +142,7 @@ outputs = llm.generate(prompts, SamplingParams(max_tokens=128))
 
 ### Usage with `trtllm-bench` or `trtllm-serve`
 
-You can enable Sparse Attention in benchmarking and serving tools by providing a `sparse_attention_config` in an `extra_config.yaml` file.
+You can enable sparse attention in benchmarking and serving tools by providing a `sparse_attention_config` in an `extra_config.yaml` file.
 
 **extra_config.yaml:**
 ```yaml
@@ -94,25 +170,32 @@ trtllm-eval --model <path_to_model> --extra_llm_api_options extra_config.yaml lo
 
 ## Developer Guide
 
-This section describes the Sparse Attention framework architecture and guides developers on how to implement new sparse attention algorithms in TensorRT LLM. Unless otherwise specified, this framework primarily targets **MHA/MQA/GQA-based** attention mechanisms.
+This section describes the sparse attention framework architecture and guides developers on how to implement new sparse attention algorithms in TensorRT LLM. Unless otherwise specified, this framework primarily targets **MHA/MQA/GQA-based** attention mechanisms.
 
 ### Architecture Overview
 
-TensorRT LLM abstracts sparse attention into a prediction-based workflow: *a prediction module first identifies the sparse indices (tokens/blocks to keep or attend to), which are then used by the subsequent attention operator*.
+<div align="center">
+<figure>
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/tree/user/yuhangh/add_sprase_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: The sparse attention framework in TensorRT LLM.</em></sub></p>
 
-TensorRT LLM currently supports the following operations:
+Our goal is to design a generic, extensible, and flexible sparse attention framework. Figure 1 illustrates the overall design. The architecture is built by inheriting from the existing `AttentionBackend` to define algorithm-specific sparse attention backends. Within these backends, a `prediction` method is implemented to generate the corresponding sparse indices. These indices are then passed as arguments to the `AttentionOp` to perform the sparse attention computation. This approach balances system flexibility with extensibility, allowing new algorithms to be integrated by simply defining their prediction logic **without** modifying the core attention kernels.
 
-1.  **Context Phase (Sparse Storage)**:
+TensorRT LLM abstracts sparse attention into a prediction-based workflow: *a prediction module first identifies the sparse indices (tokens/blocks to keep or attend to), which are then used by the subsequent attention operator*. Currently, for standard attention, TensorRT LLM supports **KV cache compression** in the context phase and **sparse computation** in the generation phase as mentioned above. Different KV heads are allowed to use different sparse indices, while Q heads that map to the same KV head share the same sparse pattern. It does **not** yet support sparse computation in the context phase or KV cache compression in the generation phase.
+
+TensorRT LLM currently supports the following operations for standard attention:
+
+1.  **Context Phase (KV cache compression)**:
     *   **Goal**: Reduce the size of the KV cache populated during the context phase.
     *   **Mechanism**: Identify important tokens from the prompt and permanently evict non-essential tokens before entering the generation phase.
 
-2.  **Generation Phase (Sparse Computation)**:
+2.  **Generation Phase (sparse computation)**:
     *   **Goal**: Accelerate attention computation during token generation.
-    *   **Mechanism**: For each new token, dynamically select a subset of relevant blocks/tokens from the KV cache to attend to.
+    *   **Mechanism**: For each new token, dynamically select a subset of relevant blocks/tokens from the kv cache to attend to.
 
-Currently, for standard attention, TensorRT LLM supports sparse storage in the context phase and sparse computation in the generation phase as above mentioned. It's allowed to have different sparse indices in different kv heads (but shared with same sparse pattern across q heads). It does **not** yet support sparse computation in the context phase or sparse storage (dynamic eviction) in the generation phase.
-
-However, Multi-head Latent Attention (MLA), used by algorithms like DSA, is a special case. It currently supports sparse computation in both context and generation phases, but does not support sparse storage. Its sparse computation implementation is handled directly within the TRTLLM-GEN MLA kernel and does not use the general pass described below.
+However, Multi-head Latent Attention (MLA), used by algorithms like DSA, is a special case. It currently supports sparse computation in both context and generation phases, but does not support KV cache compression. Its sparse computation implementation is handled directly within the TRTLLM-GEN MLA kernel and does not use the general pass described below.
 
 ### Framework Implementation
 
@@ -121,7 +204,7 @@ To hide the complexity of sparse algorithms, the main prediction logic is encaps
 We have extended the existing `AttentionBackend` to include a prediction step that retrieves sparse indices before the attention operation. The logic flow in `TrtllmAttention` is conceptually:
 
 ```python
-# Predict indices for sparse storage (context phase)
+# Predict indices for KV Cache compression (context phase)
 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
     q, k, metadata, **kwargs)
 
@@ -138,31 +221,63 @@ The key files located in `tensorrt_llm/_torch/attention_backend/sparse/` are:
 *   `kernel.py`: Custom Triton kernels for importance scoring or selection.
 *   `utils.py`: Dispatch related logic.
 
+<div align="center">
+<figure>
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/tree/user/yuhangh/add_sprase_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
+
+In `AttentionOp`, as illustrated in Figure 2, for the GQA/MHA path we have implemented two kernels, `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel`, applied in the context and generation phases respectively:
+
+*   **`updateSparseKvCacheAfterFmha`**: Invoked in the post-processing stage after the context attention computation. It performs a rewrite of the KV cache based on the selected indices, effectively implementing KV cache compression.
+
+*   **`gatherKvPageOffsetsKernel`**: Executed before the attention computation in the generation phase. It converts the input sparse indices (which can be of arbitrary granularity) into page-aligned indices. It then gathers `kv_page_offsets` and updates `kv_len` to produce new metadata, which is fed into the subsequent attention kernel for computation.
+
+Currently, for GQA/MHA, sparse attention only supports sparse computation at page-size granularity in the generation phase. In addition, we provide a sparse MLA kernel that supports token-level sparse computation in both the context and generation phases.
+
+Many sparse attention algorithms also require additional auxiliary memory. In the current system, there are two paths to fulfill this requirement:
+
+*   Implement a simple, custom CacheManager at the Python level, inheriting from `KVCacheManager`.
+
+*   Use `KVCacheManagerCpp` to simultaneously manage both the KV Cache and auxiliary memory.
+
+Each option has its own advantages and disadvantages, which we summarize below.
+
 ### Implementing a New Algorithm
 
-To add a new Sparse Attention algorithm, you need to implement a new backend inheriting from `TrtllmAttention` and define its configuration.
+#### 1. Configuration Class
 
-#### 1. Implement the prediction module in Attention Backend
+Define a configuration class in `tensorrt_llm/llmapi/llm_args.py` inheriting from `BaseSparseAttentionConfig`. This class should hold user-tunable parameters for your algorithm.
+
+```python
+@dataclass
+class MySparseAttentionConfig(BaseSparseAttentionConfig):
+    topk: int = 64
+    # ... other parameters
+```
+
+#### 2. Implement the prediction module in Attention Backend
 
 Create a new class inheriting from `TrtllmAttention` (in `tensorrt_llm/_torch/attention_backend/trtllm.py`). You typically need to override two main prediction methods:
 
 **`sparse_kv_predict(self, q, k, metadata, ...)`**
-*   **Purpose**: Predict indices for **sparse storage** during the context phase.
+*   **Purpose**: Predict indices for KV cache compression during the context phase.
 *   **Behavior**: This function performs prediction to return the indices of tokens to be preserved in the KV cache.
 *   **Output**: `sparse_kv_indices` (tokens to keep).
 *   **KV Cache Update**: The system calls `updateSparseKvCacheAfterFmha` to gather the KV cache based on these indices. This effectively "compresses" the prompt's KV cache.
-*   **Constraint**: Returned indices must be **sorted** to ensure safe in-place gathering in memory (implemented in `updateSparseKvCacheAfterFmha`). Note that this post-processing "gather" step introduces some overhead, but significantly improves flexibility, allowing compatibility with features in context like chunked prefill.
+*   **Constraint**: Returned indices must be **sorted** to ensure safe in-place gathering in memory. Note that this post-processing "gather" step introduces some overhead, but significantly improves flexibility, allowing compatibility with features in context like chunked prefill.
 
 **`sparse_attn_predict(self, q, k, metadata, ...)`**
 *   **Purpose**: Predict indices for **sparse computation** during the generation phase.
 *   **Behavior**: For the current query token, predict which pages/blocks in the KV cache are relevant.
 *   **Output**: `sparse_attn_indices` (relevant blocks/tokens).
-*   **KV Cache Selection**: These indices are passed to the underlying C++ attention operator. A specific kernel, `gatherKvPageOffsetsKernel`, uses these indices to gather `kv_page_offsets` and update `kv_len`, but not the KV cache directly to reduce the overhead. This enables the attention kernel to perform "dense" attention on just the selected pages. The `gatherKvPageOffsetsKernel` supports **arbitrary granularity** (e.g., token-level or page-level) and **unordered indices**. The granularity is obtained from `sparse_attention_config.get_indices_block_size`. The kernel automatically maps these arbitrary, potentially unordered indices to the granularity of KV cache page size.
+*   **KV Cache Selection**: These indices are passed to the underlying C++ attention operator. The `gatherKvPageOffsetsKernel` uses these indices to gather `kv_page_offsets` and update `kv_len`, enabling the attention kernel to perform "dense" attention on just the selected pages.
 *   **Constraint**: The generation phase sparse computation is supported for NVIDIA Blackwell GPUs and newer (SM 100+) using TRTLLM-GEN kernels. However, it is flexible enough to extend to different architectures. Currently, only KV cache's **page-level** granularity is supported for sparse computation.
 
 **Note**: The prediction process can be time-consuming, especially in low-latency scenarios where it might account for a significant portion of the attention time. It is highly recommended to optimize this step using custom Triton or CUDA kernels.
 
-#### 2. Manage Auxiliary Memory Pool
+#### 3. Manage Auxiliary Memory Pool
 
 Many sparse algorithms (like RocketKV or DSA) require auxiliary structures (e.g., a "KT cache" or "Kcache") to select relevant tokens. There are two primary ways to manage this memory in TensorRT LLM:
 
@@ -185,27 +300,27 @@ For tighter integration, you can manage the auxiliary memory within the C++ `KVC
 *   **Pros**: Enables compatibility with advanced features such as KV cache reuse and disagg-serving. For example, DSA's low-rank Kcache can be reused or transmitted between context and generation engines.
 *   **Cons**: Higher implementation complexity. The current C++ `KVCacheManager` is optimized for the standard KV cache pool. Adding custom pools often requires significant modifications or manual implementation of the pool management logic within the C++ level.
 
-**Note**: If your algorithm involves sparse storage, standard KV cache block reuse is generally incompatible because eviction modifies the block content uniquely for each request. However, algorithms like DSA that use low-rank approximation without eviction can support block reuse.
-
-#### 3. Configuration Class
-
-Define a configuration class in `tensorrt_llm/llmapi/llm_args.py` inheriting from `BaseSparseAttentionConfig`. This class should hold user-tunable parameters.
-
-```python
-@dataclass
-class MySparseAttentionConfig(BaseSparseAttentionConfig):
-    topk: int = 64
-    # ... other parameters
-```
+**Note**: If your algorithm involves KV cache compression, standard KV cache block reuse is generally incompatible because eviction modifies the block content uniquely for each request. However, algorithms like DSA that use low-rank approximation without eviction can support block reuse.
 
 #### 4. Registration and Dispatch
 
 *   Register your config and backend in `tensorrt_llm/_torch/attention_backend/sparse/utils.py` and `tensorrt_llm/_torch/pyexecutor/_util.py` to ensure the system routes the request to your new backend when the config is present.
 *   Add initialization logic in `cpp/tensorrt_llm/thop/attentionOp.cpp` and `cpp/tensorrt_llm/kernels/sparseAttentionKernels.h` if new C++ level parameters are required.
 
-## Future Work
+## Summary and Future Work
 
-*   **Sparse Computation in Context Phase**: We plan to introduce sparse computation support for the context phase, allowing the TensorRT LLM sparse attention framework to cover most scenarios.
+### Current State
+
+Currently, the status of the Sparse Attention framework is as follows:
+
+1.  **Supported Operations**: The `AttentionOp` currently supports **KV cache compression** in the context phase and **sparse computation** in the generation phase. Other combinations (for example, sparse computation in the context phase) are not yet supported for MHA/GQA. For MLA, sparse computation is supported in both the context and generation phases.
+2.  **Algorithm Support**: RocketKV is supported in both the vanilla (PyTorch) backend and the TRTLLM backend, while DSA is supported in the TRTLLM backend. These implementations validate the generality and flexibility of the framework.
+3.  **Auxiliary Memory**: Both Python-level and C++-level implementations are algorithm-specific. There is no unified abstraction for auxiliary memory management yet.
+
+### Future Work
+
+*   **Sparse Computation in Context Phase**: We plan to introduce sparse computation support for the context phase for MHA/GQA, allowing the TensorRT LLM sparse attention framework to cover most scenarios.
 *   **Dynamic Eviction in Generation Phase**: Dynamically evicting KV cache blocks during the generation phase poses significant challenges to KV cache flexibility. While difficult to implement in the current framework, block-level eviction appears to be a promising compromise and is under further exploration.
+*   **Unified Auxiliary Memory Management**: We are exploring a unified mechanism to manage auxiliary memory pools. This would allow users to define custom auxiliary spaces more flexibly while automatically inheriting advanced features from the KV cache, such as reuse and offloading.
 *   **Code Refactoring**: As more sparse attention algorithms are integrated, the framework will undergo refactoring to unify code and improve maintainability.
-*   **Optimization and Feature Integration**: We are discussing further optimizations, such as enabling fine-grained token-level sparse computation. Additionally, we are exploring integration with other advanced features like KV cache reuse and disagg-serving.
+*   **Optimization and Feature Integration**: We are discussing further optimizations, such as enabling fine-grained token-level sparse computation for MHA/GQA. Additionally, we are exploring integration with other advanced features like Disaggregated Serving.
