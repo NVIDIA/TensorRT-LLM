@@ -264,10 +264,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3(self, overlap_scheduler, eagle3_one_model):
+    @parametrize_with_ids("sampler_async_worker", [True, False])
+    def test_eagle3(self, overlap_scheduler, eagle3_one_model,
+                    sampler_async_worker):
         pytorch_config = dict(
             max_batch_size=
             1,  # add max_batch_size to avoid error in overlap scheduler
+            sampler_force_async_worker=sampler_async_worker,
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=1,
                                               enable_padding=True),
@@ -431,6 +434,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("disable_overlap_scheduler", [False, True])
     @parametrize_with_ids(
         "enable_cuda_graph,enable_padding",
@@ -440,7 +444,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             (True, True),  # CUDA Graph with padding
         ])
     def test_auto_dtype_beam_search(self, enable_cuda_graph, enable_padding,
-                                    disable_overlap_scheduler):
+                                    disable_overlap_scheduler,
+                                    sampler_async_worker):
         max_beam_width = 2
         sampling_params = SamplingParams(n=max_beam_width,
                                          best_of=max_beam_width,
@@ -465,6 +470,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 max_batch_size=max_beam_width,
                 max_seq_len=2048,
                 max_beam_width=max_beam_width,
+                sampler_force_async_worker=sampler_async_worker,
                 disable_overlap_scheduler=disable_overlap_scheduler,
                 cuda_graph_config=cuda_graph_config,
         ) as llm:
@@ -474,6 +480,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="beam_width=2")
 
     @skip_pre_hopper
+    @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("disable_overlap_scheduler", [False, True])
     @parametrize_with_ids(
         "enable_cuda_graph,enable_padding",
@@ -483,7 +490,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             (True, True),  # CUDA Graph with padding
         ])
     def test_fp8_beam_search(self, enable_cuda_graph, enable_padding,
-                             disable_overlap_scheduler):
+                             disable_overlap_scheduler, sampler_async_worker):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
         max_beam_width = 2
         sampling_params = SamplingParams(n=max_beam_width,
@@ -509,6 +516,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_seq_len=2048,
             max_beam_width=max_beam_width,
             disable_overlap_scheduler=disable_overlap_scheduler,
+            sampler_force_async_worker=sampler_async_worker,
             cuda_graph_config=cuda_graph_config,
         )
 
@@ -539,14 +547,17 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("sampler_async_worker", [True, False])
     @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
     @pytest.mark.parametrize("pp_size", [2, 4], ids=["pp2", "pp4"])
-    def test_return_logits_pp(self, pp_size, disable_overlap_scheduler):
+    def test_return_logits_pp(self, pp_size, disable_overlap_scheduler,
+                              sampler_async_worker):
         prompts = ["A B C"]
 
         llm = LLM(model=self.MODEL_PATH,
                   pipeline_parallel_size=pp_size,
-                  disable_overlap_scheduler=disable_overlap_scheduler)
+                  disable_overlap_scheduler=disable_overlap_scheduler,
+                  sampler_force_async_worker=sampler_async_worker)
 
         sampling_params = SamplingParams(max_tokens=8,
                                          return_context_logits=True,
@@ -1559,6 +1570,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     @skip_ray
+    @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -1574,7 +1586,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
-                                    overlap_scheduler, torch_compile):
+                                    overlap_scheduler, torch_compile,
+                                    sampler_async_worker):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1587,6 +1600,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(
                 backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
+            sampler_force_async_worker=sampler_async_worker,
         )
 
         if fp8kv:
