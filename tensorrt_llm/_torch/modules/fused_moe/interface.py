@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
 import weakref
 from abc import abstractmethod
 from enum import Enum, IntEnum
@@ -11,7 +27,8 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
-from .routing import BaseMoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, get_cached_perfect_router_logits,
+                      precompute_common_perfect_router_logits)
 
 
 class MoEWeightLoadingMode(Enum):
@@ -224,6 +241,19 @@ class MoE(nn.Module):
                 range(self.slot_start, self.slot_end))
             self.initial_global_assignments = list(range(self.num_experts))
             self.allreduce = None
+
+        # Perfect router caching - precompute common logits if enabled
+        self._init_perfect_router(model_config)
+
+    def _init_perfect_router(self, model_config: ModelConfig):
+        """Initialize perfect router by precomputing common batch size logits."""
+        if os.environ.get('ENABLE_BALANCED_MOE', '0') == '1':
+            # Precompute logits for common batch sizes (uses global cache with deduplication)
+            precompute_common_perfect_router_logits(
+                num_experts=self.num_experts,
+                experts_per_token=self.routing_method.experts_per_token,
+                moe_ep_size=self.ep_size,
+                dtype=self.dtype)
 
     def _init_load_balancer(
         self,
@@ -630,6 +660,17 @@ class MoE(nn.Module):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        # Replace router logits with perfect load-balanced logits if enabled
+        if os.environ.get('ENABLE_BALANCED_MOE', '0') == '1':
+            num_tokens, num_experts = router_logits.shape
+            router_logits = get_cached_perfect_router_logits(
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                experts_per_token=self.routing_method.experts_per_token,
+                moe_ep_size=self.ep_size,
+                device=router_logits.device,
+                dtype=router_logits.dtype)
+
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
