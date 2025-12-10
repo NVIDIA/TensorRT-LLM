@@ -288,7 +288,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_json_schema,parse_raw,update_forward_refs,model_validate,model_fields_set,model_construct,model_rebuild,schema_json,parse_file,model_extra,model_config,model_fields,dict,model_parametrized_name,model_validate_strings,from_orm,copy,model_dump,construct,model_post_init,model_copy,validate,json,model_computed_fields,model_validate_json,model_dump_json,parse_obj,schema
+    :exclude-members: model_parametrized_name,update_forward_refs,model_rebuild,parse_raw,from_orm,model_validate_strings,model_computed_fields,validate,model_post_init,model_copy,dict,schema,parse_obj,json,model_validate_json,copy,model_config,model_dump_json,model_fields,schema_json,construct,model_extra,model_json_schema,model_validate,model_dump,parse_file,model_fields_set,model_construct
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -297,7 +297,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_json_schema,parse_raw,update_forward_refs,model_validate,model_fields_set,model_construct,model_rebuild,schema_json,parse_file,model_extra,model_config,model_fields,dict,model_parametrized_name,model_validate_strings,from_orm,copy,model_dump,construct,model_post_init,model_copy,validate,json,model_computed_fields,model_validate_json,model_dump_json,parse_obj,schema
+    :exclude-members: model_parametrized_name,update_forward_refs,model_rebuild,parse_raw,from_orm,model_validate_strings,model_computed_fields,validate,model_post_init,model_copy,dict,schema,parse_obj,json,model_validate_json,copy,model_config,model_dump_json,model_fields,schema_json,construct,model_extra,model_json_schema,model_validate,model_dump,parse_file,model_fields_set,model_construct
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:

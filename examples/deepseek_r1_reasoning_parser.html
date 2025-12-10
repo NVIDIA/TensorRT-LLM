@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -372,7 +372,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -413,11 +415,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -516,17 +521,30 @@
   <section id="deepseek-r1-reasoning-parser">
 <h1>Deepseek R1 Reasoning Parser<a class="headerlink" href="#deepseek-r1-reasoning-parser" title="Link to this heading">#</a></h1>
 <p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html">trtllm-serve documentation</a> for starting a server.</p>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/a761585d9c15b4c1249aaf65a8f90764efa83a3c/examples/serve/deepseek_r1_reasoning_parser.sh">NVIDIA/TensorRT-LLM</a>.</p>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/serve/deepseek_r1_reasoning_parser.sh">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
 <span class="linenos"> 2</span>
-<span class="linenos"> 3</span>trtllm-serve<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 4</span><span class="w">    </span>deepseek-ai/DeepSeek-R1<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 5</span><span class="w">    </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 6</span><span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">161</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">1160</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 7</span><span class="w">    </span>--tp_size<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 8</span><span class="w">    </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.95<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 9</span><span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml<span class="w"> </span><span class="se">\</span>
-<span class="linenos">10</span><span class="w">    </span>--reasoning_parser<span class="w"> </span>deepseek-r1
+<span class="linenos"> 3</span>cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="linenos"> 4</span><span class="s">cuda_graph_config:</span>
+<span class="linenos"> 5</span><span class="s">    enable_padding: true</span>
+<span class="linenos"> 6</span><span class="s">    max_batch_size: 512</span>
+<span class="linenos"> 7</span><span class="s">enable_attention_dp: true</span>
+<span class="linenos"> 8</span><span class="s">kv_cache_config:</span>
+<span class="linenos"> 9</span><span class="s">    dtype: fp8</span>
+<span class="linenos">10</span><span class="s">    free_gpu_memory_fraction: 0.8</span>
+<span class="linenos">11</span><span class="s">stream_interval: 10</span>
+<span class="linenos">12</span><span class="s">moe_config:</span>
+<span class="linenos">13</span><span class="s">    backend: DEEPGEMM</span>
+<span class="linenos">14</span><span class="s">EOF</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span>trtllm-serve<span class="w"> </span><span class="se">\</span>
+<span class="linenos">17</span><span class="w">    </span>deepseek-ai/DeepSeek-R1<span class="w"> </span><span class="se">\</span>
+<span class="linenos">18</span><span class="w">    </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">19</span><span class="w">    </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
+<span class="linenos">20</span><span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">21</span><span class="w">    </span>--tp_size<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">22</span><span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml<span class="w"> </span><span class="se">\</span>
+<span class="linenos">23</span><span class="w">    </span>--reasoning_parser<span class="w"> </span>deepseek-r1
 </pre></div>
 </div>
 </section>
@@ -656,9 +674,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

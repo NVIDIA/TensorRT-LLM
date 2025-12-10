@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -376,7 +376,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -417,11 +419,14 @@
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -548,7 +553,7 @@ Likewise, if the format shares some components with an already supported framewo
 <p><strong>Key Methods:</strong></p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">load_config(checkpoint_dir,</span> <span class="pre">**kwargs)</span></code>: Loads and returns a <code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code> object</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">load_weights(checkpoint_dir,</span> <span class="pre">**kwargs)</span></code>: Loads and returns a dictionary of weights</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">load_weights(checkpoint_dir,</span> <span class="pre">mapping,</span> <span class="pre">**kwargs)</span></code>: Loads and returns a dictionary of weights</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">get_initialized_weight_mapper(model,</span> <span class="pre">config)</span></code>: Returns a runtime initialized weight mapper for the model</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">cleanup()</span></code>: Releases resources and cleans up internal state</p></li>
 </ul>
@@ -578,7 +583,7 @@ Likewise, if the format shares some components with an already supported framewo
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.models.checkpoints.base_weight_loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseWeightLoader</span>
 
 <span class="k">class</span><span class="w"> </span><span class="nc">CustomWeightLoader</span><span class="p">(</span><span class="n">BaseWeightLoader</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
         <span class="c1"># Load weights from your custom format</span>
         <span class="c1"># Return a dictionary mapping parameter names to tensors</span>
         <span class="k">return</span> <span class="n">weights_dict</span>
@@ -698,11 +703,12 @@ Likewise, if the format shares some components with an already supported framewo
 
 <span class="nd">@register_checkpoint_weight_loader</span><span class="p">(</span><span class="s2">&quot;CUSTOM_FORMAT&quot;</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">CustomWeightLoader</span><span class="p">(</span><span class="n">BaseWeightLoader</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Load weights from your custom format.</span>
 <span class="sd">        Args:</span>
 <span class="sd">            checkpoint_dir: Directory containing checkpoint files</span>
+<span class="sd">            mapping: A mapping object containing the distributed configuration.</span>
 <span class="sd">            **kwargs: Additional loading parameters</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            Dictionary mapping parameter names to tensors</span>
@@ -1001,9 +1007,9 @@ Likewise, if the format shares some components with an already supported framewo
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

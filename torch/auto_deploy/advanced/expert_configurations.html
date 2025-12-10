@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,7 +74,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -374,7 +374,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -415,11 +417,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -656,6 +661,84 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 </pre></div>
 </div>
 </section>
+<section id="sharding-configuration">
+<h2>Sharding configuration<a class="headerlink" href="#sharding-configuration" title="Link to this heading">#</a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">detect_sharding</span></code> transform automatically detects and applies sharding strategies to the model. It supports multiple sharding sources and dimensions, allowing flexible configuration for different model architectures and parallelism strategies.</p>
+<section id="configuration-parameters">
+<h3>Configuration Parameters<a class="headerlink" href="#configuration-parameters" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">detect_sharding</span></code> transform accepts the following configuration parameters:</p>
+<section id="simple-shard-only-bool-default-false">
+<h4><code class="docutils literal notranslate"><span class="pre">simple_shard_only</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">false</span></code>)<a class="headerlink" href="#simple-shard-only-bool-default-false" title="Link to this heading">#</a></h4>
+<p>When set to <code class="docutils literal notranslate"><span class="pre">true</span></code>, forces simple sharding (row-wise sharding with all-gather) for all linear layers, bypassing more sophisticated column/row sharding strategies. This is useful when you want a uniform sharding approach across all layers or when debugging sharding issues.</p>
+</section>
+<section id="sharding-source-list-default-manual-factory-heuristic">
+<h4><code class="docutils literal notranslate"><span class="pre">sharding_source</span></code> (list, default: <code class="docutils literal notranslate"><span class="pre">['manual',</span> <span class="pre">'factory',</span> <span class="pre">'heuristic']</span></code>)<a class="headerlink" href="#sharding-source-list-default-manual-factory-heuristic" title="Link to this heading">#</a></h4>
+<p>Specifies the priority order of sharding sources. The order matters: if multiple sources try to apply sharding to the same layer, only the first one in the list will be applied. The available sources are:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'manual'</span></code></strong>: Uses manually provided sharding configuration via <code class="docutils literal notranslate"><span class="pre">manual_config</span></code> parameter</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'factory'</span></code></strong>: Uses factory-provided sharding configuration (e.g., from HuggingFace model configs)</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'heuristic'</span></code></strong>: Uses automatic heuristic-based sharding detection based on layer patterns</p></li>
+</ul>
+<p>Example: If both <code class="docutils literal notranslate"><span class="pre">manual</span></code> and <code class="docutils literal notranslate"><span class="pre">heuristic</span></code> try to apply sharding to layer L, only the <code class="docutils literal notranslate"><span class="pre">manual</span></code> transformation will be applied since it appears first in the list.</p>
+</section>
+<section id="support-partial-config-bool-default-true">
+<h4><code class="docutils literal notranslate"><span class="pre">support_partial_config</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)<a class="headerlink" href="#support-partial-config-bool-default-true" title="Link to this heading">#</a></h4>
+<p>When <code class="docutils literal notranslate"><span class="pre">true</span></code>, allows partial sharding configurations where not all layers need to be specified in the manual or factory config. Layers not explicitly configured will be handled by heuristic sharding or left unsharded. When <code class="docutils literal notranslate"><span class="pre">false</span></code>, the configuration must specify all layers or it will be invalidated and skipped.</p>
+</section>
+<section id="sharding-dims-list-default-tp-ep-bmm">
+<h4><code class="docutils literal notranslate"><span class="pre">sharding_dims</span></code> (list, default: <code class="docutils literal notranslate"><span class="pre">['tp',</span> <span class="pre">'ep',</span> <span class="pre">'bmm']</span></code>)<a class="headerlink" href="#sharding-dims-list-default-tp-ep-bmm" title="Link to this heading">#</a></h4>
+<p>Specifies which sharding dimensions to apply during heuristic sharding. The available dimensions are:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'tp'</span></code></strong>: Tensor parallelism - applies column/row sharding for standard transformer layers</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'ep'</span></code></strong>: Expert parallelism - shards experts across ranks for Mixture-of-Experts (MoE) models</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'bmm'</span></code></strong>: Batch matrix multiplication sharding - shards batch matrix multiplication operations</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">'ssm'</span></code></strong>: State space model sharding - applies specialized sharding for Mamba/SSM layers</p></li>
+</ul>
+<p>You can enable multiple dimensions simultaneously. For example, <code class="docutils literal notranslate"><span class="pre">['tp',</span> <span class="pre">'ep']</span></code> will apply both tensor parallelism and expert parallelism.</p>
+</section>
+<section id="requires-shape-prop-bool-default-true">
+<h4><code class="docutils literal notranslate"><span class="pre">requires_shape_prop</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)<a class="headerlink" href="#requires-shape-prop-bool-default-true" title="Link to this heading">#</a></h4>
+<p>Whether shape propagation is required before applying this transform. Shape propagation enables the transform to make informed decisions about sharding strategies based on tensor dimensions.</p>
+</section>
+</section>
+<section id="manual-tp-sharding-configuration">
+<h3>Manual TP Sharding Configuration<a class="headerlink" href="#manual-tp-sharding-configuration" title="Link to this heading">#</a></h3>
+<p>For advanced users, you can provide a manual sharding configuration. An example of such setting:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">args</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">transforms</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">detect_sharding</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">manual_config</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">head_dim</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
+<span class="w">        </span><span class="nt">tp_plan</span><span class="p">:</span>
+<span class="w">          </span><span class="c1"># mamba SSM layers</span>
+<span class="w">          </span><span class="nt">in_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mamba</span>
+<span class="w">          </span><span class="nt">out_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rowwise</span>
+<span class="w">          </span><span class="c1"># attention layers</span>
+<span class="w">          </span><span class="nt">q_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">colwise</span>
+<span class="w">          </span><span class="nt">k_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">colwise</span>
+<span class="w">          </span><span class="nt">v_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">colwise</span>
+<span class="w">          </span><span class="nt">o_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rowwise</span>
+<span class="w">          </span><span class="c1"># NOTE: for performance reason, consider not sharding the following</span>
+<span class="w">          </span><span class="c1"># layers at all. Commenting out the following layers will replicate</span>
+<span class="w">          </span><span class="c1"># them across ranks.</span>
+<span class="w">          </span><span class="c1"># MLP and shared experts in MoE layers</span>
+<span class="w">          </span><span class="nt">gate_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">colwise</span>
+<span class="w">          </span><span class="nt">up_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">colwise</span>
+<span class="w">          </span><span class="nt">down_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rowwise</span>
+<span class="w">          </span><span class="c1"># MoLE: latent projections: simple shard</span>
+<span class="w">          </span><span class="nt">fc1_latent_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gather</span>
+<span class="w">          </span><span class="nt">fc2_latent_proj</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gather</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">tp_plan</span></code> dictionary maps layer names (using module paths with wildcard <code class="docutils literal notranslate"><span class="pre">*</span></code> support) to sharding strategies:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">colwise</span></code></strong>: Column-wise sharding (splits the weight matrix along columns)</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">rowwise</span></code></strong>: Row-wise sharding (splits the weight matrix along rows)</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">mamba</span></code></strong>: Specialized sharding for Mamba SSM layers</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">gather</span></code></strong>: Simple shard with row-wise sharding and all-gather operation</p></li>
+</ul>
+</section>
+</section>
 <section id="built-in-default-configuration">
 <h2>Built-in Default Configuration<a class="headerlink" href="#built-in-default-configuration" title="Link to this heading">#</a></h2>
 <p>Both <code class="docutils literal notranslate"><span class="pre">AutoDeployConfig</span></code> and <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code> classes automatically load a built-in <code class="docutils literal notranslate"><span class="pre">default.yaml</span></code> configuration file that provides defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the <code class="docutils literal notranslate"><span class="pre">_get_config_dict()</span></code> function in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch.auto_deploy.llm_args</span></code> and defines default transform configurations for graph optimization stages.</p>
@@ -708,6 +791,18 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cli-arguments-with-dot-notation">CLI Arguments with Dot Notation</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#yaml-configuration-files">YAML Configuration Files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-precedence-and-deep-merging">Configuration Precedence and Deep Merging</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sharding-configuration">Sharding configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-parameters">Configuration Parameters</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#simple-shard-only-bool-default-false"><code class="docutils literal notranslate"><span class="pre">simple_shard_only</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">false</span></code>)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#sharding-source-list-default-manual-factory-heuristic"><code class="docutils literal notranslate"><span class="pre">sharding_source</span></code> (list, default: <code class="docutils literal notranslate"><span class="pre">['manual',</span> <span class="pre">'factory',</span> <span class="pre">'heuristic']</span></code>)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#support-partial-config-bool-default-true"><code class="docutils literal notranslate"><span class="pre">support_partial_config</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#sharding-dims-list-default-tp-ep-bmm"><code class="docutils literal notranslate"><span class="pre">sharding_dims</span></code> (list, default: <code class="docutils literal notranslate"><span class="pre">['tp',</span> <span class="pre">'ep',</span> <span class="pre">'bmm']</span></code>)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#requires-shape-prop-bool-default-true"><code class="docutils literal notranslate"><span class="pre">requires_shape_prop</span></code> (bool, default: <code class="docutils literal notranslate"><span class="pre">true</span></code>)</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#manual-tp-sharding-configuration">Manual TP Sharding Configuration</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#built-in-default-configuration">Built-in Default Configuration</a></li>
 </ul>
 </li>
@@ -803,9 +898,9 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -372,7 +372,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -413,11 +415,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -515,7 +520,7 @@
                   
   <section id="sampling-techniques-showcase">
 <h1>Sampling Techniques Showcase<a class="headerlink" href="#sampling-techniques-showcase" title="Link to this heading">#</a></h1>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/a761585d9c15b4c1249aaf65a8f90764efa83a3c/examples/llm-api/llm_sampling.py">NVIDIA/TensorRT-LLM</a>.</p>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/llm-api/llm_sampling.py">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="sd">&quot;&quot;&quot;</span>
 <span class="linenos">  2</span><span class="sd">This example demonstrates various sampling techniques available in TensorRT-LLM.</span>
 <span class="linenos">  3</span><span class="sd">It showcases different sampling parameters and their effects on text generation.</span>
@@ -652,96 +657,115 @@
 <span class="linenos">134</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Sequence </span><span class="si">{</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 <span class="linenos">135</span>
 <span class="linenos">136</span>
-<span class="linenos">137</span><span class="k">def</span><span class="w"> </span><span class="nf">demonstrate_with_logprobs</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="linenos">138</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;Demonstrates generation with log probabilities.&quot;&quot;&quot;</span>
-<span class="linenos">139</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">📊 === GENERATION WITH LOG PROBABILITIES ===&quot;</span><span class="p">)</span>
-<span class="linenos">140</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Get probability information for generated tokens&quot;</span><span class="p">)</span>
-<span class="linenos">141</span>
-<span class="linenos">142</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">137</span><span class="k">def</span><span class="w"> </span><span class="nf">demonstrate_beam_search</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="linenos">138</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;Demonstrates beam search.&quot;&quot;&quot;</span>
+<span class="linenos">139</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">🎯 === BEAM SEARCH ===&quot;</span><span class="p">)</span>
+<span class="linenos">140</span>    <span class="n">beam_width</span> <span class="o">=</span> <span class="mi">2</span>
+<span class="linenos">141</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">142</span>              <span class="n">max_beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">)</span>
 <span class="linenos">143</span>
 <span class="linenos">144</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
-<span class="linenos">145</span>        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
-<span class="linenos">146</span>        <span class="n">temperature</span><span class="o">=</span><span class="mf">0.7</span><span class="p">,</span>
-<span class="linenos">147</span>        <span class="n">top_k</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>
-<span class="linenos">148</span>        <span class="n">logprobs</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>  <span class="c1"># Return log probabilities</span>
-<span class="linenos">149</span>    <span class="p">)</span>
-<span class="linenos">150</span>
-<span class="linenos">151</span>    <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">152</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">145</span>        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>
+<span class="linenos">146</span>        <span class="n">use_beam_search</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">147</span>        <span class="n">n</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+<span class="linenos">148</span>    <span class="p">)</span>
+<span class="linenos">149</span>
+<span class="linenos">150</span>    <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">151</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">152</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Response: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 <span class="linenos">153</span>
-<span class="linenos">154</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">155</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">156</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Logprobs: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">157</span>
-<span class="linenos">158</span>
-<span class="linenos">159</span><span class="k">def</span><span class="w"> </span><span class="nf">run_all_demonstrations</span><span class="p">(</span><span class="n">model_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-<span class="linenos">160</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;Run all sampling demonstrations.&quot;&quot;&quot;</span>
-<span class="linenos">161</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;🚀 TensorRT LLM Sampling Techniques Showcase&quot;</span><span class="p">)</span>
-<span class="linenos">162</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">50</span><span class="p">)</span>
-<span class="linenos">163</span>
-<span class="linenos">164</span>    <span class="c1"># Use the first prompt for most demonstrations</span>
-<span class="linenos">165</span>    <span class="n">demo_prompt</span> <span class="o">=</span> <span class="n">prompts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-<span class="linenos">166</span>
-<span class="linenos">167</span>    <span class="c1"># Run all demonstrations</span>
-<span class="linenos">168</span>    <span class="n">demonstrate_greedy_decoding</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">169</span>    <span class="n">demonstrate_temperature_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">170</span>    <span class="n">demonstrate_top_k_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">171</span>    <span class="n">demonstrate_top_p_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">172</span>    <span class="n">demonstrate_combined_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">173</span>    <span class="c1"># TODO[Superjomn]: enable them once pytorch backend supports</span>
-<span class="linenos">174</span>    <span class="c1"># demonstrate_multiple_sequences(llm, demo_prompt)</span>
-<span class="linenos">175</span>    <span class="c1"># demonstrate_beam_search(demo_prompt)</span>
-<span class="linenos">176</span>    <span class="n">demonstrate_with_logprobs</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">177</span>
-<span class="linenos">178</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">🎉 All sampling demonstrations completed!&quot;</span><span class="p">)</span>
-<span class="linenos">179</span>
-<span class="linenos">180</span>
-<span class="linenos">181</span><span class="nd">@click</span><span class="o">.</span><span class="n">command</span><span class="p">()</span>
-<span class="linenos">182</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--model&quot;</span><span class="p">,</span>
-<span class="linenos">183</span>              <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
-<span class="linenos">184</span>              <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-<span class="linenos">185</span>              <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Path to the model or model name&quot;</span><span class="p">)</span>
-<span class="linenos">186</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--demo&quot;</span><span class="p">,</span>
-<span class="linenos">187</span>              <span class="nb">type</span><span class="o">=</span><span class="n">click</span><span class="o">.</span><span class="n">Choice</span><span class="p">([</span>
-<span class="linenos">188</span>                  <span class="s2">&quot;greedy&quot;</span><span class="p">,</span> <span class="s2">&quot;temperature&quot;</span><span class="p">,</span> <span class="s2">&quot;top_k&quot;</span><span class="p">,</span> <span class="s2">&quot;top_p&quot;</span><span class="p">,</span> <span class="s2">&quot;combined&quot;</span><span class="p">,</span>
-<span class="linenos">189</span>                  <span class="s2">&quot;multiple&quot;</span><span class="p">,</span> <span class="s2">&quot;beam&quot;</span><span class="p">,</span> <span class="s2">&quot;logprobs&quot;</span><span class="p">,</span> <span class="s2">&quot;creative&quot;</span><span class="p">,</span> <span class="s2">&quot;all&quot;</span>
-<span class="linenos">190</span>              <span class="p">]),</span>
-<span class="linenos">191</span>              <span class="n">default</span><span class="o">=</span><span class="s2">&quot;all&quot;</span><span class="p">,</span>
-<span class="linenos">192</span>              <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Which demonstration to run&quot;</span><span class="p">)</span>
-<span class="linenos">193</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--prompt&quot;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Custom prompt to use&quot;</span><span class="p">)</span>
-<span class="linenos">194</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">demo</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
-<span class="linenos">195</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="linenos">196</span><span class="sd">    Showcase various sampling techniques in TensorRT-LLM.</span>
+<span class="linenos">154</span>
+<span class="linenos">155</span><span class="k">def</span><span class="w"> </span><span class="nf">demonstrate_with_logprobs</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="linenos">156</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;Demonstrates generation with log probabilities.&quot;&quot;&quot;</span>
+<span class="linenos">157</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">📊 === GENERATION WITH LOG PROBABILITIES ===&quot;</span><span class="p">)</span>
+<span class="linenos">158</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Get probability information for generated tokens&quot;</span><span class="p">)</span>
+<span class="linenos">159</span>
+<span class="linenos">160</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">161</span>
+<span class="linenos">162</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
+<span class="linenos">163</span>        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos">164</span>        <span class="n">temperature</span><span class="o">=</span><span class="mf">0.7</span><span class="p">,</span>
+<span class="linenos">165</span>        <span class="n">top_k</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>
+<span class="linenos">166</span>        <span class="n">logprobs</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>  <span class="c1"># Return log probabilities</span>
+<span class="linenos">167</span>    <span class="p">)</span>
+<span class="linenos">168</span>
+<span class="linenos">169</span>    <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">170</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">171</span>
+<span class="linenos">172</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">173</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">174</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Logprobs: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">175</span>
+<span class="linenos">176</span>
+<span class="linenos">177</span><span class="k">def</span><span class="w"> </span><span class="nf">run_all_demonstrations</span><span class="p">(</span><span class="n">model_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="linenos">178</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;Run all sampling demonstrations.&quot;&quot;&quot;</span>
+<span class="linenos">179</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;🚀 TensorRT LLM Sampling Techniques Showcase&quot;</span><span class="p">)</span>
+<span class="linenos">180</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">50</span><span class="p">)</span>
+<span class="linenos">181</span>
+<span class="linenos">182</span>    <span class="c1"># Use the first prompt for most demonstrations</span>
+<span class="linenos">183</span>    <span class="n">demo_prompt</span> <span class="o">=</span> <span class="n">prompts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">184</span>
+<span class="linenos">185</span>    <span class="c1"># Run all demonstrations</span>
+<span class="linenos">186</span>    <span class="n">demonstrate_greedy_decoding</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">187</span>    <span class="n">demonstrate_temperature_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="n">demonstrate_top_k_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">189</span>    <span class="n">demonstrate_top_p_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">190</span>    <span class="n">demonstrate_combined_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">191</span>    <span class="n">demonstrate_multiple_sequences</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">192</span>    <span class="n">demonstrate_beam_search</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">193</span>    <span class="n">demonstrate_with_logprobs</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">194</span>
+<span class="linenos">195</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">🎉 All sampling demonstrations completed!&quot;</span><span class="p">)</span>
+<span class="linenos">196</span>
 <span class="linenos">197</span>
-<span class="linenos">198</span><span class="sd">    Examples:</span>
-<span class="linenos">199</span><span class="sd">        python llm_sampling.py --demo all</span>
-<span class="linenos">200</span><span class="sd">        python llm_sampling.py --demo temperature --prompt &quot;Tell me a joke&quot;</span>
-<span class="linenos">201</span><span class="sd">        python llm_sampling.py --demo beam --model path/to/your/model</span>
-<span class="linenos">202</span><span class="sd">    &quot;&quot;&quot;</span>
-<span class="linenos">203</span>
-<span class="linenos">204</span>    <span class="n">demo_prompt</span> <span class="o">=</span> <span class="n">prompt</span> <span class="ow">or</span> <span class="n">prompts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-<span class="linenos">205</span>
-<span class="linenos">206</span>    <span class="c1"># Run specific demonstration</span>
-<span class="linenos">207</span>    <span class="k">if</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;greedy&quot;</span><span class="p">:</span>
-<span class="linenos">208</span>        <span class="n">demonstrate_greedy_decoding</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">209</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;temperature&quot;</span><span class="p">:</span>
-<span class="linenos">210</span>        <span class="n">demonstrate_temperature_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">211</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;top_k&quot;</span><span class="p">:</span>
-<span class="linenos">212</span>        <span class="n">demonstrate_top_k_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">213</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;top_p&quot;</span><span class="p">:</span>
-<span class="linenos">214</span>        <span class="n">demonstrate_top_p_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">215</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;combined&quot;</span><span class="p">:</span>
-<span class="linenos">216</span>        <span class="n">demonstrate_combined_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">217</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;multiple&quot;</span><span class="p">:</span>
-<span class="linenos">218</span>        <span class="n">demonstrate_multiple_sequences</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">219</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;logprobs&quot;</span><span class="p">:</span>
-<span class="linenos">220</span>        <span class="n">demonstrate_with_logprobs</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
-<span class="linenos">221</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;all&quot;</span><span class="p">:</span>
-<span class="linenos">222</span>        <span class="n">run_all_demonstrations</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
-<span class="linenos">223</span>
-<span class="linenos">224</span>
-<span class="linenos">225</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
-<span class="linenos">226</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">198</span><span class="nd">@click</span><span class="o">.</span><span class="n">command</span><span class="p">()</span>
+<span class="linenos">199</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--model&quot;</span><span class="p">,</span>
+<span class="linenos">200</span>              <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
+<span class="linenos">201</span>              <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+<span class="linenos">202</span>              <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Path to the model or model name&quot;</span><span class="p">)</span>
+<span class="linenos">203</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--demo&quot;</span><span class="p">,</span>
+<span class="linenos">204</span>              <span class="nb">type</span><span class="o">=</span><span class="n">click</span><span class="o">.</span><span class="n">Choice</span><span class="p">([</span>
+<span class="linenos">205</span>                  <span class="s2">&quot;greedy&quot;</span><span class="p">,</span> <span class="s2">&quot;temperature&quot;</span><span class="p">,</span> <span class="s2">&quot;top_k&quot;</span><span class="p">,</span> <span class="s2">&quot;top_p&quot;</span><span class="p">,</span> <span class="s2">&quot;combined&quot;</span><span class="p">,</span>
+<span class="linenos">206</span>                  <span class="s2">&quot;multiple&quot;</span><span class="p">,</span> <span class="s2">&quot;beam&quot;</span><span class="p">,</span> <span class="s2">&quot;logprobs&quot;</span><span class="p">,</span> <span class="s2">&quot;creative&quot;</span><span class="p">,</span> <span class="s2">&quot;all&quot;</span>
+<span class="linenos">207</span>              <span class="p">]),</span>
+<span class="linenos">208</span>              <span class="n">default</span><span class="o">=</span><span class="s2">&quot;all&quot;</span><span class="p">,</span>
+<span class="linenos">209</span>              <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Which demonstration to run&quot;</span><span class="p">)</span>
+<span class="linenos">210</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--prompt&quot;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Custom prompt to use&quot;</span><span class="p">)</span>
+<span class="linenos">211</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">demo</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
+<span class="linenos">212</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="linenos">213</span><span class="sd">    Showcase various sampling techniques in TensorRT-LLM.</span>
+<span class="linenos">214</span>
+<span class="linenos">215</span><span class="sd">    Examples:</span>
+<span class="linenos">216</span><span class="sd">        python llm_sampling.py --demo all</span>
+<span class="linenos">217</span><span class="sd">        python llm_sampling.py --demo temperature --prompt &quot;Tell me a joke&quot;</span>
+<span class="linenos">218</span><span class="sd">        python llm_sampling.py --demo beam --model path/to/your/model</span>
+<span class="linenos">219</span><span class="sd">    &quot;&quot;&quot;</span>
+<span class="linenos">220</span>
+<span class="linenos">221</span>    <span class="n">demo_prompt</span> <span class="o">=</span> <span class="n">prompt</span> <span class="ow">or</span> <span class="n">prompts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">222</span>
+<span class="linenos">223</span>    <span class="c1"># Run specific demonstration</span>
+<span class="linenos">224</span>    <span class="k">if</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;greedy&quot;</span><span class="p">:</span>
+<span class="linenos">225</span>        <span class="n">demonstrate_greedy_decoding</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">226</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;temperature&quot;</span><span class="p">:</span>
+<span class="linenos">227</span>        <span class="n">demonstrate_temperature_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;top_k&quot;</span><span class="p">:</span>
+<span class="linenos">229</span>        <span class="n">demonstrate_top_k_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">230</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;top_p&quot;</span><span class="p">:</span>
+<span class="linenos">231</span>        <span class="n">demonstrate_top_p_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">232</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;combined&quot;</span><span class="p">:</span>
+<span class="linenos">233</span>        <span class="n">demonstrate_combined_sampling</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">234</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;multiple&quot;</span><span class="p">:</span>
+<span class="linenos">235</span>        <span class="n">demonstrate_multiple_sequences</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">236</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;beam&quot;</span><span class="p">:</span>
+<span class="linenos">237</span>        <span class="n">demonstrate_beam_search</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">238</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;logprobs&quot;</span><span class="p">:</span>
+<span class="linenos">239</span>        <span class="n">demonstrate_with_logprobs</span><span class="p">(</span><span class="n">demo_prompt</span><span class="p">)</span>
+<span class="linenos">240</span>    <span class="k">elif</span> <span class="n">demo</span> <span class="o">==</span> <span class="s2">&quot;all&quot;</span><span class="p">:</span>
+<span class="linenos">241</span>        <span class="n">run_all_demonstrations</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+<span class="linenos">242</span>
+<span class="linenos">243</span>
+<span class="linenos">244</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+<span class="linenos">245</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -871,9 +895,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

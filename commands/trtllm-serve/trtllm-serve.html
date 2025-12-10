@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -376,7 +376,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -417,11 +419,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -550,12 +555,77 @@
 <section id="chat-api">
 <h3>Chat API<a class="headerlink" href="#chat-api" title="Link to this heading">#</a></h3>
 <p>You can query Chat API with any http clients, a typical example is OpenAI Python client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### :title OpenAI Chat Client</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 6</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="p">)</span>
+<span class="linenos"> 9</span>
+<span class="linenos">10</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">11</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">12</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos">13</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos">14</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos">15</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">16</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos">17</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;Where is New York?&quot;</span>
+<span class="linenos">18</span>    <span class="p">}],</span>
+<span class="linenos">19</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos">20</span><span class="p">)</span>
+<span class="linenos">21</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+</pre></div>
+</div>
 <p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 4</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos"> 6</span><span class="s1">        &quot;model&quot;: &quot;TinyLlama-1.1B-Chat-v1.0&quot;,</span>
+<span class="linenos"> 7</span><span class="s1">        &quot;messages&quot;:[{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are a helpful assistant.&quot;},</span>
+<span class="linenos"> 8</span><span class="s1">                    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is New York?&quot;}],</span>
+<span class="linenos"> 9</span><span class="s1">        &quot;max_tokens&quot;: 16,</span>
+<span class="linenos">10</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">11</span><span class="s1">    }&#39;</span>
+</pre></div>
+</div>
 </section>
 <section id="completions-api">
 <h3>Completions API<a class="headerlink" href="#completions-api" title="Link to this heading">#</a></h3>
 <p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### :title OpenAI Completion Client</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 6</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="p">)</span>
+<span class="linenos"> 9</span>
+<span class="linenos">10</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">11</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">12</span>    <span class="n">prompt</span><span class="o">=</span><span class="s2">&quot;Where is New York?&quot;</span><span class="p">,</span>
+<span class="linenos">13</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos">14</span><span class="p">)</span>
+<span class="linenos">15</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+</pre></div>
+</div>
 <p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>curl<span class="w"> </span>http://localhost:8000/v1/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 4</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos"> 6</span><span class="s1">        &quot;model&quot;: &quot;TinyLlama-1.1B-Chat-v1.0&quot;,</span>
+<span class="linenos"> 7</span><span class="s1">        &quot;prompt&quot;: &quot;Where is New York?&quot;,</span>
+<span class="linenos"> 8</span><span class="s1">        &quot;max_tokens&quot;: 16,</span>
+<span class="linenos"> 9</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">10</span><span class="s1">    }&#39;</span>
+</pre></div>
+</div>
 </section>
 <section id="multimodal-serving">
 <h3>Multimodal Serving<a class="headerlink" href="#multimodal-serving" title="Link to this heading">#</a></h3>
@@ -582,6 +652,96 @@
 <h3>Multimodal Chat API<a class="headerlink" href="#multimodal-chat-api" title="Link to this heading">#</a></h3>
 <p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
 <p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="c1"># SINGLE IMAGE INFERENCE</span>
+<span class="linenos"> 4</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w">  </span><span class="se">\</span>
+<span class="linenos"> 6</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos"> 7</span><span class="s1">        &quot;model&quot;: &quot;Qwen2.5-VL-3B-Instruct&quot;,</span>
+<span class="linenos"> 8</span><span class="s1">        &quot;messages&quot;:[{</span>
+<span class="linenos"> 9</span><span class="s1">            &quot;role&quot;: &quot;system&quot;,</span>
+<span class="linenos">10</span><span class="s1">            &quot;content&quot;: &quot;You are a helpful assistant.&quot;</span>
+<span class="linenos">11</span><span class="s1">        }, {</span>
+<span class="linenos">12</span><span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="linenos">13</span><span class="s1">            &quot;content&quot;: [</span>
+<span class="linenos">14</span><span class="s1">                {</span>
+<span class="linenos">15</span><span class="s1">                    &quot;type&quot;: &quot;text&quot;,</span>
+<span class="linenos">16</span><span class="s1">                    &quot;text&quot;: &quot;Describe the natural environment in the image.&quot;</span>
+<span class="linenos">17</span><span class="s1">                },</span>
+<span class="linenos">18</span><span class="s1">                {</span>
+<span class="linenos">19</span><span class="s1">                    &quot;type&quot;:&quot;image_url&quot;,</span>
+<span class="linenos">20</span><span class="s1">                    &quot;image_url&quot;: {</span>
+<span class="linenos">21</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
+<span class="linenos">22</span><span class="s1">                    }</span>
+<span class="linenos">23</span><span class="s1">                }</span>
+<span class="linenos">24</span><span class="s1">            ]</span>
+<span class="linenos">25</span><span class="s1">        }],</span>
+<span class="linenos">26</span><span class="s1">        &quot;max_tokens&quot;: 64,</span>
+<span class="linenos">27</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">28</span><span class="s1">    }&#39;</span>
+<span class="linenos">29</span>
+<span class="linenos">30</span><span class="c1"># MULTI IMAGE INFERENCE</span>
+<span class="linenos">31</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos">32</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">33</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos">34</span><span class="s1">        &quot;model&quot;: &quot;Qwen2.5-VL-3B-Instruct&quot;,</span>
+<span class="linenos">35</span><span class="s1">        &quot;messages&quot;:[{</span>
+<span class="linenos">36</span><span class="s1">            &quot;role&quot;: &quot;system&quot;,</span>
+<span class="linenos">37</span><span class="s1">            &quot;content&quot;: &quot;You are a helpful assistant.&quot;</span>
+<span class="linenos">38</span><span class="s1">        }, {</span>
+<span class="linenos">39</span><span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="linenos">40</span><span class="s1">            &quot;content&quot;: [</span>
+<span class="linenos">41</span><span class="s1">                {</span>
+<span class="linenos">42</span><span class="s1">                    &quot;type&quot;: &quot;text&quot;,</span>
+<span class="linenos">43</span><span class="s1">                    &quot;text&quot;:&quot;Tell me the difference between two images&quot;</span>
+<span class="linenos">44</span><span class="s1">                },</span>
+<span class="linenos">45</span><span class="s1">                {</span>
+<span class="linenos">46</span><span class="s1">                    &quot;type&quot;:&quot;image_url&quot;,</span>
+<span class="linenos">47</span><span class="s1">                    &quot;image_url&quot;: {</span>
+<span class="linenos">48</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png&quot;</span>
+<span class="linenos">49</span><span class="s1">                    }</span>
+<span class="linenos">50</span><span class="s1">                },</span>
+<span class="linenos">51</span><span class="s1">                {</span>
+<span class="linenos">52</span><span class="s1">                    &quot;type&quot;:&quot;image_url&quot;,</span>
+<span class="linenos">53</span><span class="s1">                    &quot;image_url&quot;: {</span>
+<span class="linenos">54</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
+<span class="linenos">55</span><span class="s1">                    }</span>
+<span class="linenos">56</span><span class="s1">                }</span>
+<span class="linenos">57</span><span class="s1">            ]</span>
+<span class="linenos">58</span><span class="s1">        }],</span>
+<span class="linenos">59</span><span class="s1">        &quot;max_tokens&quot;: 64,</span>
+<span class="linenos">60</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">61</span><span class="s1">    }&#39;</span>
+<span class="linenos">62</span>
+<span class="linenos">63</span><span class="c1"># SINGLE VIDEO INFERENCE</span>
+<span class="linenos">64</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos">65</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">66</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos">67</span><span class="s1">        &quot;model&quot;: &quot;Qwen2.5-VL-3B-Instruct&quot;,</span>
+<span class="linenos">68</span><span class="s1">        &quot;messages&quot;:[{</span>
+<span class="linenos">69</span><span class="s1">            &quot;role&quot;: &quot;system&quot;,</span>
+<span class="linenos">70</span><span class="s1">            &quot;content&quot;: &quot;You are a helpful assistant.&quot;</span>
+<span class="linenos">71</span><span class="s1">        }, {</span>
+<span class="linenos">72</span><span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="linenos">73</span><span class="s1">            &quot;content&quot;: [</span>
+<span class="linenos">74</span><span class="s1">                {</span>
+<span class="linenos">75</span><span class="s1">                    &quot;type&quot;: &quot;text&quot;,</span>
+<span class="linenos">76</span><span class="s1">                    &quot;text&quot;:&quot;Tell me what you see in the video briefly.&quot;</span>
+<span class="linenos">77</span><span class="s1">                },</span>
+<span class="linenos">78</span><span class="s1">                {</span>
+<span class="linenos">79</span><span class="s1">                    &quot;type&quot;:&quot;video_url&quot;,</span>
+<span class="linenos">80</span><span class="s1">                    &quot;video_url&quot;: {</span>
+<span class="linenos">81</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4&quot;</span>
+<span class="linenos">82</span><span class="s1">                    }</span>
+<span class="linenos">83</span><span class="s1">                }</span>
+<span class="linenos">84</span><span class="s1">            ]</span>
+<span class="linenos">85</span><span class="s1">        }],</span>
+<span class="linenos">86</span><span class="s1">        &quot;max_tokens&quot;: 64,</span>
+<span class="linenos">87</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">88</span><span class="s1">    }&#39;</span>
+</pre></div>
+</div>
 </section>
 <section id="multimodal-modality-coverage">
 <h3>Multimodal Modality Coverage<a class="headerlink" href="#multimodal-modality-coverage" title="Link to this heading">#</a></h3>
@@ -713,16 +873,31 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 </pre></div>
 </div>
 </section>
+<section id="configuring-with-yaml-files">
+<h2>Configuring with YAML Files<a class="headerlink" href="#configuring-with-yaml-files" title="Link to this heading">#</a></h2>
+<p>You can configure various options of <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> using YAML files by setting the <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> option to the path of a YAML file, the arguments in the file will override the corresponding command line arguments.</p>
+<p>The yaml file is configuration of <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs">tensorrt_llm.llmapi.LlmArgs</a>, the class has multiple levels of hierarchy, to configure the top level arguments like <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, the yaml file should be like:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+</pre></div>
+</div>
+<p>To configure the nested level arguments like <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code>, the yaml file should be like:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTLASS</span>
+</pre></div>
+</div>
+</section>
 <section id="syntax">
 <h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
 <section id="trtllm-serve">
 <h3>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading">#</a></h3>
+<p class="rubric">Usage</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>COMMAND<span class="w"> </span><span class="o">[</span>ARGS<span class="o">]</span>...
 </pre></div>
 </div>
 <section id="trtllm-serve-disaggregated">
 <h4>disaggregated<a class="headerlink" href="#trtllm-serve-disaggregated" title="Link to this heading">#</a></h4>
 <p>Running server in disaggregated mode</p>
+<p class="rubric">Usage</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
 </div>
@@ -772,6 +947,7 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 <section id="trtllm-serve-disaggregated-mpi-worker">
 <h4>disaggregated_mpi_worker<a class="headerlink" href="#trtllm-serve-disaggregated-mpi-worker" title="Link to this heading">#</a></h4>
 <p>Launching disaggregated MPI worker</p>
+<p class="rubric">Usage</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>disaggregated_mpi_worker<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
 </div>
@@ -798,6 +974,7 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 <h4>mm_embedding_serve<a class="headerlink" href="#trtllm-serve-mm-embedding-serve" title="Link to this heading">#</a></h4>
 <p>Running an OpenAI API compatible server</p>
 <p>MODEL: model name | HF checkpoint path | TensorRT engine path</p>
+<p class="rubric">Usage</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>mm_embedding_serve<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>MODEL
 </pre></div>
 </div>
@@ -873,6 +1050,7 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 <h4>serve<a class="headerlink" href="#trtllm-serve-serve" title="Link to this heading">#</a></h4>
 <p>Running an OpenAI API compatible server</p>
 <p>MODEL: model name | HF checkpoint path | TensorRT engine path</p>
+<p class="rubric">Usage</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>serve<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>MODEL
 </pre></div>
 </div>
@@ -948,26 +1126,32 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tp_size">
-<span class="sig-name descname"><span class="pre">--tp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tp_size" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-tensor_parallel_size">
+<span id="cmdoption-trtllm-serve-serve-tp_size"></span><span class="sig-name descname"><span class="pre">--tensor_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--tp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tensor_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-tensor_parallel_size" title="Link to this definition">#</a></dt>
 <dd><p>Tensor parallelism size.</p>
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-pp_size">
-<span class="sig-name descname"><span class="pre">--pp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-pp_size" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-pipeline_parallel_size">
+<span id="cmdoption-trtllm-serve-serve-pp_size"></span><span class="sig-name descname"><span class="pre">--pipeline_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--pp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pipeline_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-pipeline_parallel_size" title="Link to this definition">#</a></dt>
 <dd><p>Pipeline parallelism size.</p>
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-ep_size">
-<span class="sig-name descname"><span class="pre">--ep_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;ep_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-ep_size" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-context_parallel_size">
+<span id="cmdoption-trtllm-serve-serve-cp_size"></span><span class="sig-name descname"><span class="pre">--context_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--cp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;context_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-context_parallel_size" title="Link to this definition">#</a></dt>
+<dd><p>Context parallelism size.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-moe_expert_parallel_size">
+<span id="cmdoption-trtllm-serve-serve-ep_size"></span><span class="sig-name descname"><span class="pre">--moe_expert_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--ep_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;moe_expert_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-moe_expert_parallel_size" title="Link to this definition">#</a></dt>
 <dd><p>expert parallelism size</p>
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-cluster_size">
-<span class="sig-name descname"><span class="pre">--cluster_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;cluster_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-cluster_size" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-moe_cluster_parallel_size">
+<span id="cmdoption-trtllm-serve-serve-cluster_size"></span><span class="sig-name descname"><span class="pre">--moe_cluster_parallel_size</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--cluster_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;moe_cluster_parallel_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-moe_cluster_parallel_size" title="Link to this definition">#</a></dt>
 <dd><p>expert cluster parallelism size</p>
 </dd></dl>
 
@@ -978,8 +1162,8 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">
-<span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;kv_cache_free_gpu_memory_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">
+<span id="cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction"></span><span class="sig-name descname"><span class="pre">--free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;free_gpu_memory_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction" title="Link to this definition">#</a></dt>
 <dd><p>Free GPU memory fraction reserved for KV Cache, after allocating model weights and buffers.</p>
 </dd></dl>
 
@@ -996,9 +1180,15 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-extra_llm_api_options">
-<span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-extra_llm_api_options" title="Link to this definition">#</a></dt>
-<dd><p>Path to a YAML file that overwrites the parameters specified by trtllm-serve.</p>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-revision">
+<span class="sig-name descname"><span class="pre">--revision</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;revision&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-revision" title="Link to this definition">#</a></dt>
+<dd><p>The revision to use for the HuggingFace model (branch name, tag name, or commit id).</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-config">
+<span id="cmdoption-trtllm-serve-serve-extra_llm_api_options"></span><span class="sig-name descname"><span class="pre">--config</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-config" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that overwrites the parameters specified by trtllm-serve. Can be specified as either –config or –extra_llm_api_options.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -1063,6 +1253,12 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-media_io_kwargs">
 <span class="sig-name descname"><span class="pre">--media_io_kwargs</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;media_io_kwargs&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-media_io_kwargs" title="Link to this definition">#</a></dt>
 <dd><p>Keyword arguments for media I/O.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-chat_template">
+<span class="sig-name descname"><span class="pre">--chat_template</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;chat_template&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-chat_template" title="Link to this definition">#</a></dt>
+<dd><p>[Experimental] Specify a custom chat template. Can be a file path or one-liner template string</p>
 </dd></dl>
 
 <p class="rubric">Arguments</p>
@@ -1140,6 +1336,7 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-serving-with-slurm">Multi-node Serving with Slurm</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics-endpoint">Metrics Endpoint</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuring-with-yaml-files">Configuring with YAML Files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#syntax">Syntax</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve">trtllm-serve</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-disaggregated">disaggregated</a></li>
@@ -1241,9 +1438,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

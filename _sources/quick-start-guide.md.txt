@@ -10,7 +10,7 @@ This is the starting point to try out TensorRT LLM. Specifically, this Quick Sta
 The [TensorRT LLM container](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) maintained by NVIDIA contains all of the required dependencies pre-installed. You can start the container on a machine with NVIDIA GPUs via:
 
 ```bash
-docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc4
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc5
 ```
 
 
@@ -23,6 +23,15 @@ To start the server, you can run a command like the following example inside a D
 ```bash
 trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
+
+You may also deploy pre-quantized models to improve performance.
+Ensure your GPU supports FP8 quantization before running the following:
+
+```bash
+trtllm-serve "nvidia/Qwen3-8B-FP8"
+```
+
+For more options, browse the full [collection of generative models](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer) that have been quantized and optimized for inference with the TensorRT Model Optimizer.
 
 ```{note}
 If you are running `trtllm-serve` inside a Docker container, you have two options for sending API requests:

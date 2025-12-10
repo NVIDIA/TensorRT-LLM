@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -377,7 +377,9 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -418,11 +420,14 @@
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -723,12 +728,16 @@
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/sampling.html#general-usage">General usage</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/sampling.html#beam-search">Beam search</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/sampling.html#guided-decoding">Guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/sampling.html#logits-processor">Logits processor</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/additional-outputs.html#options">Options</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/guided-decoding.html#online-api-trtllm-serve">Online API: <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/guided-decoding.html#offline-api-llm-api">Offline API: LLM API</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a><ul>
@@ -770,6 +779,20 @@
 <li class="toctree-l2"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html#tips-for-piecewise-cuda-graph">Tips for Piecewise CUDA Graph</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html#known-issue">Known Issue</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html#development-guide">Development Guide</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/helix.html#how-helix-works">How Helix Works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/helix.html#when-to-use-helix">When to Use Helix</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/helix.html#supported-models">Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/helix.html#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/helix.html#testing-helix-with-tensorrt-llm">Testing Helix with TensorRT-LLM</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="features/kv-cache-connector.html">KV Cache Connector</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#use-cases">Use Cases</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#example-implementation">Example Implementation</a></li>
 </ul>
 </li>
 </ul>
@@ -1150,9 +1173,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

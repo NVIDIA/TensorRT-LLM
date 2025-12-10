@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -376,7 +376,9 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -417,11 +419,14 @@
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -525,7 +530,7 @@
 <section id="architected-on-pytorch">
 <h3>🔥 <strong>Architected on Pytorch</strong><a class="headerlink" href="#architected-on-pytorch" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM provides a high-level Python <a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-llm-api"><span class="std std-ref">LLM API</span></a> that supports a wide range of inference setups - from single-GPU to multi-GPU or multi-node deployments. It includes built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a> and the <a class="reference external" href="https://github.com/triton-inference-server/server">Triton Inference Server</a>.</p>
-<p>TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native architecture allows developers to experiment with the runtime or extend functionality. Several popular models are also pre-defined and can be customized using <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585/tensorrt_llm/_torch/models/modeling_deepseekv3.py">native PyTorch code</a>, making it easy to adapt the system to specific needs.</p>
+<p>TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native architecture allows developers to experiment with the runtime or extend functionality. Several popular models are also pre-defined and can be customized using <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078/tensorrt_llm/_torch/models/modeling_deepseekv3.py">native PyTorch code</a>, making it easy to adapt the system to specific needs.</p>
 </section>
 <section id="state-of-the-art-performance">
 <h3>⚡ <strong>State-of-the-Art Performance</strong><a class="headerlink" href="#state-of-the-art-performance" title="Link to this heading">#</a></h3>
@@ -537,7 +542,7 @@
 </section>
 <section id="comprehensive-model-support">
 <h3>🎯 <strong>Comprehensive Model Support</strong><a class="headerlink" href="#comprehensive-model-support" title="Link to this heading">#</a></h3>
-<p>TensorRT LLM supports the latest and most popular LLM architectures:</p>
+<p>TensorRT LLM supports the latest and most popular LLM <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/models/supported-models.html">architectures</a>.</p>
 <ul class="simple">
 <li><p><strong>Language Models</strong>: GPT-OSS, Deepseek-R1/V3, Llama 3/4, Qwen2/3, Gemma 3, Phi 4…</p></li>
 <li><p><strong>Multi-modal Models</strong>: LLaVA-NeXT, Qwen2-VL, VILA, Llama 3.2 Vision…</p></li>
@@ -555,21 +560,21 @@
 <section id="advanced-optimization-production-features">
 <h3>🚀 <strong>Advanced Optimization &amp; Production Features</strong><a class="headerlink" href="#advanced-optimization-production-features" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p><strong>In-Flight Batching &amp; Paged Attention</strong>: <a class="reference internal" href="legacy/advanced/gpt-attention.html#inflight-batching"><span class="std std-ref">In-flight Batching</span></a> eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.</p></li>
-<li><p><strong>Multi-GPU Multi-Node Inference</strong>: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.</p></li>
-<li><p><strong>Advanced Quantization</strong>:</p>
+<li><p><strong><a class="reference internal" href="features/paged-attention-ifb-scheduler.html"><span class="std std-doc">In-Flight Batching &amp; Paged Attention</span></a></strong>: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.</p></li>
+<li><p><strong><a class="reference internal" href="features/parallel-strategy.html"><span class="std std-doc">Multi-GPU Multi-Node Inference</span></a></strong>: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.</p></li>
+<li><p><strong><a class="reference internal" href="features/quantization.html"><span class="std std-doc">Advanced Quantization</span></a></strong>:</p>
 <ul>
 <li><p><strong>FP4 Quantization</strong>: Native support on NVIDIA B200 GPUs with optimized FP4 kernels</p></li>
 <li><p><strong>FP8 Quantization</strong>: Automatic conversion on NVIDIA H100 GPUs leveraging Hopper architecture</p></li>
 </ul>
 </li>
-<li><p><strong>Speculative Decoding</strong>: Multiple algorithms including EAGLE, MTP and NGram</p></li>
-<li><p><strong>KV Cache Management</strong>: Paged KV cache with intelligent block reuse and memory optimization</p></li>
-<li><p><strong>Chunked Prefill</strong>: Efficient handling of long sequences by splitting context into manageable chunks</p></li>
-<li><p><strong>LoRA Support</strong>: Multi-adapter support with HuggingFace and NeMo formats, efficient fine-tuning and adaptation</p></li>
-<li><p><strong>Checkpoint Loading</strong>: Flexible model loading from various formats (HuggingFace, NeMo, custom)</p></li>
-<li><p><strong>Guided Decoding</strong>: Advanced sampling with stop words, bad words, and custom constraints</p></li>
-<li><p><strong>Disaggregated Serving (Beta)</strong>: Separate context and generation phases across different GPUs for optimal resource utilization</p></li>
+<li><p><strong><a class="reference internal" href="features/speculative-decoding.html"><span class="std std-doc">Speculative Decoding</span></a></strong>: Multiple algorithms including EAGLE, MTP and NGram</p></li>
+<li><p><strong><a class="reference internal" href="features/kvcache.html"><span class="std std-doc">KV Cache Management</span></a></strong>: Paged KV cache with intelligent block reuse and memory optimization</p></li>
+<li><p><strong><a class="reference internal" href="features/paged-attention-ifb-scheduler.html"><span class="std std-doc">Chunked Prefill</span></a></strong>: Efficient handling of long sequences by splitting context into manageable chunks</p></li>
+<li><p><strong><a class="reference internal" href="features/lora.html"><span class="std std-doc">LoRA Support</span></a></strong>: Multi-adapter support with HuggingFace and NeMo formats, efficient fine-tuning and adaptation</p></li>
+<li><p><strong><a class="reference internal" href="features/checkpoint-loading.html"><span class="std std-doc">Checkpoint Loading</span></a></strong>: Flexible model loading from various formats (HuggingFace, NeMo, custom)</p></li>
+<li><p><strong><a class="reference internal" href="features/guided-decoding.html"><span class="std std-doc">Guided Decoding</span></a></strong>: Advanced sampling with stop words, bad words, and custom constraints</p></li>
+<li><p><strong><a class="reference internal" href="features/disagg-serving.html"><span class="std std-doc">Disaggregated Serving (Beta)</span></a></strong>: Separate context and generation phases across different GPUs for optimal resource utilization</p></li>
 </ul>
 </section>
 <section id="latest-gpu-architecture-support">
@@ -741,9 +746,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

@@ -1,8 +1,8 @@
 Sparse Attention
 ================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/a761585d9c15b4c1249aaf65a8f90764efa83a3c/examples/llm-api/llm_sparse_attention.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/llm-api/llm_sparse_attention.py.
 
 .. literalinclude:: ../../../examples/llm-api/llm_sparse_attention.py
-    :lines: 4-209
+    :lines: 4-229
     :language: python
     :linenos:
