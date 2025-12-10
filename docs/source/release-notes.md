@@ -29,6 +29,8 @@ All published functionality in the Release Notes has been fully tested and verif
     - **DeepEP:** Optimized low-precision (FP4) combined kernels and all-to-all communication.
     - **AutoTuner:** Refactored tuning config and generalized tactic selection for better kernel performance.
     - **CuteDSL:** Integrated CuteDSL NVFP4 grouped GEMM for Blackwell.
+  - **Hardware:**
+    - **B300/GB300:** Added support for B300/GB300.
 - **Benchmark**
   - **New Benchmarks:**
     - **Disaggregated Serving:** Added dedicated performance tests for disaggregated serving scenarios (`test_perf.py`).
@@ -41,8 +43,7 @@ All published functionality in the Release Notes has been fully tested and verif
 - **Documentation**
   - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.
   - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.
-  - **Tech Blogs:** Published blogs on "Combining Guided Decoding and Speculative Decoding" and "ADP Balance Strategy".
-  - **Hardware:** Updated documentation to reflect B300/GB300 support.
+  - **Tech Blogs:** Published blogs on "[Combining Guided Decoding and Speculative Decoding](./blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)" and "[ADP Balance Strategy](./blogs/tech_blog/blog10_ADP_Balance_Strategy.md)".
   - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).
   - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.
   - **Performance:** Updated online benchmarking documentation and performance overview pages.
@@ -96,7 +97,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Known Issues
 
-- **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release. GB300 multi-node configurations have been validated in 1.2.0rc4+
+- **GB300 Multi-Node:** Support for GB300 in multi-node configurations is currently in beta and not fully validated in this release. GB300 multi-node configurations have been validated in 1.2.0rc4+.
 
 
 ## TensorRT-LLM Release 1.0
