@@ -342,7 +342,7 @@ P99 ITL (ms):                            6.14
 
 ## Benchmark using AIPerf
 
-TensorRT-LLM also supports benchmarking `trtllm-serve` using **AIPerf**, NVIDIA’s
+TensorRT-LLM also supports benchmarking `trtllm-serve` using [**AIPerf**](https://github.com/ai-dynamo/aiperf), NVIDIA’s
 comprehensive benchmarking tool for LLMs.  
 AIPerf provides throughput, latency, TTFT, and concurrency measurements for both
 text and multimodal workloads.
