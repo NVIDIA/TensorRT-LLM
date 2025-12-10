@@ -151,7 +151,11 @@ def add_llm_args(parser):
     parser.add_argument('--allow_advanced_sampling',
                         default=False,
                         action='store_true')
-    parser.add_argument('--eagle3_model_arch', type=str, default="llama3", choices=["llama3", "mistral_large3"], help="The model architecture of the eagle3 model.")
+    parser.add_argument('--eagle3_model_arch',
+                        type=str,
+                        default="llama3",
+                        choices=["llama3", "mistral_large3"],
+                        help="The model architecture of the eagle3 model.")
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
