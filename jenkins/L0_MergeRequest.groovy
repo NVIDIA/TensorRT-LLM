@@ -464,14 +464,10 @@ def launchReleaseCheck(pipeline)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                if (RELESE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
-                    catchError(
-                        buildResult: 'SUCCESS',
-                        stageResult: 'FAILURE') {
-                        error "Release Check failed but ignored due to Jenkins configuration"
-                    }
-                } else {
-                    throw e
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Release Check failed: ${e.toString()}"
                 }
             }
         }
@@ -892,7 +888,7 @@ def collectTestResults(pipeline, testFilter)
             if (env.alternativeTRT || isOfficialPostMergeJob) {
                 catchError(
                     buildResult: 'FAILURE',
-                    stageResult: 'FAILURE') {
+                    stageResult: 'UNSTABLE') {
                     error "Some failed tests were reruned, please check the rerun report."
                 }
             } else {
@@ -1242,19 +1238,29 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 stage("[Build-Docker-Images] Remote Run") {
-                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                    if (globalVars[GITHUB_PR_API_URL]) {
-                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                        ]
+
+                        launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        catchError(
+                            buildResult: 'SUCCESS',
+                            stageResult: 'UNSTABLE') {
+                            error "Build-Docker-Images job failed: ${e.toString()}"
+                        }
                     }
-
-                    def additionalParameters = [
-                        'branch': branch,
-                        'action': "push",
-                        'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
-                    ]
-
-                    launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
