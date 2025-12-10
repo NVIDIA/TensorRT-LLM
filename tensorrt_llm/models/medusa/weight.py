@@ -11,8 +11,8 @@ from tqdm import tqdm
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (dup_kv_weight, generate_int8,
                                                smooth_gemm,
