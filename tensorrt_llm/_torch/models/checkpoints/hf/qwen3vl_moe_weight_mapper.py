@@ -15,4 +15,10 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
         allow_partial_loading: bool = False,
     ) -> None:
         if isinstance(module, MoE):
-            module.load_weights(weights=[module_weights])
+            updated_module_weights = {}
+            for weight_name, weight_value in module_weights.items():
+                new_weight_name = weight_name.replace("scale_inv", "weight_scale")
+                updated_module_weights[new_weight_name] = weight_value
+            module.load_weights(
+                weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
+            )

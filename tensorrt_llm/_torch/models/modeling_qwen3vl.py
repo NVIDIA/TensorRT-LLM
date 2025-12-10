@@ -40,7 +40,7 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
-from .modeling_utils import ModelConfig, _load_weights_impl, filter_weights
+from .modeling_utils import ModelConfig, QuantConfig, _load_weights_impl, filter_weights
 
 
 class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -656,6 +656,12 @@ class Qwen3VisionModelBase(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.model_dtype = self.model_config.pretrained_config.text_config.dtype
+
+        # NOTE: Re-setting QuantConfig to exclude vision encoder weights from quantization load.
+        self.model_config.quant_config = QuantConfig(
+            kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
+        )
+
         self.visual = model_class(self.model_config).to(self.model_dtype)
 
         self.post_config()
