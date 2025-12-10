@@ -241,7 +241,8 @@ class GuidedDecoder:
                     if req.is_draft:
                         self.is_draft_terminated[slot] = True
                         logger.debug(
-                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
+                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}. "
+                            f"This may indicate that bitmask constraints were not properly applied during draft token generation in MTP mode."
                         )
                         continue
                     # TODO: Make this an error response.
@@ -517,6 +518,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
                 continue
             req.new_token = new_tokens_list[i]
             if draft_step == 0:
+                self.is_draft_terminated[slot] = False
                 # When overlap scheduler is enabled, it is possible that
                 # - The EOS token is in the draft tokens, and
                 # - Some draft tokens after the EOS token are accepted by the target model.
@@ -547,6 +549,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
         # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
+        # Critical fix: Ensure bitmask is applied for all draft steps to prevent grammar violations
+        # in MTP scenarios where draft tokens must conform to grammar constraints
         self.apply_bitmask(logits,
                            d2t=d2t,
                            num_bitmask_tokens=len(self.requests))
