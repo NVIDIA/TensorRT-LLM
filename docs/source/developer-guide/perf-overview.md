@@ -7,7 +7,7 @@ This document summarizes performance measurements of TensorRT-LLM on a number of
 The data in the following tables is provided as a reference point to help users validate observed performance.
 It should *not* be considered as the peak performance that can be delivered by TensorRT-LLM.
 
-Not all configurations were tested for all GPUs. 
+Not all configurations were tested for all GPUs.
 
 We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
 Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situation.
@@ -24,9 +24,9 @@ and shows the throughput scenario under maximum load. The reported metric is `Ou
 
 The performance numbers below were collected using the steps described in this document.
 
-Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/TensorRT-Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
+Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/Model-Optimizer/) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
 
-RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network. 
+RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network.
 
 
 ### Hardware
@@ -64,22 +64,35 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 All performance values are measured in `output tokens per second per GPU`, where `output tokens` includes the first and all subsequent generated tokens (input tokens are not included).
 
-Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`. 
+Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`.
 The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188)
 
 
 ## Table of Contents
 
+- [Overview](#overview)
+  - [Throughput Measurements](#throughput-measurements)
+    - [Hardware](#hardware)
+    - [FP4 Models](#fp4-models)
+    - [FP8 Models](#fp8-models)
+- [Performance Summary - All Networks](#performance-summary---all-networks)
+  - [Units](#units)
+  - [Table of Contents](#table-of-contents)
 - [Deepseek R1 0528](#deepseek-r1-0528)
 - [GPT-OSS 120B](#gpt-oss-120b)
 - [GPT-OSS 20B](#gpt-oss-20b)
 - [LLaMA v3.3 70B](#llama-v33-70b)
-  - [LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition](#llama-v33-70b-rtx-configurations)
+- [LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition](#llama-v33-70b---rtx-6000-pro-blackwell-server-edition)
 - [LLaMA v4 Maverick](#llama-v4-maverick)
 - [Qwen3 235B A22B](#qwen3-235b-a22b)
-  - [Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition](#qwen3-235b-a22b-rtx-configurations)
+- [Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition](#qwen3-235b-a22b---rtx-6000-pro-blackwell-server-edition)
 - [Qwen3 30B A3B](#qwen3-30b-a3b)
-  - [Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition](#qwen3-30b-a3b-rtx-configurations)
+- [Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition](#qwen3-30b-a3b---rtx-6000-pro-blackwell-server-edition)
+  - [Reproducing Benchmarked Results](#reproducing-benchmarked-results)
+    - [Command Overview](#command-overview)
+    - [Variables](#variables)
+    - [Preparing a Dataset](#preparing-a-dataset)
+    - [Running the Benchmark](#running-the-benchmark)
 
 ---
 

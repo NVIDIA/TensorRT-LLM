@@ -23,7 +23,7 @@ The default PyTorch backend supports FP4 and FP8 quantization on the latest Blac
 
 ### Running Pre-quantized Models
 
-TensorRT LLM can directly run [pre-quantized models](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) generated with the [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+TensorRT LLM can directly run [pre-quantized models](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) generated with the [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer).
 
 ```python
 from tensorrt_llm import LLM
@@ -91,7 +91,7 @@ The language component decides which quantization methods are supported by a giv
 ```
 
 
-## Hardware Support Matrix 
+## Hardware Support Matrix
 
 | Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache |W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
@@ -109,4 +109,4 @@ FP8 block wise scaling GEMM kernels for sm100/103 are using MXFP8 recipe (E4M3 a
 ## Quick Links
 
 - [Pre-quantized Models by ModelOpt](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4)
-- [ModelOpt Support Matrix](https://nvidia.github.io/TensorRT-Model-Optimizer/guides/0_support_matrix.html)
+- [ModelOpt Support Matrix](https://nvidia.github.io/Model-Optimizer/guides/0_support_matrix.html)
