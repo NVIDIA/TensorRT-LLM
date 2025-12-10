@@ -20,7 +20,7 @@ from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
-ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "0") == "1"
+ENABLE_CONFIGURABLE_MOE = os.environ.get("ENABLE_CONFIGURABLE_MOE", "1") == "1"
 
 
 def get_moe_cls(
@@ -345,8 +345,8 @@ def create_moe(
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
     if ENABLE_CONFIGURABLE_MOE or moe_cls == CuteDslFusedMoE:
-        # ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends
-        if moe_cls in (TRTLLMGenFusedMoE, CuteDslFusedMoE, CutlassFusedMoE):
+        if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
+                       CutlassFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,
@@ -377,9 +377,25 @@ def create_moe(
                     f"Continuing with legacy MoE backend {moe_cls.__name__}.")
             else:
                 # For other incompatible backends, raise error
-                raise ValueError(
-                    f"ENABLE_CONFIGURABLE_MOE is set but backend {moe_cls.__name__} is not supported. "
-                    f"ConfigurableMoE only supports TRTLLMGenFusedMoE backend.")
+                return create_moe_backend(
+                    moe_cls=moe_cls,
+                    routing_method=routing_method,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    dtype=dtype,
+                    reduce_results=reduce_results,
+                    model_config=model_config,
+                    aux_stream_dict=aux_stream_dict,
+                    weight_loading_mode=weight_loading_mode,
+                    bias=bias,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    layer_idx=layer_idx,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    swiglu_limit=swiglu_limit,
+                    activation_type=activation_type,
+                )
 
     # Use legacy create_moe_backend for other backends or when ConfigurableMoE is disabled
     return create_moe_backend(
