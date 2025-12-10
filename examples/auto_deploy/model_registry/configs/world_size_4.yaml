@@ -1,2 +1,2 @@
 # Configuration for 4 GPU models
-tensor_parallel_size: 4
+world_size: 4

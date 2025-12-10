@@ -7,4 +7,4 @@ compile_backend: torch-compile
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 max_seq_len: 512
-benchmark_enabled: true
+benchmark_enabled: false

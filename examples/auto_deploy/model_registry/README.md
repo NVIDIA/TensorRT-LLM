@@ -46,8 +46,7 @@ Config files are stored in `configs/` subdirectory and define runtime parameters
 |------|---------|
 | `multimodal.yaml` | Vision + text models |
 | `demollm_triton.yaml` | DemoLLM runtime with Triton backend |
-| `simple_shard_only.yaml` | Large models requiring simple sharding |
-| `benchmark_disabled.yaml` | Skip benchmarking for specific models |
+| `simple_shard_only.yaml` | Large models requiring simple sharding
 
 ### Model-Specific Configs
 
@@ -120,14 +119,22 @@ yaml_extra:
 
 ## Model Coverage
 
-Current registry contains **103 models**:
+The registry contains models distributed across different GPU configurations (world sizes 1, 2, 4, and 8), including both text-only and multimodal models.
 
-- **9 models** for 1 GPU
-- **54 models** for 2 GPUs
-- **17 models** for 4 GPUs
-- **24 models** for 8 GPUs
+**To verify current model counts and coverage:**
 
-Total: Text-only (85), Multimodal (18)
+```bash
+cd /path/to/autodeploy-dashboard
+python3 scripts/prepare_model_coverage_v2.py \
+    --source local \
+    --local-path /path/to/TensorRT-LLM \
+    --output /tmp/model_coverage.yaml
+
+# View summary
+grep -E "^- name:|yaml_extra:" /path/to/TensorRT-LLM/examples/auto_deploy/model_registry/models.yaml | wc -l
+```
+
+When adding or removing models, use `prepare_model_coverage_v2.py` to validate the registry structure and coverage.
 
 ## Best Practices
 

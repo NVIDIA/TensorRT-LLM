@@ -62,7 +62,7 @@ models:
 - name: deepseek-ai/DeepSeek-Prover-V2-7B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'demollm_triton.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ibm-granite/granite-3.1-2b-instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ibm-granite/granite-3.1-8b-instruct
@@ -126,7 +126,7 @@ models:
 - name: meta-llama/Llama-3.2-11B-Vision-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama-3.3-70b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
 - name: meta-llama/CodeLlama-34b-Instruct-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: meta-llama/Llama-2-13b-chat-hf
@@ -144,7 +144,7 @@ models:
 - name: perplexity-ai/r1-1776-distill-llama-70b
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'nano_v3_extra.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
 - name: Qwen/QwQ-32B-Preview
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: Qwen/Qwen3-Coder-32B-Instruct
@@ -204,6 +204,6 @@ models:
 - name: openai/gpt-oss-120b
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'llama-4-scout.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
 - name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'llama4_maverick_lite.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
