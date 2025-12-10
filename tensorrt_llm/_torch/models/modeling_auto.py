@@ -43,7 +43,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             config._frozen = False
             config.skip_create_weights_in_init = True
             config._frozen = True
-        extra_attrs = {}
+        extra_attrs = config.extra_attrs
         with model_extra_attrs(extra_attrs):
             model = cls(config)
         model.extra_attrs = extra_attrs
