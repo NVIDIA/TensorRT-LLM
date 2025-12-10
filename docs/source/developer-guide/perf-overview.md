@@ -7,7 +7,7 @@ This document summarizes performance measurements of TensorRT-LLM on a number of
 The data in the following tables is provided as a reference point to help users validate observed performance.
 It should *not* be considered as the peak performance that can be delivered by TensorRT-LLM.
 
-Not all configurations were tested for all GPUs. 
+Not all configurations were tested for all GPUs.
 
 We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
 Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situation.
@@ -24,9 +24,9 @@ and shows the throughput scenario under maximum load. The reported metric is `Ou
 
 The performance numbers below were collected using the steps described in this document.
 
-Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
+Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/Model-Optimizer/) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
 
-RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network. 
+RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network.
 
 
 ### Hardware
@@ -64,7 +64,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 All performance values are measured in `output tokens per second per GPU`, where `output tokens` includes the first and all subsequent generated tokens (input tokens are not included).
 
-Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`. 
+Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`.
 The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188)
 
 
