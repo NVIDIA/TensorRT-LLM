@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <array>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -159,7 +160,19 @@ public:
         }
         else
         {
-            // TODO: implement pg bcast
+            tensorrt_llm::pg_utils::PgHelper pgh{mPgComm};
+
+            auto const rank = getRank();
+            int64_t vecSize = (rank == root) ? static_cast<int64_t>(vec.size()) : int64_t(0);
+            PGCHECK_THROW(pgh.broadcast(&vecSize, root));
+
+            vec.resize(static_cast<size_t>(vecSize));
+            if (vec.empty())
+            {
+                return;
+            }
+
+            PGCHECK_THROW(pgh.broadcast(std::ref(vec), root));
         }
     }
 

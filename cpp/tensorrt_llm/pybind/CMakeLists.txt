@@ -57,7 +57,7 @@ target_compile_definitions(
   ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)
 # Add cppzmq include directory for ZeroMQ C++ bindings
-target_include_directories(${TRTLLM_NB_MODULE}
+target_include_directories(${TRTLLM_PYBIND_MODULE}
                            PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
 
 if(NOT WIN32)
