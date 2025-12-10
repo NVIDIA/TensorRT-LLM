@@ -23,6 +23,8 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
 
+from tensorrt_llm.logger import logger
+
 
 class Eagle3Attention(Attention):
 
@@ -380,6 +382,153 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         return hidden_states
 
 
+class MistralLarge3DraftModel(DecoderModel):
+
+    def __init__(
+        self,
+        model_config,
+        start_layer_idx: int,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+    ) -> None:
+        super().__init__(model_config)
+        
+        from .modeling_deepseekv3 import DeepseekV3DecoderLayer
+        config = model_config.pretrained_config
+        self.spec_config = model_config.spec_config
+        self.dtype = config.torch_dtype
+        self.hidden_size = config.hidden_size
+        self.mapping = model_config.mapping
+        self.num_layers = model_config.pretrained_config.num_hidden_layers
+
+        self.fc = Linear(self.hidden_size * 2,
+                         config.hidden_size,
+                         bias=getattr(config, "bias", False),
+                         dtype=config.torch_dtype,
+                         quant_config=model_config.get_quant_config(),
+                         )
+        self.layers = nn.ModuleList([
+            DeepseekV3DecoderLayer(model_config, start_layer_idx,
+                                   aux_stream_dict)
+        ])
+
+        self.norm = RMSNorm(hidden_size=config.hidden_size,
+                            eps=config.rms_norm_eps,
+                            dtype=config.torch_dtype)
+        self.embed_tokens = None
+
+    def post_load_weights(self):
+        self.layers[0].next_layer_layernorm = self.norm
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert self.embed_tokens is not None
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
+
+        assert hidden_states is not None
+
+        # NOTE: If hidden states from the target model have to be concatenated,
+        # we expect that to happen outside the model definition. This helps us
+        # avoid data-dependent control flow and gives us better CUDA graph
+        # coverage.
+        residual = None
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        hidden_states, residual = self.layers[0](position_ids=position_ids,
+                                                 hidden_states=hidden_states,
+                                                 attn_metadata=attn_metadata,
+                                                 residual=None,
+                                                 spec_metadata=spec_metadata)
+
+        return hidden_states, hidden_states
+
+
+# We use MistralLarge3 as the base architecture for EAGLE3 draft layers
+@register_auto_model("MistralLarge3EagleForCausalLM")
+class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        start_layer_idx: int,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+    ):
+        draft_vocab_size = model_config.pretrained_config.vocab_size
+        super().__init__(MistralLarge3DraftModel(model_config,
+                                                 start_layer_idx,
+                                                 aux_stream_dict),
+                         config=model_config,
+                         hidden_size=model_config.pretrained_config.hidden_size,
+                         vocab_size=draft_vocab_size)
+        self.load_lm_head_from_target = True
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = spec_metadata.get_hidden_states()
+        output, _ = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            hidden_states=hidden_states,
+        )
+
+        return self.logits_processor.forward(
+            output,
+            self.lm_head,
+            attn_metadata,
+            return_context_logits,
+        )
+
+    def load_weights(self, weights: Dict, *args, **kwargs):
+        from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
+            MistralLarge3WeightMapper
+        params_map = kwargs.get("params_map")
+        weight_mapper = MistralLarge3WeightMapper()
+        if params_map is None:
+            params_map = weight_mapper.mistral_llm_mapping
+
+        llm_weights = weight_mapper.rename_by_params_map(weights=weights,
+                                                         params_map=params_map)
+        from .modeling_deepseekv3 import DeepseekV3WeightLoader
+        weight_loader = DeepseekV3WeightLoader(self, is_draft_model=False)
+        weight_loader.load_weights(llm_weights, skip_modules=['lm_head'])
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        if self.model.embed_tokens is None:
+            self.model.embed_tokens = target_model.model.embed_tokens
+        if self.load_lm_head_from_target:
+            self.lm_head = target_model.lm_head
+
+    def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.model.dtype)
+        return hidden_states
+
+
 class MTPForCausalLM(nn.Module):
 
     def __init__(
@@ -556,8 +705,18 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     assert getattr(model_config, 'spec_config', None) != None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
-        return Eagle3ForCausalLM(
-            draft_config, model_config.pretrained_config.num_hidden_layers)
+        if model_config.spec_config.eagle3_model_arch == "llama3":
+            return Eagle3ForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+        elif model_config.spec_config.eagle3_model_arch == "mistral_large3":
+            return MistralLarge3EagleForCausalLM(
+                draft_config,
+                model_config.pretrained_config.num_hidden_layers,
+                model.aux_stream_dict)
+        else:
+            raise ValueError(
+                f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
+            )
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
@@ -583,15 +742,40 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             if spec_config.spec_dec_mode.is_eagle3_one_model():
-                self.draft_config = ModelConfig.from_pretrained(
-                    model_config.spec_config.speculative_model_dir,
-                    trust_remote_code=True,
-                    attn_backend=model_config.attn_backend,
-                    moe_backend=model_config.moe_backend,
-                    mapping=model_config.mapping,
-                    spec_config=model_config.spec_config,
-                    max_num_tokens=model_config.max_num_tokens,
-                    moe_max_num_tokens=model_config.moe_max_num_tokens)
+                if spec_config.eagle3_model_arch == "mistral_large3":
+                    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+                        MistralConfigLoader
+                    self.draft_config = MistralConfigLoader().load(
+                        spec_config.speculative_model_dir,
+                        mapping=model_config.mapping,
+                        moe_backend=model_config.moe_backend,
+                        moe_max_num_tokens=model_config.moe_max_num_tokens,
+                        max_num_tokens=model_config.max_num_tokens,
+                        moe_load_balancer=model_config.moe_load_balancer,
+                        skip_create_weights_in_init=True, # FIXME: checked
+                        )
+                    self.draft_config.extra_attrs = model_config.extra_attrs
+                    from tensorrt_llm.quantization.mode import QuantAlgo
+                    from tensorrt_llm._utils import get_sm_version
+                    if get_sm_version() == 100 and self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                        # FIXME There is a known issue on TRTLLM moe backend + FP8 blockwise 
+                        logger.warning(
+                            "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
+                        )
+                        self.draft_config._frozen = False
+                        self.draft_config.moe_backend = "DEEPGEMM"
+                        self.draft_config._frozen = True
+
+                elif spec_config.eagle3_model_arch == "llama3":
+                    self.draft_config = ModelConfig.from_pretrained(
+                        model_config.spec_config.speculative_model_dir,
+                        trust_remote_code=True,
+                        attn_backend=model_config.attn_backend,
+                        moe_backend=model_config.moe_backend,
+                        mapping=model_config.mapping,
+                        spec_config=model_config.spec_config,
+                        max_num_tokens=model_config.max_num_tokens,
+                        moe_max_num_tokens=model_config.moe_max_num_tokens)
                 self.draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
 
@@ -601,7 +785,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                model_config,
                                                model_config.mapping)
 
-            if self.draft_config is not None:
+            if self.draft_config is not None and model_config.spec_config.eagle3_model_arch == "llama3":
                 for key, value in self.draft_config.extra_attrs.items():
                     assert key in ('attn_layers', 'mla_layers')
                     assert key in model_config.extra_attrs
