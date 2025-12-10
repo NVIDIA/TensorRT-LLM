@@ -1,0 +1,8 @@
+Generate text with multiple LoRA adapters
+=========================================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/llm-api/llm_multilora.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_multilora.py
+    :lines: 4-89
+    :language: python
+    :linenos:

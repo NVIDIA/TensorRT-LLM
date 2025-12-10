@@ -1,0 +1,8 @@
+Runtime Configuration Examples
+==============================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/llm-api/llm_runtime.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_runtime.py
+    :lines: 4-144
+    :language: python
+    :linenos:

@@ -1,0 +1,8 @@
+KV Cache Connector
+==================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/e4c707845ff58fcc0b1d87afb4dd0e64885c780a/examples/llm-api/llm_kv_cache_connector.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_kv_cache_connector.py
+    :lines: 4-326
+    :language: python
+    :linenos:
