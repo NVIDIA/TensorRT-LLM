@@ -1,14 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-
 # copy from https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/encoding/encoding_dsv32.py
+# ruff: noqa: E501
 import copy
 import json
 import re
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-# flake8: noqa: E501
 TOOLS_SYSTEM_TEMPLATE = """## Tools
 You have access to a set of tools you can use to answer the user's question.
 You can invoke functions by writing a "<{dsml_token}function_calls>" block like the following as part of your reply to the user:
@@ -89,7 +85,7 @@ def tool_calls_to_openai_format(tool_calls):
     ]
 
 
-def encode_arguments_to_dsml(tool_call: dict[str, str]) -> str:
+def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = (
         """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
     )
@@ -111,8 +107,8 @@ def encode_arguments_to_dsml(tool_call: dict[str, str]) -> str:
 
 
 def decode_dsml_to_arguments(
-    tool_name: str, tool_args: dict[str, tuple[str, str]]
-) -> dict[str, str]:
+    tool_name: str, tool_args: Dict[str, Tuple[str, str]]
+) -> Dict[str, str]:
     def _decode_value(key: str, value: str, string: str):
         if string == "true":
             value = to_json(value)
@@ -126,7 +122,7 @@ def decode_dsml_to_arguments(
     return dict(name=tool_name, arguments=tool_args_json)
 
 
-def render_tools(tools: list[dict[str, str | dict[str, Any]]]) -> str:
+def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
     tools_json = [to_json(t) for t in tools]
 
     return TOOLS_SYSTEM_TEMPLATE.format(
@@ -137,7 +133,7 @@ def render_tools(tools: list[dict[str, str | dict[str, Any]]]) -> str:
     )
 
 
-def find_last_user_index(messages: list[dict[str, Any]]) -> int:
+def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         if messages[idx].get("role") in ["user", "developer"]:
@@ -146,7 +142,7 @@ def find_last_user_index(messages: list[dict[str, Any]]) -> int:
     return last_user_index
 
 
-def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: str) -> str:
+def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str) -> str:
     assert 0 <= index < len(messages)
     assert thinking_mode in ["chat", "thinking"], f"Invalid thinking_mode `{thinking_mode}`"
 
@@ -159,6 +155,7 @@ def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: st
     tools = msg.get("tools")
     response_format = msg.get("response_format")
     tool_calls = msg.get("tool_calls")
+    # support both reasoning_content and reasoning for compatibility
     reasoning_content = msg.get("reasoning") or msg.get("reasoning_content")
 
     if tools:
@@ -272,9 +269,9 @@ def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: st
 
 
 def drop_thinking_messages(
-    messages: list[dict[str, Any]], last_user_idx: int | None = None
-) -> list[dict[str, Any]]:
-    messages_wo_thinking: list[dict[str, Any]] = []
+    messages: List[Dict[str, Any]], last_user_idx: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    messages_wo_thinking: List[Dict[str, Any]] = []
     last_user_idx = find_last_user_index(messages) if last_user_idx is None else last_user_idx
     for idx, msg in enumerate(messages):
         role = msg.get("role")
@@ -292,9 +289,9 @@ def drop_thinking_messages(
 
 
 def encode_messages(
-    messages: list[dict[str, Any]],
+    messages: List[Dict[str, Any]],
     thinking_mode: str,
-    context: list[dict[str, Any]] | None = None,
+    context: Optional[List[Dict[str, Any]]] = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
 ) -> str:
@@ -312,7 +309,7 @@ def encode_messages(
     return prompt
 
 
-def _read_until_stop(index: int, text: str, stop: list[str]) -> tuple[int, str, None | str]:
+def _read_until_stop(index: int, text: str, stop: List[str]) -> Tuple[int, str, Optional[str]]:
     min_pos = len(text)
     matched_stop = None
 
@@ -331,7 +328,7 @@ def _read_until_stop(index: int, text: str, stop: list[str]) -> tuple[int, str, 
 
 
 def parse_tool_calls(index: int, text: str):
-    tool_calls: list[dict[str, Any]] = []
+    tool_calls: List[Dict[str, Any]] = []
     stop_token = None
     tool_calls_end_token = f"</{dsml_token}function_calls>"
 
@@ -354,16 +351,14 @@ def parse_tool_calls(index: int, text: str):
         assert len(p_tool_name) == 1, "Tool name format error"
         tool_name = p_tool_name[0]
 
-        tool_args: dict[str, tuple[str, str]] = {}
+        tool_args: Dict[str, Tuple[str, str]] = {}
         while stop_token == f"<{dsml_token}parameter":
             index, param_content, stop_token = _read_until_stop(
                 index, text, [f"/{dsml_token}parameter"]
             )
 
             param_kv = re.findall(
-                r'^ name="(.*?)" string="(true|false)">(.*?)<$',
-                param_content,
-                flags=re.DOTALL,
+                r'^ name="(.*?)" string="(true|false)">(.*?)<$', param_content, flags=re.DOTALL
             )
             assert len(param_kv) == 1, "Parameter format error"
             param_name, string, param_value = param_kv[0]
@@ -416,13 +411,7 @@ def parse_message_from_completion_text(text: str, thinking_mode: str):
 
     assert len(text) == index and stop_token in [eos_token, None], "Unexpected content at end"
 
-    for sp_token in [
-        bos_token,
-        eos_token,
-        thinking_start_token,
-        thinking_end_token,
-        dsml_token,
-    ]:
+    for sp_token in [bos_token, eos_token, thinking_start_token, thinking_end_token, dsml_token]:
         assert sp_token not in summary_content and sp_token not in reasoning_content, (
             "Unexpected special token in content"
         )
