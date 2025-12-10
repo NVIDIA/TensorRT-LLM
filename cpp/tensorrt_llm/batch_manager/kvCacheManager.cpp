@@ -1353,7 +1353,7 @@ void WindowBlockManager::storeBlocks(
     auto searchRoot = mCachedBlocksRoot;
     bool needMatch = true;
 
-    auto numBlocks = std::min(blockKeys.size(),blockIds.size());
+    auto numBlocks = std::min(blockKeys.size(), blockIds.size());
     std::vector<BlockPtr> storedBlocks;
     for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
     {
