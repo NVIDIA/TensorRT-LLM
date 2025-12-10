@@ -70,10 +70,24 @@ def generate_timeout_xml(testList, stage_name):
     print(xmlContent)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tests", required=True, help="Test list file")
+    parser.add_argument("--test-file-path", required=True, help="Test list file path")
     parser.add_argument("--stage-name", required=True, help="Stage name")
     args = parser.parse_args(sys.argv[1:])
-    testList = args.tests.split("\n")
-    generate_timeout_xml(testList, args.stage_name)
+    testFilePath = args.test_file_path
+    stageName = args.stage_name
+
+    if not os.path.exists(stageName + "/" + testFilePath):
+        print(f"No {testFilePath} found in {stageName}, skipping timeout XML generation")
+        return
+    timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
+    print(f"timeoutTests: {timeoutTests}")
+    if timeoutTests == "":
+        print(f"No timeout tests found in {testFilePath}, skipping timeout XML generation")
+        return
+    generate_timeout_xml(timeoutTests.split("\n"), stageName)
+
+
+if __name__ == "__main__":
+    main()
