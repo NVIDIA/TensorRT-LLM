@@ -484,7 +484,8 @@ def per_token_quant_and_transform(
             input = input.transpose(0, 1)
         b, m, k = input.shape
     else:
-        assert False, f"Unsupported input shape rank: {original_input_rank}"
+        raise AssertionError(
+            f"Unsupported input shape rank: {original_input_rank}")
 
     # Create output
     output = torch.empty((b, m, k), dtype=torch.float8_e4m3fn, device="cuda")
