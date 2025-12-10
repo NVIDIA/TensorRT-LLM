@@ -600,8 +600,8 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert "search_web" in info2.begin
         assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
 
-    def test_qwen3_format_compliance(self, sample_tools, parser):
-        """Test that Qwen3ToolParser follows the documented format structure."""
+    def test_kimi_k2_format_compliance(self, sample_tools, parser):
+        """Test that KimiK2ToolParser follows the documented format structure."""
 
         # Test the exact format from the docstring
         text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"Tokyo"}<|tool_call_end|><|tool_calls_section_end|>'
