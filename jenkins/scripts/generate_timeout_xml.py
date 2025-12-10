@@ -1,5 +1,6 @@
 import argparse
 import sys
+from html import escape
 
 
 def parse_xml_classname_name_file_from_testname(testname, stage_name):
@@ -43,14 +44,28 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
 
 
 def generate_timeout_xml(testList, stage_name):
-    xmlContent = f"""<?xml version="1.0" encoding="UTF-8"?><testsuites>
-        <testsuite name="{stage_name}" errors="{len(testList)}" failures="0" skipped="0" tests="{len(testList)}" time="1.00">"""
+    num_tests = len(testList)
+    # Escape stage_name for XML safety
+    stage_name_escaped = escape(stage_name, quote=True)
+    xmlContent = (
+        f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
+        f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
+        f'failures="0" skipped="0" tests="{num_tests}" time="1.00">'
+    )
 
     for test in testList:
         classname, name, file = parse_xml_classname_name_file_from_testname(test, stage_name)
-        xmlContent += f"""<testcase classname="{classname}" name="{name}" file="{file}" time="1.0">
-        <error message="Test terminated unexpectedly"> Test terminated unexpectedly
-        </error></testcase>"""
+        # Escape all XML attribute values
+        classname_escaped = escape(classname, quote=True)
+        name_escaped = escape(name, quote=True)
+        file_escaped = escape(file, quote=True)
+        xmlContent += (
+            f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
+            f'file="{file_escaped}" time="1.0">\n'
+            f'        <error message="Test terminated unexpectedly">'
+            f' Test terminated unexpectedly\n'
+            f'        </error></testcase>'
+        )
     xmlContent += "</testsuite></testsuites>"
     print(xmlContent)
 
