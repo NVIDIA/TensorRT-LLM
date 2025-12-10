@@ -150,7 +150,7 @@ def test_flat_gqa_op(
 
     # Use torch backend as clean reference
     ref_flat = TorchAttentionReference.flattened_mha_with_cache(
-        q, k, v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
+        q, k, v, batch_info, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
     )
 
     assert torch.allclose(
