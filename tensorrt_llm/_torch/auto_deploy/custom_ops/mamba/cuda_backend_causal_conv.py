@@ -203,7 +203,7 @@ class CudaBackendCausalConv(AttentionDescriptor):
 
         def _get_conv_cache(si: SequenceInfo):
             return torch.empty(
-                si.max_batch_size,
+                si.max_state_slots,
                 in_channels,
                 max(1, kernel_size - 1),
                 device=si.device,

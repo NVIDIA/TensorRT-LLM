@@ -310,7 +310,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
         def _get_conv_cache(si: SequenceInfo):
             return torch.empty(
-                si.max_batch_size,
+                si.max_state_slots,
                 in_channels,
                 kernel_size,
                 device=si.device,

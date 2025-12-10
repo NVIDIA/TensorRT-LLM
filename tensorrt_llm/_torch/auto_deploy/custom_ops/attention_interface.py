@@ -423,6 +423,9 @@ class SequenceInfo:
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1
 
+        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9883 clean up this hack
+        self.max_state_slots = max_batch_size + 1
+
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len_adjusted,
         # we use the provided max_num_tokens. If max_num_tokens provided is more, we still use
         # max_batch_size * max_seq_len_adjusted since the extra tokens cannot be used.

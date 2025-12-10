@@ -46,7 +46,12 @@ from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
+from ...pyexecutor.resource_manager import (
+    BaseResourceManager,
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
@@ -210,6 +215,39 @@ def _round_up_to_closest(batch_sizes: List[int], bs: int) -> Optional[int]:
     return min(batch_sizes, key=lambda x: (x < bs, abs(x - bs)), default=None)
 
 
+def _generate_dummy_request(
+    resource_manager: ResourceManager, request_id: int, **request_kwargs
+) -> Optional[LlmRequest]:
+    # get resource managers we want
+    kv_cache_manager: KVCacheManager = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER
+    )
+    slot_manager: SeqSlotManager = resource_manager.get_resource_manager(
+        ResourceManagerType.SEQ_SLOT_MANAGER
+    )
+    spec_res_mgr: Optional[BaseResourceManager] = resource_manager.get_resource_manager(
+        ResourceManagerType.SPEC_RESOURCE_MANAGER
+    )
+
+    # check if we have a free slot available and free page available
+    if not slot_manager.slot_manager.free_slots or kv_cache_manager.get_num_free_blocks() == 0:
+        return None
+
+    # generate a dummy request
+    dummy_request = kv_cache_manager.add_dummy_requests([request_id], **request_kwargs)[0]
+    dummy_request.is_cuda_graph_dummy = True
+
+    # add to spec resource manager
+    if spec_res_mgr:
+        spec_res_mgr.add_dummy_requests([request_id])
+
+    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9883 clean up this hack
+    dummy_request.seq_slot = slot_manager.get_max_resource_count()
+    dummy_request.py_seq_slot = dummy_request.seq_slot
+
+    return dummy_request
+
+
 def maybe_pad_for_cuda_graph(func):
     def wrapper(
         self: "ADEngine",
@@ -221,14 +259,21 @@ def maybe_pad_for_cuda_graph(func):
         def _call_func():
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
+        # check if we use cuda graph and we can run it
         if not (self.cuda_graph_used and scheduled_requests.can_run_cuda_graph):
             return _call_func()
 
-        # check if it's generate-only batch
-        is_generate_only = len(scheduled_requests.context_requests) == 0
-
-        if not is_generate_only:
-            return _call_func()
+        # generate a persistent dummy request right away to ensure we can reserve the necessary
+        # resources (kv page and slot)
+        if self.padding_dummy_request is None:
+            self.padding_dummy_request = _generate_dummy_request(
+                resource_manager,
+                request_id=CUDA_GRAPH_DUMMY_REQUEST_ID,
+                is_gen=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+                use_mrope=False,
+                max_beam_width=self.max_beam_width,
+            )
 
         # check closest cuda graph batch size
         closest_cg_bs = _round_up_to_closest(
@@ -241,59 +286,17 @@ def maybe_pad_for_cuda_graph(func):
         if num_padding <= 0:
             return _call_func()
 
-        # create a dummy request if it doesn't already exist
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-        if self.padding_dummy_request is None and kv_cache_manager.get_num_free_blocks() > 0:
-            self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
-                request_ids=[CUDA_GRAPH_DUMMY_REQUEST_ID],
-                is_gen=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-                use_mrope=False,
-                max_beam_width=self.max_beam_width,
-            )[0]
-            self.padding_dummy_request.is_cuda_graph_dummy = True
-            spec_res_mgr = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER
-            )
-            if spec_res_mgr:
-                spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
-
+        # check if we have a dummy request to use
         if self.padding_dummy_request is None:
+            ad_logger.error("No CUDA graph padding possible due to missing dummy request.")
             return _call_func()
-
-        # now call slot manager to add the dummy request
-        slot_manager: SeqSlotManager = resource_manager.get_resource_manager(
-            ResourceManagerType.SEQ_SLOT_MANAGER
-        )
-
-        # check if we have a free slot available
-        if not slot_manager.slot_manager.free_slots:
-            # NOTE: this should never happen, but we'll check just in case and emit an error
-            ad_logger.error("No free slots available for CUDA graph padding")
-            return _call_func()
-
-        seq_slot = slot_manager.slot_manager.add_slot(self.padding_dummy_request.request_id)
-        self.padding_dummy_request.seq_slot = seq_slot
-        self.padding_dummy_request.py_seq_slot = seq_slot
 
         # pad the scheduled requests with the dummy request
         scheduled_requests.generation_requests.extend([self.padding_dummy_request] * num_padding)
 
         ret = _call_func()
 
-        # free the slot for the dummy request
-        # NOTE: unlike the occupied page, we do free the slot here because slots are limited by the
-        # max batch size, so we need them to be available for the next batch.
-        slot_manager.free_resources(self.padding_dummy_request)
-
-        # NOTE: C++ interface forbids setting this back to None - so we will use an illegal value
-        # instead
-        self.padding_dummy_request.seq_slot = slot_manager.get_max_resource_count()
-        self.padding_dummy_request.py_seq_slot = slot_manager.get_max_resource_count()
-
-        # truncate requests
+        # truncate requests to remove the dummy requests we added
         scheduled_requests.generation_requests = scheduled_requests.generation_requests[
             :-num_padding
         ]

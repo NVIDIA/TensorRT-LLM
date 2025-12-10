@@ -175,7 +175,7 @@ class FlaDeltaBackend(AttentionDescriptor):
 
         def _get_delta_cache(si: SequenceInfo):
             return torch.empty(
-                si.max_batch_size,
+                si.max_state_slots,
                 num_heads,
                 key_dim,
                 value_dim,

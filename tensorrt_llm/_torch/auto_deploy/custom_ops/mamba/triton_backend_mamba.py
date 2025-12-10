@@ -327,7 +327,7 @@ class TritonBackendSSM(AttentionDescriptor):
 
         def _get_ssm_cache(si: SequenceInfo):
             return torch.empty(
-                si.max_batch_size,
+                si.max_state_slots,
                 num_heads,
                 head_dim,
                 ssm_state_size,
