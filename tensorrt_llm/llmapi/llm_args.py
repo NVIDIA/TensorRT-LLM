@@ -821,6 +821,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
+    # The model architecture of the eagle3 model.
+    # choices: llama3, mistral_large3
+    eagle3_model_arch: str = "llama3"
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -844,6 +847,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
             setattr(self, attr_name, attr_value)
 
         assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+        if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
+            # FIXME find a better way to setup it.
+            self.eagle3_layers_to_capture = {-1}
 
         # Static tree logic
         # Checks whether the input eagle choices is valid

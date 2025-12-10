@@ -1,4 +1,6 @@
 import json
+import torch
+
 from pathlib import Path
 from typing import Any
 
@@ -280,7 +282,7 @@ class MistralConfigLoader(BaseConfigLoader):
         config_dict, pretrained_config = self._parse_mistral_config(checkpoint_dir)
 
         # Some checkpoints lack torch_dtype, populate with dtype
-        pretrained_config.torch_dtype = getattr(pretrained_config, "dtype", None)
+        pretrained_config.torch_dtype = getattr(pretrained_config, "dtype", torch.bfloat16) or torch.bfloat16
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -302,6 +304,31 @@ class MistralConfigLoader(BaseConfigLoader):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.group_size = 128
                 quant_config.exclude_modules = ["*q_a_proj*", "*kv_a_proj_with_mqa*"]
+        elif hf_quant_config.get("quant_method") == "fp8":
+            # Used for Eagle3 weight
+            if hf_quant_config.get("weight_block_size", []):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.exclude_modules = [
+                        "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                    ]
+
+                block_size = hf_quant_config.get("weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.group_size = block_size[0]
+
+            # DeepSeek V3 FP8 per tensor hack
+            elif hf_quant_config.get("activation_scheme", None) == "static":
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.exclude_modules = [
+                    "*kv_b_proj*",
+                    "*k_b_proj*",
+                    "*eh_proj"
+                ]
+
+                block_size = (128, 128)
+                quant_config.group_size = block_size[0]
 
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
         model_config = ModelConfig(
@@ -310,5 +337,7 @@ class MistralConfigLoader(BaseConfigLoader):
             quant_config_dict=layer_quant_config,
             **kwargs,
         )
+        from ...modeling_mistral_large3 import Mistral3Gate
+        model_config.pretrained_config.gate_cls = Mistral3Gate
         model_config._frozen = True
         return model_config

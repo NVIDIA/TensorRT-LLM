@@ -359,6 +359,7 @@ class Mistral3VLM(PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
+        self.is_multimodal = True
         if _is_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "
