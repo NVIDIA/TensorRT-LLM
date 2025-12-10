@@ -114,7 +114,7 @@ def validate_timing_metrics(perf_metrics_item, request_context=""):
          )), f"gen server_first_token_time is not numeric in {request_context}"
     assert gen_server_arrival <= gen_server_first_token, f"gen server_arrival_time > server_first_token_time in {request_context}"
 
-    # Network Time Protocol can ensure ms-level accuracy in LAN
+    # Network Time Protocol can ensure ms-level accuracy in LAANN
     ntp_tolerance = 1e-3
 
     # Validate timing relationships between different levels
