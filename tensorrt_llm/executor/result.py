@@ -624,6 +624,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self._streaming = streaming
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
+        # Save token lengths before processing to detect which outputs received new tokens
+        prev_token_lens = {o.index: len(o.token_ids) for o in self._outputs}
+
         GenerationResultBase._handle_response(self, response)
 
         # The postprocess has been performed, return directly
@@ -638,7 +641,15 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         }
         if self.sampling_params.detokenize and self.tokenizer is not None:
             for beam_output in self.outputs:
+                # Always update _last_text_len to prevent stale text_diff
                 beam_output._last_text_len = len(beam_output.text)
+                # For n > 1 streaming: only detokenize outputs that received new tokens
+                # to prevent re-decoding the same tokens multiple times
+                output_received_new_tokens = len(
+                    beam_output.token_ids) != prev_token_lens.get(
+                        beam_output.index, 0)
+                if not output_received_new_tokens:
+                    continue
                 if hasattr(
                         self.tokenizer, 'decode_incrementally'
                 ) and self._streaming and not self.sampling_params.use_beam_search:
@@ -652,10 +663,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
-
-                # Update _last_token_ids_len after detokenization to prevent
-                # re-decoding the same tokens in subsequent responses when n > 1.
-                beam_output._last_token_ids_len = len(beam_output.token_ids)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
