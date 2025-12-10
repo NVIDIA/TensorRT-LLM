@@ -15,6 +15,7 @@ from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..utils import make_weak_ref, piecewise_cuda_graph
+from .mamba_cache_manager import MambaCacheManager, MambaHybridCacheManager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .scheduler import ScheduledRequests
@@ -388,6 +389,12 @@ class CUDAGraphRunner:
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+
+        # handle special cases of padding requests + MambaCacheManager or MambaHybridCacheManager
+        if isinstance(kv_cache_manager,
+                      (MambaCacheManager, MambaHybridCacheManager)):
+            kv_cache_manager.reorder_state_indices_when_padding_requests(
+                batch_size, padding_size)
 
         self.padding_dummy_request.py_draft_tokens = [0] * runtime_draft_len
         batch.generation_requests.extend([self.padding_dummy_request] *

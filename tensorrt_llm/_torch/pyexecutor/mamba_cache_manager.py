@@ -110,6 +110,14 @@ class MambaCacheManager(BaseResourceManager):
                                                         device=device,
                                                         dtype=torch.int32)
 
+        # only for `reorder_state_indices_when_padding_requests`
+        self.request_mask = torch.ones(max_batch_size,
+                                       dtype=torch.bool,
+                                       device=device)
+        self.state_indices_arange = torch.arange(max_batch_size,
+                                                 dtype=torch.int32,
+                                                 device=device)
+
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
         for r in request_ids:
@@ -125,6 +133,18 @@ class MambaCacheManager(BaseResourceManager):
                 state_indices.append(block)
         self.state_indices[:len(state_indices)] = torch.as_tensor(
             state_indices, dtype=torch.int32, device=self.ssm_states.device)
+
+    # When there exists padded requests, the state indices should not be repeated.
+    def reorder_state_indices_when_padding_requests(self, request_size,
+                                                    padding_size):
+        if padding_size == 0:
+            return
+
+        self.request_mask[:] = True
+        self.request_mask[self.state_indices[:request_size]] = False
+        self.state_indices[request_size:request_size +
+                           padding_size] = self.state_indices_arange[
+                               self.request_mask][:padding_size]
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
