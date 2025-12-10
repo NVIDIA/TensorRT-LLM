@@ -5,7 +5,6 @@ import inspect
 import itertools
 import json
 import os
-import pickle
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -169,6 +168,10 @@ class TunableRunner(ABC):
         The autotuner will just pass the tactic value to the forward w/o. any knowledge on what the tactic
         means. User can choose to implement their own types of tactic for flexibility, such as using a dict-typed
         to represent a collection of named configs.
+
+        The type of the tactic is arbitrary. But serialization/deserialization of the cache requires that the type is compatible with json.dumps/json.loads.
+        To evaluate if a type of tactic is compatible with current workflow, try the following code:
+            *  eval(json.loads(json.dumps(repr(YOUR_TACTIC_OBJECT))))
 
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
@@ -478,23 +481,11 @@ class AutoTunerProfilingCache:
         for key, value in self.cache.items():
             # Convert any simple object to string for JSON compatibility
             key_str = str(key)
-
             runner_id, tactic, min_time = value
-
-            # Serialize tactic using pickle + hex encoding for robust handling of any Python object
-            try:
-                serialized_tactic = pickle.dumps(tactic).hex()
-            except Exception as e:
-                # Fallback to string representation if pickle fails (shouldn't happen for most objects)
-                logger.warning(
-                    f"[AutoTuner] Failed to pickle tactic {tactic}: {e}, falling back to string"
-                )
-                serialized_tactic = str(tactic)
-
+            tactic_str = repr(tactic)
             serializable_cache["cache_data"][key_str] = {
                 "runner_id": runner_id,
-                "tactic": repr(tactic),
-                "tactic_pickle_hex": serialized_tactic,
+                "tactic": tactic_str,
                 "min_time": min_time,
             }
 
@@ -526,24 +517,19 @@ class AutoTunerProfilingCache:
         for key_str, value in cache_data.items():
             # Reconstruct the tuple key safely
             try:
-                key = ast.literal_eval(key_str)  # Safer than eval()
+                key = ast.literal_eval(key_str)
             except (ValueError, SyntaxError):
                 logger.warning(
                     f"[AutoTuner] Could not reconstruct cache key: {key_str}")
                 continue
-
-            runner_id = value["runner_id"]
-            tactic_pickle_hex = value["tactic_pickle_hex"]
-
-            # Deserialize tactic with backward compatibility
             try:
-                # Try pickle deserialization first (hex-encoded)
-                tactic = pickle.loads(bytes.fromhex(tactic_pickle_hex))
-            except (ValueError, TypeError, pickle.PickleError):
+                tactic = ast.literal_eval(value["tactic"])
+            except (ValueError, TypeError):
                 raise ValueError(
-                    f"[AutoTuner] Could not deserialize tactic: {tactic_pickle_hex} for {key_str}"
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for {key_str}"
                 )
 
+            runner_id = value["runner_id"]
             min_time = value["min_time"]
 
             cache[key] = (runner_id, tactic, min_time)
