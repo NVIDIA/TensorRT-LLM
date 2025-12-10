@@ -278,7 +278,7 @@ def terminate(*args, show_log_lines=30, release_port=True):
         if arg and isinstance(arg, ProcessWrapper):
             try:
                 # tail the log file for better debugging on CI
-                if os.path.exists(arg.log_path):
+                if arg.log_path and os.path.exists(arg.log_path):
                     print(f"-------------{arg.log_path}---------------")
                     print(tail(arg.log_path, show_log_lines))
             except Exception as e:
