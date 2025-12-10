@@ -95,6 +95,9 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
   - llmapi/test_llm_api_connector.py::test_connector_multi_request
+  # third-party policy checks CPU-only
+  - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
+  - thirdparty/test_git_modules.py::test_gitmodules
 - condition:
     ranges:
       system_gpu_count:
