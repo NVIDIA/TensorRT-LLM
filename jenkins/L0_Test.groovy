@@ -625,6 +625,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
                     }
                     counter++
+                    // If entrypoint script fails to start, do not poll for agent connection
+                    try {
+                        SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        // If the exception is about job being inactive, enrich it with log path
+                        if (e.message.contains("is no longer active")) {
+                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        }
+                        // Otherwise, log the error but continue (SSH might be temporarily unavailable)
+                        pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
+                    }
                 }
             }
 

@@ -118,6 +118,9 @@ struct KernelParams
     int32_t mBatchSize;
     // The chunked attention size in log2.
     int32_t mChunkedAttentionSizeLog2;
+    // The factor to add to the maximum value to increase the probability
+    //   of skip correction during next iterations.
+    float mInflateMax;
     // The log of the Sage Attention block size for K.
     int32_t mLogNumEltsPerSageAttnBlkK;
     // The log of the Sage Attention block size for P.
