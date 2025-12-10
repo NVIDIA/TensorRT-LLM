@@ -9,11 +9,12 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Key Features and Enhancements
 
 - **Model Support**
-  - Add GPT-OSS model support
-  - Add Hunyuan-Dense model support
-  - Add Hunyuan-MoE model support
-  - Add Nemotron Nano VL V2 model support
-  - Add Seed-OSS model support
+  - Add GPT-OSS model support.
+  - Add Hunyuan-Dense model support. Thanks to the contribution from @sorenwu.
+  - Add Hunyuan-MoE model support. Thanks to the contribution from @qianbiaoxiang.
+  - Add Nemotron Nano VL V2 model support.
+  - Add Seed-OSS model support. Thanks to the contribution from @Nekofish-L.
+
 - **Features**
   - **KV Cache & Context:**
     - **Connector API:** Introduced a new KV Cache Connector API for state transfer in disaggregated serving.
