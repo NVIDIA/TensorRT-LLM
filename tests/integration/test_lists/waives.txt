@@ -384,7 +384,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mt
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5701425)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_tp8] SKIP (https://nvbugs/5698897)
 unittest/_torch/modules/tests_lora_modules/test_lora_attention_pytorch_flow_vs_trt.py::TestLoraAttentionPytorchFlowVsTRT::test_lora_attention SKIP (https://nvbugs/5701421)
-unittest/llmapi/test_llm_pytorch.py::test_embedding_bias_with_torch_sampler_strategies SKIP (https://nvbugs/5702791)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[no_cuda_graph_overlap-cutlass] SKIP (https://nvbugs/5702795)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass] SKIP (https://nvbugs/5702795)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp4ep1-cutlass] SKIP (https://nvbugs/5702795)
