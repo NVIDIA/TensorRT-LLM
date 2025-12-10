@@ -270,7 +270,7 @@ class CacheSender
 public:
     /// @brief Constructor.
     CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
     CacheSender() = default;
 

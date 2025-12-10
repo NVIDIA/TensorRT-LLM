@@ -333,8 +333,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManagerPtrs, isMLA); };
 
-    mCacheSender
-        = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(), mUuid);
+    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
     mCacheReceiver
         = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(), mUuid);
 

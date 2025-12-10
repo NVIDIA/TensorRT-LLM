@@ -302,12 +302,11 @@ public:
     using SessionKey = std::pair<RequestIdType, UuidType>;
 
     Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid)
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
         : mManager{manager}
         , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
         , mFormatter{std::move(formatter)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
-        , mServerUuid{serverUuid}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
@@ -1228,9 +1227,8 @@ void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
 }
 
 CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-    SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, UuidType const& serverUuid)
-    : mImpl{std::unique_ptr<Impl, ImplDeleter>(
-        new Impl(manager, selfCacheState, selfIndex, std::move(formatter), serverUuid))}
+    SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfCacheState, selfIndex, std::move(formatter)))}
 {
 }
 
