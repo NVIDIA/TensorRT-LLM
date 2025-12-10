@@ -508,7 +508,7 @@ class Etcd3ClusterStorage(ClusterStorage):
             return self.client.put_if_not_exists(key, value, lease=lease)
         else:
             self.client.put(key, value, lease=lease)
-            return True if lease else False
+            return True
 
     @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
@@ -522,11 +522,13 @@ class Etcd3ClusterStorage(ClusterStorage):
     @handle_etcd_error(return_on_error=False)
     async def expire(self, key: str, ttl: int) -> bool:
         if ttl <= 0:
-            raise ValueError(f"TTL must be greater than 0, got {ttl}")
+            logger.error(f"TTL must be greater than 0, got {ttl}")
+            return False
         lease = self._get_lease(key, ttl)
+        assert lease is not None, "Lease must be created"
         # TTL will be ignored since it can only be set when creating a lease
         next(self.client.refresh_lease(lease_id=lease.id), None)
-        return True if lease else False
+        return True
 
     @handle_etcd_error(return_on_error={})
     async def get_prefix(self,
