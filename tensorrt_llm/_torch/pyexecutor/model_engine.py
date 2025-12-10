@@ -1467,6 +1467,7 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
 
+            spec_metadata.num_tokens = total_num_tokens
             spec_metadata.prepare()
 
             # Handle distributed spec metadata
@@ -1578,6 +1579,7 @@ class PyTorchModelEngine(ModelEngine):
                                                                                           num_generation_tokens]
 
         # Use common metadata preparation logic
+        virtual_num_tokens = total_num_tokens + num_gen_requests
         lora_params = self._prepare_incremental_update_metadata(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
@@ -1585,13 +1587,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata=spec_metadata,
             prompt_lengths=prompt_lengths,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            total_num_tokens=total_num_tokens,
+            total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
             num_extend_ctx_requests=0)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        virtual_num_tokens = total_num_tokens + num_gen_requests
         if self.enable_attention_dp:
             attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
                 attn_metadata)
@@ -1778,6 +1779,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.attn_backend) and spec_config.is_linear_tree:
             num_extend_ctx_requests = num_extend_requests
 
+        virtual_num_tokens = num_generation_tokens
         lora_params = self._prepare_incremental_update_metadata(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
@@ -1785,14 +1787,13 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata=spec_metadata,
             prompt_lengths=prompt_lengths,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            total_num_tokens=total_num_tokens,
+            total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
             request_accepted_path=request_accepted_path,
             num_extend_ctx_requests=num_extend_ctx_requests)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
-        virtual_num_tokens = num_generation_tokens
         if self.enable_attention_dp:
             attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
                 attn_metadata)
