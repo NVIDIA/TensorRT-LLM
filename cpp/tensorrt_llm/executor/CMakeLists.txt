@@ -88,6 +88,9 @@ set_property(TARGET ${EXECUTOR_STATIC_TARGET}
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${EXECUTOR_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+target_include_directories(${EXECUTOR_STATIC_TARGET}
+                           PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+target_link_libraries(${EXECUTOR_STATIC_TARGET} PRIVATE ${ZMQ_LIBRARIES})
 
 add_subdirectory(cache_transmission/ucx_utils)
 add_subdirectory(cache_transmission/nixl_utils)

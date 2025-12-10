@@ -68,44 +68,31 @@ UniqueIdClient::UniqueIdClient()
     mContext = std::make_unique<zmq::context_t>(1);
 }
 
-int UniqueIdClient::getUniqueId(
-    std::string const& serverEndpoint, RequestIdType const& generationRequestId, UuidType const& serverUuid)
+int UniqueIdClient::getUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
+    UuidType const& serverUuid, int32_t expectedRefCount)
 {
     std::lock_guard<std::mutex> lock(mMutex);
 
-    // Get or create socket for this endpoint
-    zmq::socket_t* socket = nullptr;
-    // auto it = mSockets.find(serverEndpoint);
-    // if (it == mSockets.end())
-    // {
-    auto newSocket = std::make_unique<zmq::socket_t>(*mContext, zmq::socket_type::dealer);
-    newSocket->connect(serverEndpoint);
-    socket = newSocket.get();
-    // mSockets[serverEndpoint] = std::move(newSocket);
-    // }
-    // else
-    // {
-    // socket = it->second.get();
-    // }
+    zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
+    socket.connect(serverEndpoint);
 
     CacheTransferRequest req;
     std::memset(&req, 0, sizeof(req));
     req.type = CacheTransferRequestType::kGetUniqueId;
     req.payload.getUniqueId.requestId = generationRequestId;
     req.payload.getUniqueId.serverUuid = serverUuid;
+    req.payload.getUniqueId.expectedRefCount = expectedRefCount;
 
     zmq::message_t requestMsg(&req, sizeof(req));
-    socket->send(requestMsg, zmq::send_flags::none);
+    socket.send(requestMsg, zmq::send_flags::none);
 
     zmq::message_t responseMsg;
-    (void) socket->recv(responseMsg, zmq::recv_flags::none);
-    if (responseMsg.size() != sizeof(int))
-    {
-        TLLM_THROW("UniqueIdClient received invalid response size: %zu", responseMsg.size());
-    }
+    (void) socket.recv(responseMsg, zmq::recv_flags::none);
+    TLLM_CHECK_WITH_INFO(
+        responseMsg.size() == sizeof(int), "UniqueIdClient received invalid response size: %zu", responseMsg.size());
+
     int uniqueId;
     std::memcpy(&uniqueId, responseMsg.data(), sizeof(int));
-    socket->close();
     return uniqueId;
 }
 
@@ -114,20 +101,8 @@ void UniqueIdClient::releaseUniqueId(std::string const& serverEndpoint, RequestI
 {
     std::lock_guard<std::mutex> lock(mMutex);
 
-    // Get or create socket for this endpoint
-    zmq::socket_t* socket = nullptr;
-    // auto it = mSockets.find(serverEndpoint);
-    // if (it == mSockets.end())
-    // {
-    auto newSocket = std::make_unique<zmq::socket_t>(*mContext, zmq::socket_type::dealer);
-    newSocket->connect(serverEndpoint);
-    socket = newSocket.get();
-    // mSockets[serverEndpoint] = std::move(newSocket);
-    // }
-    // else
-    // {
-    // socket = it->second.get();
-    // }
+    zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
+    socket.connect(serverEndpoint);
 
     CacheTransferRequest req;
     std::memset(&req, 0, sizeof(req));
@@ -137,20 +112,21 @@ void UniqueIdClient::releaseUniqueId(std::string const& serverEndpoint, RequestI
     req.payload.releaseUniqueId.uniqueId = uniqueId;
 
     zmq::message_t requestMsg(&req, sizeof(req));
-    socket->send(requestMsg, zmq::send_flags::none);
+    socket.send(requestMsg, zmq::send_flags::none);
 
     zmq::message_t responseMsg;
-    (void) socket->recv(responseMsg, zmq::recv_flags::none);
-    socket->close();
+    (void) socket.recv(responseMsg, zmq::recv_flags::none);
 }
 
 UniqueIdClient::~UniqueIdClient()
 {
-    for (auto& socket : mSockets)
+    try
     {
-        socket.second->close();
+        mContext->close();
     }
-    mContext->close();
+    catch (...)
+    {
+    }
 }
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
@@ -234,6 +210,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::vector<char> uuidVec(mUuid.begin(), mUuid.end());
         mGroupComm->bcast(uuidVec, 0);
         mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServer->waitForReady();
         mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
     }
     else

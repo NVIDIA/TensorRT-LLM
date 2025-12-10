@@ -207,8 +207,8 @@ public:
         return instance;
     }
 
-    int getUniqueId(
-        std::string const& serverEndpoint, RequestIdType const& generationRequestId, UuidType const& serverUuid);
+    int getUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
+        UuidType const& serverUuid, int32_t expectedRefCount);
     void releaseUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
         UuidType const& serverUuid, int uniqueId);
 
@@ -221,7 +221,6 @@ private:
     UniqueIdClient& operator=(UniqueIdClient const&) = delete;
 
     std::unique_ptr<zmq::context_t> mContext;
-    std::unordered_map<std::string, std::unique_ptr<zmq::socket_t>> mSockets;
     std::mutex mMutex;
 };
 

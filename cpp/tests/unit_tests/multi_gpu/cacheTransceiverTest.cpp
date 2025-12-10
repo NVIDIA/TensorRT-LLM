@@ -170,39 +170,43 @@ TEST_F(CacheConfigTest, EqualTo)
 TEST(CacheTransferServerTest, BasicCommunication)
 {
     CacheTransferServer server;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    server.waitForReady();
 
-    // Client logic
     std::string endpoint = server.getEndpoint();
     auto& client = UniqueIdClient::instance();
 
-    // Test GetUniqueId
+    // Test GetUniqueId and ReleaseUniqueId flow
     {
-        CacheTransferRequest req;
-        req.type = CacheTransferRequestType::kGetUniqueId;
-        req.payload.getUniqueId.requestId = 123;
-        // Mock UUID
-        std::fill(req.payload.getUniqueId.serverUuid.begin(), req.payload.getUniqueId.serverUuid.end(), 0);
+        UuidType serverUuid{};
+        std::fill(serverUuid.begin(), serverUuid.end(), 0);
+        RequestIdType requestId = 123;
 
-        int uniqueId
-            = client.getUniqueId(endpoint, req.payload.getUniqueId.requestId, req.payload.getUniqueId.serverUuid);
+        // Get unique ID with expectedRefCount=1
+        int uniqueId = client.getUniqueId(endpoint, requestId, serverUuid, /*expectedRefCount=*/1);
         EXPECT_GE(uniqueId, 0);
+
+        // Release it - this should decrement refCount to 0 and remove the entry
+        client.releaseUniqueId(endpoint, requestId, serverUuid, uniqueId);
     }
 
-    // // Test ReleaseUniqueId
-    // {
-    //     CacheTransferRequest req;
-    //     req.type = CacheTransferRequestType::kReleaseUniqueId;
-    //     req.payload.releaseUniqueId.requestId = 123;
-    //     std::fill(req.payload.releaseUniqueId.serverUuid.begin(), req.payload.releaseUniqueId.serverUuid.end(), 0);
-    //     req.payload.releaseUniqueId.uniqueId = 8192; // Dummy ID
+    // Test that same request ID returns same unique ID when entry exists
+    {
+        UuidType serverUuid{};
+        std::fill(serverUuid.begin(), serverUuid.end(), 1);
+        RequestIdType requestId = 456;
 
-    //     client.releaseUniqueId(endpoint, req.payload.releaseUniqueId.requestId,
-    //     req.payload.releaseUniqueId.serverUuid, req.payload.releaseUniqueId.uniqueId);
-    // }
+        // Get unique ID with expectedRefCount=2 (expecting 2 releases)
+        int uniqueId1 = client.getUniqueId(endpoint, requestId, serverUuid, /*expectedRefCount=*/2);
+        EXPECT_GE(uniqueId1, 0);
 
-    server.stop();
-    // Server thread join is handled in destructor
+        // Getting same key should return same unique ID
+        int uniqueId2 = client.getUniqueId(endpoint, requestId, serverUuid, /*expectedRefCount=*/2);
+        EXPECT_EQ(uniqueId1, uniqueId2);
+
+        // Release twice to clean up
+        client.releaseUniqueId(endpoint, requestId, serverUuid, uniqueId1);
+        client.releaseUniqueId(endpoint, requestId, serverUuid, uniqueId1);
+    }
 }
 
 // TODO: Restore multi-rank tests.
@@ -448,6 +452,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
     {
         mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServer->waitForReady();
         mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
         std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
@@ -855,10 +860,26 @@ protected:
                 = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
 
-            boost::uuids::random_generator uuidGen;
             UuidType serverUuid;
-            std::string serverUuidStr = boost::uuids::to_string(uuidGen());
-            std::copy(serverUuidStr.begin(), serverUuidStr.end(), serverUuid.begin());
+            if (mSizeInInstance > 1)
+            {
+                // Multiple ranks in this instance - rank 0 generates UUID and broadcasts to others
+                if (mRankInInstance == 0)
+                {
+                    boost::uuids::random_generator uuidGen;
+                    std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+                    std::copy(serverUuidStr.begin(), serverUuidStr.end(), serverUuid.begin());
+                }
+                auto const& sessionComm = tensorrt_llm::mpi::MpiComm::session();
+                sessionComm.bcast(serverUuid.data(), serverUuid.size(), tensorrt_llm::mpi::MpiType::kCHAR, 0);
+            }
+            else
+            {
+                // Only one rank in this instance - just generate UUID locally
+                boost::uuids::random_generator uuidGen;
+                std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+                std::copy(serverUuidStr.begin(), serverUuidStr.end(), serverUuid.begin());
+            }
 
             if (mIsContext)
             {
@@ -1409,6 +1430,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     if (rank == 0)
     {
         mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServer->waitForReady();
         mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
         std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
@@ -1524,6 +1546,22 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    int rank = tensorrt_llm::mpi::MpiComm::world().getRank();
+    if (rank == 0)
+    {
+        mCacheTransferServer = std::make_unique<CacheTransferServer>();
+        mCacheTransferServer->waitForReady();
+        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
+        std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+        tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
+    }
+    else
+    {
+        std::vector<char> endpointVec;
+        tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
+        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+    }
 
     if (mIsContext || mIsGeneration)
     {

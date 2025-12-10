@@ -289,8 +289,9 @@ public:
     virtual void setCommState(executor::kv_cache::CommState commState);
 
     /// @brief Synchronously send data.
-    /// @param llmRequest The request object to which the data belongs.
-    virtual void sendSync(LlmRequest const& llmRequest);
+    /// @param generationRequestId The request ID from the generation side.
+    /// @param serverUuid The server UUID.
+    virtual void sendSync(LlmRequest::RequestIdType generationRequestId, UuidType const& serverUuid);
 
     /// @brief Receive request information.
     /// @param llmRequest The request object to which the data belongs.
@@ -302,9 +303,11 @@ public:
     virtual bool cancelRequest(LlmRequest const& llmRequest);
 
     /// @brief Send ready signal.
-    /// @param requestId The ID used in the context phase of the current request.
+    /// @param generationRequestId The request ID from the generation side.
+    /// @param serverUuid The server UUID.
     /// @param isReady Whether the request is ready to be received.
-    virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
+    virtual void sendReadySignal(
+        LlmRequest::RequestIdType generationRequestId, UuidType const& serverUuid, bool isReady);
 
     /// @brief Destructor.
     virtual ~CacheSender();
