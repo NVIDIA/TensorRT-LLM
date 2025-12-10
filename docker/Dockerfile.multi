@@ -73,7 +73,7 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
 
 # Copy and install dependencies from constraints.txt
 COPY constraints.txt /tmp/constraints.txt
-RUN pip3 install --no-cache-dir --upgrade -r /tmp/constraints.txt && rm /tmp/constraints.txt
+RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
