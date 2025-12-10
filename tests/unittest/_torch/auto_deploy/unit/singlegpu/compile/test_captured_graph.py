@@ -101,13 +101,19 @@ def test_cudagraph_capture_replay(
 
     compiled_model = CapturedGraph(
         graph_module,
-        cuda_graph_batch_sizes=[batch_size],
         num_batched_inputs=num_inputs,
     )
 
+    # Create a get_args_kwargs function for capture_graph
+    def get_args_kwargs(bs):
+        if model_type == "llm":
+            return tuple(x[:bs] for x in input_data[:num_inputs]), {}
+        else:  # vit
+            return tuple(x[:bs] for x in input_data[:num_inputs]), {}
+
     with torch.inference_mode():
-        # Capture graph with all inputs
-        compiled_model.capture_graph(*args)
+        # Capture graph with batch sizes
+        compiled_model.capture_graph(get_args_kwargs, [batch_size])
 
         # Ensure the graph is stored for the combined shape of all inputs
         assert combined_shape in compiled_model.cudagraphs, (

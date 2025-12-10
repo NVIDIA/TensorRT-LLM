@@ -156,7 +156,10 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
-    batch_info: torch.Tensor, cu_seqlen: torch.Tensor, seq_len_with_cache: torch.Tensor
+    position_ids: torch.Tensor,
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Prepare metadata for flashinfer attention.
 
@@ -174,24 +177,29 @@ def prepare_flashinfer_metadata(
 
     qo_indptr = cu_seqlen[: num_seq + 1]
 
+    # NOTE: in theory we could easily precompute batch_indices. And positions is just position_ids
+    # so we could skip that as well. However, we still need a place for resetting the planner and
+    # for now we keep it here since the kernel is fast
     # Compute batch_indices and positions so that they can be reused for kv cache appends
     # for all the layers
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr, seq_len_with_cache[:num_seq], num_tokens
     )
-    # return extrametadata
+    # return extra metadata
     return batch_indices, positions
 
 
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    batch_info: torch.Tensor, cu_seqlen: torch.Tensor, seq_len_with_cache: torch.Tensor
+    position_ids: torch.Tensor,
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
 ):
-    num_prefill, _, num_decode = batch_info.tolist()
-    num_seq = num_prefill + num_decode
+    num_tokens = position_ids.shape[0] * position_ids.shape[1]
     return (
-        torch.empty(num_seq, dtype=cu_seqlen.dtype, device=cu_seqlen.device),  # batch_indices
-        torch.empty(num_seq, dtype=cu_seqlen.dtype, device=cu_seqlen.device),  # positions
+        torch.empty(num_tokens, dtype=torch.int32, device=position_ids.device),  # batch_indices
+        torch.empty(num_tokens, dtype=torch.int32, device=position_ids.device),  # positions
     )
 
 
@@ -356,7 +364,7 @@ class FlashInferAttention(AttentionDescriptor):
     def get_prepare_extra_metadata_info(
         cls, any_source_attn_node: Node
     ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
-        return torch.ops.auto_deploy.flashinfer_attention_prepare_metadata.default, 2, []
+        return (torch.ops.auto_deploy.flashinfer_attention_prepare_metadata.default, 2, [])
 
     @classmethod
     def get_cache_initializers(
