@@ -17,6 +17,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <tuple>
 #include <unordered_map>
