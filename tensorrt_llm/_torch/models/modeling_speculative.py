@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.logger import logger
+
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -22,8 +24,6 @@ from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
-
-from tensorrt_llm.logger import logger
 
 
 class Eagle3Attention(Attention):
@@ -391,7 +391,7 @@ class MistralLarge3DraftModel(DecoderModel):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ) -> None:
         super().__init__(model_config)
-        
+
         from .modeling_deepseekv3 import DeepseekV3DecoderLayer
         config = model_config.pretrained_config
         self.spec_config = model_config.spec_config
@@ -400,12 +400,13 @@ class MistralLarge3DraftModel(DecoderModel):
         self.mapping = model_config.mapping
         self.num_layers = model_config.pretrained_config.num_hidden_layers
 
-        self.fc = Linear(self.hidden_size * 2,
-                         config.hidden_size,
-                         bias=getattr(config, "bias", False),
-                         dtype=config.torch_dtype,
-                         quant_config=model_config.get_quant_config(),
-                         )
+        self.fc = Linear(
+            self.hidden_size * 2,
+            config.hidden_size,
+            bias=getattr(config, "bias", False),
+            dtype=config.torch_dtype,
+            quant_config=model_config.get_quant_config(),
+        )
         self.layers = nn.ModuleList([
             DeepseekV3DecoderLayer(model_config, start_layer_idx,
                                    aux_stream_dict)
@@ -467,8 +468,7 @@ class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
         draft_vocab_size = model_config.pretrained_config.vocab_size
-        super().__init__(MistralLarge3DraftModel(model_config,
-                                                 start_layer_idx,
+        super().__init__(MistralLarge3DraftModel(model_config, start_layer_idx,
                                                  aux_stream_dict),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
@@ -708,8 +708,7 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 draft_config, model_config.pretrained_config.num_hidden_layers)
         elif model_config.spec_config.eagle3_model_arch == "mistral_large3":
             return MistralLarge3EagleForCausalLM(
-                draft_config,
-                model_config.pretrained_config.num_hidden_layers,
+                draft_config, model_config.pretrained_config.num_hidden_layers,
                 model.aux_stream_dict)
         else:
             raise ValueError(
@@ -750,13 +749,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_load_balancer=model_config.moe_load_balancer,
-                        skip_create_weights_in_init=True, # FIXME: checked
-                        )
+                        skip_create_weights_in_init=True,
+                    )
                     self.draft_config.extra_attrs = model_config.extra_attrs
-                    from tensorrt_llm.quantization.mode import QuantAlgo
                     from tensorrt_llm._utils import get_sm_version
-                    if get_sm_version() == 100 and self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-                        # FIXME There is a known issue on TRTLLM moe backend + FP8 blockwise 
+                    from tensorrt_llm.quantization.mode import QuantAlgo
+                    if get_sm_version(
+                    ) == 100 and self.draft_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                        # FIXME There is a known issue on TRTLLM moe backend + FP8 blockwise
                         logger.warning(
                             "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
                         )
