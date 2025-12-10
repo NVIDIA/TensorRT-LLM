@@ -2242,7 +2242,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         use_2cta_instrs = mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2 == 0
 
         # Skip invalid mma tile shape
-        if not (mma_tiler_mn[0] in [64, 128, 256]):
+        if mma_tiler_mn[0] not in (64, 128, 256):
             is_valid = False
         # Skip invalid mma tile n
         if mma_tiler_mn[1] not in (64, 128, 192, 256):
@@ -2477,7 +2477,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             c,
             a_sf,
             b_sf,
-            "n",
             tile_idx_to_group_idx,
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
