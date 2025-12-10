@@ -2036,18 +2036,8 @@ def launchTestListCheck(pipeline)
 }
 
 def generateTimeoutTestResultXml(path, stageName, testFilePath) {
-    if (!fileExists("${stageName}/${testFilePath}")) {
-        echo "No ${testFilePath} found in ${stageName}, skipping timeout XML generation"
-        return null
-    }
-    String timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
-    echo "timeoutTests: ${timeoutTests}"
-
-    if (timeoutTests == null || timeoutTests == "") {
-        return null
-    }
     def xmlContent = sh(
-        script: "python3 ${path} --tests '${timeoutTests}' --stage-name '${stageName}'",
+        script: "python3 ${path} --test-file-path '${testFilePath}' --stage-name '${stageName}'",
         returnStdout: true
     ).trim()
     echo "xmlContent: ${xmlContent}"
