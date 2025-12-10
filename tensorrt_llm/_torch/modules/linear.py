@@ -2098,12 +2098,6 @@ class Linear(nn.Module):
             'cutlass', 'cublaslt', 'cuda_core'
         ]
 
-        # add a environment variable to override the nvfp4_allowed_backends
-        if os.environ.get("TLLM_OVERRIDE_NVFP4_ALLOWED_BACKENDS"):
-            # check that all the backends in override_nvfp4_allowed_backends are in the self.nvfp4_allowed_backends
-            self.nvfp4_allowed_backends = os.environ.get(
-                "TLLM_OVERRIDE_NVFP4_ALLOWED_BACKENDS").split(",")
-
         local_in_features = in_features
         local_out_features = out_features
 
