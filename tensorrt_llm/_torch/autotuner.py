@@ -169,6 +169,10 @@ class TunableRunner(ABC):
         means. User can choose to implement their own types of tactic for flexibility, such as using a dict-typed
         to represent a collection of named configs.
 
+        The type of the tactic is arbitrary. But serialization/deserialization of the cache requires that the type is compatible with json.dumps/json.loads.
+        To evaluate if a type of tactic is compatible with current workflow, try the following code:
+            *  assert YOUR_TACTIC_OBJECT == eval(repr(YOUR_TACTIC_OBJECT))
+
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
             * when the autotuner cannot find a valid tactic in it's cache.
@@ -475,14 +479,22 @@ class AutoTunerProfilingCache:
         }
 
         for key, value in self.cache.items():
-            # Convert tuple key to string for JSON compatibility
+            # Convert any simple object to string for JSON compatibility
             key_str = str(key)
-
             runner_id, tactic, min_time = value
+            tactic_str = repr(tactic)
+            try:
+                assert tactic == ast.literal_eval(
+                    tactic_str
+                ), f"Tactic is not compatible with json.dumps/json.loads"
+            except Exception as e:
+                logger.warning_once(
+                    f"[AutoTuner] Could not serialize tactic: {tactic_str} for cache key {key_str} due to {e}. Deserialization may fail.",
+                    key=tactic_str)
 
             serializable_cache["cache_data"][key_str] = {
                 "runner_id": runner_id,
-                "tactic": tactic,
+                "tactic": tactic_str,
                 "min_time": min_time,
             }
 
@@ -511,22 +523,22 @@ class AutoTunerProfilingCache:
         cache = {}
         cache_data = serializable_cache["cache_data"]
 
-        def lists_to_tuples(obj):
-            if isinstance(obj, list):
-                return tuple(lists_to_tuples(x) for x in obj)
-            return obj
-
         for key_str, value in cache_data.items():
             # Reconstruct the tuple key safely
             try:
-                key = ast.literal_eval(key_str)  # Safer than eval()
+                key = ast.literal_eval(key_str)
             except (ValueError, SyntaxError):
                 logger.warning(
                     f"[AutoTuner] Could not reconstruct cache key: {key_str}")
                 continue
+            try:
+                tactic = ast.literal_eval(value["tactic"])
+            except (ValueError, TypeError):
+                logger.warning_once(
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}",
+                    key=value["tactic"])
 
             runner_id = value["runner_id"]
-            tactic = lists_to_tuples(value["tactic"])
             min_time = value["min_time"]
 
             cache[key] = (runner_id, tactic, min_time)
