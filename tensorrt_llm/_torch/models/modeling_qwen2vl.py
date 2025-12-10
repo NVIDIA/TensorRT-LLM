@@ -50,44 +50,6 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
-def process_weights(weights: Dict,
-                    prefix: str = "visual",
-                    weight_name_mapping: Dict[str, str] = None) -> Dict:
-    """
-    Filter and transform weights in a single modular function.
-
-    Args:
-        weights: Dictionary of all model weights
-        prefix: Prefix to filter weights by (default: "visual")
-        weight_name_mapping: Optional mapping to transform weight names
-
-    Returns:
-        Dictionary of processed weights ready for loading
-    """
-
-    # Filter weights by prefix (handles both direct and "model." prefixed keys)
-    filtered_weights = {}
-    for key, weight in weights.items():
-        if key.startswith(prefix):
-            filtered_weights[key] = weight
-        elif key.startswith("model." + prefix):
-            filtered_weights[key[len("model."):]] = weight
-
-    # Transform weight names if mapping provided
-    if weight_name_mapping:
-        transformed_weights = {}
-        for key, weight in filtered_weights.items():
-            new_key = key
-            for old_suffix, new_suffix in weight_name_mapping.items():
-                if key.endswith(old_suffix):
-                    new_key = key.replace(old_suffix, new_suffix)
-                    break
-            transformed_weights[new_key] = weight
-        return transformed_weights
-
-    return filtered_weights
-
-
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
@@ -1069,8 +1031,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not _is_disagg():
-            vision_encoder_weights = process_weights(weights, "visual")
-            self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
+            self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights, weight_mapper)
 

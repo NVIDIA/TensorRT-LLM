@@ -1,5 +1,6 @@
-from typing import List
+from typing import Dict, List
 
+import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
@@ -50,22 +51,14 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
             "multimodal_embedding",
         ]
 
-    def load_weights(self, weights, weight_mapper: BaseWeightMapper):
-        weight_mapper = Qwen3VLMoeHfWeightMapper()
-        weight_mapper.init_model_and_config(self.llm, self.model_config)
-
+    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)
 
-        transformed_weights = {}
-        language_model_prefix = "model.language_model."
-        vision_model_prefix = "model.visual."
-        for key, value in weights.items():
-            if key.startswith(language_model_prefix):
-                new_key = "model." + key[len(language_model_prefix) :]
-                transformed_weights[new_key] = value
-            elif key.startswith(vision_model_prefix):
-                continue
-            else:
-                transformed_weights[key] = value
-        self.llm.load_weights(transformed_weights, weight_mapper)
+        weight_mapper = Qwen3VLMoeHfWeightMapper()
+        weight_mapper.init_model_and_config(self.llm, self.model_config)
+        filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+        params_map = {
+            r"^model\.language_model\.(.*)$": r"model.\1",
+        }
+        self.llm.load_weights(filtered_weights, weight_mapper, params_map=params_map)

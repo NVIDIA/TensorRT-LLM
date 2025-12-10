@@ -43,44 +43,6 @@ from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
 from .modeling_utils import ModelConfig, _load_weights_impl, filter_weights
 
 
-def process_weights(
-    weights: Dict, prefix: str = "visual", weight_name_mapping: Dict[str, str] = None
-) -> Dict:
-    """
-    Filter and transform weights in a single modular function.
-
-    Args:
-        weights: Dictionary of all model weights
-        prefix: Prefix to filter weights by (default: "visual")
-        weight_name_mapping: Optional mapping to transform weight names
-
-    Returns:
-        Dictionary of processed weights ready for loading
-    """
-
-    # Filter weights by prefix (handles both direct and "model." prefixed keys)
-    filtered_weights = {}
-    for key, weight in weights.items():
-        if key.startswith(prefix):
-            filtered_weights[key] = weight
-        elif key.startswith("model." + prefix):
-            filtered_weights[key[len("model.") :]] = weight
-
-    # Transform weight names if mapping provided
-    if weight_name_mapping:
-        transformed_weights = {}
-        for key, weight in filtered_weights.items():
-            new_key = key
-            for old_suffix, new_suffix in weight_name_mapping.items():
-                if key.endswith(old_suffix):
-                    new_key = key.replace(old_suffix, new_suffix)
-                    break
-            transformed_weights[new_key] = weight
-        return transformed_weights
-
-    return filtered_weights
-
-
 class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     def __init__(
         self,
@@ -701,7 +663,7 @@ class Qwen3VisionModelBase(nn.Module):
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict[str, torch.Tensor]):
         visual_weights = filter_weights("model.visual", weights)
         converted_weights = {}
 
