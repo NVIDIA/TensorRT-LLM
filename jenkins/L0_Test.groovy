@@ -130,16 +130,20 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
-            if (downloadTimeoutTestSucceed && !stageIsInterrupted) {
-                sh "ls ${stageName}"
-                def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
-                if (timeoutTestXml != null) {
-                    sh """
+            if (downloadTimeoutTestSucceed) {
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    sh "ls ${stageName}"
+                    def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
+                    if (timeoutTestXml != null) {
+                        sh """
 cat > ${stageName}/results-timeout.xml << 'EOF_TIMEOUT_XML'
 ${timeoutTestXml}
 EOF_TIMEOUT_XML
-                    """
-                    hasTimeoutTest = true
+                        """
+                        hasTimeoutTest = true
+                    }
                 }
             }
             // Download normal test results
@@ -1597,7 +1601,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
-                if (!stageIsInterrupted) {
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
                     def timeoutTestXml = generateTimeoutTestResultXml(stageName, "unfinished_test.txt")
                     if (timeoutTestXml != null) {
                         sh """
