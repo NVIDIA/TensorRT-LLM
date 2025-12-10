@@ -171,7 +171,7 @@ class TunableRunner(ABC):
 
         The type of the tactic is arbitrary. But serialization/deserialization of the cache requires that the type is compatible with json.dumps/json.loads.
         To evaluate if a type of tactic is compatible with current workflow, try the following code:
-            *  eval(json.loads(json.dumps(repr(YOUR_TACTIC_OBJECT))))
+            *  assert YOUR_TACTIC_OBJECT == eval(repr(YOUR_TACTIC_OBJECT))
 
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
@@ -483,6 +483,15 @@ class AutoTunerProfilingCache:
             key_str = str(key)
             runner_id, tactic, min_time = value
             tactic_str = repr(tactic)
+            try:
+                assert tactic == ast.literal_eval(
+                    tactic_str
+                ), f"Tactic is not compatible with json.dumps/json.loads"
+            except Exception as e:
+                logger.warning_once(
+                    f"[AutoTuner] Could not serialize tactic: {tactic_str} for cache key {key_str} due to {e}. Deserialization may fail.",
+                    key=tactic_str)
+
             serializable_cache["cache_data"][key_str] = {
                 "runner_id": runner_id,
                 "tactic": tactic_str,
@@ -525,9 +534,9 @@ class AutoTunerProfilingCache:
             try:
                 tactic = ast.literal_eval(value["tactic"])
             except (ValueError, TypeError):
-                raise ValueError(
-                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for {key_str}"
-                )
+                logger.warning_once(
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}",
+                    key=value["tactic"])
 
             runner_id = value["runner_id"]
             min_time = value["min_time"]
