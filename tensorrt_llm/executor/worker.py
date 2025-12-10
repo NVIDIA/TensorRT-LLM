@@ -288,8 +288,6 @@ def worker_main(
     if llm_args is not None and llm_args.trust_remote_code:
         _init_hf_modules()
 
-    logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
-
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
 
