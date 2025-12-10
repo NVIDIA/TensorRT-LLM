@@ -4923,9 +4923,11 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
         [
             (4, 1, 4, False, True, True, "TRTLLM", False),
+            (4, 1, 4, False, True, True, "TRTLLM", True),
         ],
         ids=[
             "latency_moe_trtllm",
+            "latency_moe_trtllm_eagle",
         ],
     )
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
