@@ -176,7 +176,7 @@ This section describes the sparse attention framework architecture and guides de
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: The sparse attention framework in TensorRT LLM.</em></sub></p>
@@ -223,7 +223,7 @@ The key files located in `tensorrt_llm/_torch/attention_backend/sparse/` are:
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_doc/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
