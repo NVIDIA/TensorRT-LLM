@@ -27,10 +27,10 @@
 #include <string>
 #include <vector>
 
-#include "6kd_blockwise_gemm/sm120_fp8_gemm_1d1d.cuh"
 #include "ada_blockwise_gemm/sm89_fp8_gemm_1d1d.cuh"
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
+#include "sm120_blockwise_gemm/sm120_fp8_gemm_1d1d.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/deep_gemm/fp8_gemm.cuh"

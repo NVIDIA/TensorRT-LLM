@@ -674,6 +674,7 @@ def fp8_block_scaling_bmm_out(
         out.copy_(output)
     elif sm_version == 120:
         mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(mat1)
+        output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
                                                    mat1_scale, mat2_scale,
                                                    output)
@@ -1808,15 +1809,6 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            if self.k_b_proj_trans_scale.dtype != torch.int32:
-                self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
-                    self.k_b_proj_trans, self.k_b_proj_trans_scale)
-                self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
-                    self.k_b_proj_trans_scale,
-                    mn=self.k_b_proj_trans.shape[0],
-                    k=self.k_b_proj_trans.shape[1],
-                    recipe=(1, 128, 128),
-                    is_sfa=False)
             maybe_execute_in_parallel(
                 lambda: fp8_block_scaling_bmm_out(
                     q_nope,
@@ -1951,15 +1943,6 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            if self.k_b_proj_trans_scale.dtype != torch.int32:
-                self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
-                    self.k_b_proj_trans, self.k_b_proj_trans_scale)
-                self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
-                    self.k_b_proj_trans_scale,
-                    mn=self.k_b_proj_trans.shape[0],
-                    k=self.k_b_proj_trans.shape[1],
-                    recipe=(1, 128, 128),
-                    is_sfa=False)
             fp8_block_scaling_bmm_out(
                 q_nope,
                 self.k_b_proj_trans,
@@ -2082,15 +2065,6 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = q_nope_out.transpose(0, 1)
 
-            if self.k_b_proj_trans_scale.dtype != torch.int32:
-                self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
-                    self.k_b_proj_trans, self.k_b_proj_trans_scale)
-                self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
-                    self.k_b_proj_trans_scale,
-                    mn=self.k_b_proj_trans.shape[0],
-                    k=self.k_b_proj_trans.shape[1],
-                    recipe=(1, 128, 128),
-                    is_sfa=False)
             fp8_block_scaling_bmm_out(
                 q_nope,
                 self.k_b_proj_trans,
@@ -2217,3 +2191,26 @@ class MLA(nn.Module):
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output
+
+    def post_load_weights(self):
+        has_fp8_block_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
+        is_sm120 = get_sm_version() == 120
+        if is_sm120 and has_fp8_block_scales:
+            self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
+                self.k_b_proj_trans, self.k_b_proj_trans_scale)
+            self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
+                self.k_b_proj_trans_scale,
+                mn=self.k_b_proj_trans.shape[0],
+                k=self.k_b_proj_trans.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
+            self.v_b_proj, self.v_b_proj_scale = fp8_utils.resmooth_to_fp8_e8m0(
+                self.v_b_proj, self.v_b_proj_scale)
+            self.v_b_proj_scale = fp8_utils.transform_sf_into_required_layout(
+                self.v_b_proj_scale,
+                mn=self.v_b_proj.shape[0],
+                k=self.v_b_proj.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
