@@ -31,4 +31,8 @@ ruff==0.9.4
 lm_eval[api]==0.4.8
 docstring_parser
 genai-perf==0.0.13
+opentelemetry-sdk>=1.26.0
+opentelemetry-api>=1.26.0
+opentelemetry-exporter-otlp>=1.26.0
+opentelemetry-semantic-conventions-ai>=0.4.1
 arctic-inference==0.1.1 # Required for suffix decoding test
