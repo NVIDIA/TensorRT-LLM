@@ -1427,8 +1427,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
+    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                             ids=lambda x: ""
+                             if x == 0 else "enable_configurable_moe")
     def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
-                              overlap_scheduler, torch_compile):
+                              overlap_scheduler, torch_compile,
+                              enable_configurable_moe, mocker):
+        # Patch MpiPoolSession to propagate env vars to MPI worker processes
+        env_value = "1" if enable_configurable_moe == 1 else "0"
+        patch_mpi_pool_session_for_env(mocker,
+                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
+
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
