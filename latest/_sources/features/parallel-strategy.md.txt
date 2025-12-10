@@ -80,6 +80,8 @@ enable_attention_dp: true
 EOF
 ```
 
+then set `--extra_llm_api_options parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
+
 ### FFN Module
 
 #### Dense Models

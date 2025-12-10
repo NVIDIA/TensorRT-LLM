@@ -60,7 +60,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,7 +73,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -369,7 +369,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -410,11 +412,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -1142,13 +1147,44 @@
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_workspace_size_auto</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                                 <span class="n">support_deterministic</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Calculate workspace size for allreduce fusion kernel.</span>
+
+<span class="sd">        The workspace is used for lamport buffers in the fusion kernel.</span>
+<span class="sd">        Required size calculation:</span>
+<span class="sd">        - Each GPU needs 3 sub-buffers (for triple buffering)</span>
+<span class="sd">        - Each sub-buffer stores: max_num_tokens * hidden_size * dtype_size (bf16=2)</span>
+<span class="sd">        - The lamport allocation multiplies by tp_size, so:</span>
+<span class="sd">          lamport_size = 3 * size * tp_size (per GPU)</span>
+
+<span class="sd">        Example: Llama 8B (hidden=4096), max_tokens=8192, bf16, TP=4</span>
+<span class="sd">        - Data per sub-buffer: 8192 * 4096 * 2 = 64 MiB</span>
+<span class="sd">        - Total lamport: 3 * 64MB * 4 = 768 MiB per GPU</span>
+<span class="sd">        - Required &#39;size&#39; parameter: 64 MiB (gets multiplied by tp_size in allocation)</span>
+
+<span class="sd">        Default (67,108,864 = 64 MiB) supports:</span>
+<span class="sd">        - Models up to hidden_size=4096 with max_num_tokens=8192</span>
+<span class="sd">        - Or hidden_size=8192 with max_num_tokens=4096</span>
+
+<span class="sd">        Override with TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE env var if needed for larger models.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="n">force_all_reduce_deterministic</span><span class="p">()</span> <span class="ow">and</span> <span class="n">support_deterministic</span><span class="p">:</span>
             <span class="n">workspace_size</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE&quot;</span><span class="p">,</span>
                                        <span class="s2">&quot;1000000000&quot;</span><span class="p">)</span>
             <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">workspace_size</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">tp_size</span> <span class="o">&lt;=</span> <span class="mi">2</span><span class="p">:</span>
-            <span class="k">return</span> <span class="mi">16_000_000</span>
-        <span class="k">return</span> <span class="mi">8_000_000</span>
+
+        <span class="c1"># Allow override via environment variable for edge cases</span>
+        <span class="n">workspace_size_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">workspace_size_env</span><span class="p">:</span>
+            <span class="n">size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">workspace_size_env</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Using custom allreduce fusion workspace size: </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2"> bytes (</span><span class="si">{</span><span class="n">size</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="mi">1024</span><span class="o">**</span><span class="mi">2</span><span class="p">)</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> MiB)&quot;</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="n">size</span>
+
+        <span class="c1"># Default: 64 MiB - supports most common model configurations</span>
+        <span class="c1"># Increase via env var if you see CUDA illegal memory access errors with large models</span>
+        <span class="n">default_size</span> <span class="o">=</span> <span class="mi">67_108_864</span>  <span class="c1"># Exactly 64 MiB</span>
+        <span class="k">return</span> <span class="n">default_size</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_workspace_size_lowprecision</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1399,9 +1435,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

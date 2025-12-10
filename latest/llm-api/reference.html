@@ -61,7 +61,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -376,7 +376,9 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -417,11 +419,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -596,11 +601,13 @@
 <li><p><strong>otlp_traces_endpoint</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Target URL to which OpenTelemetry traces will be sent. Defaults to None.</p></li>
 <li><p><strong>return_perf_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Return perf metrics. Defaults to False.</p></li>
 <li><p><strong>orchestrator_type</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'rpc'</em><em>, </em><em>'ray'</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The orchestrator type to use. Defaults to None, which uses MPI. Defaults to None.</p></li>
+<li><p><strong>env_overrides</strong> (<em>Optional</em><em>[</em><em>Dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> [EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand. Defaults to None.</p></li>
 <li><p><strong>garbage_collection_gen0_threshold</strong> (<em>int</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Threshold for Python garbage collection of generation 0 objects.Lower values trigger more frequent garbage collection. Defaults to 20000.</p></li>
 <li><p><strong>cuda_graph_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.CudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.CudaGraphConfig</em></a><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> CUDA graph config.If true, use CUDA graphs for decoding.         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes,         and are enabled for batches that consist of decoding requests <em>only</em>         (the reason is that it’s hard to capture a single graph with prefill requests         since the input shapes are a function of the sequence lengths).         Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to None.</p></li>
 <li><p><strong>attention_dp_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.AttentionDpConfig" title="tensorrt_llm.llmapi.llm_args.AttentionDpConfig"><em>tensorrt_llm.llmapi.llm_args.AttentionDpConfig</em></a><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Optimized load-balancing for the DP Attention scheduler. Defaults to None.</p></li>
 <li><p><strong>disable_overlap_scheduler</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Disable the overlap scheduler. Defaults to False.</p></li>
 <li><p><strong>moe_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.MoeConfig" title="tensorrt_llm.llmapi.llm_args.MoeConfig"><em>tensorrt_llm.llmapi.llm_args.MoeConfig</em></a>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> MoE config. Defaults to None.</p></li>
+<li><p><strong>nvfp4_gemm_config</strong> (<em>tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> NVFP4 GEMM backend config. Defaults to None.</p></li>
 <li><p><strong>attn_backend</strong> (<em>str</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Attention backend to use. Defaults to TRTLLM.</p></li>
 <li><p><strong>sampler_type</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>tensorrt_llm.llmapi.llm_args.SamplerType</em><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested. Defaults to auto.</p></li>
 <li><p><strong>enable_iter_perf_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable iteration performance statistics. Defaults to False.</p></li>
@@ -627,6 +634,7 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <li><p><strong>mm_encoder_only</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Only load/execute the vision encoder part of the full model. Defaults to False. Defaults to False.</p></li>
 <li><p><strong>ray_worker_extension_cls</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The full worker extension class name including module path.Allows users to extend the functions of the RayGPUWorker class. Defaults to None.</p></li>
 <li><p><strong>enable_sleep</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading.Only enable it if you intend to use this feature. Defaults to False.</p></li>
+<li><p><strong>disable_flashinfer_sampling</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Disable the use of FlashInfer.sampling. This option is likely to be removed in the future. Defaults to False.</p></li>
 </ul>
 </dd>
 </dl>
@@ -5352,12 +5360,17 @@ a subset of the possible backends.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.decoding_type">
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'Lookahead'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -6077,6 +6090,11 @@ a subset of the possible backends.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.MedusaDecodingConfig.decoding_type">
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'Medusa'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.MedusaDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -7611,6 +7629,11 @@ a subset of the possible backends.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.MTPDecodingConfig.decoding_type">
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'MTP'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MTPDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.MTPDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MTPDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -10324,6 +10347,11 @@ left untouched.  Characters mapped to None are deleted.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.QuantAlgo.NVFP4">
 <span class="sig-name descname"><span class="pre">NVFP4</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'NVFP4'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.QuantAlgo.NVFP4" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.QuantAlgo.NVFP4_AWQ">
+<span class="sig-name descname"><span class="pre">NVFP4_AWQ</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'NVFP4_AWQ'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.QuantAlgo.NVFP4_AWQ" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -15133,6 +15161,11 @@ a subset of the possible backends.</p>
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'NGram'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.model_computed_fields">
 <span class="sig-name descname"><span class="pre">model_computed_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.model_computed_fields" title="Link to this definition">#</a></dt>
@@ -15850,6 +15883,11 @@ a subset of the possible backends.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.UserProvidedDecodingConfig.decoding_type">
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'User_Provided'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.UserProvidedDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -17229,6 +17267,11 @@ a subset of the possible backends.</p>
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'Draft_Target'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_computed_fields">
 <span class="sig-name descname"><span class="pre">model_computed_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_computed_fields" title="Link to this definition">#</a></dt>
@@ -17342,12 +17385,14 @@ a subset of the possible backends.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">return_perf_metrics:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">orchestrator_type:</span> <span class="pre">~typing.Literal['rpc'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">'ray']</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">~tensorrt_llm.builder.BuildConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">env_overrides:</span> <span class="pre">~typing.Dict[str</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">str]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CudaGraphConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.AttentionDpConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MoeConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">nvfp4_gemm_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attn_backend:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'TRTLLM'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sampler_type:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SamplerType</span> <span class="pre">=</span> <span class="pre">SamplerType.auto</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_perf_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
@@ -17378,6 +17423,7 @@ a subset of the possible backends.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">mm_encoder_only:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">ray_worker_extension_cls:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_sleep:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disable_flashinfer_sampling:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs" title="Link to this definition">#</a></dt>
@@ -17431,12 +17477,6 @@ a subset of the possible backends.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.build_config">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">build_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><span class="pre">BuildConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config" title="Link to this definition">#</a></dt>
-<dd><p><code class="tag deprecated docutils literal notranslate"><span class="pre">deprecated</span></code> Build config.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cache_transceiver_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cache_transceiver_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.CacheTransceiverConfig" title="tensorrt_llm.llmapi.CacheTransceiverConfig"><span class="pre">CacheTransceiverConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cache_transceiver_config" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Cache transceiver config.</p>
@@ -17474,6 +17514,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.CudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.CudaGraphConfig"><span class="pre">CudaGraphConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_config" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> CUDA graph config.If true, use CUDA graphs for decoding.         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes,         and are enabled for batches that consist of decoding requests <em>only</em>         (the reason is that it’s hard to capture a single graph with prefill requests         since the input shapes are a function of the sequence lengths).         Note that each CUDA graph can use up to 200 MB of extra memory.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.disable_flashinfer_sampling">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">disable_flashinfer_sampling</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.disable_flashinfer_sampling" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -17546,6 +17592,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_sleep">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_sleep</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_sleep" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading.Only enable it if you intend to use this feature.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.env_overrides">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">env_overrides</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.env_overrides" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> [EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -17690,6 +17742,12 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.num_postprocess_workers">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">num_postprocess_workers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.num_postprocess_workers" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of processes used for postprocessing the generated tokens, including detokenization.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.nvfp4_gemm_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">nvfp4_gemm_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Nvfp4GemmConfig</span></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.nvfp4_gemm_config" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> NVFP4 GEMM backend config.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -17913,19 +17971,8 @@ validated to form a valid model.</p>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.init_build_config">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">init_build_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_build_config" title="Link to this definition">#</a></dt>
-<dd><p>Creating a default BuildConfig if none is provided</p>
-</dd></dl>
-
-<dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.set_default_max_input_len">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">set_default_max_input_len</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.set_default_max_input_len" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.set_runtime_knobs_from_build_config">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">set_runtime_knobs_from_build_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.set_runtime_knobs_from_build_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -17965,16 +18012,6 @@ validated to form a valid model.</p>
 </dd></dl>
 
 <dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_build_config_remaining</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_with_runtime_params">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_build_config_with_runtime_params</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_with_runtime_params" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_checkpoint_format</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_checkpoint_format"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -18010,19 +18047,14 @@ validated to form a valid model.</p>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_model">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_model</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">model</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_model" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_misc">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_misc</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_misc"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_misc" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_model_format_misc">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_model_format_misc</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_model_format_misc" title="Link to this definition">#</a></dt>
-<dd><p>Load the model format, and do the following:</p>
-<ol class="arabic simple">
-<li><p>Load the build_config if got an engine.</p></li>
-<li><p>Load the parallel_config if got a checkpoint.</p></li>
-</ol>
-</dd></dl>
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_model">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_model</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">model</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_model" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_parallel_config">
@@ -18046,7 +18078,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_speculative_config">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_speculative_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_speculative_config" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_speculative_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_speculative_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_speculative_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -18180,6 +18212,8 @@ validated to form a valid model.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">return_perf_metrics:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">orchestrator_type:</span> <span class="pre">~typing.Literal['rpc'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">'ray']</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">env_overrides:</span> <span class="pre">~typing.Dict[str</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">str]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_tqdm:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">workspace:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_build_cache:</span> <span class="pre">object</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
@@ -18297,6 +18331,12 @@ validated to form a valid model.</p>
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_tqdm</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm" title="Link to this definition">#</a></dt>
 <dd><p>Enable tqdm for progress bar.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.env_overrides">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">env_overrides</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.env_overrides" title="Link to this definition">#</a></dt>
+<dd><p>[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -18613,7 +18653,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.init_build_config">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">init_build_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_build_config" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">init_build_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.init_build_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_build_config" title="Link to this definition">#</a></dt>
 <dd><p>Creating a default BuildConfig if none is provided</p>
 </dd></dl>
 
@@ -18625,11 +18665,6 @@ validated to form a valid model.</p>
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.set_default_max_input_len">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">set_default_max_input_len</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.set_default_max_input_len" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method pydantic_validator">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.set_runtime_knobs_from_build_config">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">set_runtime_knobs_from_build_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.set_runtime_knobs_from_build_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -18645,12 +18680,12 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_build_config_remaining</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_build_config_remaining</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.validate_build_config_remaining"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_build_config_with_runtime_params</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_build_config_with_runtime_params</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.validate_build_config_with_runtime_params"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -18685,7 +18720,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_model_format_misc</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_model_format_misc</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.validate_model_format_misc"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc" title="Link to this definition">#</a></dt>
 <dd><p>Load the model format, and do the following:</p>
 <ol class="arabic simple">
 <li><p>Load the build_config if got an engine.</p></li>
@@ -18715,7 +18750,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.validate_speculative_config">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_speculative_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_speculative_config" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_speculative_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.validate_speculative_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_speculative_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -19418,6 +19453,11 @@ a subset of the possible backends.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.AutoDecodingConfig.decoding_type">
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'AUTO'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.AutoDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.AutoDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.AutoDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -20888,6 +20928,11 @@ a subset of the possible backends.</p>
 <span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'SaveState'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.is_linear_tree">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_linear_tree</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.is_linear_tree" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_computed_fields">
 <span class="sig-name descname"><span class="pre">model_computed_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_computed_fields" title="Link to this definition">#</a></dt>
@@ -20951,12 +20996,13 @@ Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden st
 
 <dl>
 <dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">window_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">kernel_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">topr</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">76</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">topk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">128</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">prompt_budget</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1266</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">page_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">3</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">window_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">32</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kernel_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">63</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">topr</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">128</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">topk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">64</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">prompt_budget</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2048</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">page_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kt_cache_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'float8_e5m2'</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#RocketSparseAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig" title="Link to this definition">#</a></dt>
@@ -20964,37 +21010,43 @@ Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden st
 <p>Configuration for RocketKV sparse attention.</p>
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.kernel_size">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kernel_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kernel_size" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kernel_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">63</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kernel_size" title="Link to this definition">#</a></dt>
 <dd><p>The kernel size for snap KV.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.kt_cache_dtype">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kt_cache_dtype</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'float8_e5m2'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kt_cache_dtype" title="Link to this definition">#</a></dt>
+<dd><p>KT cache dtype</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.page_size">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">page_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">3</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.page_size" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">page_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">4</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.page_size" title="Link to this definition">#</a></dt>
 <dd><p>Page size</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.prompt_budget">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">prompt_budget</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1266</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.prompt_budget" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">prompt_budget</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2048</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.prompt_budget" title="Link to this definition">#</a></dt>
 <dd><p>Prompt budget</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.topk">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">topk</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">128</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.topk" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">topk</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">64</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.topk" title="Link to this definition">#</a></dt>
 <dd><p>Top-k</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.topr">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">topr</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">76</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.topr" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">topr</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">128</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.topr" title="Link to this definition">#</a></dt>
 <dd><p>Top-r</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.window_size">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">window_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.window_size" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">window_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">32</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.window_size" title="Link to this definition">#</a></dt>
 <dd><p>The window size for snap KV.</p>
 </dd></dl>
 
@@ -21631,7 +21683,7 @@ a subset of the possible backends.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_fields">
-<span class="sig-name descname"><span class="pre">model_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'kernel_size':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=None,</span> <span class="pre">description='The</span> <span class="pre">kernel</span> <span class="pre">size</span> <span class="pre">for</span> <span class="pre">snap</span> <span class="pre">KV.'),</span> <span class="pre">'page_size':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=3,</span> <span class="pre">description='Page</span> <span class="pre">size'),</span> <span class="pre">'prompt_budget':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=1266,</span> <span class="pre">description='Prompt</span> <span class="pre">budget'),</span> <span class="pre">'topk':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=128,</span> <span class="pre">description='Top-k'),</span> <span class="pre">'topr':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">float,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=76,</span> <span class="pre">description='Top-r'),</span> <span class="pre">'window_size':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=None,</span> <span class="pre">description='The</span> <span class="pre">window</span> <span class="pre">size</span> <span class="pre">for</span> <span class="pre">snap</span> <span class="pre">KV.')}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_fields" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">model_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'kernel_size':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=63,</span> <span class="pre">description='The</span> <span class="pre">kernel</span> <span class="pre">size</span> <span class="pre">for</span> <span class="pre">snap</span> <span class="pre">KV.'),</span> <span class="pre">'kt_cache_dtype':</span> <span class="pre">FieldInfo(annotation=Union[str,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default='float8_e5m2',</span> <span class="pre">description='KT</span> <span class="pre">cache</span> <span class="pre">dtype',</span> <span class="pre">json_schema_extra={'choices':</span> <span class="pre">['bfloat16',</span> <span class="pre">'float8_e5m2']}),</span> <span class="pre">'page_size':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=4,</span> <span class="pre">description='Page</span> <span class="pre">size'),</span> <span class="pre">'prompt_budget':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=2048,</span> <span class="pre">description='Prompt</span> <span class="pre">budget'),</span> <span class="pre">'topk':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=64,</span> <span class="pre">description='Top-k'),</span> <span class="pre">'topr':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">float,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=128,</span> <span class="pre">description='Top-r'),</span> <span class="pre">'window_size':</span> <span class="pre">FieldInfo(annotation=Union[int,</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=32,</span> <span class="pre">description='The</span> <span class="pre">window</span> <span class="pre">size</span> <span class="pre">for</span> <span class="pre">snap</span> <span class="pre">KV.')}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_fields" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
@@ -22795,6 +22847,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values"><code class="docutils literal notranslate"><span class="pre">validate_positive_values</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -22846,6 +22899,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -22965,6 +23019,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -23213,6 +23268,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.MIXED_PRECISION"><code class="docutils literal notranslate"><span class="pre">MIXED_PRECISION</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.NO_QUANT"><code class="docutils literal notranslate"><span class="pre">NO_QUANT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.NVFP4"><code class="docutils literal notranslate"><span class="pre">NVFP4</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.NVFP4_AWQ"><code class="docutils literal notranslate"><span class="pre">NVFP4_AWQ</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A16"><code class="docutils literal notranslate"><span class="pre">W4A16</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A16_AWQ"><code class="docutils literal notranslate"><span class="pre">W4A16_AWQ</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A16_GPTQ"><code class="docutils literal notranslate"><span class="pre">W4A16_GPTQ</span></code></a></li>
@@ -23596,6 +23652,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -23647,6 +23704,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -23740,6 +23798,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -23758,13 +23817,13 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_iters"><code class="docutils literal notranslate"><span class="pre">batch_wait_timeout_iters</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_ms"><code class="docutils literal notranslate"><span class="pre">batch_wait_timeout_ms</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.batched_logits_processor"><code class="docutils literal notranslate"><span class="pre">batched_logits_processor</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cache_transceiver_config"><code class="docutils literal notranslate"><span class="pre">cache_transceiver_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.checkpoint_format"><code class="docutils literal notranslate"><span class="pre">checkpoint_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.checkpoint_loader"><code class="docutils literal notranslate"><span class="pre">checkpoint_loader</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.context_parallel_size"><code class="docutils literal notranslate"><span class="pre">context_parallel_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cp_config"><code class="docutils literal notranslate"><span class="pre">cp_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.disable_flashinfer_sampling"><code class="docutils literal notranslate"><span class="pre">disable_flashinfer_sampling</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler"><code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.dtype"><code class="docutils literal notranslate"><span class="pre">dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_attention_dp"><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code></a></li>
@@ -23777,6 +23836,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_lora"><code class="docutils literal notranslate"><span class="pre">enable_lora</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency"><code class="docutils literal notranslate"><span class="pre">enable_min_latency</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_sleep"><code class="docutils literal notranslate"><span class="pre">enable_sleep</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.env_overrides"><code class="docutils literal notranslate"><span class="pre">env_overrides</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.fail_fast_on_attention_window_too_large"><code class="docutils literal notranslate"><span class="pre">fail_fast_on_attention_window_too_large</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.force_dynamic_quantization"><code class="docutils literal notranslate"><span class="pre">force_dynamic_quantization</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.garbage_collection_gen0_threshold"><code class="docutils literal notranslate"><span class="pre">garbage_collection_gen0_threshold</span></code></a></li>
@@ -23801,6 +23861,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_tensor_parallel_size"><code class="docutils literal notranslate"><span class="pre">moe_tensor_parallel_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.mpi_session"><code class="docutils literal notranslate"><span class="pre">mpi_session</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.num_postprocess_workers"><code class="docutils literal notranslate"><span class="pre">num_postprocess_workers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.nvfp4_gemm_config"><code class="docutils literal notranslate"><span class="pre">nvfp4_gemm_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.orchestrator_type"><code class="docutils literal notranslate"><span class="pre">orchestrator_type</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.otlp_traces_endpoint"><code class="docutils literal notranslate"><span class="pre">otlp_traces_endpoint</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.peft_cache_config"><code class="docutils literal notranslate"><span class="pre">peft_cache_config</span></code></a></li>
@@ -23836,25 +23897,21 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_executor_config"><code class="docutils literal notranslate"><span class="pre">get_executor_config()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_runtime_sizes"><code class="docutils literal notranslate"><span class="pre">get_runtime_sizes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_backend"><code class="docutils literal notranslate"><span class="pre">init_backend</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_build_config"><code class="docutils literal notranslate"><span class="pre">init_build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.set_default_max_input_len"><code class="docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.set_runtime_knobs_from_build_config"><code class="docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.sync_quant_config_with_kv_cache_config_dtype"><code class="docutils literal notranslate"><span class="pre">sync_quant_config_with_kv_cache_config_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_and_init_tokenizer"><code class="docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_attention_dp_config"><code class="docutils literal notranslate"><span class="pre">validate_attention_dp_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_max_tokens_ratio"><code class="docutils literal notranslate"><span class="pre">validate_batch_wait_max_tokens_ratio</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_iters"><code class="docutils literal notranslate"><span class="pre">validate_batch_wait_timeout_iters</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_ms"><code class="docutils literal notranslate"><span class="pre">validate_batch_wait_timeout_ms</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining"><code class="docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_with_runtime_params"><code class="docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format"><code class="docutils literal notranslate"><span class="pre">validate_checkpoint_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_dtype"><code class="docutils literal notranslate"><span class="pre">validate_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_gpus_per_node"><code class="docutils literal notranslate"><span class="pre">validate_gpus_per_node</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer"><code class="docutils literal notranslate"><span class="pre">validate_load_balancer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_lora_config_consistency"><code class="docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_misc"><code class="docutils literal notranslate"><span class="pre">validate_misc</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_model"><code class="docutils literal notranslate"><span class="pre">validate_model</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_model_format_misc"><code class="docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_parallel_config"><code class="docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_peft_cache_config"><code class="docutils literal notranslate"><span class="pre">validate_peft_cache_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_ray_worker_extension_cls"><code class="docutils literal notranslate"><span class="pre">validate_ray_worker_extension_cls</span></code></a></li>
@@ -23895,6 +23952,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_lora"><code class="docutils literal notranslate"><span class="pre">enable_lora</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_prompt_adapter"><code class="docutils literal notranslate"><span class="pre">enable_prompt_adapter</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm"><code class="docutils literal notranslate"><span class="pre">enable_tqdm</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.env_overrides"><code class="docutils literal notranslate"><span class="pre">env_overrides</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config"><code class="docutils literal notranslate"><span class="pre">extended_runtime_perf_knob_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.fail_fast_on_attention_window_too_large"><code class="docutils literal notranslate"><span class="pre">fail_fast_on_attention_window_too_large</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build"><code class="docutils literal notranslate"><span class="pre">fast_build</span></code></a></li>
@@ -23949,7 +24007,6 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_build_config"><code class="docutils literal notranslate"><span class="pre">init_build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_calib_config"><code class="docutils literal notranslate"><span class="pre">init_calib_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.set_default_max_input_len"><code class="docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.set_runtime_knobs_from_build_config"><code class="docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.setup_embedding_parallel_mode"><code class="docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_and_init_tokenizer"><code class="docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining"><code class="docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></a></li>
@@ -24019,6 +24076,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.AutoDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -24125,6 +24183,7 @@ a subset of the possible backends.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.validate_draft_len_schedule_and_sort"><code class="docutils literal notranslate"><span class="pre">validate_draft_len_schedule_and_sort</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.is_linear_tree"><code class="docutils literal notranslate"><span class="pre">is_linear_tree</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_extra"><code class="docutils literal notranslate"><span class="pre">model_extra</span></code></a></li>
@@ -24136,6 +24195,7 @@ a subset of the possible backends.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RocketSparseAttentionConfig</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kernel_size"><code class="docutils literal notranslate"><span class="pre">kernel_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kt_cache_dtype"><code class="docutils literal notranslate"><span class="pre">kt_cache_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.page_size"><code class="docutils literal notranslate"><span class="pre">page_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.prompt_budget"><code class="docutils literal notranslate"><span class="pre">prompt_budget</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RocketSparseAttentionConfig.topk"><code class="docutils literal notranslate"><span class="pre">topk</span></code></a></li>
@@ -24315,9 +24375,9 @@ a subset of the possible backends.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       

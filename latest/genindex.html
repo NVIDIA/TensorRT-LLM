@@ -60,7 +60,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,7 +73,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc4" />
+  <meta name="docsearch:version" content="1.2.0rc5" />
 
 
   </head>
@@ -369,7 +369,9 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
 </ul>
@@ -410,11 +412,14 @@
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/kv-cache-connector.html">KV Cache Connector</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -568,6 +573,13 @@
 </li>
       </ul></li>
       <li>
+    --chat_template
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-chat_template">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --chat_template_kwargs
 
       <ul>
@@ -578,6 +590,8 @@
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-chat_template_kwargs">trtllm-eval-gpqa_main command line option</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-chat_template_kwargs">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-chat_template_kwargs">trtllm-eval-longbench_v2 command line option</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-chat_template_kwargs">trtllm-eval-mmlu command line option</a>
 </li>
@@ -597,7 +611,7 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-cluster_size">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-cluster_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_cluster_parallel_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -610,6 +624,19 @@
 </li>
       </ul></li>
       <li>
+    --config
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-config">trtllm-bench-latency command line option</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-config">trtllm-bench-throughput command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-config">trtllm-eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-config">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --config_file
 
       <ul>
@@ -619,10 +646,24 @@
 </li>
       </ul></li>
       <li>
+    --context_parallel_size
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-context_parallel_size">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --cot
 
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-cot">trtllm-eval-longbench_v2 command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --cp_size
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-context_parallel_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -755,7 +796,7 @@
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-ep_size">trtllm-eval command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_expert_parallel_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -769,13 +810,13 @@
     --extra_llm_api_options
 
       <ul>
-        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-extra_llm_api_options">trtllm-bench-latency command line option</a>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-config">trtllm-bench-latency command line option</a>
 </li>
-        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-extra_llm_api_options">trtllm-bench-throughput command line option</a>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-config">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-extra_llm_api_options">trtllm-eval command line option</a>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-config">trtllm-eval command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-config">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -790,6 +831,13 @@
 
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-fewshot_as_multiturn">trtllm-eval-gsm8k command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --free_gpu_memory_fraction
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -843,7 +891,7 @@
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-kv_cache_free_gpu_memory_fraction">trtllm-eval command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1046,6 +1094,20 @@
 </li>
       </ul></li>
       <li>
+    --moe_cluster_parallel_size
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_cluster_parallel_size">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --moe_expert_parallel_size
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_expert_parallel_size">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --no_context
 
       <ul>
@@ -1134,6 +1196,13 @@
 </li>
       </ul></li>
       <li>
+    --pipeline_parallel_size
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pipeline_parallel_size">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --port
 
       <ul>
@@ -1159,7 +1228,7 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-pp_size">trtllm-eval command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pipeline_parallel_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1234,6 +1303,17 @@
 
       <ul>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">trtllm-serve-disaggregated command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --revision
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-revision">trtllm-bench command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-revision">trtllm-eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-revision">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1329,6 +1409,13 @@
 </li>
       </ul></li>
       <li>
+    --tensor_parallel_size
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tensor_parallel_size">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --tokenizer
 
       <ul>
@@ -1361,7 +1448,7 @@
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-tp_size">trtllm-eval command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tensor_parallel_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1784,10 +1871,10 @@
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.beam_search_diversity_rate">(tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_width_array">beam_width_array (tensorrt_llm.llmapi.SamplingParams attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_width_array">beam_width_array (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.begin_thinking_phase_token">begin_thinking_phase_token (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.bert_attention">bert_attention() (in module tensorrt_llm.functional)</a>
@@ -1822,12 +1909,8 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.buffer_allocated">buffer_allocated (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.build_config">build_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.build_config">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.build_config">build_config (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
-      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig">BuildCacheConfig (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig">BuildConfig (class in tensorrt_llm.llmapi)</a>
@@ -2420,6 +2503,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.disable_finalize_fusion">disable_finalize_fusion (tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_flashinfer_sampling">disable_flashinfer_sampling (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SD3Transformer2DModel.disable_forward_chunking">disable_forward_chunking() (tensorrt_llm.models.SD3Transformer2DModel method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler">disable_overlap_scheduler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -2642,10 +2727,10 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.encode">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.encoder_run">encoder_run() (tensorrt_llm.runtime.EncDecModelRunner method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel">EncoderModel (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.end_id">end_id (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -2670,6 +2755,12 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.engine_inspector">engine_inspector (tensorrt_llm.runtime.GenerationSession property)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.env_overrides">env_overrides (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.env_overrides">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.eq">eq() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ContextChunkingPolicy.EQUAL_PROGRESS">EQUAL_PROGRESS (tensorrt_llm.llmapi.ContextChunkingPolicy attribute)</a>
@@ -3630,12 +3721,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.init_backend">init_backend() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.init_build_config">init_build_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.init_build_config">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.init_build_config">init_build_config() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
-      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.init_calib_config">init_calib_config() (tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_image_encoder">init_image_encoder() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
@@ -3674,8 +3761,26 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_keep_all">is_keep_all (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.is_linear_tree">is_linear_tree (tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.is_linear_tree">is_linear_tree (tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.MedusaDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.MTPDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.is_medusa_mode">is_medusa_mode (tensorrt_llm.runtime.GenerationSession property)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.is_module_excluded_from_quantization">is_module_excluded_from_quantization() (tensorrt_llm.llmapi.QuantConfig method)</a>
@@ -3690,6 +3795,8 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.is_trt_wrapper">is_trt_wrapper() (tensorrt_llm.functional.Tensor method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_use_oldest">is_use_oldest (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.MoEAllReduceParams.is_valid">is_valid() (tensorrt_llm.functional.MoEAllReduceParams method)</a>
@@ -3700,8 +3807,6 @@
         <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.is_valid">(tensorrt_llm.layers.attention.KeyValueCacheParams method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid_cross_attn">is_valid_cross_attn() (tensorrt_llm.layers.attention.AttentionParams method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.isalnum">isalnum() (tensorrt_llm.llmapi.BatchingType method)</a>
@@ -3909,6 +4014,8 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kernel_size">kernel_size (tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">KeyValueCacheParams (class in tensorrt_llm.layers.attention)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.kt_cache_dtype">kt_cache_dtype (tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_config">kv_cache_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 
@@ -5494,8 +5601,6 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.num_beams">num_beams (tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_capture_layers">num_capture_layers (tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
 
       <ul>
@@ -5504,6 +5609,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers">num_eagle_layers (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -5557,6 +5664,10 @@
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.numel">numel() (tensorrt_llm.runtime.TensorInfo method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.NVFP4">NVFP4 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.NVFP4_AWQ">NVFP4_AWQ (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.nvfp4_gemm_config">nvfp4_gemm_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv48nvinfer1">nvinfer1 (C++ type)</a>
 </li>
@@ -6574,12 +6685,6 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.set_rel_attn_table">set_rel_attn_table() (tensorrt_llm.layers.attention.Attention method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.set_runtime_knobs_from_build_config">set_runtime_knobs_from_build_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.set_runtime_knobs_from_build_config">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
-</li>
-      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session.set_shapes">set_shapes() (tensorrt_llm.runtime.Session method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.set_smooth_quant_plugins">set_smooth_quant_plugins() (tensorrt_llm.plugin.PluginConfig method)</a>
@@ -6634,10 +6739,10 @@
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_attn_blocks">skip_cross_attn_blocks (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.skip_cross_kv">skip_cross_kv (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.skip_special_tokens">skip_special_tokens (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.skip_tokenizer_init">skip_tokenizer_init (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -9875,9 +9980,13 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13ConfigurationE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration (C++ class)</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration7alignedENSt6size_tEi">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::aligned (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration23backgroundConfigurationE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::backgroundConfiguration (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration13ConfigurationER24CudaVirtualMemoryManagerNSt6stringE11RestoreMode13CudaStreamPtr">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::Configuration (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration13ConfigurationER24CudaVirtualMemoryManagerNSt6stringE11RestoreMode13CudaStreamPtrb">[1]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration10mAlignmentE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mAlignment (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration11mBackgroundE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mBackground (C++ member)</a>
 </li>
@@ -9887,11 +9996,7 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration5mModeE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mMode (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration9mPageSizeE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mPageSize (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration4mTagE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mTag (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration11pageAlignedENSt6size_tE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::pageAligned (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::setVirtualMemoryAllocator (C++ function)</a>
 </li>
@@ -10049,8 +10154,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::name (C++ member)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::size (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::type (C++ type)</a>
@@ -10067,6 +10170,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::name (C++ member)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::size (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::type (C++ type)</a>
@@ -12703,6 +12808,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-model_path">--model_path</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-revision">--revision</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-w">--workspace</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-m">-m</a>
@@ -12753,13 +12860,15 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-concurrency">--concurrency</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-config">--config</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-dataset">--dataset</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-engine_dir">--engine_dir</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-ep">--ep</a>
 </li>
-        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-extra_llm_api_options">--extra_llm_api_options</a>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-config">--extra_llm_api_options</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-iteration_log">--iteration_log</a>
 </li>
@@ -12798,6 +12907,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-concurrency">--concurrency</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-config">--config</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-custom_module_dirs">--custom_module_dirs</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-data_device">--data_device</a>
@@ -12814,7 +12925,7 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-ep">--ep</a>
 </li>
-        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-extra_llm_api_options">--extra_llm_api_options</a>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-config">--extra_llm_api_options</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-image_data_format">--image_data_format</a>
 </li>
@@ -12865,11 +12976,13 @@
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-backend">--backend</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-config">--config</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-disable_kv_cache_reuse">--disable_kv_cache_reuse</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-ep_size">--ep_size</a>
 </li>
-        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-extra_llm_api_options">--extra_llm_api_options</a>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-config">--extra_llm_api_options</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpus_per_node">--gpus_per_node</a>
 </li>
@@ -12888,6 +13001,8 @@
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-model">--model</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-pp_size">--pp_size</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-revision">--revision</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-tokenizer">--tokenizer</a>
 </li>
@@ -13025,6 +13140,8 @@
 
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-chat_template_kwargs">--chat_template_kwargs</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-cot">--cot</a>
 </li>
@@ -13174,7 +13291,15 @@
       <ul>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-backend">--backend</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-cluster_size">--cluster_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-chat_template">--chat_template</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_cluster_parallel_size">--cluster_size</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-config">--config</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-context_parallel_size">--context_parallel_size</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-context_parallel_size">--cp_size</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-custom_module_dirs">--custom_module_dirs</a>
 </li>
@@ -13182,17 +13307,19 @@
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-enable_chunked_prefill">--enable_chunked_prefill</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">--ep_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_expert_parallel_size">--ep_size</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">--extra_llm_api_options</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-config">--extra_llm_api_options</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">--fail_fast_on_attention_window_too_large</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">--free_gpu_memory_fraction</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">--gpus_per_node</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">--host</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">--log_level</a>
 </li>
@@ -13208,23 +13335,33 @@
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">--metadata_server_config_file</a>
 </li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_cluster_parallel_size">--moe_cluster_parallel_size</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_expert_parallel_size">--moe_expert_parallel_size</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-num_postprocess_workers">--num_postprocess_workers</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-otlp_traces_endpoint">--otlp_traces_endpoint</a>
 </li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pipeline_parallel_size">--pipeline_parallel_size</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-port">--port</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">--pp_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pipeline_parallel_size">--pp_size</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-reasoning_parser">--reasoning_parser</a>
 </li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-revision">--revision</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-server_role">--server_role</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tensor_parallel_size">--tensor_parallel_size</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tokenizer">--tokenizer</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tool_parser">--tool_parser</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">--tp_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tensor_parallel_size">--tp_size</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-trust_remote_code">--trust_remote_code</a>
 </li>
@@ -13477,18 +13614,10 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_ms">validate_batch_wait_timeout_ms() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining">validate_build_config_remaining() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining">validate_build_config_remaining() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
-      </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_with_runtime_params">validate_build_config_with_runtime_params() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params">validate_build_config_with_runtime_params() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
-      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.validate_capture_num_tokens">validate_capture_num_tokens() (tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">validate_checkpoint_format() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
@@ -13551,18 +13680,16 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_gpu_total_bytes">validate_max_gpu_total_bytes() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_misc">validate_misc() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_model">validate_model() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_model">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_model_format_misc">validate_model_format_misc() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc">validate_model_format_misc() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
-      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_parallel_config">validate_parallel_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 
       <ul>
@@ -13848,9 +13975,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 23, 2025.</p>
+  <p>Last updated on December 07, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a761585">a761585</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e4c7078">e4c7078</a>.</p>
   
 </div></div>
       
