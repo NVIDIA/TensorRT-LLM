@@ -154,14 +154,14 @@ class ZeroMqQueue:
         else:
             return False
 
-    def put(self, obj: Any):
+    def put(self, obj: Any, routing_id: Optional[bytes] = None):
         self.setup_lazily()
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
-                self._send_data(data)
+                self._send_data(data, routing_id=routing_id)
             else:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
@@ -197,14 +197,14 @@ class ZeroMqQueue:
                 else:
                     logger.error(f"Failed to send object: {obj}")
 
-    async def put_async(self, obj: Any):
+    async def put_async(self, obj: Any, routing_id: Optional[bytes] = None):
         self.setup_lazily()
         self._check_thread_safety()
         try:
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
-                await self._send_data_async(data)
+                await self._send_data_async(data, routing_id=routing_id)
             else:
                 # Standard socket without encryption
                 await self.socket.send_pyobj(obj)
@@ -243,7 +243,9 @@ class ZeroMqQueue:
         self._check_thread_safety()
         return await self._recv_data_async()
 
-    async def get_async_noblock(self, timeout: float = 0.5) -> Any:
+    async def get_async_noblock(self,
+                                timeout: float = 0.5,
+                                return_identity: bool = False) -> Any:
         """Get data with timeout using polling to avoid message drops.
 
         This method uses ZMQ's NOBLOCK flag with polling instead of asyncio.wait_for
@@ -251,9 +253,10 @@ class ZeroMqQueue:
 
         Args:
             timeout: Timeout in seconds
+            return_identity: Whether to return the identity of the sender (for ROUTER sockets)
 
         Returns:
-            The received object
+            The received object, or (object, identity) if return_identity is True
 
         Raises:
             asyncio.TimeoutError: If timeout is reached without receiving data
@@ -271,13 +274,22 @@ class ZeroMqQueue:
                     identity, data = await self.socket.recv_multipart(
                         flags=zmq.NOBLOCK)
                     self._last_identity = identity
-                    return self._parse_data(data)
+                    obj = self._parse_data(data)
+                    if return_identity:
+                        return obj, identity
+                    else:
+                        return obj
                 else:
                     if self.use_hmac_encryption:
                         data = await self.socket.recv(flags=zmq.NOBLOCK)
-                        return self._parse_data(data)
+                        obj = self._parse_data(data)
                     else:
-                        return await self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+                        obj = await self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+
+                    if return_identity:
+                        return obj, None
+                    else:
+                        return obj
             except zmq.Again:
                 # No message available yet
                 if asyncio.get_event_loop().time() >= deadline:
@@ -329,30 +341,39 @@ class ZeroMqQueue:
         else:
             return pickle.loads(data)  # nosec B301
 
-    def _send_data(self, data: bytes, flags: int = 0):
+    def _send_data(self,
+                   data: bytes,
+                   flags: int = 0,
+                   routing_id: Optional[bytes] = None):
         """Send data using appropriate API based on socket type."""
         if self.socket_type == zmq.ROUTER:
-            if self._last_identity is None:
+            identity = routing_id if routing_id is not None else self._last_identity
+            if identity is None:
                 raise ValueError("ROUTER socket requires identity")
-            self.socket.send_multipart([self._last_identity, data], flags=flags)
+            self.socket.send_multipart([identity, data], flags=flags)
         else:
             self.socket.send(data, flags=flags)
 
-    async def _send_data_async(self, data: bytes):
+    async def _send_data_async(self,
+                               data: bytes,
+                               routing_id: Optional[bytes] = None):
         """Async version of _send_data."""
         if self.socket_type == zmq.ROUTER:
-            if self._last_identity is None:
+            identity = routing_id if routing_id is not None else self._last_identity
+            if identity is None:
                 raise ValueError("ROUTER socket requires identity")
-            await self.socket.send_multipart([self._last_identity, data])
+            await self.socket.send_multipart([identity, data])
         else:
             await self.socket.send(data)
 
-    def _recv_data(self) -> Any:
+    def _recv_data(self, return_identity: bool = False) -> Any:
         """Receive data using appropriate API based on socket type."""
         if self.socket_type == zmq.ROUTER:
             identity, data = self.socket.recv_multipart()
             self._last_identity = identity  # Store for replies
             obj = self._parse_data(data)
+            if return_identity:
+                return obj, identity
             return obj
         else:
             if self.use_hmac_encryption:
@@ -360,20 +381,30 @@ class ZeroMqQueue:
                 obj = self._parse_data(data)
             else:
                 obj = self.socket.recv_pyobj()
+
+            if return_identity:
+                return obj, None
             return obj
 
-    async def _recv_data_async(self) -> Any:
+    async def _recv_data_async(self, return_identity: bool = False) -> Any:
         """Async version of _recv_data."""
         if self.socket_type == zmq.ROUTER:
             identity, data = await self.socket.recv_multipart()
             self._last_identity = identity  # Store for replies
-            return self._parse_data(data)
+            obj = self._parse_data(data)
+            if return_identity:
+                return obj, identity
+            return obj
         else:
             if self.use_hmac_encryption:
                 data = await self.socket.recv()
-                return self._parse_data(data)
+                obj = self._parse_data(data)
             else:
-                return await self.socket.recv_pyobj()
+                obj = await self.socket.recv_pyobj()
+
+            if return_identity:
+                return obj, None
+            return obj
 
     def notify_with_retry(self, message, max_retries=5, timeout=1):
         """
