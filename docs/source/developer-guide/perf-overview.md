@@ -70,29 +70,16 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 
 ## Table of Contents
 
-- [Overview](#overview)
-  - [Throughput Measurements](#throughput-measurements)
-    - [Hardware](#hardware)
-    - [FP4 Models](#fp4-models)
-    - [FP8 Models](#fp8-models)
-- [Performance Summary - All Networks](#performance-summary---all-networks)
-  - [Units](#units)
-  - [Table of Contents](#table-of-contents)
 - [Deepseek R1 0528](#deepseek-r1-0528)
 - [GPT-OSS 120B](#gpt-oss-120b)
 - [GPT-OSS 20B](#gpt-oss-20b)
 - [LLaMA v3.3 70B](#llama-v33-70b)
-- [LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition](#llama-v33-70b---rtx-6000-pro-blackwell-server-edition)
+  - [LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition](#llama-v33-70b-rtx-configurations)
 - [LLaMA v4 Maverick](#llama-v4-maverick)
 - [Qwen3 235B A22B](#qwen3-235b-a22b)
-- [Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition](#qwen3-235b-a22b---rtx-6000-pro-blackwell-server-edition)
+  - [Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition](#qwen3-235b-a22b-rtx-configurations)
 - [Qwen3 30B A3B](#qwen3-30b-a3b)
-- [Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition](#qwen3-30b-a3b---rtx-6000-pro-blackwell-server-edition)
-  - [Reproducing Benchmarked Results](#reproducing-benchmarked-results)
-    - [Command Overview](#command-overview)
-    - [Variables](#variables)
-    - [Preparing a Dataset](#preparing-a-dataset)
-    - [Running the Benchmark](#running-the-benchmark)
+  - [Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition](#qwen3-30b-a3b-rtx-configurations)
 
 ---
 
