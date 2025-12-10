@@ -78,7 +78,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(backend=backend,
-                                                      max_tokens_in_buffer=512)
+                                                      max_tokens_in_buffer=128)
     dist = MPIDist(mapping=mapping)
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_ctx, attention_type,
@@ -145,7 +145,7 @@ def test_cancel_request_in_transmission(attention_type):
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
-                                                      max_tokens_in_buffer=512)
+                                                      max_tokens_in_buffer=128)
 
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_ctx, attention_type,
