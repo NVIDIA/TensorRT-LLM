@@ -709,12 +709,13 @@ class PyTorchModelEngine(ModelEngine):
         sparse_config = self.sparse_attention_config
         if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
         ):
-            # For short sequences, use the sequence length threshold as the maximum sequence length.
+            # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
+            # to make sure all of the past and current input tokens are within the sequence length threshold.
             # For long sequences, use the default maximum sequence length (self.max_seq_len).
-            if sparse_config.seq_len_threshold < self.max_seq_len:
-                max_seq_len_list = [
-                    self.max_seq_len, sparse_config.seq_len_threshold
-                ]
+            max_seq_len = sparse_config.seq_len_threshold - (
+                self.max_draft_len + 1)
+            if max_seq_len < self.max_seq_len:
+                max_seq_len_list = [self.max_seq_len, max_seq_len]
             else:
                 max_seq_len_list = [self.max_seq_len]
         else:
