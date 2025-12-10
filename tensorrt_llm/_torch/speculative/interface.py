@@ -136,21 +136,15 @@ class SpeculativeDecodingMode(IntEnum):
             # 1-model has separate logic for handling draft tokens
             return False
 
-        if issubclass(attention_backend,
-                      TrtllmAttention) and self.is_mtp_eagle():
-            # TRTLLM MLA does not work with the chunked context mode.
-            return False
-
         return not issubclass(attention_backend,
-                              TrtllmAttention) or get_sm_version() != 100
+                              TrtllmAttention) or get_sm_version() < 90
 
     def attention_need_spec_dec_mode(
-        self,
-        spec_resource_manager: BaseResourceManager,
-        is_draft_model: bool,
-        attention_backend: Type[AttentionBackend],
-        use_chain_drafter: bool,  # CDL
-        is_spec_dec_tree: bool,
+            self,
+            spec_resource_manager: Optional[BaseResourceManager],
+            is_draft_model: bool,
+            attention_backend: Type[AttentionBackend],
+            use_chain_drafter: bool,  # CDL
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -159,22 +153,19 @@ class SpeculativeDecodingMode(IntEnum):
             is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
             use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
-            is_spec_dec_tree: whether the spec-dec mode is a tree, i.e., static tree or dynamic tree.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
-        # Case 1: one model
-        use_case_1 = self.is_eagle3_one_model()
-        # Case 2: eagle3 two model + draft model + CDL + is_first_draft + TRTLLM attention
-        use_case_2 = self.is_eagle3(
-        ) and spec_resource_manager.is_first_draft and use_chain_drafter and is_draft_model and is_trtllm_attention
-        # Case 3: eagle3 two model + tree decoding + draft model + CDL + TRTLLM attention
-        use_case_3 = self.is_eagle3(
-        ) and is_spec_dec_tree and is_draft_model and use_chain_drafter and is_trtllm_attention
-        # Case 4: eagle3 two model + tree decoding + target model + TRTLLM attention
-        use_case_4 = self.is_eagle3(
-        ) and is_spec_dec_tree and not is_draft_model and is_trtllm_attention
 
-        return use_case_1 or use_case_2 or use_case_3 or use_case_4
+        # Always use the multi-token query mode for 1-model.
+        # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
+        # the target model (verification) or on the first draft for CDL based speculation.
+        use_case_1 = self.is_eagle3_one_model()
+        use_case_2 = (not is_draft_model or
+                      (spec_resource_manager is not None
+                       and spec_resource_manager.is_first_draft
+                       and use_chain_drafter)) and is_trtllm_attention
+
+        return use_case_1 or use_case_2
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
