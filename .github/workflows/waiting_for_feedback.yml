@@ -16,17 +16,23 @@ jobs:
     if: github.repository == 'NVIDIA/TensorRT-LLM'
     steps:
       - name: Check membership and manage label
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const commenter = context.payload.comment.user.login;
-            const issueNumber = context.issue.number;
             const label = 'waiting for feedback';
 
-            // Get the author of the issue/PR
+            // Handle both issue_comment and pull_request_review_comment events
+            // context.issue.number is only available for issue_comment events
+            const issueNumber = context.issue?.number || context.payload.pull_request?.number;
             const issue = context.payload.issue || context.payload.pull_request;
             const author = issue?.user?.login;
             const isAuthor = (commenter === author);
+
+            if (!issueNumber) {
+              console.log('Could not determine issue/PR number. Skipping.');
+              return;
+            }
 
             console.log(`Comment by ${commenter} on #${issueNumber} (author: ${author})`);
 
