@@ -304,7 +304,12 @@ class MistralConfigLoader(BaseConfigLoader):
             elif "FP8_BLOCK" in hf_quant_config.get("config_groups"):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.group_size = 128
-                quant_config.exclude_modules = ["*q_a_proj*", "*kv_a_proj_with_mqa*"]
+                quant_config.exclude_modules = [
+                    "language_model.model.layers.*.self_attn.q_a_proj*",
+                    "language_model.model.layers.*.self_attn.kv_a_proj_with_mqa*",
+                    "model.layers.*.self_attn.q_a_proj*",
+                    "model.layers.*.self_attn.kv_a_proj_with_mqa*"
+                ]
         elif hf_quant_config.get("quant_method") == "fp8":
             # Used for Eagle3 weight
             if hf_quant_config.get("weight_block_size", []):
