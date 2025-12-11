@@ -53,7 +53,9 @@ if __name__ == "__main__":
             actual_hostname_port = f.read().strip()
             actual_hostname = actual_hostname_port.split(':')[0]
             actual_port = actual_hostname_port.split(':')[1]
-            print(f"Hostname: {actual_hostname}, Port: {actual_port} in {hostname_file}")
+            print(
+                f"Hostname: {actual_hostname}, Port: {actual_port} in {hostname_file}"
+            )
 
         if hostname_file.startswith("CTX"):
             ctx_urls.append(f"{actual_hostname}:{actual_port}")

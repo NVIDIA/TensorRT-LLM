@@ -2,11 +2,11 @@
 
 import argparse
 import glob
+import math
 import os
 import shutil
 import subprocess
 import sys
-import math
 from datetime import datetime
 
 import yaml
