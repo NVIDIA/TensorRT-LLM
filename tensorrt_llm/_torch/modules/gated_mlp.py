@@ -58,15 +58,6 @@ class GatedMLP(nn.Module):
         else:
             mapping = config.mapping
 
-        # Calculate local intermediate size after tensor parallel sharding
-        tp_size = mapping.tp_size
-        local_intermediate_size = self.intermediate_size // tp_size
-
-        gateup_shard_indices_mapping = {
-            'gate': (0, local_intermediate_size),
-            'up': (local_intermediate_size, local_intermediate_size),
-        }
-
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -83,7 +74,6 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             disable_deep_gemm=disable_deep_gemm,
-            fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
@@ -175,21 +165,14 @@ class GatedMLP(nn.Module):
         assert lora_params is not None
         assert self.layer_idx is not None, "layer_idx is required for lora"
 
-        # TODO: Remove this path when LoRA grouped_gemm supports FP8
-        x_for_lora = x
-        if isinstance(x, torch.Tensor) and x.dtype == torch.float8_e4m3fn:
-            x_for_lora = x.to(torch.bfloat16)
-
         h1 = self.gate_up_proj(x)
 
-        h1_lora = self.splitted_gate_up_lora(x_for_lora, lora_params,
-                                             self.layer_idx)
+        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
 
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h1_lora = self.fused_gate_up_lora(x_for_lora, lora_params,
-                                          self.layer_idx)
+        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
