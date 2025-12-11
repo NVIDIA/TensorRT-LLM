@@ -7,6 +7,7 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
 from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
+from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
 
 
 def setup_moe_test(dtype, num_experts):
@@ -173,8 +174,8 @@ def test_bmm_based_moe_op_run(dtype):
             [fused_w3_w1_stacked_weight],  # Wrap in list for unified interface
             [fused_w2_weight],  # Wrap in list for unified interface
             [],  # Empty w3_weight list for stacked gated MLP
-            mlp_style="gated_mlp",
-            act_fn="silu",
+            is_gated_mlp=True,
+            act_fn=ActivationType.Silu,
             apply_routing_on_input=True,
         )
         output_torch_fused_moe = torch.ops.auto_deploy.torch_moe_fused(

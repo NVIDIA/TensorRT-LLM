@@ -10,6 +10,7 @@ from einops import rearrange
 from transformers import AutoModelForCausalLM
 
 from tensorrt_llm._torch.auto_deploy.models.patches.bamba import _bamba_mixer_torch_forward
+from tensorrt_llm._torch.utils import ActivationType
 
 
 # Forked from:
@@ -148,8 +149,8 @@ def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
         w1_weight=[e.up_proj.weight for e in self.experts],
         w2_weight=[e.down_proj.weight for e in self.experts],
         w3_weight=[],
-        act_fn="relu2",
-        mlp_style="mlp",
+        act_fn=ActivationType.Relu2,
+        is_gated_mlp=False,
     )
 
     if has_latent_proj:

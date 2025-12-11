@@ -82,7 +82,7 @@ def compute_with_experts(
     alpha=None,
     beta=None,
     limit=None,
-    activation_func="silu",
+    activation_func: ActivationType = ActivationType.Silu,
 ):
     def relu2(x: torch.Tensor) -> torch.Tensor:
         return torch.square(F.relu(x))
@@ -110,7 +110,7 @@ def compute_with_experts(
 
             inter = x1_scaled * x2
         else:
-            if activation_func == "swiglu" or activation_func == "silu":
+            if activation_func == ActivationType.Swiglu or activation_func == ActivationType.Silu:
                 inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
             else:
                 inter = relu2(expert_inputs @ w1_expert.t())
@@ -134,10 +134,6 @@ def _get_test_data(
     w31_empty_scales = torch.empty(num_experts, 2, dtype=otype).cuda()
     w2_empty_scales = torch.empty(num_experts, 1, dtype=otype).cuda()
     return x, router_logits, w31_weight, w2_weight, w31_empty_scales, w2_empty_scales
-
-
-def _activation_type_from_str(activation_func: str) -> ActivationType:
-    return ActivationType.Swiglu if activation_func in ["swiglu", "silu"] else ActivationType.Relu2
 
 
 def _print_diff_if(
@@ -183,7 +179,7 @@ F16_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", F16_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
 @skip_pre_hopper
 def test_trtllm_fused_moe(
     batch_size,
@@ -201,13 +197,13 @@ def test_trtllm_fused_moe(
         pytest.skip(f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})")
 
     torch.manual_seed(42)
-    if activation_func in ["swiglu", "silu"]:
+    if activation_func in [ActivationType.Swiglu, ActivationType.Silu]:
         X_GEN_SCALE = 1.0
     else:
         X_GEN_SCALE = 0.5
     W_GEN_SCALE = 0.1
 
-    x, router_logits, w31_weight, w2_weight, w31_scales, w2_scales = _get_test_data(
+    x, router_logits, w31_weight, w2_weight, _, _ = _get_test_data(
         otype,
         wtype,
         batch_size,
@@ -239,19 +235,17 @@ def test_trtllm_fused_moe(
         "F16 test only supports bfloat16 or float16"
     )
 
-    activation_type = _activation_type_from_str(activation_func)
-
     def get_fc1_expert_weights(
-        activation_func: str, w31_weight: torch.Tensor, w1_weight: torch.Tensor
+        activation_func: ActivationType, w31_weight: torch.Tensor, w1_weight: torch.Tensor
     ) -> torch.Tensor:
-        if activation_func == "relu2":
+        if activation_func == ActivationType.Relu2:
             return w1_weight.contiguous()
         else:
             return w31_weight
 
     # (num_experts, 2 * intermediate_size, hidden_size) => (num_experts, intermediate_size, hidden_size)
     _, w1_weight = torch.chunk(w31_weight, 2, dim=1)
-    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
 
     torch.cuda.synchronize()
     ad_test_output = torch.ops.auto_deploy.trtllm_moe_fused(
@@ -260,8 +254,12 @@ def test_trtllm_fused_moe(
         routing_weights,
         w3_w1_stacked_weight=get_fc1_expert_weights(activation_func, w31_weight, w1_weight),
         w2_stacked_weight=w2_weight,
-        mlp_style=mlp_style,
+        is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
+    )
+    # Convert ActivationType.Silu to ActivationType.Swiglu for C++ op compatibility
+    cpp_activation_type = (
+        ActivationType.Swiglu if activation_func == ActivationType.Silu else activation_func
     )
     trtllm_test_output = torch.ops.trtllm.fused_moe(
         x,
@@ -273,11 +271,11 @@ def test_trtllm_fused_moe(
         fc2_expert_biases=None,
         output_dtype=otype,
         quant_scales=[],
-        activation_type=activation_type,
+        activation_type=cpp_activation_type,
     )[0].view(x.shape)
 
     torch.cuda.synchronize()
-    if mlp_style == "mlp":
+    if not is_gated_mlp:
         with torch.inference_mode():
             output_triton_moe = torch.ops.auto_deploy.triton_moe_fused(
                 x,
@@ -285,6 +283,7 @@ def test_trtllm_fused_moe(
                 routing_weights,
                 w1_weight.contiguous(),
                 w2_weight.contiguous(),
+                is_gated_mlp=False,
             )[0].view(x.shape)
             torch.testing.assert_close(output_triton_moe, ad_test_output, rtol=1e-2, atol=1e-2)
 
@@ -308,7 +307,7 @@ FP8_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("itype, otype, wtype", FP8_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
 @pytest.mark.skipif(
     not fp8_compatible() or not trtllm_ops_available(),
     reason="Requires fp8 and trtllm support",
@@ -336,7 +335,7 @@ def test_trtllm_fused_moe_fp8(
     )
 
     torch.manual_seed(42)
-    if activation_func in ["swiglu", "silu"]:
+    if activation_func in [ActivationType.Swiglu, ActivationType.Silu]:
         X_GEN_SCALE = 1.0
     else:
         X_GEN_SCALE = 0.5
@@ -399,7 +398,7 @@ def test_trtllm_fused_moe_fp8(
 
     # (num_experts, 2 * intermediate_size, hidden_size) => (num_experts, intermediate_size, hidden_size)
     w3_weight, w1_weight = torch.chunk(w31_weight, 2, dim=1)
-    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
 
     # compute quant_scales
     gemm1_dequant = (w1_scales * hidden_states_scale).contiguous().squeeze().to(torch.float32)
@@ -424,13 +423,13 @@ def test_trtllm_fused_moe_fp8(
         gemm1_dequant=gemm1_dequant,
         gemm2_act_quant=gemm2_act_quant,
         gemm2_dequant=gemm2_dequant,
-        mlp_style=mlp_style,
+        is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
     )
 
     torch.cuda.synchronize()
 
-    if mlp_style == "mlp":
+    if not is_gated_mlp:
         with torch.inference_mode():
             output_triton_fp8_moe = torch.ops.auto_deploy.triton_quant_fp8_moe(
                 x,
@@ -445,7 +444,7 @@ def test_trtllm_fused_moe_fp8(
                 w1_scales,
                 w2_scales,
                 w3_scales,
-                mlp_style=mlp_style,
+                is_gated_mlp=is_gated_mlp,
                 act_fn=activation_func,
             )
             torch.testing.assert_close(output_triton_fp8_moe, ref_output, rtol=1e-1, atol=1e-1)
@@ -569,7 +568,7 @@ NVFP4_TEST_DTYPES = [
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype, wtype", NVFP4_TEST_DTYPES)
-@pytest.mark.parametrize("activation_func", ["silu", "relu2"])
+@pytest.mark.parametrize("activation_func", [ActivationType.Silu, ActivationType.Relu2])
 @pytest.mark.skipif(
     not fp4_compatible() or not trtllm_ops_available(),
     reason="Requires fp4 and trtllm support",
@@ -693,25 +692,23 @@ def test_trtllm_fused_moe_nvfp4(
     fc1_alpha = 1.0 / (fc1_activation_gs * fc1_weight_gs)
     fc2_alpha = 1.0 / (fc2_activation_gs * w2_gs)
 
-    mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
-    if mlp_style == "gated_mlp":
+    is_gated_mlp = False if activation_func == ActivationType.Relu2 else True
+    if is_gated_mlp:
         # For gated MLP, concatenate w1 and w3 as [w3, w1]
         fc1_expert_weights_fp4 = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
         fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
         fc1_weight_gs = torch.max(w3_gs, w1_gs)
-        if activation_func != "silu":
+        if activation_func != ActivationType.Silu:
             raise ValueError(
                 f"Unsupported activation '{activation_func}' for gated_mlp. Use 'silu'."
             )
-    elif mlp_style == "mlp":
+    else:
         # For non-gated MLP with ReLU^2
         fc1_expert_weights_fp4 = w1_q_fp4
         fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
         fc1_weight_gs = w1_gs
-        if activation_func != "relu2":
+        if activation_func != ActivationType.Relu2:
             raise ValueError(f"Unsupported activation '{activation_func}' for mlp. Use 'relu2'.")
-    else:
-        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
     fc2_expert_weights_fp4 = w2_q_fp4.view(torch.long)
     fc2_weight_blockscale_fp8 = w2_blockscale.view(torch.long)
@@ -729,7 +726,7 @@ def test_trtllm_fused_moe_nvfp4(
         fc2_activation_gs,
         fc1_alpha,
         fc2_alpha,
-        mlp_style=mlp_style,
+        is_gated_mlp=is_gated_mlp,
         act_fn=activation_func,
     )
 
@@ -747,8 +744,7 @@ def test_trtllm_fused_moe_nvfp4(
             block_size=NVFP4_BLOCK_SIZE,
         )
 
-        concat_w3_w1 = mlp_style == "gated_mlp"
-        if concat_w3_w1:
+        if is_gated_mlp:
             w1_gs = w3_gs = torch.max(w1_gs, w3_gs)
 
         w1_dq = torch.empty(w1.shape, device="cuda", dtype=otype)
@@ -784,12 +780,12 @@ def test_trtllm_fused_moe_nvfp4(
 
         ref_output = torch_moe_nvfp4(
             x_dq,
-            torch.cat([w3_dq, w1_dq], dim=1) if concat_w3_w1 else w1_dq,
+            torch.cat([w3_dq, w1_dq], dim=1) if is_gated_mlp else w1_dq,
             w2_dq,
             top_k,
             routing_weights,
             selected_experts,
-            _activation_type_from_str(activation_func),
+            activation_func,
         )
         return ref_output
 

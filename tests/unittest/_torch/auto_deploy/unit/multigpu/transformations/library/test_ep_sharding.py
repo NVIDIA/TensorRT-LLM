@@ -183,7 +183,7 @@ def test_llama4_stacked_moe_pattern_detection():
         moe_node = graph.call_function(
             torch.ops.auto_deploy.torch_moe,
             args=(x, selected_experts, routing_weights, w1_list, w2_list, w3_list),
-            kwargs={"mlp_style": "gated_mlp", "apply_routing_on_input": True},
+            kwargs={"is_gated_mlp": True, "apply_routing_on_input": True},
         )
         graph.output(moe_node)
 
