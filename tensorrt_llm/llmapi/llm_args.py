@@ -1460,6 +1460,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MedusaDecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
+    SuffixDecodingConfig,
     UserProvidedDecodingConfig,
     SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
@@ -2830,6 +2831,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
+            elif isinstance(self.speculative_config, SuffixDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."
