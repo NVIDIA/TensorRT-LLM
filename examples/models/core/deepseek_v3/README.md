@@ -140,12 +140,13 @@ To avoid OOM (out of memory) error, you need to adjust the values of "--max_batc
 #### ISL-64k-OSL-1024
 ```bash
 DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
-python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
-        --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
+trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
+        prepare-dataset \
+        --output /tmp/benchmarking_64k.txt \
         token-norm-dist \
         --input-mean 65536 --output-mean 1024 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 24 > /tmp/benchmarking_64k.txt
+        --num-requests 24
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
@@ -166,12 +167,13 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
 #### ISL-128k-OSL-1024
 ```bash
 DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
-python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
-        --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
+trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
+        prepare-dataset \
+        --output /tmp/benchmarking_128k.txt \
         token-norm-dist \
         --input-mean 131072 --output-mean 1024 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 4 > /tmp/benchmarking_128k.txt
+        --num-requests 4
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
@@ -356,7 +358,7 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-For DeepSeek-R1 FP4, use the model name `nvidia/DeepSeek-R1-FP4-v2`.  
+For DeepSeek-R1 FP4, use the model name `nvidia/DeepSeek-R1-FP4-v2`.
 For DeepSeek-V3, use the model name `deepseek-ai/DeepSeek-V3`.
 
 ### Disaggregated Serving
@@ -610,10 +612,10 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
 
 Step 1: Prepare dataset and `extra-llm-api-config.yml`.
 ```bash
-python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
-    --tokenizer=/path/to/DeepSeek-R1 \
-    --stdout token-norm-dist --num-requests=49152 \
-    --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
+trtllm-bench --model /path/to/DeepSeek-R1 \
+    prepare-dataset --output /tmp/dataset.txt \
+    token-norm-dist --num-requests=49152 \
+    --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
 cuda_graph_config:

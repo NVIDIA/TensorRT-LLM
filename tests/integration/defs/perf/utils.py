@@ -730,8 +730,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
         self._gpu_clock_lock = gpu_clock_lock
         tmpDir = temp_wd(self.get_working_dir())
 
-        is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
-            cmd_idx)
+        cmd_str = commands.get_cmd_str(cmd_idx)
+        is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
 
         is_perf_sanity_test = "perf_sanity" in full_test_name
 

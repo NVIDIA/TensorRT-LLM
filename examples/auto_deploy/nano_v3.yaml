@@ -13,6 +13,7 @@ kv_cache_config:
   enable_block_reuse: false
 transforms:
   detect_sharding:
+    allreduce_strategy: SYMM_MEM
     sharding_dims: ['ep', 'bmm']
     manual_config:
       head_dim: 128

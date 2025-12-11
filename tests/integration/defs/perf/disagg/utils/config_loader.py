@@ -477,6 +477,7 @@ class ConfigLoader:
             ("environment", "work_dir"): lambda: EnvManager.get_script_dir(),
             ("environment", "model_path"): lambda: self._get_full_model_path(config),
             ("slurm", "script_file"): lambda: self._get_script_file(config),
+            ("slurm", "set_segment"): lambda: EnvManager.get_slurm_set_segment(),
         }
 
         # Apply overrides based on field paths
