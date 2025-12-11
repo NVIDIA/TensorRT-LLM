@@ -18,9 +18,8 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
-    DSACacheManager, Indexer, compute_cu_seqlen_kv_bounds_with_cache,
-    split_prefill_chunks)
-from tensorrt_llm._torch.utils import maybe_compile
+    DSACacheManager, DSAtrtllmAttentionMetadata, Indexer,
+    compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -394,21 +393,20 @@ def _create_mock_metadata(request_ids,
         def __init__(self):
             self.num_cached_tokens_per_seq = num_cached_tokens
 
-    class MockMetadata:
+    class MockMetadata(DSAtrtllmAttentionMetadata):
 
         def __init__(self):
             self.num_sms = deep_gemm.get_num_sms()
             self.request_ids = request_ids
             self.num_contexts = num_contexts
             self.num_generations = num_generations
-            self.num_seqs = num_contexts + num_generations
+            self._num_seqs = num_contexts + num_generations
             self.max_draft_tokens = max_draft_tokens
             self.sparse_mla_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
-            self.seq_lens_cuda = seq_lens.cuda()
             self.kv_lens = kv_lens
             self.kv_cache_params = MockKVCacheParams()
             self.kv_cache_manager = cache_manager
@@ -472,8 +470,8 @@ def _create_mock_metadata(request_ids,
                 device='cpu',
                 pin_memory=True,
                 dtype=torch.int64)
-            self.num_ctx_tokens = num_ctx_tokens
-            self.num_tokens = num_tokens
+            self._num_ctx_tokens = num_ctx_tokens
+            self._num_tokens = num_tokens
             self.num_gen_tokens = num_tokens - num_ctx_tokens
             # Also set private attributes used by DSAtrtllmAttentionMetadata
             self._num_contexts = num_contexts
@@ -567,40 +565,14 @@ def _create_mock_metadata(request_ids,
                             non_blocking=True)
 
             # Add skip indexer attributes
-            @maybe_compile(dynamic=True)
-            def _get_dense_topk_indices(seq_lens, kv_lens, num_tokens):
-                device = kv_lens.device
-                past_kv_lens = kv_lens - seq_lens
-                # get position ids
-                seq_ends = torch.cumsum(seq_lens, dim=0)
-                seq_starts = seq_ends - seq_lens
-                per_seq_offsets = past_kv_lens - seq_starts  # Shape: [batch_size]
-                global_indices = torch.arange(num_tokens, device=device)
-                batch_indices = torch.searchsorted(seq_ends,
-                                                   global_indices,
-                                                   side='right')
-                repeated_offsets = per_seq_offsets[batch_indices]
-                position_ids = global_indices + repeated_offsets
-                # get the dense topk indices with causal mask
-                range_row = torch.arange(self.sparse_mla_topk, device=device)
-                mask = range_row <= position_ids.unsqueeze(1)
-                return torch.where(mask, range_row, -1)
-
             self.topk_indices_buffer = torch.zeros(
                 (num_tokens, self.sparse_mla_topk),
                 device='cuda',
                 dtype=torch.int32)
+
             if self.num_contexts > 0 and self.enable_indexer_skip:
                 self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
                 ).item() <= self.sparse_mla_topk
-                if self.skip_indexer_for_ctx_reqs:
-                    ctx_range = slice(self.num_ctx_tokens)
-                    self.topk_indices_buffer[ctx_range, :].copy_(
-                        _get_dense_topk_indices(
-                            self.seq_lens_cuda[:self.num_contexts],
-                            self.kv_lens_cuda_runtime[:self.num_contexts],
-                            self.num_ctx_tokens),
-                        non_blocking=True)
             else:
                 self.skip_indexer_for_ctx_reqs = False
 
@@ -609,17 +581,16 @@ def _create_mock_metadata(request_ids,
                 self.skip_indexer_for_gen_reqs = kv_lens[
                     self.num_contexts:self.num_seqs].max().item(
                     ) <= self.sparse_mla_topk
-                if self.skip_indexer_for_gen_reqs:
-                    gen_range = slice(self.num_ctx_tokens, self.num_tokens)
-                    self.topk_indices_buffer[gen_range, :].copy_(
-                        _get_dense_topk_indices(
-                            self.seq_lens_cuda[self.num_contexts:self.num_seqs],
-                            self.kv_lens_cuda_runtime[self.num_contexts:self.
-                                                      num_seqs],
-                            self.num_tokens - self.num_ctx_tokens),
-                        non_blocking=True)
             else:
                 self.skip_indexer_for_gen_reqs = False
+            self.prepare_dense_topk_indices(self.kv_lens_cuda_runtime, device=True)
+
+        @property
+        def num_seqs(self) -> int:
+            """
+            The number of sequences in the batch.
+            """
+            return self._num_seqs
 
     return MockMetadata()
 

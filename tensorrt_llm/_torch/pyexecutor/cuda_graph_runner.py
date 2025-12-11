@@ -25,7 +25,7 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-
+type KeyType = Tuple[int, int, bool, bool]
 
 @dataclass
 class CUDAGraphRunnerConfig:
@@ -100,12 +100,10 @@ class CUDAGraphRunner:
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
 
-        self.graphs: Dict[Tuple[int, int, bool, bool],
-                          torch.cuda.CUDAGraph] = {}
-        self.graph_outputs: Dict[Tuple[int, int, bool, bool],
+        self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
-        self.graph_metadata: Dict[Tuple[int, int, bool, bool], Dict[str,
-                                                                    Any]] = {}
+        self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
 
@@ -274,7 +272,7 @@ class CUDAGraphRunner:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
 
-    def needs_capture(self, key: Tuple[int, int, bool, bool]):
+    def needs_capture(self, key: KeyType):
         return key not in self.graph_outputs
 
     def get_graph_pool(self):
@@ -287,7 +285,7 @@ class CUDAGraphRunner:
         return self.memory_pool
 
     def capture(self,
-                key: Tuple[int, int, bool, bool],
+                key: KeyType,
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
@@ -324,7 +322,7 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: Tuple[int, int, bool, bool],
+        def _setup_spec_decoding_and_forward(key: KeyType,
                                              forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
             is_first_draft = key[2]
@@ -356,7 +354,7 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
-    def replay(self, key: Tuple[int, int, bool, bool],
+    def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         stored_meta = self.graph_metadata[key]
