@@ -282,19 +282,10 @@ def submit_job(config, log_dir):
         f'--error={log_dir}/slurm-%j.err',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
-        # Hardware configuration
-        '--gpus-per-node', str(hw_config['gpus_per_node']),
-        '--numa-bind', str(slurm_config['numa_bind']).lower(),
-        '--ctx-nodes', str(ctx_nodes),  # Number of nodes needed for ctx workers
-        '--gen-nodes', str(gen_nodes),  # Number of nodes needed for gen workers
-        '--ctx-world-size', str(ctx_world_size),  # World size for ctx workers
-        '--gen-world-size', str(gen_world_size),  # World size for gen workers
 
         # Worker configuration
         '--num-ctx-servers', str(ctx_num),
-        '--ctx-config-path', ctx_config_path,
         '--num-gen-servers', str(gen_num),
-        '--gen-config-path', gen_config_path,
         '--concurrency-list', config['benchmark']['concurrency_list'],
 
         # Sequence and benchmark parameters
@@ -304,9 +295,6 @@ def submit_job(config, log_dir):
         '--benchmark-ratio', str(config['benchmark']['benchmark_ratio']),
         '--streaming', str(config['benchmark']['streaming']).lower(),
         '--use-nv-sa-benchmark', str(config['benchmark']['use_nv_sa_benchmark']).lower(),
-        '--benchmark-mode', config['benchmark']['mode'],
-        '--cache-max-tokens', str(config['worker_config']['gen']['cache_transceiver_config']
-            ['max_tokens_in_buffer']),
 
         # Environment and paths
         '--dataset-file', config['benchmark']['dataset_file'],
@@ -319,19 +307,11 @@ def submit_job(config, log_dir):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
 
-        # Profiling
-        '--nsys-on', str(profiling_config['nsys_on']).lower(),
-        '--ctx-profile-range', profiling_config['ctx_profile_range'],
-        '--gen-profile-range', profiling_config['gen_profile_range'],
-
         # Accuracy evaluation
         '--enable-accuracy-test', str(config['accuracy']['enable_accuracy_test']).lower(),
         '--accuracy-model', config['accuracy']['model'],
         '--accuracy-tasks', config['accuracy']['tasks'],
         '--model-args-extra', config['accuracy']['model_args_extra'],
-
-        # Worker environment variables
-        '--worker-env-var', env_config['worker_env_var'],
 
         # Server environment variables
         '--server-env-var', env_config['server_env_var']
