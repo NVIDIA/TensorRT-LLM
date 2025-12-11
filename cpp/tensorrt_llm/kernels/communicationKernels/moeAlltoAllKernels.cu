@@ -362,13 +362,20 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
-    if (local_token_idx >= local_num_tokens && local_num_tokens != 0)
+    if (local_num_tokens == 0)
     {
-        return;
+        // Special case: If local_num_tokens == 0,
+        // we need to keep the threads where local_token_idx == 0 alive to participate in the synchronization.
+        // Other threads should return.
+        if (local_token_idx > 0)
+            return;
     }
-
-    if (local_num_tokens != 0)
+    else
     {
+        // Threads that do not have a token to process should return.
+        if (local_token_idx >= local_num_tokens)
+            return;
+
         // Prepare per-policy shared-memory tiles for this token
         extern __shared__ int smem[];
         int* smem_topk_target_ranks;
@@ -917,9 +924,19 @@ __global__ void moeA2ACombineKernel(
     int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * sizeof(T);
 
-    if (local_token_idx >= local_num_tokens && local_num_tokens != 0)
+    if (local_num_tokens == 0)
     {
-        return;
+        // Special case: If local_num_tokens == 0,
+        // we need to keep the threads where local_token_idx == 0 alive to participate in the synchronization.
+        // Other threads should return.
+        if (local_token_idx > 0)
+            return;
+    }
+    else
+    {
+        // Threads that do not have a token to process should return.
+        if (local_token_idx >= local_num_tokens)
+            return;
     }
 
 #if !DISABLE_SYNC_FOR_PROFILING
