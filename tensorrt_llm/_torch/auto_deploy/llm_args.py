@@ -46,7 +46,7 @@ def _check_for_default_value_only(
 
 
 def default_eagle3_layers_to_capture(num_hidden_layers: int) -> Set[int]:
-    if num_hidden_layers <= 5:
+    if num_hidden_layers <= 6:
         raise ValueError("Not enough hidden layers for default EAGLE3 capture")
     return {1, num_hidden_layers // 2 - 1, num_hidden_layers - 4}
 
@@ -434,7 +434,7 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
-    def default_eagle3_layers_to_capture(self):
+    def set_eagle3_layers_to_capture(self):
         if self.speculative_config is None or not isinstance(
             self.speculative_config, EagleDecodingConfig
         ):
@@ -447,6 +447,12 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
             )
 
         # insert the layers to capture into the transforms config.
+        if self.transforms is None:
+            self.transforms = {}
+
+        if "detect_hidden_states_for_capture" not in self.transforms:
+            self.transforms["detect_hidden_states_for_capture"] = {}
+
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             self.speculative_config.eagle3_layers_to_capture
         )

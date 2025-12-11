@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+from typing import Optional
 
 import pytest
 from build_and_run_ad import ExperimentConfig, main
@@ -65,7 +66,9 @@ def make_spec_config(spec_dec_mode: str, spec_model_path: str):
     raise ValueError(f"Unknown speculative mode: {spec_dec_mode}")
 
 
-def run_with_autodeploy(model, speculative_model_dir, batch_size, spec_dec_mode: str | None):
+def run_with_autodeploy(
+    model, speculative_model_dir, batch_size, spec_dec_mode: Optional[str] = None
+):
     """Run AutoDeploy with or without speculative decoding.
 
     Args:
