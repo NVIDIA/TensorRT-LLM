@@ -27,18 +27,18 @@ namespace torch_ext
 namespace cublas_lut
 {
 
-struct hash_tuple
+struct HashTuple
 {
-    size_t operator()(std::tuple<int, int, int> const& x) const
+    size_t operator()(std::tuple<int32_t, int32_t, int32_t> const& x) const
     {
         return std::get<0>(x) ^ std::get<1>(x) ^ std::get<2>(x);
     }
 };
 
 // {mp2, k, n}: {algo, m_tile, m_stages, m_numsK, m_reduction, m_swizzle, m_custom, m_cga}
-using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, std::array<int, 8>, hash_tuple>;
+using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, std::array<int, 8>, HashTuple>;
 
-inline AlgoListType spark_bf16_algo_list = {
+inline const AlgoListType spark_bf16_algo_list = {
     // llama 8b instruct fp16 decode
     // [-algo67 -m_tile6 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom130 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 4096, 4096}, {67, 6, 35, 1, 0, 0, 130, 2}},
@@ -75,7 +75,7 @@ inline AlgoListType spark_bf16_algo_list = {
 };
 
 // bf16*bf16->fp32->bf16
-inline AlgoListType bf16_algo_list = {
+inline const AlgoListType bf16_algo_list = {
     // Deepseek v3/R1 router gemm
     // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 7168, 256}, {66, 10, 35, 1, 0, 0, 3, 2}},
@@ -84,7 +84,7 @@ inline AlgoListType bf16_algo_list = {
 };
 
 // fp8*fp8->fp32->fp16
-inline AlgoListType fp8_algo_list = {
+inline const AlgoListType fp8_algo_list = {
     // Llama-3.1-70B
     // [-algo66 -m_tile393 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom5 -m_mma0 -m_cga2 -m_scheduling1]
     {{8, 8192, 8192}, {66, 393, 36, 1, 0, 0, 5, 2}},

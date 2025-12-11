@@ -64,18 +64,18 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     cudaDataType_t bType, cudaDataType_t outType)
 {
     int32_t mp2 = std::max(nextPowerOfTwo(m), 8);
-    AlgoListType algo_list;
+    AlgoListType const* algo_list = nullptr;
     if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {
         // TODO: remove this after cublas fix the heuristic for Spark
         algo_list = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
-            ? cublas_lut::spark_bf16_algo_list
-            : cublas_lut::bf16_algo_list;
+            ? &cublas_lut::spark_bf16_algo_list
+            : &cublas_lut::bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {
-        algo_list = cublas_lut::fp8_algo_list;
+        algo_list = &cublas_lut::fp8_algo_list;
     }
     else
     {
@@ -83,7 +83,7 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
             "No special cublasLt algo found for aType=%d, outType=%d, compType=%d\n", aType, outType, compType);
         return false;
     }
-    if (auto algo_iter = algo_list.find({mp2, k, n}); algo_iter != algo_list.end())
+    if (auto algo_iter = algo_list->find({mp2, k, n}); algo_iter != algo_list->end())
     {
         int const algoID = algo_iter->second[0];
         check_cuda_error(cublasLtMatmulAlgoInit(

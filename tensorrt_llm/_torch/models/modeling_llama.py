@@ -894,9 +894,7 @@ class LlamaModel(DecoderModel):
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
 
-        prop = torch.cuda.get_device_properties(0)
-        sm_version = prop.major * 10 + prop.minor
-        self.use_custom_cublas_mm = sm_version == 121
+        self.use_custom_cublas_mm = get_sm_version() == 121
 
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
