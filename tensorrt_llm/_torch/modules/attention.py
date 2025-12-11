@@ -590,18 +590,12 @@ class Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         if bool(lora_params):
-            # TODO: Remove this path when LoRA grouped_gemm supports FP8
-            hidden_states_for_lora = hidden_states
-            if isinstance(hidden_states, torch.Tensor
-                          ) and hidden_states.dtype == torch.float8_e4m3fn:
-                hidden_states_for_lora = hidden_states.to(torch.bfloat16)
-
-            qkv_lora = self.splitted_qkv_lora(hidden_states_for_lora,
-                                              lora_params, self.layer_idx)
+            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
+                                              self.layer_idx)
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-            qkv_lora = self.fused_qkv_lora(hidden_states_for_lora, lora_params,
+            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
                                            self.layer_idx)
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
