@@ -2192,25 +2192,32 @@ class MLA(nn.Module):
                                   all_reduce_params=all_reduce_params)
         return attn_output
 
+    def resmooth_parameters(self, weight, scale, recipe=(1, 128, 128)):
+        weight_param, weight_param = fp8_utils.resmooth_to_fp8_e8m0(
+            weight, scale)
+
+        scale_param = fp8_utils.transform_sf_into_required_layout(
+            scale,
+            mn=weight_param.shape[0],
+            k=weight_param.shape[1],
+            recipe=recipe,
+            is_sfa=False)
+
+        weight_param = torch.nn.Parameter(weight_param, requires_grad=False)
+        scale_param = torch.nn.Parameter(scale_param, requires_grad=False)
+
+        return weight_param, scale_param
+
     def post_load_weights(self):
         has_fp8_block_scales = (
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
         is_sm120 = get_sm_version() == 120
         if is_sm120 and has_fp8_block_scales:
-            self.k_b_proj_trans, self.k_b_proj_trans_scale = fp8_utils.resmooth_to_fp8_e8m0(
-                self.k_b_proj_trans, self.k_b_proj_trans_scale)
-            self.k_b_proj_trans_scale = fp8_utils.transform_sf_into_required_layout(
+            self.k_b_proj_trans, self.k_b_proj_trans_scale = self.resmooth_parameters(
+                self.k_b_proj_trans,
                 self.k_b_proj_trans_scale,
-                mn=self.k_b_proj_trans.shape[0],
-                k=self.k_b_proj_trans.shape[1],
-                recipe=(1, 128, 128),
-                is_sfa=False)
-            self.v_b_proj, self.v_b_proj_scale = fp8_utils.resmooth_to_fp8_e8m0(
-                self.v_b_proj, self.v_b_proj_scale)
-            self.v_b_proj_scale = fp8_utils.transform_sf_into_required_layout(
-                self.v_b_proj_scale,
-                mn=self.v_b_proj.shape[0],
-                k=self.v_b_proj.shape[1],
-                recipe=(1, 128, 128),
-                is_sfa=False)
+                recipe=(1, 128, 128))
+
+            self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
+                self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
