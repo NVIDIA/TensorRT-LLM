@@ -169,6 +169,10 @@ class TunableRunner(ABC):
         means. User can choose to implement their own types of tactic for flexibility, such as using a dict-typed
         to represent a collection of named configs.
 
+        The type of the tactic is arbitrary. But serialization/deserialization of the cache requires that the type is compatible with json.dumps/json.loads.
+        To evaluate if a type of tactic is compatible with current workflow, try the following code:
+            *  assert YOUR_TACTIC_OBJECT == eval(repr(YOUR_TACTIC_OBJECT))
+
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
             * when the autotuner cannot find a valid tactic in it's cache.
@@ -365,11 +369,14 @@ class AutoTunerProfilingCache:
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
+            runner_id is the index in the current runners list
         """
-        for r in runners:
+        for idx, r in enumerate(runners):
             if (cache_key := self.get_cache_key(custom_op, r, input_shapes,
                                                 tuning_config)) in self.cache:
-                return True, *self.cache[cache_key]
+                # Return the current index in runners list, not the cached runner_id
+                cached_runner_id, tactic, min_time = self.cache[cache_key]
+                return True, idx, tactic, min_time
 
         return False, *self.fallback_entry()
 
@@ -472,14 +479,22 @@ class AutoTunerProfilingCache:
         }
 
         for key, value in self.cache.items():
-            # Convert tuple key to string for JSON compatibility
+            # Convert any simple object to string for JSON compatibility
             key_str = str(key)
-
             runner_id, tactic, min_time = value
+            tactic_str = repr(tactic)
+            try:
+                assert tactic == ast.literal_eval(
+                    tactic_str
+                ), f"Tactic is not compatible with json.dumps/json.loads"
+            except Exception as e:
+                logger.warning_once(
+                    f"[AutoTuner] Could not serialize tactic: {tactic_str} for cache key {key_str} due to {e}. Deserialization may fail.",
+                    key=tactic_str)
 
             serializable_cache["cache_data"][key_str] = {
                 "runner_id": runner_id,
-                "tactic": tactic,
+                "tactic": tactic_str,
                 "min_time": min_time,
             }
 
@@ -511,14 +526,19 @@ class AutoTunerProfilingCache:
         for key_str, value in cache_data.items():
             # Reconstruct the tuple key safely
             try:
-                key = ast.literal_eval(key_str)  # Safer than eval()
+                key = ast.literal_eval(key_str)
             except (ValueError, SyntaxError):
                 logger.warning(
                     f"[AutoTuner] Could not reconstruct cache key: {key_str}")
                 continue
+            try:
+                tactic = ast.literal_eval(value["tactic"])
+            except (ValueError, TypeError):
+                logger.warning_once(
+                    f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}",
+                    key=value["tactic"])
 
             runner_id = value["runner_id"]
-            tactic = value["tactic"]
             min_time = value["min_time"]
 
             cache[key] = (runner_id, tactic, min_time)
@@ -727,7 +747,7 @@ class AutoTuner:
             # Log the cache miss. Expect no cache miss in inference.
             if not is_cache_hit:
                 logger.warning_once(
-                    f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
+                    f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
 
             return (best_runner, best_tactic)
@@ -849,14 +869,9 @@ class AutoTuner:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
                     logger.warning_once(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Set TLLM_LOG_LEVEL=DEBUG for more details.",
+                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
                         key=(custom_op, "warning_autotuning_profile_failure"),
                     )
-                    (logger.info_once
-                     if self._log_level_to_info else logger.debug_once)(
-                         f"[Autotuner] Exception captured: {e}",
-                         key=(custom_op, "debug_autotuning_exception"),
-                     )
 
                     # Record the failed profiling combinations
                     self.stats.failed_profiling_count[custom_op].add(

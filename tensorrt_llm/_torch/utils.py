@@ -6,6 +6,7 @@ from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
+from torch.nn import functional as F
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.mapping import Mapping
@@ -44,6 +45,14 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+
+
+# IMPORTANT: when adding a new activation type, please update this function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    return activation_type in [
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+    ]
 
 
 def set_torch_compiling(enable: bool):
@@ -282,6 +291,15 @@ def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16,
+                                                     is_swizzled_layout=False)
+    return scale_shape * 2
+
+
 _enable_piecewise_cuda_graph = True
 
 
@@ -370,3 +388,18 @@ def maybe_compile(func=None, **compile_kwargs):
         return wrapper
 
     return decorator(func) if func else decorator
+
+
+def split(x: torch.Tensor,
+          tp_size: int,
+          idx: int,
+          dim: int = 0) -> torch.Tensor:
+    assert x.shape[dim] % tp_size == 0
+    split_size = x.shape[dim] // tp_size
+    if tp_size == 1:
+        return x
+    return torch.split(x, split_size, dim=dim)[idx]
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    return torch.square(F.relu(x))

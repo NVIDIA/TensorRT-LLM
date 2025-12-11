@@ -335,10 +335,6 @@ def test_fused_moe_alltoall(alltoall_method_type):
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
-
-    if alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-        pytest.skip("Skipped due to https://nvbugs/5467531")
-
     world_size = 4
     dtype = torch.bfloat16
     HIDDEN_SIZE = 4096
@@ -1360,7 +1356,24 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @pytest.mark.parametrize("moe_backend", [
     pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
 ])
-def test_fused_moe_nvfp4(dtype, moe_backend):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
+
+    if enable_configurable_moe == 1 and moe_backend not in [
+            "TRTLLM", "CUTLASS"
+    ]:
+        pytest.skip(
+            "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
+        )
+
+    mocker.patch.dict(
+        os.environ, {
+            "ENABLE_CONFIGURABLE_MOE":
+            "1" if enable_configurable_moe == 1
+            and moe_backend in ["TRTLLM", "CUTLASS"] else "0"
+        })
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
@@ -1368,9 +1381,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         if dtype == torch.float16:
             pytest.skip(
                 "CUTEDSL NVFP4 MoE backend does not support float16 yet")
-        if get_sm_version() != 100:
+        if get_sm_version() not in (100, 103):
             pytest.skip(
-                "CUTEDSL NVFP4 MoE backend is only supported on SM 100 GPUs")
+                "CUTEDSL NVFP4 MoE backend supports SM 100 (B200) and SM 103 (B300) only"
+            )
 
     test_all_kernels = True
     if get_sm_version() == 120:
@@ -1518,7 +1532,15 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend, enable_configurable_moe, mocker):
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
+
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1933,7 +1955,16 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 @pytest.mark.parametrize("hidden_unpadded", [64, 192, 256])
 @pytest.mark.parametrize("seq_len", [8, 128])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
+                               enable_configurable_moe, mocker):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     if moe_backend == "CUTLASS" and hidden_unpadded % 128 != 0:
         pytest.skip()
@@ -2194,7 +2225,16 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
             marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
     ],
 )
-def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
+                           enable_configurable_moe, mocker):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     mapping = Mapping()
     mapping.rank = mpi_rank()

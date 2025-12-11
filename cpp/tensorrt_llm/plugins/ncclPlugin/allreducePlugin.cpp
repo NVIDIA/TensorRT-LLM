@@ -137,13 +137,12 @@ bool AllreducePlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     int base_inputs = 0;
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB)
+    switch (mStrategy)
     {
-        base_inputs = 1;
-    }
-    else
-    {
-        base_inputs = 2;
+    case AllReduceStrategyType::NCCL:
+    case AllReduceStrategyType::UB:
+    case AllReduceStrategyType::NCCL_SYMMETRIC: base_inputs = 1; break;
+    default: base_inputs = 2; break;
     }
     int fusion_op_extra_inputs = 0;
     int scale_idx = 0;
@@ -169,9 +168,15 @@ bool AllreducePlugin::supportsFormatCombination(
 
     TLLM_CHECK(nbInputs == (base_inputs + fusion_op_extra_inputs));
 
-    if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB && pos == 1)
+    if (pos == 1)
     {
-        return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        switch (mStrategy)
+        {
+        case AllReduceStrategyType::NCCL:
+        case AllReduceStrategyType::UB:
+        case AllReduceStrategyType::NCCL_SYMMETRIC: break;
+        default: return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
     }
     if (mStrategy == AllReduceStrategyType::UB)
     {
@@ -222,25 +227,26 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
     {
         if (!isAuto)
         {
-            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
         }
         else if (forceDeterministic)
         {
             TLLM_LOG_WARNING(
-                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might "
+                "produce "
                 "non-deterministic results.");
         }
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     if (isAuto && !mIsNVLINKSupported && !forceDeterministic)
     {
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     auto const maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
 
-    AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
+    AllReduceStrategyType strat = AllReduceStrategyType::NCCL_SYMMETRIC;
     auto const messageSizeBytes = messageSize * common::getDTypeSize(type);
 
     if (messageSizeBytes <= maxWorkspaceSize)
@@ -268,7 +274,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::NCCL;
+                strat = AllReduceStrategyType::NCCL_SYMMETRIC;
             }
         }
         else
@@ -279,7 +285,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::NCCL;
+                strat = AllReduceStrategyType::NCCL_SYMMETRIC;
             }
         }
 
@@ -287,30 +293,31 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
         {
             if (!isAuto)
             {
-                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL");
+                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
             }
             else if (forceDeterministic)
             {
                 TLLM_LOG_WARNING(
-                    "Since not aligned, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                    "Since not aligned, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might produce "
                     "non-deterministic results.");
             }
-            strat = AllReduceStrategyType::NCCL;
+            strat = AllReduceStrategyType::NCCL_SYMMETRIC;
         }
     }
     else
     {
         if (!isAuto)
         {
-            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
         }
         else if (forceDeterministic)
         {
             TLLM_LOG_WARNING(
-                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might "
+                "produce "
                 "non-deterministic results.");
         }
-        strat = AllReduceStrategyType::NCCL;
+        strat = AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     return strat;
@@ -337,6 +344,10 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
         runtimeStrategy = AllReduceStrategyType::NCCL;
     }
+    else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL_SYMMETRIC;
+    }
     else if (mStrategy == AllReduceStrategyType::UB)
     {
         runtimeStrategy = AllReduceStrategyType::UB;
@@ -353,6 +364,11 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     case AllReduceStrategyType::NCCL:
     {
         TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
+        break;
+    }
+    case AllReduceStrategyType::NCCL_SYMMETRIC:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
         break;
     }
     case AllReduceStrategyType::ONESHOT:
@@ -373,14 +389,14 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     default: break;
     }
 
-    if (runtimeStrategy == AllReduceStrategyType::NCCL)
+    if (runtimeStrategy == AllReduceStrategyType::NCCL || runtimeStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
     {
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
         {
             NCCLCHECK(ncclAllReduce(inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
             int fusion_ptr_idx = 0;
-            if (mStrategy == AllReduceStrategyType::NCCL)
+            if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
             {
                 fusion_ptr_idx = 1;
             }

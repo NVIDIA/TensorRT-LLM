@@ -494,16 +494,15 @@ class BenchRunner:
         return self.run_bench()
 
     def prepare_dataset(self):
-        dataset_tool = Path(self.llm_root, "benchmarks", "cpp",
-                            "prepare_dataset.py")
-
         # Generate a small dataset to run a test.
         self.work_dir.mkdir(parents=True)
         command = [
-            f"{dataset_tool.resolve()}",
-            "--stdout",
-            "--tokenizer",
+            "trtllm-bench",
+            "--model",
             f"{self.model_path}",
+            "prepare-dataset",
+            "--output",
+            f"{self.dataset_path}",
             "token-norm-dist",
             "--input-mean",
             "128",
@@ -517,13 +516,6 @@ class BenchRunner:
             str(self.num_requests),
         ]
         print(f"Running command: {' '.join(command)}")
-        dataset_output = self.llm_venv.run_cmd(
-            command,
-            caller=check_output,
-        )
-        # Grab the stdout and write it to a dataset file for passing to suite.
-        with open(self.dataset_path, "w") as dataset:
-            dataset.write(dataset_output)
 
     def build_engine(self):
         if self.skip_engine_build:
@@ -774,7 +766,6 @@ def trtllm_bench_prolog(
     stream_mode = "streaming" if streaming else "non-streaming"
     benchmark_name = f"trtllm-bench-sanity-{quant_name}-{stream_mode}"
     benchmark_name += "-pytorch-backend" if skip_engine_build else benchmark_name
-    dataset_tool = Path(llm_root, "benchmarks", "cpp", "prepare_dataset.py")
 
     work_dir = Path(tempfile.TemporaryDirectory().name
                     ) if skip_engine_build else Path(engine_dir)
@@ -783,29 +774,26 @@ def trtllm_bench_prolog(
     shutil.rmtree(work_dir, ignore_errors=True)
     # Generate a small dataset to run a test.
     work_dir.mkdir(parents=True)
-    dataset_output = llm_venv.run_cmd(
-        [
-            f"{dataset_tool.resolve()}",
-            "--stdout",
-            "--tokenizer",
-            f"{model_path}",
-            "token-norm-dist",
-            "--input-mean",
-            "128",
-            "--output-mean",
-            "128",
-            "--input-stdev",
-            "0",
-            "--output-stdev",
-            "0",
-            "--num-requests",
-            "10",
-        ],
-        caller=check_output,
-    )
-    # Grab the stdout and write it to a dataset file for passing to suite.
-    with open(dataset_path, "w") as dataset:
-        dataset.write(dataset_output)
+    dataset_cmd = [
+        "trtllm-bench",
+        "--model",
+        f"{model_path}",
+        "prepare-dataset",
+        "--output",
+        f"{dataset_path}",
+        "token-norm-dist",
+        "--input-mean",
+        "128",
+        "--output-mean",
+        "128",
+        "--input-stdev",
+        "0",
+        "--output-stdev",
+        "0",
+        "--num-requests",
+        "10",
+    ]
+    check_output(" ".join(dataset_cmd), shell=True)
 
     if not skip_engine_build:
         build_cmd = \
@@ -1663,6 +1651,14 @@ def test_openai_responses(llm_root, llm_venv):
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_responses.py")])
+
+
+def test_openai_health(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_metrics.py"), "-k", "test_health"
+    ])
 
 
 def test_openai_prometheus(llm_root, llm_venv):

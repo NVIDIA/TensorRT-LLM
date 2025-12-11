@@ -66,7 +66,9 @@ def row_linear_residual_norm_fusion_forward(
         x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
         dtype: torch.dtype, tensor_parallel_size: int,
         tensor_parallel_rank: int, weights: torch.Tensor, fused_add_norm: bool):
-    backend = Backend()
+    backend = Backend(mapping=Mapping(world_size=tensor_parallel_size,
+                                      tp_size=tensor_parallel_size,
+                                      rank=tensor_parallel_rank))
     x = x.cuda()
     residual = residual.cuda()
     norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")

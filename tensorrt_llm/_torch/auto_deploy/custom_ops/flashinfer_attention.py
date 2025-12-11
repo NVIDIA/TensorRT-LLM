@@ -7,6 +7,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+from ...flashinfer_utils import get_env_enable_pdl
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args
@@ -256,9 +257,9 @@ def flashinfer_mha_with_cache(
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
 
-    q = q.contiguous().view(b * s, -1, head_dim)
-    k = k.contiguous().view(b * s, -1, head_dim)
-    v = v.contiguous().view(b * s, -1, head_dim)
+    q = q.reshape(b * s, -1, head_dim)
+    k = k.reshape(b * s, -1, head_dim)
+    v = v.reshape(b * s, -1, head_dim)
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -275,11 +276,12 @@ def flashinfer_mha_with_cache(
         sm_scale=scale,
     )
 
-    # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
+    # Assuming k_scale = v_scale = 1.0
     k_scale, v_scale = 1.0, 1.0
+    # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
     if k_cache.dtype == torch.float8_e4m3fn:
-        k = (k / k_scale).to(torch.float8_e4m3fn)
-        v = (v / v_scale).to(torch.float8_e4m3fn)
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
 
     flashinfer.page.append_paged_kv_cache(
         k,
@@ -300,7 +302,10 @@ def flashinfer_mha_with_cache(
         paged_kv_last_page_len,
         pp,
     )
-    y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+
+    y = wrapper.run(
+        q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, enable_pdl=get_env_enable_pdl()
+    )
 
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 

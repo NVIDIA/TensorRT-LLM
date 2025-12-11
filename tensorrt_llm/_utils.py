@@ -524,13 +524,6 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
-def ray_use_rpc() -> bool:
-    """True if TLLM_RAY_USE_RPC is set to "1", False otherwise.
-    # TODO: deprecate this once Ray is fully moved to use RPC client/server.
-    """
-    return os.environ.get("TLLM_RAY_USE_RPC") == "1"
-
-
 def mpi_rank():
     if mpi_disabled():
         try:
@@ -1173,6 +1166,50 @@ def set_prometheus_multiproc_dir() -> object:
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.info(
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def confidential_compute_enabled() -> bool:
+    """
+    Query NVML for the confidential compute state
+    """
+
+    cc_enabled = False
+
+    try:
+        # Init
+        import pynvml
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
+                pynvml.NVML_SUCCESS):
+            cc_enabled = (cc_settings.ccFeature
+                          == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+                          or cc_settings.multiGpuMode
+                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+                          or cc_settings.multiGpuMode
+                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = (
+                cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED)
+        except Exception as e:
+            logger.error(f"Error querying confidential compute state: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error querying confidential compute state: {str(e)}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 P = ParamSpec("P")

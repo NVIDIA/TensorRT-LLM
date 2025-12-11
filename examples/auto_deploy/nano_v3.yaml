@@ -13,8 +13,28 @@ kv_cache_config:
   enable_block_reuse: false
 transforms:
   detect_sharding:
-    sharding_source: ['factory', 'heuristic']
+    allreduce_strategy: SYMM_MEM
     sharding_dims: ['ep', 'bmm']
+    manual_config:
+      head_dim: 128
+      tp_plan:
+        # mamba SSM layer
+        "in_proj": "mamba"
+        "out_proj": "rowwise"
+        # attention layer
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        # NOTE: consider not sharding shared experts and/or
+        # latent projections at all, keeping them replicated.
+        # To do so, comment out the corresponding entries.
+        # moe layer: SHARED experts
+        "up_proj": "colwise"
+        "down_proj": "rowwise"
+        # MoLE: latent projections: simple shard
+        "fc1_latent_proj": "gather"
+        "fc2_latent_proj": "gather"
   multi_stream_moe:
     stage: compile
     enabled: true

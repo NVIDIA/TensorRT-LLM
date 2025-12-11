@@ -140,12 +140,13 @@ To avoid OOM (out of memory) error, you need to adjust the values of "--max_batc
 #### ISL-64k-OSL-1024
 ```bash
 DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
-python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
-        --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
+trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
+        prepare-dataset \
+        --output /tmp/benchmarking_64k.txt \
         token-norm-dist \
         --input-mean 65536 --output-mean 1024 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 24 > /tmp/benchmarking_64k.txt
+        --num-requests 24
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
@@ -166,12 +167,13 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
 #### ISL-128k-OSL-1024
 ```bash
 DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1
-python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
-        --stdout --tokenizer ${DS_R1_NVFP4_MODEL_PATH} \
+trtllm-bench --model ${DS_R1_NVFP4_MODEL_PATH} \
+        prepare-dataset \
+        --output /tmp/benchmarking_128k.txt \
         token-norm-dist \
         --input-mean 131072 --output-mean 1024 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 4 > /tmp/benchmarking_128k.txt
+        --num-requests 4
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
@@ -356,7 +358,7 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-For DeepSeek-R1 FP4, use the model name `nvidia/DeepSeek-R1-FP4-v2`.  
+For DeepSeek-R1 FP4, use the model name `nvidia/DeepSeek-R1-FP4-v2`.
 For DeepSeek-V3, use the model name `deepseek-ai/DeepSeek-V3`.
 
 ### Disaggregated Serving
@@ -610,10 +612,10 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
 
 Step 1: Prepare dataset and `extra-llm-api-config.yml`.
 ```bash
-python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
-    --tokenizer=/path/to/DeepSeek-R1 \
-    --stdout token-norm-dist --num-requests=49152 \
-    --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
+trtllm-bench --model /path/to/DeepSeek-R1 \
+    prepare-dataset --output /tmp/dataset.txt \
+    token-norm-dist --num-requests=49152 \
+    --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
 cuda_graph_config:
@@ -773,7 +775,7 @@ You can enable FP8 MLA through either of these methods:
 
 **Option 1: Checkpoint config**
 
-TensorRT LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+TensorRT LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/Model-Optimizer).
 
 To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 GEMM quantization + FP8 MLA:
 
@@ -808,14 +810,14 @@ Or you can follow the steps to generate one by yourselves.
 
 #### Activation calibration
 
-[ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) is used for calibrating activations of MoE layers. We provide a calibrated file at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main/act_scales.safetensors) or you can run the following commands to generate by yourselves.
+[ModelOpt](https://github.com/NVIDIA/Model-Optimizer) is used for calibrating activations of MoE layers. We provide a calibrated file at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main/act_scales.safetensors) or you can run the following commands to generate by yourselves.
 
 ```bash
 # Make sure for enough GPU resources (8xH200s) to run the following commands
 PATH_OF_DEEPSEEK_R1=/llm-models/DeepSeek-R1/DeepSeek-R1
 
 # Install ModelOpt from source
-git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer/ && cd modelopt
+git clone https://github.com/NVIDIA/Model-Optimizer/ && cd modelopt
 pip install "nvidia-modelopt[all]" -U --extra-index-url https://pypi.nvidia.com
 
 # Clone DeepSeek-V3 (base model of R1) Github repository for FP8 inference,
@@ -881,12 +883,3 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_pref
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-## Known Issues
-- Support for KV Cache Reuse and Chunked Prefill in DeepSeek-V3.2-Exp is currently under development. When running `quickstart_advanced.py`, please include `--disable_kv_cache_reuse` to disable KV Cache Reuse. When using `trtllm-eval`/`trtllm-serve`/`trtllm-bench`, please include the following configuration in the extra llm_api options:
-```
-kv_cache_config:
-    enable_block_reuse: false
-    tokens_per_block: 64
-enable_chunked_prefill: false
-```

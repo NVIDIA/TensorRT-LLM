@@ -1,3 +1,4 @@
+import gc
 import importlib
 import os
 from pathlib import Path
@@ -12,7 +13,6 @@ from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag,
                                                 verify_sleep_wakeup_tags)
-from tensorrt_llm._utils import ray_use_rpc
 
 from ..bindings import executor as tllm
 from ..builder import Engine
@@ -23,7 +23,7 @@ from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
-from .rpc_worker import RpcWorkerMixin
+from .rpc_worker_mixin import RpcWorkerMixin
 
 __all__ = [
     "RayGPUWorker",
@@ -44,7 +44,6 @@ class RayWorkerWrapper:
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
-
         # Ray can't pickle TensorRT logger
         global logger
         from tensorrt_llm.logger import logger
@@ -169,6 +168,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
+        hmac_key: Optional[bytes] = None,
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
@@ -189,14 +189,11 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if self.global_rank > 1:
             logger.set_rank(self.global_rank)
 
-        if ray_use_rpc():
-            if rpc_addr is None:
-                raise RuntimeError(
-                    "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
-            self.init_rpc_worker(self.global_rank, rpc_addr)
-            self.start_rpc_server()
-        else:
-            self.setup_engine()
+        if rpc_addr is None:
+            raise RuntimeError(
+                "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
+        self.init_rpc_worker(self.global_rank, rpc_addr, hmac_key)
+        self.start_rpc_server()
 
     def setup_engine(self):
         if torch.distributed.is_initialized(
@@ -221,6 +218,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             torch.cuda.synchronize()
             release_with_tag(*tags)
             torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception as e:
             logger.error(f"Encountered an error in sleep: {e}")
             raise e

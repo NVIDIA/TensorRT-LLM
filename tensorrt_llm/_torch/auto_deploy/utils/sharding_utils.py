@@ -6,10 +6,18 @@ import re
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
-
-if TYPE_CHECKING:
-    from ..transform.library.sharding import ShardingTransformConfig
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -31,6 +39,9 @@ from .quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
+
+if TYPE_CHECKING:
+    from ..transform.library.sharding import ShardingTransformConfig
 
 
 def validate_allreduce_strategy(v):
@@ -163,21 +174,22 @@ def _validate_sharded_shapes(
         include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
         boundary_condition=is_any_lin_op,
     )
-    for view_node in nodes_to_validate:
-        if len(view_node.args) < 2:
+    for shape_node in nodes_to_validate:
+        # Parameter update must be idempotent
+        if "sharded" in shape_node.meta and shape_node.meta["sharded"]:
             continue
-        if "sharded" in view_node.meta and view_node.meta["sharded"]:
+        if len(shape_node.args) < 2:
             continue
-        view_shape = list(view_node.args[1])
+        view_shape = list(shape_node.args[1])
         if not isinstance(view_shape, list):
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
-            args = list(view_node.args)
+            args = list(shape_node.args)
             view_shape[2] = -1  # view_shape[2] // world_size
             args[1] = tuple(view_shape)
-            view_node.args = tuple(args)
-            view_node.meta["sharded"] = True
-            ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
+            shape_node.args = tuple(args)
+            shape_node.meta["sharded"] = True
+            ad_logger.debug(f"\nUpdated view node {shape_node} arguments to {shape_node.args}")
 
     # if fused_weight_dims is provided, we need to update all split sizes
     if fused_weight_dims is not None:
@@ -187,14 +199,18 @@ def _validate_sharded_shapes(
         split_nodes = subgraph(
             [node],
             [next_lin_node],
-            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+            include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
         )
         for split_node in split_nodes:
+            # Parameter update must be idempotent
+            if "sharded" in split_node.meta and split_node.meta["sharded"]:
+                continue
             orig_sizes = split_node.args[1]
             new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
             args = list(split_node.args)
             args[1] = new_sizes
             split_node.args = tuple(args)
+            split_node.meta["sharded"] = True
             ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
 
 
@@ -256,10 +272,6 @@ def shard_weight_tensor(
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
-            # dim_d = t.shape[d]
-            # num_parts = 1
-            # part_size = dim_d // num_parts
-            # fused_dims = [part_size] * num_parts
             return torch.cat(
                 [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
                 dim=d,
@@ -407,7 +419,9 @@ def _insert_sharded_mamba(
     conv_args[-1] = conv1d_node.args[-1] // world_size
     conv1d_node.args = tuple(conv_args)
 
-    # First, shard the entry_node (the first linear layer)
+    ##############################################################
+    ####### shard the entry_node (the first linear layer) ########
+    ##############################################################
     # Extract entry node's fused_weight_dims by matching weight name against patterns
     entry_fused_dims = None
     if fused_weight_dims:
@@ -431,6 +445,9 @@ def _insert_sharded_mamba(
         allreduce_strategy=allreduce_strategy,
     )
 
+    ##############################################################
+    ######## Shard remaining weights: conv1d and RMSNorm #########
+    ##############################################################
     # Get all weight nodes in the subgraph except for out_proj
     weight_nodes = [
         n
@@ -438,7 +455,6 @@ def _insert_sharded_mamba(
         if "out_proj" not in str(n)
     ]
 
-    # Shard remaining weights, such as conv1d or RMSNorm
     for weight_node in weight_nodes:
         weight_key = weight_node.target
 
@@ -480,6 +496,45 @@ def _insert_sharded_mamba(
             f"Sharded weight {weight_key} on dim {shard_dim}: "
             f"{weight_param.shape} -> {sharded_shape}"
         )
+
+    ##############################################################
+    ############## update split node parameters ##################
+    ##############################################################
+    next_lin_node, _ = bfs(entry_node, is_any_lin_op, include_root=False)
+
+    split_nodes = subgraph(
+        [entry_node],
+        [next_lin_node],
+        include=lambda n: is_op(n, [torch.ops.aten.split_with_sizes]),
+    )
+    for split_node in split_nodes:
+        orig_sizes = split_node.args[1]
+        new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
+        args = list(split_node.args)
+        args[1] = new_sizes
+        split_node.args = tuple(args)
+        ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
+
+    nodes_to_validate = subgraph(
+        [entry_node],
+        include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
+        boundary_condition=is_any_lin_op,
+    )
+    for reshape_node in nodes_to_validate:
+        if len(reshape_node.args) < 2:
+            continue
+        if "sharded" in reshape_node.meta and reshape_node.meta["sharded"]:
+            continue
+        view_shape = list(reshape_node.args[1])
+        if not isinstance(view_shape, list):
+            continue
+        if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
+            args = list(reshape_node.args)
+            view_shape[2] = -1  # view_shape[2] // world_size
+            args[1] = tuple(view_shape)
+            reshape_node.args = tuple(args)
+            reshape_node.meta["sharded"] = True
+            ad_logger.debug(f"\nUpdated view node {reshape_node} arguments to {reshape_node.args}")
 
 
 def _shard_parameter_node(
@@ -574,10 +629,6 @@ def _shard_parameter_node(
 
     # # # column shard with no gather: the output is sharded
     if not add_dist:
-        if is_any_lin_op(node):
-            _validate_sharded_shapes(
-                node, fused_weight_dims=fused_weight_dims, world_size=world_size
-            )
         return
 
     # figure out the right dist op (backend-aware)
@@ -717,36 +768,19 @@ class WeightShardingInfo(ShardingTransformInfo):
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
-        if self.layer_type == LayerType.MAMBA:
-            _insert_sharded_mamba(
-                gm=gm,
-                entry_node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                dist_backend=self.dist_backend,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims
-                if isinstance(self.fused_weight_dims, dict)
-                else None,
-                quantization_cb=self.quantization_cb,
-                allreduce_strategy=self.allreduce_strategy,
-            )
-        else:
-            _shard_parameter_node(
-                gm=gm,
-                node=node,
-                dim=self.split_dim.value,
-                rank=self.rank,
-                world_size=self.world_size,
-                dist_backend=self.dist_backend,
-                add_dist=self.dist_op is not None,
-                min_local_shape=self.min_local_shape,
-                fused_weight_dims=self.fused_weight_dims,
-                quantization_cb=self.quantization_cb,
-                allreduce_strategy=self.allreduce_strategy,
-            )
+        _shard_parameter_node(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            dist_backend=self.dist_backend,
+            min_local_shape=self.min_local_shape,
+            fused_weight_dims=self.fused_weight_dims,
+            quantization_cb=self.quantization_cb,
+            allreduce_strategy=self.allreduce_strategy,
+        )
 
 
 class ParameterUpdateInfo(ShardingTransformInfo):
@@ -1048,9 +1082,13 @@ def _insert_sharded_moe(
     dist_backend: str,
     scale_names: Sequence[str] = (),
 ):
-    """Update the torch_moe node with sharded weight lists,
+    """Update the torch_moe node with sharded weight lists or stacked tensors,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
+
+    Handles both:
+    - Standard format: per-expert weight lists
+    - Stacked format: single-element lists containing stacked 3D tensors (Llama4 pattern)
 
     NOTE: allreduce_strategy is MANDATORY.
     """
@@ -1058,7 +1096,52 @@ def _insert_sharded_moe(
         raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
     scale_names = list(scale_names)
 
-    num_experts = len(node.args[3])
+    # Detect format: check if w1_weight is a single-element list with a 3D tensor (stacked format)
+    w1_weight_arg = node.args[3]
+    is_stacked = False
+
+    # In FX graphs, the list might be a Node representing a list() call
+    if isinstance(w1_weight_arg, Node):
+        # Check if this is a list() call node
+        if w1_weight_arg.target is list and len(w1_weight_arg.args) > 0:
+            # Get the actual list content from the args
+            list_content = w1_weight_arg.args[0]
+            if isinstance(list_content, (list, tuple)) and len(list_content) == 1:
+                first_elem = list_content[0]
+                if isinstance(first_elem, Node) and first_elem.op == "get_attr":
+                    try:
+                        tensor = gm.get_parameter(first_elem.target)
+                        is_stacked = tensor.ndim == 3
+                    except (AttributeError, KeyError):
+                        pass
+                elif isinstance(first_elem, torch.Tensor):
+                    is_stacked = first_elem.ndim == 3
+    # Handle case where it's a direct Python list (not in FX graph context)
+    elif isinstance(w1_weight_arg, (list, tuple)) and len(w1_weight_arg) == 1:
+        first_elem = w1_weight_arg[0]
+        if isinstance(first_elem, Node) and first_elem.op == "get_attr":
+            try:
+                tensor = gm.get_parameter(first_elem.target)
+                is_stacked = tensor.ndim == 3
+            except (AttributeError, KeyError):
+                pass
+        elif isinstance(first_elem, torch.Tensor):
+            is_stacked = first_elem.ndim == 3
+
+    if is_stacked:
+        # Use stacked tensor sharding logic (similar to _insert_sharded_moe_bmm)
+        _insert_sharded_moe_stacked(gm, node, rank, world_size, allreduce_strategy, scale_names)
+        return
+
+    # Standard per-expert list sharding
+    # For FX graphs, get the list from the Node; for direct calls, use the list directly
+    if isinstance(w1_weight_arg, Node) and w1_weight_arg.target is list:
+        # Extract the list content from the list() call node
+        num_experts = len(w1_weight_arg.args[0]) if w1_weight_arg.args else 0
+    elif isinstance(w1_weight_arg, (list, tuple)):
+        num_experts = len(w1_weight_arg)
+    else:
+        raise ValueError(f"Unexpected w1_weight format in node {node.name}: {type(w1_weight_arg)}")
     args = list(node.args)
 
     # -- Handle selected_experts and final_scales sharding --
@@ -1131,14 +1214,255 @@ def _insert_sharded_moe(
         dist_node.replace_input_with(dist_node, node)
 
 
-def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
-    """Return tensor_node[lo:hi, ...] via aten.slice along dim 0."""
-    with gm.graph.inserting_after(tensor_node):
-        # aten.slice.Tensor(self, dim, start, end, step)
-        return gm.graph.call_function(
-            torch.ops.aten.slice.Tensor,
-            args=(tensor_node, 0, lo, hi, 1),
+def _slice_expert_dim(
+    gm: GraphModule,
+    tensor_node_or_tensor: Union[Node, torch.Tensor],
+    lo: int,
+    hi: int,
+) -> Union[Node, torch.Tensor]:
+    """Slice expert weights along dim 0 and register load hook (simple version).
+
+    This is the original simple slicing function used by MXFP4 EP sharding.
+    For parameters, it modifies them in-place and returns the same node.
+
+    Args:
+        gm: The graph module
+        tensor_node_or_tensor: Either a Node (from FX graph) or a Tensor
+        lo: Start index for slicing
+        hi: End index for slicing
+
+    Returns:
+        Node or Tensor depending on input type
+    """
+    # Handle raw tensor case
+    if isinstance(tensor_node_or_tensor, torch.Tensor):
+        return tensor_node_or_tensor[lo:hi]
+
+    # Handle Node case
+    tensor_node = tensor_node_or_tensor
+
+    if tensor_node.op != "get_attr":
+        # If not a parameter node, just add a runtime slice node after it
+        with gm.graph.inserting_after(tensor_node):
+            return gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(tensor_node, 0, lo, hi, 1),
+            )
+
+    # Get the parameter
+    param_key = str(tensor_node.target)
+    modname, _, param_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname) if modname else gm
+    full_param = getattr(submod, param_name)
+
+    # Slice the parameter
+    sliced_param = full_param[lo:hi].detach().clone()
+    sliced_shape = sliced_param.shape
+
+    # Define slice function for load hook
+    def slice_expert_tensor(t: torch.Tensor) -> torch.Tensor:
+        return t[lo:hi]
+
+    # Register load hook to slice during checkpoint loading
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=slice_expert_tensor,
+            param_key=param_key,
+            param_shape=sliced_shape,
         )
+    )
+
+    # Replace the parameter with the sliced version
+    new_param = nn.Parameter(sliced_param, requires_grad=False)
+    setattr(submod, param_name, new_param)
+
+    # Return the same node (it now points to the sliced parameter)
+    return tensor_node
+
+
+def _transform_bmm_moe_weight_param(
+    gm: GraphModule,
+    param_node: Node,
+    lo: int,
+    hi: int,
+    swap_gate_up: bool = False,
+) -> None:
+    """Transform a parameter for BMM MoE: slice experts, optionally swap gate/up, transpose.
+
+    This modifies the parameter in-place and registers a load hook.
+    Does NOT create graph nodes - those should be created separately by the caller.
+
+    Args:
+        gm: Graph module
+        param_node: The get_attr node for the parameter
+        lo: Start index for expert slicing
+        hi: End index for expert slicing
+        swap_gate_up: If True, swap W1 and W3 (Llama4 -> TRT-LLM format)
+    """
+    if param_node.op != "get_attr":
+        return  # Only works on parameters
+
+    param_key = str(param_node.target)
+    modname, _, param_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname) if modname else gm
+    full_param = getattr(submod, param_name)
+
+    # Slice the parameter along expert dimension (dim 0)
+    sliced_param = full_param[lo:hi].detach().clone()
+
+    # Swap W1 and W3 if needed (for gate_up weights)
+    # Llama4: (E, H, 2*I) with [W1, W3], TRT-LLM wants [W3, W1]
+    if swap_gate_up and sliced_param.ndim == 3:
+        intermediate_size = sliced_param.shape[2] // 2
+        w1 = sliced_param[:, :, :intermediate_size]
+        w3 = sliced_param[:, :, intermediate_size:]
+        sliced_param = torch.cat([w3, w1], dim=2)
+
+    # Transpose: Llama4 (E, H, X) -> TRT-LLM (E, X, H)
+    transposed_param = sliced_param.transpose(1, 2)
+    transposed_shape = transposed_param.shape
+
+    # Define transformation function for load hook
+    def transform_tensor(t: torch.Tensor) -> torch.Tensor:
+        t_sliced = t[lo:hi]
+        if swap_gate_up and t_sliced.ndim == 3:
+            intermediate_size = t_sliced.shape[2] // 2
+            w1 = t_sliced[:, :, :intermediate_size]
+            w3 = t_sliced[:, :, intermediate_size:]
+            t_sliced = torch.cat([w3, w1], dim=2)
+        return t_sliced.transpose(1, 2).contiguous()
+
+    # Register load hook
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=transform_tensor,
+            param_key=param_key,
+            param_shape=transposed_shape,
+        )
+    )
+
+    # Replace the parameter with the transformed version
+    new_param = nn.Parameter(transposed_param, requires_grad=False)
+    setattr(submod, param_name, new_param)
+
+
+def _get_dim0_from_arg(gm: GraphModule, arg: Union[Node, torch.Tensor]) -> int:
+    """Helper to get the first dimension size of an argument (Node or Tensor)."""
+    if isinstance(arg, torch.Tensor):
+        return arg.shape[0]
+    if isinstance(arg, Node):
+        if arg.op == "get_attr":
+            # Traverse attributes to find the tensor
+            obj = gm
+            for atom in arg.target.split("."):
+                obj = getattr(obj, atom)
+            return obj.shape[0]
+        if "val" in arg.meta:
+            return arg.meta["val"].shape[0]
+    raise ValueError(f"Cannot determine shape[0] for {arg}")
+
+
+def _insert_sharded_moe_stacked(
+    gm: GraphModule,
+    node: Node,
+    rank: int,
+    world_size: int,
+    allreduce_strategy: AllReduceStrategy,
+    scale_names: Sequence[str] = (),
+):
+    """Update the torch_moe node with sliced stacked weight tensors,
+    sharded `selected_experts` and `final_scales(router_logics)`.
+    Add an all_reduce node after the moe node.
+
+    For torch_moe with stacked tensor format (single-element lists containing 3D tensors).
+
+    NOTE: allreduce_strategy is MANDATORY and must be explicitly provided.
+    """
+    if allreduce_strategy is None:
+        raise ValueError(f"allreduce_strategy must be set for MoE sharding on node {node.name}")
+
+    # Extract the stacked tensors from single-element lists
+    # args[3] = w1_weight (Node representing list with one 3D tensor, or direct list)
+    # args[4] = w2_weight (Node representing list with one 3D tensor, or direct list)
+
+    # Helper to extract tensor node from list (handles both Node and direct list)
+    def extract_tensor_from_list_arg(list_arg):
+        if isinstance(list_arg, Node) and list_arg.target is list:
+            # It's a list() call node - extract from its args
+            return list_arg.args[0][0]  # args[0] is the list content, [0] is first element
+        elif isinstance(list_arg, (list, tuple)):
+            # Direct list
+            return list_arg[0]
+        else:
+            raise ValueError(f"Unexpected list format: {type(list_arg)}")
+
+    w3_w1_tensor_node = extract_tensor_from_list_arg(node.args[3])
+    w2_tensor_node = extract_tensor_from_list_arg(node.args[4])
+    num_experts = _get_dim0_from_arg(gm, w3_w1_tensor_node)
+
+    args = list(node.args)
+
+    # -- Handle selected_experts and final_scales sharding --
+    selected_experts = args[1]
+    final_scales = args[2]
+
+    experts_per_rank = num_experts // world_size
+
+    with gm.graph.inserting_before(node):
+        lower = experts_per_rank * rank
+        # selected_experts_local = selected_experts - low
+        selected_experts_local = gm.graph.create_node(
+            "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
+        )
+
+        # For num_experts % world_size != 0 case,
+        # assign the last (num_experts % world_size) experts to the last rank
+        div_node = gm.graph.create_node(
+            "call_function", operator.floordiv, args=(selected_experts, experts_per_rank), kwargs={}
+        )
+
+        comp_op = torch.ge if rank == world_size - 1 else torch.eq
+        rank_mask = gm.graph.create_node("call_function", comp_op, args=(div_node, rank), kwargs={})
+
+        # final_scales_local = final_scales * rank_mask
+        final_scales_local = gm.graph.create_node(
+            "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
+        )
+
+    # -- Transform expert weight parameters --
+    local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
+
+    # Transform w3_w1_stacked: slice experts, swap [W1,W3]->[W3,W1], transpose (E,H,2I)->(E,2I,H)
+    if isinstance(w3_w1_tensor_node, Node):
+        _transform_bmm_moe_weight_param(
+            gm, w3_w1_tensor_node, local_lo, local_hi, swap_gate_up=True
+        )
+
+    # Transform w2_stacked: slice experts, transpose (E,I,H)->(E,H,I)
+    if isinstance(w2_tensor_node, Node):
+        _transform_bmm_moe_weight_param(gm, w2_tensor_node, local_lo, local_hi, swap_gate_up=False)
+
+    # -- Update args (keep same lists/nodes, just with transformed parameters) --
+    args[1] = selected_experts_local
+    args[2] = final_scales_local
+    # args[3] and args[4] stay the same - we modified the parameters in-place
+
+    ad_logger.debug(
+        f"Updated node {node}: replaced original arguments {node.args} with sharded arguments {args}."
+    )
+
+    node.args = tuple(args)
+
+    # -- add an all_reduce node --
+    with gm.graph.inserting_after(node):
+        dist_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+            args=(node, allreduce_strategy.name),
+        )
+        node.replace_all_uses_with(dist_node)
+        dist_node.replace_input_with(dist_node, node)
 
 
 def _split_range_last_remainder(n: int, world_size: int, rank: int):
@@ -1337,7 +1661,6 @@ class ShardingSource(Enum):
 class ShardingDim(Enum):
     """Enum for sharding dimension."""
 
-    SSM = "ssm"
     TP = "tp"
     EP = "ep"
     BMM = "bmm"
@@ -1365,7 +1688,7 @@ class ShardingTransformContainer(BaseModel):
         default_factory=lambda: [ShardingSource.HEURISTIC]
     )
     sharding_dims: List[ShardingDim] = Field(
-        default_factory=lambda: [ShardingDim.SSM, ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
+        default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
