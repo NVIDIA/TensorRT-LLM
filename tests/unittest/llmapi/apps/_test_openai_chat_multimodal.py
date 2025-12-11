@@ -1,6 +1,5 @@
 import io
 import os
-import pickle
 import sys
 import tempfile
 from base64 import b64encode
@@ -217,8 +216,9 @@ def test_single_chat_session_image_embeds(
         assert chat_completion_embeds.choices[
             0].message == chat_completion_image.choices[0].message
     except openai.BadRequestError as e:
+        assert isinstance(e.body, dict)
         with open(Path(e.body["message"]), "rb") as f:
-            intercepted_embeddings = pickle.load(f)
+            intercepted_embeddings = torch.load(f, weights_only=True)
         assert list(intercepted_embeddings.keys()) == ["image"]
         assert len(intercepted_embeddings["image"]) == 1
         torch.testing.assert_close(intercepted_embeddings["image"][0],

@@ -14,7 +14,6 @@
 
 # used by tests/unittest/llmapi/apps/_test_openai_chat_multimodal.py
 
-import pickle
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -36,7 +35,7 @@ def _attach_multimodal_embeddings(
     tempdir = tempfile.gettempdir()
     file_path = Path(tempdir) / "multimodal_embedding.pickle"
     with open(file_path, "wb") as f:
-        pickle.dump(multimodal_embedding, f)
+        torch.save(multimodal_embedding, f)
     raise ValueError(file_path)
 
 
