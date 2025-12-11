@@ -423,11 +423,11 @@ class MistralLarge3DraftModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor | None,
-        position_ids: torch.LongTensor | None,
-        inputs_embeds: torch.FloatTensor | None,
-        spec_metadata: SpecMetadata | None,
-        hidden_states: torch.Tensor | None,
+        input_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        spec_metadata: SpecMetadata | None = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.embed_tokens is not None
 
@@ -479,11 +479,11 @@ class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
         self,
         attn_metadata: AttentionMetadata,
         input_ids: torch.LongTensor = None,
-        position_ids: torch.LongTensor | None,
-        inputs_embeds: torch.FloatTensor | None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
         return_context_logits: bool = False,
-        spec_metadata: SpecMetadata | None,
-        hidden_states: torch.Tensor | None,
+        spec_metadata: SpecMetadata | None = None,
+        hidden_states: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = spec_metadata.get_hidden_states()
