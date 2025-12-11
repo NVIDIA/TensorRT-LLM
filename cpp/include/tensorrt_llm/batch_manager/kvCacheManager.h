@@ -66,13 +66,16 @@ class KVCacheBlock;
 class BlockManager;
 class KVCacheManager;
 class KVCacheTransferManager;
+class MemoryBlock;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using BlockPtr = std::shared_ptr<KVCacheBlock>;
+using MemoryBlockPtr = std::shared_ptr<MemoryBlock>;
 using FreeBlocksQueue = std::list<BlockPtr>;
+using FreeMemoryQueue = std::list<MemoryBlockPtr>;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
@@ -238,9 +241,8 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
-// Basic building block of a paged KV cache - a single
-// cache block. This class just holds metadata, no pointers
-// since it is reused across all layers.
+// Basic building block of a paged KV cache - a single cache block.
+// This class only holds tokens and metadata. Memory management is delegated to MemoryBlock.
 class KVCacheBlock
 {
 public:
@@ -248,7 +250,11 @@ public:
 
     static constexpr IdType kCachedBlocksRootId = -1;
 
-    explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
+    explicit KVCacheBlock(IdType blockId);
+
+    static BlockPtr createWithMemory(IdType blockId, MemoryBlockPtr memoryBlock);
+
+    static void bindMemoryBlock(BlockPtr const& kvCacheBlock, MemoryBlockPtr const& memoryBlock);
 
     void startScheduling();
 
@@ -256,9 +262,11 @@ public:
 
     [[nodiscard]] NextBlockMap getNextBlocks() const;
 
-    [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
+    [[nodiscard]] bool hasMemoryBlock() const;
 
-    [[nodiscard]] bool isPrimary() const;
+    [[nodiscard]] MemoryBlockPtr getMemoryBlock() const;
+
+    [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
     void swapMemoryPoolBlockOffset(std::shared_ptr<KVCacheBlock> otherBlock);
 
@@ -302,21 +310,11 @@ public:
 
     [[nodiscard]] bool isFull() const;
 
+    [[nodiscard]] bool isEmpty() const;
+
     [[nodiscard]] bool isShared() const;
 
     [[nodiscard]] bool isLeaf() const;
-
-    void setPriority(executor::RetentionPriority priority);
-
-    [[nodiscard]] executor::RetentionPriority getPriority() const;
-
-    void setDurationMs(std::optional<std::chrono::milliseconds> durationMs);
-
-    [[nodiscard]] std::optional<std::chrono::milliseconds> getDurationMs() const;
-
-    void setExpirationTime(std::optional<std::chrono::steady_clock::time_point::duration> expirationTime);
-
-    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point::duration> getExpirationTime() const;
 
     void setHash(size_t hash);
 
@@ -326,12 +324,12 @@ public:
     size_t getHash() const;
 
 private:
-    // Linear ID of block independent of pool
+    // Linear ID of block
     IdType mBlockId;
 
-    // Index of block in memory pool backing this block
-    // Choice of pool is encoded into the type
-    kernels::KVCacheIndex mMemoryPoolBlockIndex;
+    // The memory blocks holding KV cache data of tokens in this block
+    // KVCacheBlock and mMemoryBlock are bidirectionally binded, promising mMemoryBlock never changes once set.
+    MemoryBlockPtr mMemoryBlock;
 
     // Number of references to the block
     SizeType32 mRefCount;
@@ -357,14 +355,60 @@ private:
     // Flag indicating if block is full
     bool mIsFull;
 
+    // Hash for the event manager
+    size_t mHash;
+};
+
+// Represents a logical memory block that keeps a page of KV cache.
+// Use mMemoryPoolBlockIndex as subscript of a CachePool to get the actual memory.
+class MemoryBlock
+{
+public:
+    using IdType = std::int32_t;
+
+    explicit MemoryBlock(IdType uid, kernels::KVCacheIndex blockIdx);
+
+    [[nodiscard]] IdType getUniqueId() const;
+
+    [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
+
+    [[nodiscard]] bool isPrimary() const;
+
+    void setPriority(executor::RetentionPriority priority);
+
+    [[nodiscard]] executor::RetentionPriority getPriority() const;
+
+    void setDurationMs(std::optional<std::chrono::milliseconds> durationMs);
+
+    [[nodiscard]] std::optional<std::chrono::milliseconds> getDurationMs() const;
+
+    void setExpirationTime(std::optional<std::chrono::steady_clock::time_point::duration> expirationTime);
+
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point::duration> getExpirationTime() const;
+
+    void setOwnerBlock(BlockPtr ownerBlock);
+
+    [[nodiscard]] BlockPtr getOwnerBlock() const;
+
+    [[nodiscard]] bool hasRefs() const;
+
+    void swapMemoryPoolBlockOffset(MemoryBlockPtr otherBlock);
+
+    [[nodiscard]] bool isEmpty() const;
+
+private:
+    // Unique ID of the block
+    IdType mUniqueId;
+    // Owner block that this memory block belongs to
+    std::weak_ptr<KVCacheBlock> mOwnerBlock;
+    // Linear ID of block independent of pool
+    kernels::KVCacheIndex mMemoryPoolBlockIndex;
     // Priority of the block
     executor::RetentionPriority mPriority;
     // Duration that the block's priority level applies for
     std::optional<std::chrono::milliseconds> mDurationMs;
     // Expiration time of the block
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
-    // Hash for the event manager
-    size_t mHash;
 };
 
 class GenerationRequest
@@ -892,8 +936,7 @@ public:
     void resetReuseState()
     {
         std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-        mCachedBlocksRoot
-            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
+        mCachedBlocksRoot = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId);
     }
 
 private:
@@ -926,6 +969,8 @@ private:
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
+
+    std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
 
 private:
     nvinfer1::DataType mDataType;
@@ -960,6 +1005,7 @@ private:
     bool mIsSWA;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
+    std::vector<MemoryBlockPtr> mAllMemoryBlocksById;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
@@ -1004,7 +1050,6 @@ private:
     std::mutex mCachedBlocksRootMutex;
 
     // Record which sequence is using the block
-    std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
     // Record whether a sequence has all blocks held valid.
     // The boolean value is set to true upon first encounter of a new sequence.
     // It may be invalidated to false when other sequence acquires a block that
@@ -1141,7 +1186,7 @@ public:
 
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
     {
-        return sumWindows([](auto const& manager) { return manager.getNumFreeBlocks(); });
+        return sumWindows([](WindowBlockManager const& manager) { return manager.getNumFreeBlocks(); });
     }
 
     [[nodiscard]] bool schedulingHasFreeBlocks(SizeType32 numRequired, SizeType32 windowSize) const
@@ -1286,6 +1331,7 @@ public:
 
     [[nodiscard]] SizeType32 getMaxNumBlocks() const
     {
+        TLLM_LOG_DEBUG("Calculating total max num blocks across all window sizes");
         return sumWindows([](auto const& manager) { return manager.getMaxNumBlocks(); });
     }
 

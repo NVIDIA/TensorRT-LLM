@@ -87,7 +87,7 @@ KVCacheTransferManager::KVCacheTransferManager(
 }
 
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
-    BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx)
+    MemoryBlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx)
 {
     TLLM_CHECK_WITH_INFO(!pools.empty(), "Pool index %lu is out of bounds", poolIdx);
     auto const& pool = pools.at(poolIdx);
@@ -97,12 +97,12 @@ tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     return blockTensor;
 }
 
-void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
+void KVCacheTransferManager::copyBlock(MemoryBlockPtr const& src, MemoryBlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
-    TLLM_LOG_DEBUG("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
-        (isOffload ? "true" : "false"), static_cast<int>(mode));
+    TLLM_LOG_DEBUG("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getUniqueId(),
+        dst->getUniqueId(), (isOffload ? "true" : "false"), static_cast<int>(mode));
 
     if (mode == executor::KvCacheTransferMode::DRAM)
     {
@@ -162,7 +162,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
         auto ptr = isOffload ? computeBlockPointer(src, pools, poolIdx) : computeBlockPointer(dst, pools, poolIdx);
-        auto block_id = src->getBlockId();
+        auto block_id = src->getUniqueId();
 
         TLLM_CHECK_WITH_INFO(
             !directory.empty(), "Expected a directory path for KVCache offload, but none was provided.");
@@ -245,7 +245,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // Failing to do so will lead to corrupted blocks eventually.
 //
 
-void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr const& block,
+void KVCacheTransferManager::onboard(MemoryBlockPtr const& offloadedBlock, MemoryBlockPtr const& block,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
@@ -281,7 +281,7 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     mOnboardManager.getStream().record(mPendingWrites[block->getMemoryPoolBlockIndex()]);
 }
 
-void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
+void KVCacheTransferManager::offload(MemoryBlockPtr const& block, MemoryBlockPtr const& offloadBlock,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {

@@ -311,10 +311,10 @@ void runPartialCopyTest()
     for (auto cacheBlockId : cacheBlockIds)
     {
         auto block = blockManager.getBlockById(cacheBlockId, maxAttentionWindow);
-        EXPECT_TRUE(block->isPrimary());
+        EXPECT_TRUE(block->getMemoryBlock()->isPrimary());
         // offload so we can write to block in CPU code
         blockManager.offloadBlock(block, maxAttentionWindow, transferMode, directory);
-        EXPECT_FALSE(block->isPrimary());
+        EXPECT_FALSE(block->getMemoryBlock()->isPrimary());
         // need to sync so D2H transfer is done before accessing blocks
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         // fill with predictable pattern
@@ -334,7 +334,7 @@ void runPartialCopyTest()
         }
         // onboard
         blockManager.onboardBlock(seq0, block, maxAttentionWindow, transferMode, directory);
-        EXPECT_TRUE(block->isPrimary());
+        EXPECT_TRUE(block->getMemoryBlock()->isPrimary());
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
     }
@@ -384,7 +384,7 @@ void runPartialCopyTest()
     // Verify partial copied block 2
     // Block has shape [2, numLayers, numKvHeads, tokensPerBlock, sizePerHead]
     blockManager.offloadBlock(block2, maxAttentionWindow);
-    EXPECT_FALSE(block2->isPrimary());
+    EXPECT_FALSE(block2->getMemoryBlock()->isPrimary());
     // need to sync so D2H transfer is done before accessing blocks
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     memoryPoolIndex2 = block2->getMemoryPoolBlockIndex();
@@ -412,7 +412,7 @@ void runPartialCopyTest()
     }
     EXPECT_EQ(numBad, 0);
     blockManager.onboardBlock(seq2, block2, maxAttentionWindow, transferMode, directory);
-    EXPECT_TRUE(block2->isPrimary());
+    EXPECT_TRUE(block2->getMemoryBlock()->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     blockManager.releaseBlocks(seq1, llmRequest1);
@@ -2761,8 +2761,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
 
     // Raise priority of middle block to prevent offloading
     auto const& blockManager = kvCacheManager.getBlockManager();
-    auto middleBlock = blockManager.getBlockById(cacheBlockIds0[1], maxAttentionWindow);
-    middleBlock->setPriority(75);
+    auto middleBlock = blockManager.getBlockById(1, maxAttentionWindow);
+    middleBlock->getMemoryBlock()->setPriority(75);
 
     // Create another sequence with one block worth of context tokens (no reuse).
     // 4 tokens, occupying block 3
@@ -2777,10 +2777,11 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
 
     // Verify that all primary blocks are in use
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
+    printf("Added sequence 1\n");
 
     // Free first sequence
     (void) kvCacheManager.removeSequence(requestId0, llmRequest0);
-
+    printf("Removed sequence 0\n");
     // Verify that 3 primary blocks are free.
     // Since block 1 has higher priority, block 2 and 0 will be used first.
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 3);
@@ -2794,7 +2795,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto block2 = blockManager.getBlockById(2, maxAttentionWindow);
     EXPECT_TRUE(block2->getPrevBlock() != nullptr);
     EXPECT_EQ(block2->getPrevBlock()->getBlockId(), 1);
-    EXPECT_FALSE(block2->isPrimary());
+    EXPECT_FALSE(block2->getMemoryBlock()->isPrimary());
 
     // Fill block
     for (int i = 101 + tokensPerBlock; i < 100 + 2 * tokensPerBlock; ++i)
@@ -2816,7 +2817,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     EXPECT_EQ(block2->getPrevBlock(), nullptr);
     // Verify that it is block 0 that is in secondary
     auto block0 = blockManager.getBlockById(0, maxAttentionWindow);
-    EXPECT_FALSE(block0->isPrimary());
+    EXPECT_FALSE(block0->getMemoryBlock()->isPrimary());
 
     // Cleanup
     (void) kvCacheManager.removeSequence(requestId1, llmRequest1);
@@ -4189,8 +4190,8 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
         tr::bufferCast<float>(*pool.secondaryPtr)[i] = 1;
     }
 
-    auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
-    auto secondaryBlock = std::make_shared<KVCacheBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true));
+    auto primaryBlock = std::make_shared<MemoryBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
+    auto secondaryBlock = std::make_shared<MemoryBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true));
 
     transferManager.offload(primaryBlock, secondaryBlock, {pool});
     primaryBlock->swapMemoryPoolBlockOffset(secondaryBlock);

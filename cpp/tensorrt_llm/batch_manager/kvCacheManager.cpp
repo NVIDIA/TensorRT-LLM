@@ -249,19 +249,28 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     return seed;
 }
 
-KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
+KVCacheBlock::KVCacheBlock(IdType blockId)
     : mBlockId(blockId)
-    , mMemoryPoolBlockIndex{blockIdx}
     , mRefCount(0)
     , mSchedulingRefCount(0)
     , mPrevBlock(nullptr)
     , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
-    , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
-    , mDurationMs{std::nullopt}
-    , mExpirationTime{std::nullopt}
     , mHash{0}
 {
+}
+
+BlockPtr KVCacheBlock::createWithMemory(IdType blockId, MemoryBlockPtr memoryBlock)
+{
+    auto ret = BlockPtr(new KVCacheBlock(blockId));
+    bindMemoryBlock(ret, memoryBlock);
+    return ret;
+}
+
+void KVCacheBlock::bindMemoryBlock(BlockPtr const& kvCacheBlock, MemoryBlockPtr const& memoryBlock)
+{
+    kvCacheBlock->mMemoryBlock = memoryBlock;
+    memoryBlock->setOwnerBlock(kvCacheBlock);
 }
 
 void KVCacheBlock::startScheduling()
@@ -279,19 +288,24 @@ NextBlockMap KVCacheBlock::getNextBlocks() const
     return mNextBlocks;
 }
 
-tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
+[[nodiscard]] bool KVCacheBlock::hasMemoryBlock() const
 {
-    return mMemoryPoolBlockIndex.get();
+    return mMemoryBlock != nullptr;
 }
 
-bool KVCacheBlock::isPrimary() const
+[[nodiscard]] MemoryBlockPtr KVCacheBlock::getMemoryBlock() const
 {
-    return mMemoryPoolBlockIndex.isPrimary();
+    return mMemoryBlock;
+}
+
+tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
+{
+    return mMemoryBlock->getMemoryPoolBlockIndex();
 }
 
 void KVCacheBlock::swapMemoryPoolBlockOffset(std::shared_ptr<KVCacheBlock> otherBlock)
 {
-    std::swap(mMemoryPoolBlockIndex, otherBlock->mMemoryPoolBlockIndex);
+    mMemoryBlock->swapMemoryPoolBlockOffset(otherBlock->mMemoryBlock);
 }
 
 void KVCacheBlock::incRefCount()
@@ -337,36 +351,6 @@ void KVCacheBlock::setBlockKey(BlockKey const& blockKey, bool isFull)
 BlockKey KVCacheBlock::getBlockKey()
 {
     return mBlockKey;
-}
-
-void KVCacheBlock::setPriority(executor::RetentionPriority priority)
-{
-    mPriority = priority;
-}
-
-executor::RetentionPriority KVCacheBlock::getPriority() const
-{
-    return mPriority;
-}
-
-std::optional<std::chrono::milliseconds> KVCacheBlock::getDurationMs() const
-{
-    return mDurationMs;
-}
-
-void KVCacheBlock::setDurationMs(std::optional<std::chrono::milliseconds> durationMs)
-{
-    mDurationMs = durationMs;
-}
-
-void KVCacheBlock::setExpirationTime(std::optional<std::chrono::steady_clock::time_point::duration> expirationTime)
-{
-    mExpirationTime = expirationTime;
-}
-
-std::optional<std::chrono::steady_clock::time_point::duration> KVCacheBlock::getExpirationTime() const
-{
-    return mExpirationTime;
 }
 
 void KVCacheBlock::setHash(size_t hash)
@@ -477,9 +461,94 @@ bool KVCacheBlock::isFull() const
     return mIsFull;
 }
 
+[[nodiscard]] bool KVCacheBlock::isEmpty() const
+{
+    return this->getUniqueTokens().empty();
+}
+
 bool KVCacheBlock::isLeaf() const
 {
     return mNextBlocks.empty();
+}
+
+MemoryBlock::MemoryBlock(IdType uid, tk::KVCacheIndex blockIdx)
+    : mUniqueId{uid}
+    , mMemoryPoolBlockIndex{blockIdx}
+    , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
+    , mDurationMs{std::nullopt}
+    , mExpirationTime{std::nullopt}
+{
+}
+
+[[nodiscard]] MemoryBlock::IdType MemoryBlock::getUniqueId() const
+{
+    return mUniqueId;
+}
+
+bool MemoryBlock::isPrimary() const
+{
+    return mMemoryPoolBlockIndex.isPrimary();
+}
+
+kernels::KVCacheIndex::UnderlyingType MemoryBlock::getMemoryPoolBlockIndex() const
+{
+    return mMemoryPoolBlockIndex.get();
+}
+
+void MemoryBlock::setPriority(executor::RetentionPriority priority)
+{
+    mPriority = priority;
+}
+
+executor::RetentionPriority MemoryBlock::getPriority() const
+{
+    return mPriority;
+}
+
+std::optional<std::chrono::milliseconds> MemoryBlock::getDurationMs() const
+{
+    return mDurationMs;
+}
+
+void MemoryBlock::setDurationMs(std::optional<std::chrono::milliseconds> durationMs)
+{
+    mDurationMs = durationMs;
+}
+
+void MemoryBlock::setExpirationTime(std::optional<std::chrono::steady_clock::time_point::duration> expirationTime)
+{
+    mExpirationTime = expirationTime;
+}
+
+std::optional<std::chrono::steady_clock::time_point::duration> MemoryBlock::getExpirationTime() const
+{
+    return mExpirationTime;
+}
+
+void MemoryBlock::swapMemoryPoolBlockOffset(MemoryBlockPtr otherBlock)
+{
+    std::swap(mMemoryPoolBlockIndex, otherBlock->mMemoryPoolBlockIndex);
+}
+
+[[nodiscard]] bool MemoryBlock::hasRefs() const
+{
+    auto ownerBlock = mOwnerBlock.lock();
+    return ownerBlock != nullptr && ownerBlock->hasRefs();
+}
+
+[[nodiscard]] BlockPtr MemoryBlock::getOwnerBlock() const
+{
+    return mOwnerBlock.lock();
+}
+
+void MemoryBlock::setOwnerBlock(BlockPtr ownerBlock)
+{
+    mOwnerBlock = ownerBlock;
+}
+
+[[nodiscard]] bool MemoryBlock::isEmpty() const
+{
+    return this->getOwnerBlock() == nullptr || this->getOwnerBlock()->isEmpty();
 }
 
 // This function calculates the number of block a layer should have, given
@@ -657,7 +726,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mSchedulingNumFreeBlocks{0}
     , mTokensPerBlock{tokensPerBlock}
     , mIsSWA{isSWA}
-    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0})}
+    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId)}
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mLoopbackAgent{loopbackAgent}
@@ -726,20 +795,25 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
 
     // Create free blocks
     mAllBlocksById.reserve(blocksInPrimaryPool + blocksInSecondaryPool);
+    mAllMemoryBlocksById.reserve(blocksInPrimaryPool + blocksInSecondaryPool);
     for (KVCacheBlock::IdType blockId = 0; blockId < blocksInPrimaryPool; ++blockId)
     {
-        mAllBlocksById.emplace_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}));
+        auto memoryBlock = std::make_shared<MemoryBlock>(blockId, tk::KVCacheIndex{blockId, false});
+        mAllMemoryBlocksById.emplace_back(memoryBlock);
+        mAllBlocksById.emplace_back(KVCacheBlock::createWithMemory(blockId, memoryBlock));
     }
     for (KVCacheBlock::IdType blockId = 0; blockId < blocksInSecondaryPool; ++blockId)
     {
-        mAllBlocksById.emplace_back(
-            std::make_shared<KVCacheBlock>(blocksInPrimaryPool + blockId, tk::KVCacheIndex{blockId, true}));
+        auto memoryBlock
+            = std::make_shared<MemoryBlock>(blocksInPrimaryPool + blockId, tk::KVCacheIndex{blockId, true});
+        mAllMemoryBlocksById.emplace_back(memoryBlock);
+        mAllBlocksById.emplace_back(KVCacheBlock::createWithMemory(blocksInPrimaryPool + blockId, memoryBlock));
     }
     mAllocatedBlocksPerSeq.reserve(maxNumSequences);
 
     mEvictionPolicy = std::make_shared<LRUEvictionPolicy>();
     mEvictionPolicy->initialize(
-        mAllBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
+        mAllMemoryBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
     if (mEventManager)
     {
         mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool}, mWindowSize);
@@ -971,25 +1045,28 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     std::string const& directory)
 {
     // eviction policy get free primary block
-    auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel);
-    if (block->getUniqueTokens().empty())
+    auto [memBlock, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel);
+    if (memBlock->isEmpty())
     {
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
+
+    // TODO(xiweny): don't assume memBlock has a owner
+    BlockPtr block = memBlock->getOwnerBlock();
+    TLLM_CHECK(memBlock->getUniqueId() == block->getBlockId());
     // Offloading is an option only when these conditions are met:
     // 1. Block contains state (evidenced by presence of tokens)
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
     // 4. Onboarding is enabled (allowing block to be brought back into primary)
-    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
-        && mOnboardBlocks)
+    if (!memBlock->isEmpty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0 && mOnboardBlocks)
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
-        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        mTransferManager->offload(memBlock, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
-        block->swapMemoryPoolBlockOffset(offloadBlock);
+        memBlock->swapMemoryPoolBlockOffset(offloadBlock);
 
         if (mEventManager && blockInRadixTree(block))
         {
@@ -998,17 +1075,20 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
                 mWindowSize);
         }
         // Update the block as a secondary block (maintaining its priority)
-        mEvictionPolicy->claimBlock(block);
+        mEvictionPolicy->claimBlock(memBlock);
         // Release the block into secondary block queue
-        mEvictionPolicy->releaseBlock(block);
+        mEvictionPolicy->releaseBlock(memBlock);
         // We have the offloaded block as the block to use now.
-        block = offloadBlock;
+        memBlock = offloadBlock;
+        block = memBlock->getOwnerBlock();
+        TLLM_CHECK(memBlock->getUniqueId() == block->getBlockId());
+        TLLM_LOG_INFO("offload happened. Now using block id %d", block->getBlockId());
     }
 
     // Removes children of the block from the search tree
     freeChildren(block);
     // Claim the block in primary block queue
-    mEvictionPolicy->claimBlock(block, priority, durationMs);
+    mEvictionPolicy->claimBlock(memBlock, priority, durationMs);
 
     // Deal with invalidating block save for reuse for the sequence
     if (mBlockToSequence.count(block->getBlockId()) > 0)
@@ -1078,11 +1158,11 @@ void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& off
 void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
     executor::KvCacheTransferMode mode, std::string const& directory)
 {
-    if (mOnboardBlocks && !offloadBlock->isPrimary())
+    if (mOnboardBlocks && !offloadBlock->getMemoryBlock()->isPrimary())
     {
         auto block = getFreeBlock(
             sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
-        mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
+        mTransferManager->onboard(offloadBlock->getMemoryBlock(), block->getMemoryBlock(), mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block and vice versa)
         offloadBlock->swapMemoryPoolBlockOffset(block);
 
@@ -1092,8 +1172,8 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
                 tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
                 mWindowSize);
         }
-        mEvictionPolicy->releaseBlock(block); // append block to offload queue
-                                              // offloadBlock is now in primary memory pool
+        mEvictionPolicy->releaseBlock(block->getMemoryBlock()); // append block to offload queue
+                                                                // offloadBlock is now in primary memory pool
     }
 }
 
@@ -1112,15 +1192,15 @@ void WindowBlockManager::offloadBlock(
     // block is useful or not and may just lead to more traffic instead.
     // The ideal way of this is to dedicate the offloading of the block
     // to the eviction policy.
-    if (mOnboardBlocks && block->isPrimary())
+    if (mOnboardBlocks && block->getMemoryBlock()->isPrimary())
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(offloadBlock);
-        mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
+        mTransferManager->offload(block->getMemoryBlock(), offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
-        block->swapMemoryPoolBlockOffset(offloadBlock);
+        block->getMemoryBlock()->swapMemoryPoolBlockOffset(offloadBlock);
 
         if (mEventManager && blockInRadixTree(block))
         {
@@ -1130,6 +1210,10 @@ void WindowBlockManager::offloadBlock(
         }
         mEvictionPolicy->releaseBlock(offloadBlock); // append offloadBlock to mFreePrimaryBlocks queue
                                                      // block is now in secondary memory
+        // TLLM_LOG_DEBUG("offloadBlock: offloaded block %d (memory uid %d) to a free block %d (memory uid %d). Now
+        // their memory indices are: %d and %d",
+        //     block->getBlockId(), block->getMemoryBlock()->getUniqueId(), offloadBlock->getOwnerBlock()->getBlockId(),
+        //     offloadBlock->getUniqueId(), block->getMemoryPoolBlockIndex(), offloadBlock->getMemoryPoolBlockIndex());
     }
 }
 
@@ -1168,7 +1252,7 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 {
-    return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
+    return !block->isEmpty() && block->getPrevBlock() != nullptr;
 }
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
@@ -1225,11 +1309,12 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
 
             numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
             if (perBlockRetentions[bi].retentionPriority.has_value()
-                && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
+                && matchingBlock->getMemoryBlock()->getPriority() != perBlockRetentions[bi].retentionPriority
+                && mEventManager)
             {
-                mEventManager->enqueueUpdatedEvent(
-                    tle::KVCacheUpdatedData(matchingBlock->getHash())
-                        .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority),
+                mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(matchingBlock->getHash())
+                                                       .priorityUpdated(matchingBlock->getMemoryBlock()->getPriority(),
+                                                           *perBlockRetentions[bi].retentionPriority),
                     mWindowSize);
             }
             if (partialMatch)
@@ -1237,9 +1322,10 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 if (matchingBlock->hasRefs() || !matchingBlock->isLeaf())
                 {
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
-                    auto newBlock = getFreeBlock(
-                        sequence, matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
-                    mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
+                    auto newBlock = getFreeBlock(sequence, matchingBlock->getMemoryBlock()->getPriority(),
+                        matchingBlock->getMemoryBlock()->getDurationMs(), mode, directory);
+                    mTransferManager->onboard(matchingBlock->getMemoryBlock(), newBlock->getMemoryBlock(), mPools,
+                        numMatched, mode, directory);
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
                     if (blockItr != blockKeys.end())
@@ -1255,8 +1341,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 {
                     // Leaf block that nobody is using. Make block private and reuse
                     freeLeafBlock(matchingBlock);
-                    mEvictionPolicy->claimBlock(
-                        matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
+                    mEvictionPolicy->claimBlock(matchingBlock->getMemoryBlock(),
+                        perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
                 }
@@ -1265,8 +1351,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             else
             {
                 // Recover block and reuse
-                mEvictionPolicy->claimBlock(
-                    matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
+                mEvictionPolicy->claimBlock(matchingBlock->getMemoryBlock(), perBlockRetentions[bi].retentionPriority,
+                    perBlockRetentions[bi].durationMs);
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
                 searchRoot = matchingBlock;
             }
@@ -1649,7 +1735,7 @@ void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeTyp
         block->decRefCount();
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            mEvictionPolicy->releaseBlock(block->getMemoryBlock());
         }
     }
 
@@ -1691,7 +1777,7 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     // If ref count is zero, move block to free blocks
     if (!block->hasRefs())
     {
-        mEvictionPolicy->releaseBlock(block, true);
+        mEvictionPolicy->releaseBlock(block->getMemoryBlock(), true);
     }
     // Remove block from allocated blocks
     allocatedBlocks.pop_back();
@@ -1781,7 +1867,7 @@ void WindowBlockManager::unpinBlocksById(KVCacheBlock::IdType blockId)
         block->decRefCount();
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            mEvictionPolicy->releaseBlock(block->getMemoryBlock());
         }
         block = std::move(block->getPrevBlock());
     }
@@ -1920,7 +2006,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // If ref count is zero, move block to free blocks
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            mEvictionPolicy->releaseBlock(block->getMemoryBlock());
         }
     }
     // Remove stored block ids in sequence
@@ -2320,7 +2406,7 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         }
         if (!outOfWindowBlock->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(outOfWindowBlock);
+            mEvictionPolicy->releaseBlock(outOfWindowBlock->getMemoryBlock());
         }
     }
 
@@ -3002,5 +3088,4 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
     return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
 }
-
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

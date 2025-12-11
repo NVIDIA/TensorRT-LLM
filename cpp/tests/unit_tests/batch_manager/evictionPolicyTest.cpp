@@ -47,17 +47,17 @@ public:
     void SetUp() override
     {
         policy = std::make_shared<MockLRUPolicy>();
-        std::vector<BlockPtr> allBlocksById;
+        std::vector<MemoryBlockPtr> allBlocksById;
 
         for (KVCacheBlock::IdType blockId = 0; blockId < NUM_PRIMARY_BLOCKS; ++blockId)
         {
-            allBlocksById.push_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}));
+            allBlocksById.push_back(std::make_shared<MemoryBlock>(blockId, tk::KVCacheIndex{blockId, false}));
         }
 
         for (KVCacheBlock::IdType blockId = 0; blockId < NUM_SECONDARY_BLOCKS; ++blockId)
         {
-            allBlocksById.push_back(
-                std::make_shared<KVCacheBlock>(NUM_PRIMARY_BLOCKS + blockId, tk::KVCacheIndex{blockId, true}));
+            allBlocksById.push_back(std::make_shared<MemoryBlock>(
+                NUM_PRIMARY_BLOCKS + blockId, tk::KVCacheIndex{NUM_PRIMARY_BLOCKS + blockId, true}));
         }
         policy->initialize(allBlocksById, {NUM_PRIMARY_BLOCKS, NUM_SECONDARY_BLOCKS}, std::nullopt);
     }
@@ -107,15 +107,15 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
     auto origPrimaryBlock = std::get<0>(policy->getFreeBlock(0));
     policy->claimBlock(origPrimaryBlock);
 
-    EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+    EXPECT_NE(origPrimaryBlock->getUniqueId(), std::get<0>(policy->getFreeBlock(0))->getUniqueId());
 
     policy->releaseBlock(origPrimaryBlock, true);
-    EXPECT_EQ(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+    EXPECT_EQ(origPrimaryBlock->getUniqueId(), std::get<0>(policy->getFreeBlock(0))->getUniqueId());
 
     policy->claimBlock(origPrimaryBlock);
     policy->releaseBlock(origPrimaryBlock);
 
-    EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+    EXPECT_NE(origPrimaryBlock->getUniqueId(), std::get<0>(policy->getFreeBlock(0))->getUniqueId());
 }
 
 TEST_F(LRUPolicyTest, LRUTest)
@@ -134,11 +134,11 @@ TEST_F(LRUPolicyTest, LRUTest)
         auto block = std::get<0>(policy->getFreeBlock(0));
         policy->claimBlock(block);
     }
-    ASSERT_EQ(std::get<0>(policy->getFreeBlock(0))->getBlockId(), block2->getBlockId());
+    ASSERT_EQ(std::get<0>(policy->getFreeBlock(0))->getUniqueId(), block2->getUniqueId());
 
     policy->claimBlock(std::get<0>(policy->getFreeBlock(0)));
 
-    ASSERT_EQ(std::get<0>(policy->getFreeBlock(0))->getBlockId(), block1->getBlockId());
+    ASSERT_EQ(std::get<0>(policy->getFreeBlock(0))->getUniqueId(), block1->getUniqueId());
 }
 
 TEST_F(LRUPolicyTest, PriorityTest)
@@ -168,7 +168,7 @@ TEST_F(LRUPolicyTest, PriorityTest)
     policy->releaseBlock(block1);
     policy->releaseBlock(block2);
 
-    EXPECT_EQ(std::get<0>(policy->getFreeBlock(0))->getBlockId(), block2->getBlockId());
+    EXPECT_EQ(std::get<0>(policy->getFreeBlock(0))->getUniqueId(), block2->getUniqueId());
 }
 
 TEST_F(LRUPolicyTest, TimedBlockTest)

@@ -37,14 +37,14 @@ public:
         tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr);
 
     //! \brief Onboard a block to gpu memory.
-    void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
-        int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::string const& directory = "");
+    void onboard(MemoryBlockPtr const& offloadBlock, MemoryBlockPtr const& block,
+        std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy = 0,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Offload a block to cpu memory.
-    void offload(BlockPtr const& block, BlockPtr const& offloadBlock, std::vector<KVCacheBlockPool> const& pools,
-        int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::string const& directory = "");
+    void offload(MemoryBlockPtr const& block, MemoryBlockPtr const& offloadBlock,
+        std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy = 0,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Synchronize internal streams with bufferManager stream.
     //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the
@@ -60,7 +60,7 @@ public:
 private:
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
-        BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
+        MemoryBlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
 
     /*!
      * \brief The key method that copies the src block to the dst block.
@@ -75,9 +75,9 @@ private:
      *
      * The default param is set to executor::KvCacheTransferMode::DRAM.
      */
-    void copyBlock(BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools, bool isOffload,
-        int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::string const& directory = "");
+    void copyBlock(MemoryBlockPtr const& src, MemoryBlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools,
+        bool isOffload, int numTokensToCopy = 0,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
