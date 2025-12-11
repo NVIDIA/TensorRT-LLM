@@ -132,96 +132,25 @@ if ! srun -l --container-image=${container_image} \
     cleanup_on_failure "Failed to start container. Check ${full_logdir}/1_container_launch.log"
 fi
 
-# Install TensorRT-LLM
-if [ -n "${trtllm_wheel_path}" ]; then
-    # Install from pre-built wheel if path is provided
-    echo "Installing TensorRT-LLM from wheel: ${trtllm_wheel_path}..."
-    if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} --no-container-mount-home \
-        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "pip install ${trtllm_wheel_path}" \
-        &> ${full_logdir}/2_install.log; then
-        cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/2_install.log for details"
-    fi
-    echo "TensorRT-LLM wheel installation completed successfully"
-elif [ -d "${trtllm_repo}" ]; then
-    # Build and install from repository if no wheel path provided
-    echo "Installing TensorRT-LLM from ${trtllm_repo}..."
-    TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
-
-    if [ "${build_wheel}" = "true" ]; then
-        echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
-        if ! srun --container-name=${container_name} \
-            --container-mounts=${container_mount} \
-            --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
-            bash -c "cd ${trtllm_repo} && ${build_command}" \
-            &> ${full_logdir}/2_build.log; then
-            cleanup_on_failure "TensorRT-LLM build failed. Check ${full_logdir}/2_build.log for details"
-        fi
-        echo "TensorRT-LLM build completed successfully"
-    fi
-
-    echo "Installing TensorRT-LLM..."
-    if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} --no-container-mount-home \
-        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && pip install -e ." \
-        &> ${full_logdir}/2_install.log; then
-        cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
-    fi
-    echo "TensorRT-LLM installation completed successfully"
-fi
-
-# Get node lists
+# Get node lists and replace the placeholder with the actual node names
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
-
-echo "Assigning nodes..."
-srun -l --container-name=${container_name} \
-    --container-image=${container_image} \
-    --container-mounts=${container_mount} \
-    --mpi=pmix --overlap -N 1 -n 1 \
-    python3 ${work_dir}/assign_nodes.py \
-        --all-nodes ${all_nodes_str} \
-        --gpus-per-node ${gpus_per_node} \
-        --num-gen-servers ${num_gen_servers} \
-        --num-ctx-servers ${num_ctx_servers} \
-        --gen-world-size ${gen_world_size} \
-        --ctx-world-size ${ctx_world_size} \
-        --log-dir ${full_logdir} \
-        &> ${full_logdir}/3_assign_nodes.log
-
-echo "Generating start worker commands..."
-srun -l --container-name=${container_name} \
-    --container-image=${container_image} \
-    --container-mounts=${container_mount} \
-    --mpi=pmix --overlap -N 1 -n 1 \
-    python3 ${work_dir}/gen_start_worker_cmds.py \
-        --allocations ${full_logdir}/allocations.json \
-        --gen-world-size ${gen_world_size} \
-        --ctx-world-size ${ctx_world_size} \
-        --gpus-per-node ${gpus_per_node} \
-        --container-image ${container_image} \
-        --container-name ${container_name} \
-        --container-mount ${container_mount} \
-        --work-dir ${work_dir} \
-        --model-path ${model_path} \
-        --benchmark-mode ${benchmark_mode} \
-        --concurrency-list ${concurrency_list} \
-        --numa-bind ${numa_bind} \
-        --log-dir ${full_logdir} \
-        --nsys-on ${nsys_on} \
-        --ctx-profile-range ${ctx_profile_range} \
-        --gen-profile-range ${gen_profile_range} \
-        --ctx-config-path ${ctx_config_path} \
-        --gen-config-path ${gen_config_path} \
-        --worker-env-var "${worker_env_var}" \
-        &> ${full_logdir}/4_gen_start_worker_cmds.log
+echo "all_nodes_str: ${all_nodes_str}"
 
 start_worker_cmds_file=${full_logdir}/start_worker_cmds.txt
+IFS=',' read -r -a node_array <<< "$all_nodes_str"
+for i in "${!node_array[@]}"; do
+    current_val="${node_array[$i]}"
+    placeholder="<node${i}_placeholder>"
+
+    # Use sed to replace the placeholder with the value in-place
+    sed -i "s|$placeholder|$current_val|g" "${start_worker_cmds_file}"
+    echo "Replaced $placeholder with $current_val"
+done
+
+exit
+
 echo "Starting worker commands from ${start_worker_cmds_file}..."
 cat ${start_worker_cmds_file} | while read cmd; do
     echo "Starting worker command: ${cmd}"
