@@ -2193,11 +2193,11 @@ class MLA(nn.Module):
         return attn_output
 
     def resmooth_parameters(self, weight, scale, recipe=(1, 128, 128)):
-        weight_param, weight_param = fp8_utils.resmooth_to_fp8_e8m0(
+        weight_param, scale_param = fp8_utils.resmooth_to_fp8_e8m0(
             weight, scale)
 
         scale_param = fp8_utils.transform_sf_into_required_layout(
-            scale,
+            scale_param,
             mn=weight_param.shape[0],
             k=weight_param.shape[1],
             recipe=recipe,
