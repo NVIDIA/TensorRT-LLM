@@ -267,8 +267,8 @@ else
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark.sh \
             "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/8_bench.log; then
-        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/8_bench.log for details"
+            &> ${full_logdir}/7_bench.log; then
+        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/7_bench.log for details"
     fi
 fi
 echo "Benchmark completed successfully"
@@ -282,8 +282,8 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
         "${model_args_extra}" "${full_logdir}/accuracy_eval" \
-        &> ${full_logdir}/9_accuracy_eval.log; then
-        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/9_accuracy_eval.log for details"
+        &> ${full_logdir}/8_accuracy_eval.log; then
+        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/8_accuracy_eval.log for details"
     fi
     echo "Accuracy evaluation completed successfully"
 fi
