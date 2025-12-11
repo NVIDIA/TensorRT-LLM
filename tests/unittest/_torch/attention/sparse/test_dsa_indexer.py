@@ -583,7 +583,8 @@ def _create_mock_metadata(request_ids,
                     ) <= self.sparse_mla_topk
             else:
                 self.skip_indexer_for_gen_reqs = False
-            self.prepare_dense_topk_indices(self.kv_lens_cuda_runtime, device=True)
+            self.prepare_dense_topk_indices(self.kv_lens_cuda_runtime,
+                                            device=True)
 
         @property
         def num_seqs(self) -> int:

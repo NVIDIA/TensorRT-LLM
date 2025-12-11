@@ -1,7 +1,7 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
 
 import torch
 
@@ -25,7 +25,8 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-type KeyType = Tuple[int, int, bool, bool]
+KeyType: TypeAlias = Tuple[int, int, bool, bool]
+
 
 @dataclass
 class CUDAGraphRunnerConfig:
@@ -322,8 +323,7 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: KeyType,
-                                             forward_fn: Callable,
+        def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
             is_first_draft = key[2]
             needs_kv_cache_recompute = True if enable_spec_decode and self.config.spec_config.spec_dec_mode.needs_kv_cache_recompute(
