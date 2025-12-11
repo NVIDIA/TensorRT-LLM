@@ -41,9 +41,9 @@ class TorchAttentionReference:
         )
 
         # Flatten inputs to [1, total_seq_len, ...] format
-        q_flat = q.view(1, batch_size * seq_len, -1)
-        k_flat = k.view(1, batch_size * seq_len, -1)
-        v_flat = v.view(1, batch_size * seq_len, -1)
+        q_flat = q.reshape(1, batch_size * seq_len, -1)
+        k_flat = k.reshape(1, batch_size * seq_len, -1)
+        v_flat = v.reshape(1, batch_size * seq_len, -1)
 
         # Call torch backend via custom op registry
         output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache(
