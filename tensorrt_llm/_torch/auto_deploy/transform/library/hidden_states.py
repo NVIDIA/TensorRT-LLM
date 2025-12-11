@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The transform passes to capture the hidden states of the target model."""
 
 from typing import Dict, List, Optional, Set, Tuple, Type
@@ -47,13 +62,8 @@ def cached_residual_add(
 ) -> torch.Tensor:
     ret = torch.ops.aten.add(t1, t2)
     b, s, _ = ret.shape
-    print(f"In cached residual add. Ret shape: {ret.shape}")
-    print(f"Shape of hidden_states_cache: {hidden_states_cache.shape}")
     num_tokens = b * s
-    print(f"Num tokens: {num_tokens}")
 
-    # TODO(govind): do some of these correspond to padding tokens when there are varying sequence lengths?
-    # Might need to extract the actual sequence lengths from somewhere to get the appropriate indices to copy.
     hidden_states_cache[:num_tokens].copy_(ret.view(num_tokens, -1), non_blocking=True)
     return ret
 
@@ -115,8 +125,6 @@ class DetectHiddenStatesForCaptureConfig(TransformConfig):
     """Configuration for the hidden states detection transform."""
 
     # TODO: figure out how to get layers to capture.
-    # Right now default is None and EagleSpecMetadata has a heuristic to extract layer indices to capture.
-    # This seems fragile.
     # We should consider if we can use the layer indices stored in eagle checkpoints, e.g.
     # https://huggingface.co/nvidia/gpt-oss-120b-Eagle3/blob/main/config.json#L9-L14
     eagle3_layers_to_capture: Optional[Set[int]] = None  # Default: Do not capture any layers
@@ -145,15 +153,12 @@ class DetectHiddenStatesForCapture(BaseTransform):
 
         def _get_layer_number(lin_node: Node) -> Optional[int]:
             weight = lin_node.args[1]
-            print(f"Calling _get_layer_number() with lin_node: {lin_node}")
             if weight.op == "get_attr":
                 subnames = weight.target.split(".")
                 for subname in subnames:
                     if subname.isdigit():
-                        print(f"Found layer number: {int(subname)}")
                         return int(subname)
 
-            print("No layer number found")
             return None
 
         # find last closing linear node of each layer

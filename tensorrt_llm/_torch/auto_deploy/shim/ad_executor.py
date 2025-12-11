@@ -194,7 +194,7 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         num_tokens = sum(cache_seq_interface.info.seq_len)
 
         hidden_states = [hidden_state[:num_tokens] for hidden_state in full_hidden_states]
-        hidden_states = torch.cat(hidden_states, dim=1) if hidden_states else None
+        hidden_states = torch.cat(hidden_states, dim=1)
         hidden_states = hidden_states.to(dtype=self.dtype)
 
         token_idx = self.hidden_state_write_indices[:num_tokens]
