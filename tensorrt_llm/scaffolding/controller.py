@@ -76,6 +76,18 @@ class NativeGenerationController(Controller):
         yield tasks
 
 
+class NativeChatController(NativeGenerationController):
+
+    def __init__(self, sampling_params: dict = None, streaming: bool = False):
+        super().__init__(sampling_params, streaming)
+
+    def process(self, tasks: List[Task], **kwargs):
+        chat_tasks = [
+            ChatTask.create_from_prompt(task.input_str) for task in tasks
+        ]
+        yield from super().process(chat_tasks, **kwargs)
+
+
 class NativeRewardController(Controller):
 
     def __init__(self):

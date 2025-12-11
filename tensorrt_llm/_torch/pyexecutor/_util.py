@@ -853,7 +853,7 @@ def create_py_executor_instance(
     scheduler_capacity = max_num_sequences
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
-
+ 
     use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
     if use_python_scheduler:
         scheduler = SimpleUnifiedScheduler(
@@ -876,8 +876,9 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp(),
             agent_percentage=pytorch_backend_config.agent_percentage,
             agent_types=pytorch_backend_config.agent_types)
+        agent_tree_config = pytorch_backend_config.agent_tree_config
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
+                                               ctx_chunk_config, agent_tree_config)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config

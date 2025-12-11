@@ -1,8 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 from .benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from .controller import (BestOfNController, ChatWithMCPController, Controller,
-                         MajorityVoteController, NativeGenerationController,
-                         NativeRewardController, ParallelProcess, PRMController)
+                         MajorityVoteController, NativeChatController,
+                         NativeGenerationController, NativeRewardController,
+                         ParallelProcess, PRMController)
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
 from .scaffolding_llm import ScaffoldingLlm
@@ -11,7 +12,8 @@ from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    StreamGenerationTask, SystemMessage, Task, TaskStatus,
                    UserMessage)
 from .task_collection import (ChatTokenCounter, DropKVCacheWorkerTag,
-                              GenerationTokenCounter, TaskCollection, TaskTimer, QueryCollector,
+                              GenerationTokenCounter, QueryCollector,
+                              TaskCollection, TaskMetricsCollector, TaskTimer,
                               drop_kv_cache_scope, sub_request_node,
                               with_task_collection)
 from .worker import (MCPWorker, OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker,
@@ -21,6 +23,7 @@ __all__ = [
     "ScaffoldingLlm",
     "ParallelProcess",
     "Controller",
+    "NativeChatController",
     "NativeGenerationController",
     "NativeRewardController",
     "PRMController",
@@ -54,6 +57,8 @@ __all__ = [
     "ChatTokenCounter",
     "TaskTimer",
     "QueryCollector",
+    "TaskMetricsCollector",
+    "DetailedTaskProfiler",
     "sub_request_node",
     "async_scaffolding_benchmark",
     "ScaffoldingBenchRequest",

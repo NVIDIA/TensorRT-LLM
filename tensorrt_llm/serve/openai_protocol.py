@@ -84,11 +84,17 @@ class PromptTokensDetails(OpenAIBaseModel):
     cached_tokens: int = 0
 
 
+class CompletionTokensDetails(OpenAIBaseModel):
+    """Details about completion tokens, including reasoning tokens for reasoning models."""
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class ModelCard(OpenAIBaseModel):

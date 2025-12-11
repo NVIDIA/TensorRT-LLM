@@ -239,6 +239,7 @@ class ChatTask(StreamGenerationTask):
     enable_token_counting: bool = field(default=False)
     prompt_tokens_num: int = field(default=0)
     completion_tokens_num: int = field(default=0)
+    reasoning_tokens_num: int = field(default=0)
 
     # for sub request marker
     sub_request_markers: list[tuple[str, int]] = field(default_factory=list)
@@ -261,10 +262,11 @@ class ChatTask(StreamGenerationTask):
 
     @staticmethod
     def create_from_prompt(user_prompt: Optional[str],
-                           system_prompts: list[SystemMessage],
+                           system_prompts: Optional[list[SystemMessage]] = None,
                            tools: Optional[Any] = None) -> "ChatTask":
         task = ChatTask()
-        task.messages = [prompt for prompt in system_prompts]
+        if system_prompts is not None:
+            task.messages.extend(system_prompts)
         if user_prompt is not None:
             task.add_message(UserMessage(user_prompt))
         task.tools = tools

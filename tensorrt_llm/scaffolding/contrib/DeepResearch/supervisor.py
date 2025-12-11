@@ -19,10 +19,9 @@ from tensorrt_llm.scaffolding.task import (
     UserMessage,
 )
 from tensorrt_llm.scaffolding.task_collection import (
-    ChatTokenCounter,
     DropKVCacheWorkerTag,
-    TaskTimer,
     QueryCollector,
+    TaskMetricsCollector,
     drop_kv_cache_scope,
     sub_request_node,
     with_task_collection,
@@ -190,6 +189,33 @@ class Supervisor(Controller):
         return
 
 
+class BriefController(NativeGenerationController):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def process(self, tasks: List[Task], **kwargs):
+        yield from super().process(tasks, **kwargs)
+        return
+
+
+class ResearchPlanningController(NativeGenerationController):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def process(self, tasks: List[Task], **kwargs):
+        yield from super().process(tasks, **kwargs)
+        return
+
+
+class FinalReportController(NativeGenerationController):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def process(self, tasks: List[Task], **kwargs):
+        yield from super().process(tasks, **kwargs)
+        return
+
+
 def create_open_deep_research_scaffolding_llm(
     generation_worker: Worker,
     mcp_worker: Worker,
@@ -198,41 +224,45 @@ def create_open_deep_research_scaffolding_llm(
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
 ) -> ScaffoldingLlm:
-    gerneration_controller = NativeGenerationController(
-        sampling_params={
-            "temperature": 0.9,
-            "max_tokens": max_tokens,
-        }
-    )
+    sampling_params = {
+        "temperature": 0.9,
+        "max_tokens": max_tokens,
+    }
+    gerneration_controller = NativeGenerationController(sampling_params=sampling_params)
 
     supervisor_type = Supervisor
     compressor_type = Compressor
     chat_with_mcp_type = ChatWithMCPController
     researcher_type = Researcher
+    brief_type = BriefController
+    research_planning_type = ResearchPlanningController
+    final_report_type = FinalReportController
 
     if enable_statistics:
-        supervisor_type = with_task_collection(
-            "supervisor_tokens", ChatTokenCounter, statistics_name="supervisor"
-        )(supervisor_type)
-        compressor_type = with_task_collection(
-            "compress_tokens", ChatTokenCounter, statistics_name="compress"
-        )(compressor_type)
-        chat_with_mcp_type = with_task_collection(
-            "chat_with_mcp_tokens", ChatTokenCounter, statistics_name="chat_with_mcp"
-        )(chat_with_mcp_type)
-        researcher_type = with_task_collection(
-            "researcher_tokens", ChatTokenCounter, statistics_name="researcher"
-        )(researcher_type)
-        supervisor_type = with_task_collection(
-            "supervisor_timer",
-            TaskTimer,
-            statistics_name="supervisor",
-            task_types=[ChatTask, MCPCallTask],
-        )(supervisor_type)
+
+        def wrap_with_detailed_profiler(controller_type, controller_name):
+            return with_task_collection(
+                f"{controller_name}TaskCollection",
+                TaskMetricsCollector,
+                controller_name=controller_name,
+                task_types=[ChatTask, MCPCallTask],
+                enable_print=True,
+            )(controller_type)
+
+        supervisor_type = wrap_with_detailed_profiler(supervisor_type, "Supervisor")
+        compressor_type = wrap_with_detailed_profiler(compressor_type, "Compressor")
+        chat_with_mcp_type = wrap_with_detailed_profiler(chat_with_mcp_type, "ChatWithMCP")
+        researcher_type = wrap_with_detailed_profiler(researcher_type, "Researcher")
+        brief_type = wrap_with_detailed_profiler(brief_type, "Brief")
+        research_planning_type = wrap_with_detailed_profiler(
+            research_planning_type, "ResearchPlanning"
+        )
+        final_report_type = wrap_with_detailed_profiler(final_report_type, "FinalReport")
 
     if enable_query_collector:
         chat_with_mcp_type = with_task_collection(
-            "query_collect", QueryCollector,
+            "query_collect",
+            QueryCollector,
         )(chat_with_mcp_type)
 
     research_chat_with_tools_controller = chat_with_mcp_type(gerneration_controller)
@@ -250,9 +280,9 @@ def create_open_deep_research_scaffolding_llm(
         research_chat_with_tools_controller, research_compress_controller
     )
 
-    brief_controller = gerneration_controller
-    research_planning_controller = gerneration_controller
-    final_report_controller = gerneration_controller
+    brief_controller = brief_type(sampling_params=sampling_params)
+    research_planning_controller = research_planning_type(sampling_params=sampling_params)
+    final_report_controller = final_report_type(sampling_params=sampling_params)
 
     supervisor_controller = supervisor_type(
         brief_controller, research_planning_controller, research_controller, final_report_controller

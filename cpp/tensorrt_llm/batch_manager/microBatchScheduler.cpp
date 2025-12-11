@@ -16,8 +16,11 @@
  */
 
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+
+#include <algorithm>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -26,11 +29,13 @@ using SizeType32 = MicroBatchScheduler::SizeType32;
 
 MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig,
     std::optional<SizeType32> maxContextLength, LlmRequestState noScheduleUntilState,
-    LlmRequestState noScheduleAfterState)
+    LlmRequestState noScheduleAfterState, std::optional<batch_scheduler::AgentTreeConfig> agentTreeConfig)
     : mMaxContextLength(maxContextLength)
     , mCtxChunkConfig(ctxChunkConfig)
     , mNoScheduleUntilState(noScheduleUntilState)
     , mNoScheduleAfterState(noScheduleAfterState)
+    , mAgentTreeConfig(agentTreeConfig)
+    , mAgentTreeRoot(agent_tree::createAgentTreeRoot(agentTreeConfig))
 {
 }
 
@@ -184,9 +189,61 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     SizeType32 numChunkedTokens{0};
     bool allContextRequestsFit{true};
 
+    auto isAgentHierarchyDebugEnabled = []()
+    {
+        static bool enabled = []()
+        {
+            char const* envVar = std::getenv("DEBUG_AGENT_HIERARCHY");
+            return envVar != nullptr && std::string(envVar) == "1";
+        }();
+        return enabled;
+    };
+
+    auto printAgentHierarchy = [&isAgentHierarchyDebugEnabled](RequestVector const& reqVec, std::string const& name)
+    {
+        if (!isAgentHierarchyDebugEnabled())
+        {
+            return;
+        }
+        std::cout << name << " nodeIds: ";
+        for (auto const& req : reqVec)
+        {
+            if (req->getAgentHierarchy().has_value())
+            {
+                auto const& agentHierarchy = req->getAgentHierarchy().value();
+                for (auto const& [nodeType, nodeId] : agentHierarchy)
+                {
+                    std::cout << nodeId << " ";
+                }
+            }
+        }
+        std::cout << std::endl;
+    };
+
+    // Partition: generation requests first (must be scheduled in overlap scheduler),
+    // non-generation requests after (can be sorted/truncated by agent tree).
+    auto genEndIt = std::stable_partition(activeRequests.begin(), activeRequests.end(),
+        [](auto const& req) { return req->isGenerationInProgressState(); });
+    auto const genCount = static_cast<SizeType32>(std::distance(activeRequests.begin(), genEndIt));
+
+    // Sort and truncate only non-generation requests [genEndIt, end)
+    // Pass genCount as reservedCount so truncation respects: maxRequests - genCount
+    RequestVector nonGenRequests(genEndIt, activeRequests.end());
+    printAgentHierarchy(nonGenRequests, "before sorting");
+    auto sortedNonGenRequests
+        = agent_tree::sortAndTruncateRequestsByAgentTree(mAgentTreeRoot, nonGenRequests, genCount);
+    printAgentHierarchy(sortedNonGenRequests, "after sorting");
+
+    // Build final result: [generation requests] + [sorted non-generation requests]
+    RequestVector activeRequestsSortedByAgentTree;
+    activeRequestsSortedByAgentTree.reserve(genCount + sortedNonGenRequests.size());
+    activeRequestsSortedByAgentTree.insert(activeRequestsSortedByAgentTree.end(), activeRequests.begin(), genEndIt);
+    activeRequestsSortedByAgentTree.insert(
+        activeRequestsSortedByAgentTree.end(), sortedNonGenRequests.begin(), sortedNonGenRequests.end());
+
     // 1. Select the generation phase requests that meet the criteria of total token size.
     //    If there is any remaining space, include the context requests and divide them into chunks.
-    for (auto& llmReq : activeRequests)
+    for (auto& llmReq : activeRequestsSortedByAgentTree)
     {
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
         if (!llmReq->hasReachedState(mNoScheduleUntilState) || llmReq->hasReachedState(mNoScheduleAfterState))

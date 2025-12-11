@@ -112,8 +112,6 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large: bool = False,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
-        agent_percentage: float = 0.0,
-        agent_types: Optional[str] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -135,7 +133,7 @@ def get_llm_args(
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
-    agent_types = agent_types.split(';') if agent_types else None
+
     if cp_config is not None and "cp_type" in cp_config:
         cp_config = cp_config.copy()
         try:
@@ -171,8 +169,6 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large,
         "otlp_traces_endpoint": otlp_traces_endpoint,
         "enable_chunked_prefill": enable_chunked_prefill,
-        "agent_percentage": agent_percentage,
-        "agent_types": agent_types,
     }
 
     return llm_args, llm_args_extra_dict
@@ -671,9 +667,7 @@ def serve(
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
         otlp_traces_endpoint=otlp_traces_endpoint,
-        enable_chunked_prefill=enable_chunked_prefill,
-        agent_percentage=agent_percentage,
-        agent_types=agent_types)
+        enable_chunked_prefill=enable_chunked_prefill)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:

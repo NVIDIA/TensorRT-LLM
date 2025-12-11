@@ -6,8 +6,8 @@ from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
-                       CacheTransceiverConfig, CalibConfig,
+from .llm_args import (AgentTreeConfig, AttentionDpConfig, AutoDecodingConfig,
+                       BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DeepSeekSparseAttentionConfig,
                        DraftTargetDecodingConfig, DynamicBatchConfig,
@@ -33,6 +33,7 @@ __all__ = [
     'GuidedDecodingParams',
     'SamplingParams',
     'DisaggregatedParams',
+    'AgentTreeConfig',
     'KvCacheConfig',
     'KvCacheRetentionConfig',
     'CudaGraphConfig',

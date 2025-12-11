@@ -24,8 +24,8 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
-                              DeltaFunctionCall, DeltaMessage, DeltaToolCall,
-                              UsageInfo)
+                              CompletionTokensDetails, DeltaFunctionCall,
+                              DeltaMessage, DeltaToolCall, UsageInfo)
 
 # yapf: enable
 
@@ -1628,8 +1628,11 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
 
 
 def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
-                                  tool_choice: str, outputs: List, model: str,
-                                  num_prompt_tokens: int):
+                                  tool_choice: str,
+                                  outputs: List,
+                                  model: str,
+                                  num_prompt_tokens: int,
+                                  tokenizer=None):
     """Handle non-streaming response with harmony format."""
     # Parse harmony output to OpenAI format
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1658,8 +1661,14 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
     finish_reason = _determine_finish_reason(parsed_output,
                                              output.finish_reason)
 
+    # Get reasoning text for token counting
+    reasoning_text = parsed_output.get("reasoning", None)
+
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
-    usage_info = _create_usage_info(num_prompt_tokens, outputs)
+    usage_info = _create_usage_info(num_prompt_tokens,
+                                    outputs,
+                                    reasoning_text=reasoning_text,
+                                    tokenizer=tokenizer)
 
     # Create response
     response = ChatCompletionResponse(
@@ -1707,15 +1716,27 @@ def _determine_finish_reason(parsed_output: dict[str, Any],
         return reason
 
 
-def _create_usage_info(num_prompt_tokens, outputs) -> UsageInfo:
+def _create_usage_info(num_prompt_tokens,
+                       outputs,
+                       reasoning_text: str = None,
+                       tokenizer=None) -> UsageInfo:
     """Create usage info from RequestOutput following serving_chat.py pattern."""
     # Calculate completion tokens from all outputs
     num_generated_tokens = sum(len(output.token_ids) for output in outputs)
 
+    # Calculate reasoning tokens if reasoning_text is present
+    reasoning_tokens = 0
+    if reasoning_text and tokenizer is not None:
+        reasoning_token_ids = tokenizer.encode(reasoning_text,
+                                               add_special_tokens=False)
+        reasoning_tokens = len(reasoning_token_ids)
+
     # Create usage info
     usage = UsageInfo(prompt_tokens=num_prompt_tokens,
                       completion_tokens=num_generated_tokens,
-                      total_tokens=num_prompt_tokens + num_generated_tokens)
+                      total_tokens=num_prompt_tokens + num_generated_tokens,
+                      completion_tokens_details=CompletionTokensDetails(
+                          reasoning_tokens=reasoning_tokens))
     return usage
 
 

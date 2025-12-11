@@ -1,3 +1,8 @@
+import asyncio
+import json
+import logging
+import time
+
 import uvicorn
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
@@ -6,10 +11,9 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount, Route
-#from tavily import TavilyClient
+
+# from tavily import TavilyClient
 from wordllama import WordLlama
-import json
-import logging
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -18,19 +22,35 @@ query_keys = []
 query_dict = {}
 wl = WordLlama.load()
 
+# Default minimum latency for simulating real search (in seconds)
+DEFAULT_LATENCY = 1.5
+
 # Initialize FastMCP server for Weather tools (SSE)
 # Fake tavily_search
 mcp = FastMCP("tavily_search")
 
 
-@mcp.tool()
-async def tavily_search(query: str) -> str:
+def _sync_search(query: str) -> str:
+    """Synchronous search operation - runs in thread pool to avoid blocking event loop."""
     sim_key = wl.key(query)
-
-    # Most similar candidate
     best_candidate = max(query_keys, key=sim_key)
-
     return query_dict[best_candidate]
+
+
+@mcp.tool()
+async def web_search(query: str) -> str:
+    start_time = time.monotonic()
+
+    # Run CPU-bound operations in thread pool to avoid blocking the event loop
+    result = await asyncio.to_thread(_sync_search, query)
+
+    # Ensure minimum latency (simulate real search latency)
+    elapsed = time.monotonic() - start_time
+    remaining = DEFAULT_LATENCY - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+    return result
 
 
 def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
@@ -67,7 +87,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run MCP SSE-based server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8082, help="Port to listen on")
-    parser.add_argument("--query_file", type=str, default="query_result.json", help="File containing query keys")
+    parser.add_argument(
+        "--query_file", type=str, default="query_result.json", help="File containing query keys"
+    )
     args = parser.parse_args()
 
     with open(args.query_file, "r") as file:

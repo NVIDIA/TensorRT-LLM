@@ -46,6 +46,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
+from ..bindings.internal.batch_manager import AgentTreeConfig as _AgentTreeConfig # isort: skip
 # isort: on
 
 # yapf: enable
@@ -1673,6 +1674,64 @@ SparseAttentionConfig: TypeAlias = Union[
 ]
 
 
+@PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
+class AgentTreeConfig(StrictBaseModel, PybindMirror):
+    """
+    Configuration for agent tree scheduling.
+
+    Controls how agent requests are scheduled relative to regular chat requests.
+    """
+    agent_percentage: float = Field(
+        default=0.0,
+        description=
+        "The percentage of agent requests to schedule. Defaults to 0.0. "
+        "Should be between 0.0 and 1.0. -1.0 means random schedule between agent and chatbot."
+    )
+    agent_types: Optional[List[str]] = Field(
+        default=None,
+        description=
+        "Types of agents to schedule. Now Only Support DeepResearchAgent.")
+    agent_inflight_seq_num: int = Field(
+        default=2**31 - 1,
+        description="Max number of inflight sequences for agent requests.")
+
+    def _to_pybind(self):
+        return _AgentTreeConfig(
+            agent_percentage=self.agent_percentage,
+            agent_types=self.agent_types,
+            agent_inflight_seq_num=self.agent_inflight_seq_num,
+        )
+
+
+@PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
+class AgentTreeConfig(StrictBaseModel, PybindMirror):
+    """
+    Configuration for agent tree scheduling.
+
+    Controls how agent requests are scheduled relative to regular chat requests.
+    """
+    agent_percentage: float = Field(
+        default=0.0,
+        description=
+        "The percentage of agent requests to schedule. Defaults to 0.0. "
+        "Should be between 0.0 and 1.0. -1.0 means random schedule between agent and chatbot."
+    )
+    agent_types: Optional[List[str]] = Field(
+        default=None,
+        description=
+        "Types of agents to schedule. Now Only Support DeepResearchAgent.")
+    agent_inflight_seq_num: int = Field(
+        default=2**31 - 1,
+        description="Max number of inflight sequences for agent requests.")
+
+    def _to_pybind(self):
+        return _AgentTreeConfig(
+            agent_percentage=self.agent_percentage,
+            agent_types=self.agent_types,
+            agent_inflight_seq_num=self.agent_inflight_seq_num,
+        )
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """
@@ -3030,17 +3089,10 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
-    agent_percentage: float = Field(
-        default=0.0,
-        description=
-        "The percentage of agent requests to schedule. Defaults to 0.0. Should be between 0.0 and 1.0.",
-        status="prototype",
-    )
-
-    agent_types: Optional[List[str]] = Field(
+    agent_tree_config: Optional[AgentTreeConfig] = Field(
         default=None,
         description=
-        "Types of agents to schedule. Now Only Support agent_deep_research.",
+        "Configuration for agent tree scheduling. Controls how agent requests are scheduled.",
         status="prototype",
     )
 
@@ -3463,8 +3515,7 @@ class TorchLlmArgs(BaseLlmArgs):
             batch_wait_timeout_iters=self.batch_wait_timeout_iters,
             batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
             enable_sleep=self.enable_sleep,
-            agent_percentage=self.agent_percentage,
-            agent_types=self.agent_types,
+            agent_tree_config=self.agent_tree_config,
         )
 
 
@@ -3494,6 +3545,7 @@ def update_llm_args_with_extra_dict(
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
+        "agent_tree_config": AgentTreeConfig,
         "kv_cache_config": KvCacheConfig,
     }
     for field_name, field_type in field_mapping.items():

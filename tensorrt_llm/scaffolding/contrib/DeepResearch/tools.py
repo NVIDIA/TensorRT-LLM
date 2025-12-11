@@ -18,8 +18,8 @@ think_tool = OpenAIToolDescription(
     parameters={"think": {"type": "string", "description": "The reflection of the research"}},
 )
 
-tavily_search_tool = OpenAIToolDescription(
-    name="tavily_search",
+web_search_tool = OpenAIToolDescription(
+    name="web_search",
     description="For conducting web searches to gather information",
     parameters={"query": {"type": "string"}},
 )
