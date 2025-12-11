@@ -19,6 +19,9 @@ from tensorrt_llm._torch.speculative.eagle3 import Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
+# Enable capture_scalar_outputs to avoid graph breaks from Tensor.item() calls
+torch._dynamo.config.capture_scalar_outputs = True
+
 
 class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
 
