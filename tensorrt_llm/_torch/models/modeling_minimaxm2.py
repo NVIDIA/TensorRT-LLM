@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -12,7 +12,7 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
+from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
@@ -39,11 +39,19 @@ class MiniMaxM2MoE(nn.Module):
             self.hidden_dim, self.num_experts, bias=False, dtype=torch.float32, quant_config=None
         )
 
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty((self.num_experts), dtype=torch.float32), requires_grad=False
+        )
+
         reduce_results = False
         # TODO: use_routing_bias parameter, torch_dtype is None for now, we also need quant config
         self.experts = create_moe(
             num_experts=self.num_experts,
-            routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
+            routing_method=MiniMaxM2MoeRoutingMethod(
+                top_k=self.top_k,
+                num_experts=self.num_experts,
+                callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
+            ),
             hidden_size=self.hidden_dim,
             intermediate_size=self.ffn_dim,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
@@ -51,6 +59,13 @@ class MiniMaxM2MoE(nn.Module):
             reduce_results=reduce_results,
             model_config=model_config,
             layer_idx=layer_idx,
+        )
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+
+        self.e_score_correction_bias.copy_(
+            weights[0]["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
         )
 
     def forward(
