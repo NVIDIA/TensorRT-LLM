@@ -54,6 +54,7 @@ class ChatPostprocArgs(PostprocArgs):
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
+    tool_call_id_type: str
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -223,7 +224,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 # Tool call ID should be generated only once per tool call
                 if call_item.name:
                     # First chunk: include ID and function name
-                    tool_call_id = make_tool_call_id()
+                    tool_call_id = make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=call_item.name,
+                        idx=call_item.tool_index)
                     function_name = call_item.name
                 else:
                     # Subsequent chunks: null ID and name for argument deltas
