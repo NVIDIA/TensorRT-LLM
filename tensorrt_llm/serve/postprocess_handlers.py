@@ -54,7 +54,7 @@ class ChatPostprocArgs(PostprocArgs):
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
-    tool_call_id_type: str
+    tool_call_id_type: str = "random"
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
