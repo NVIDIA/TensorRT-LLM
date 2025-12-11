@@ -3010,7 +3010,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         new_tokens_host = state.host.new_tokens.flatten().tolist()
         sequence_lengths_host_data = state.host.sequence_lengths.flatten().tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
-        log_probs_host = state.host.log_probs.tolist() if state.host.log_probs is not None else None
+        log_probs_host_tensor = state.host.log_probs
         cum_log_probs_host = (
             state.host.cum_log_probs.tolist() if state.host.cum_log_probs is not None else None
         )
@@ -3032,24 +3032,31 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs
-        for request in reqs_with_new_tokens:
-            if request.py_return_log_probs:
-                seq_slot = request.py_seq_slot
-                seq_len = sequence_lengths_host_data[seq_slot]
-                begin_log_probs_offset = request.prompt_len
-                current_token = seq_len - request.prompt_len - 1
-                log_probs = [
-                    {
-                        new_tokens_host[seq_slot]: Logprob(
-                            logprob=log_probs_host[seq_slot][0][
-                                begin_log_probs_offset + current_token
-                            ],
-                            rank=1,
-                        )
-                    }
-                ]
-                cum_log_probs = [cum_log_probs_host[seq_slot]]
-                request.py_result.append_log_probs([log_probs], cum_log_probs)
+        if log_probs_host_tensor is not None:
+            # Log probs
+            seq_slots = []
+            seq_lens = []
+            for request in reqs_with_new_tokens:
+                if request.py_return_log_probs:
+                    seq_slot = request.py_seq_slot
+                    seq_slots.append(seq_slot)
+                    seq_lens.append(sequence_lengths_host_data[seq_slot] - 1)
+
+            log_probs_host = log_probs_host_tensor[seq_slots, 0, seq_lens].tolist()
+            idx = 0
+            for request in reqs_with_new_tokens:
+                if request.py_return_log_probs:
+                    log_probs = [
+                        {
+                            new_tokens_host[seq_slot]: Logprob(
+                                logprob=log_probs_host[idx],
+                                rank=1,
+                            )
+                        }
+                    ]
+                    cum_log_probs = [cum_log_probs_host[seq_slot]]
+                    request.py_result.append_log_probs([log_probs], cum_log_probs)
+                    idx += 1
 
         for request in reqs:
             request.py_decoding_iter += 1

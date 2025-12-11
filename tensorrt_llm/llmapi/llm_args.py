@@ -19,6 +19,11 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+try:
+    from ray.util.placement_group import PlacementGroup
+except ImportError:
+    PlacementGroup = None
+
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -1086,6 +1091,65 @@ class AutoDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class RayPlacementConfig(StrictBaseModel):
+    """
+    Configuration for Ray GPU workers placement.
+    This config is only used with AsyncLLM for RL scenarios.
+    """
+    defer_workers_init: bool = Field(
+        default=False,
+        description="Defer Ray worker initialization until async setup.")
+
+    placement_groups: Optional[List[Any]] = Field(
+        default=None,
+        description="List of Ray placement groups, one per node. "
+        "Each element must be a ray.util.placement_group.PlacementGroup instance."
+    )
+
+    placement_bundle_indices: Optional[List[List[int]]] = Field(
+        default=None,
+        description="List of bundle indices for each placement group. "
+        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group."
+    )
+
+    per_worker_gpu_share: Optional[float] = Field(
+        default=None,
+        description="GPU fraction per worker for colocation scenarios. "
+        "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU)."
+    )
+
+    @model_validator(mode='after')
+    def validate_ray_placement(self) -> 'RayPlacementConfig':
+        has_pgs = self.placement_groups is not None
+        has_indices = self.placement_bundle_indices is not None
+
+        if has_pgs != has_indices:
+            raise ValueError(
+                "placement_groups and placement_bundle_indices must be provided together"
+            )
+
+        if has_pgs:
+            if len(self.placement_groups) != len(self.placement_bundle_indices):
+                raise ValueError(
+                    f"placement_groups length ({len(self.placement_groups)}) must equal "
+                    f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
+                )
+            if PlacementGroup is not None:
+                for i, pg in enumerate(self.placement_groups):
+                    if not isinstance(pg, PlacementGroup):
+                        raise TypeError(
+                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                            f"got {type(pg).__name__}")
+
+        if self.per_worker_gpu_share is not None:
+            if not (0 < self.per_worker_gpu_share <= 1.0):
+                raise ValueError(
+                    f"per_worker_gpu_share must be between 0 and 1.0, "
+                    f"got {self.per_worker_gpu_share}")
+
+        return self
+
+
 class PybindMirror(ABC):
     ''' A class containing the utilities for mirroring Python classes to
     pybinding classes.
@@ -2032,6 +2096,8 @@ class BaseLlmArgs(StrictBaseModel):
     @field_validator("gpus_per_node", mode='before')
     @classmethod
     def validate_gpus_per_node(cls, v, info):
+        if os.getenv("RAY_LOCAL_WORLD_SIZE") is not None:
+            return info.data.get("tensor_parallel_size")
         if v is None:
             logger.warning(
                 f"Using default gpus_per_node: {torch.cuda.device_count()}")
@@ -2750,6 +2816,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
+    ray_placement_config: Optional[RayPlacementConfig] = Field(
+        default=None,
+        description=
+        "Placement config for RayGPUWorker. Only used with AsyncLLM and orchestrator_type='ray'.",
+        exclude=True,
+        status="prototype")
+
     enable_sleep: bool = Field(
         default=False,
         description=
@@ -3056,6 +3129,14 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_ray_placement_config(self) -> 'TorchLlmArgs':
+        if self.ray_placement_config is not None and self.orchestrator_type != "ray":
+            raise ValueError(
+                "ray_placement_config is only supported with orchestrator_type='ray'"
             )
         return self
 
