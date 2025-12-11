@@ -677,6 +677,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 }
 
                 dockerArgs = "${dockerArgs} " +
+                    "--rm" +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
                     "--entrypoint=\"\" " +
