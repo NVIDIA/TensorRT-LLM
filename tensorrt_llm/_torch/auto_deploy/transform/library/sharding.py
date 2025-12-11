@@ -2513,7 +2513,10 @@ def detect_column_row_shard(
     num_ssm_shards = 0
     num_attention_shards = 0
     num_column_row_shards = 0
-    for opening, layer_subgraph, closing in layer_subgraphs:
+    for layer in layer_subgraphs:
+        opening = layer.opening_nodes
+        closing = layer.terminating_node
+        layer_subgraph = layer.subgraph_nodes
         nodes_linear = opening + [closing]
 
         ssm_nodes = list(filtered_nodes(layer_subgraph, is_any_ssm_op))
@@ -2527,7 +2530,7 @@ def detect_column_row_shard(
             else LayerType.MLP
         )
 
-        if config.simple_shard_only:
+        if transfrom_container.simple_shard_only or not layer.col_row_shardable:
             ad_logger.debug(
                 f"Forcing Simple Shard on nodes: {nodes_linear} with layer type: {layer_type}"
             )

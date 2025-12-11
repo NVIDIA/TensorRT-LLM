@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
+from pydantic import BaseModel, ConfigDict
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
 
@@ -26,6 +27,14 @@ except ImportError:
 
 OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
+
+
+class LayerSubgraph(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    opening_nodes: List[Node]
+    subgraph_nodes: List[Node]
+    terminating_node: Union[Node, None]
+    col_row_shardable: bool
 
 
 @dataclass
@@ -457,12 +466,12 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
         # opening is the list of linear nodes
         # layer_subgraph is the list of nodes between the opening and closing linear nodes
         # closing is the last linear node in the layer
-        opening, layer_subgraph, closing = get_layer_after_linear_node(
-            linear_nodes, terminating_indices
-        )
-        if opening is not None:
-            unprocessed_linear_nodes -= set(opening) | set([closing])
-            layer_subgraphs.append([opening, layer_subgraph, closing])
+        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
+        if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
+            unprocessed_linear_nodes -= set(layer_subgraph.opening_nodes) | set(
+                [layer_subgraph.terminating_node]
+            )
+            layer_subgraphs.append(layer_subgraph)
         last_lin_index = terminating_indices[-1] + 1
 
     # unprocessed linear nodes can be "simple sharded".
@@ -705,7 +714,7 @@ def subgraph(
 
 def get_layer_after_linear_node(
     linear_nodes: List[Node], terminating_indices: List[int]
-) -> List[Node]:
+) -> LayerSubgraph:
     """
     Get the next model layer.
     The previous layer was closed by the terminating linear node with index terminating_indices[-1].
@@ -732,12 +741,18 @@ def get_layer_after_linear_node(
     while len(lin_nodes_in_subgraph) != 1:
         if start_lin_index >= len(linear_nodes):
             terminating_indices.append(len(linear_nodes))
-            return None, None, None
+            return LayerSubgraph(
+                opening_nodes=[],
+                subgraph_nodes=[],
+                terminating_node=None,
+                col_row_shardable=False,
+            )
         forward_subgraph = subgraph(
             sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
         )
         lin_nodes_in_subgraph = list(filtered_nodes(forward_subgraph, filter_condition))
         start_lin_index += 1
+    start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
     backward_subgraph = subgraph(
         sinks=[terminating_linear_node], boundary_condition=boundary_condition
@@ -749,23 +764,47 @@ def get_layer_after_linear_node(
     opening_linear_nodes = [
         n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
     ]
-    assert linear_nodes[start_lin_index - 1] in opening_linear_nodes, (
+    # check if the layer is col-row shardable
+    col_row_shardable = True
+    reduction_nodes = [n for n in backward_subgraph if has_shape(n) and shape(n)[-1] == 1]
+    if len(reduction_nodes) > 0:
+        col_row_shardable = False
+
+    layer_subgraph = LayerSubgraph(
+        opening_nodes=opening_linear_nodes,
+        subgraph_nodes=backward_subgraph,
+        terminating_node=terminating_linear_node,
+        col_row_shardable=col_row_shardable,
+    )
+    assert linear_nodes[start_lin_index] in opening_linear_nodes, (
         "Linear node not found in opening linear nodes"
     )
-    layer_subgraph = [opening_linear_nodes, backward_subgraph, terminating_linear_node]
 
     # return the index of the terminating linear node
     if terminating_linear_node == linear_nodes[-1]:
         terminating_index = len(linear_nodes)
     else:
-        terminating_index = start_lin_index + len(opening_linear_nodes) - 1
+        terminating_index = start_lin_index + len(opening_linear_nodes)
     terminating_indices.append(terminating_index)
     if terminating_index < len(linear_nodes):
-        assert linear_nodes[terminating_index] == terminating_linear_node, (
-            "Terminating linear node not found"
-        )
+        if linear_nodes[terminating_index] != terminating_linear_node:
+            # this means that the forward and backward subgraphs misalign:
+            # there are more opening nodes that we started with, so our
+            # terminating node is "linear node reachable" from unexpected
+            # paths. Therefore, we cannot safely col-row shard this layer.
+            layer_subgraph.col_row_shardable = False
     # otherwise, we are done. We processed the last linear node.
     return layer_subgraph
+
+
+def has_shape(node: Node) -> bool:
+    return hasattr(node, "meta") and "val" in node.meta and hasattr(node.meta["val"], "shape")
+
+
+def shape(node: Node) -> Tuple[int, ...]:
+    if not has_shape(node):
+        return None
+    return node.meta["val"].shape
 
 
 def draw_graph(gm: GraphModule, filename: str):
