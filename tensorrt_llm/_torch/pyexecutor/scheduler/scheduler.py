@@ -9,7 +9,8 @@ from typing import Optional, Set
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import (AgentTreeConfig,
+                                          CapacitySchedulerPolicy)
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
@@ -208,8 +209,6 @@ class BindCapacityScheduler(CapacityScheduler):
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
-        agent_percentage: float = 0.0,
-        agent_types: Optional[list[str]] = None,
     ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
@@ -222,8 +221,6 @@ class BindCapacityScheduler(CapacityScheduler):
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
             no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
-            agent_percentage=agent_percentage,
-            agent_types=agent_types,
         )
 
     def schedule_request(
@@ -253,6 +250,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+        agent_tree_config: Optional[AgentTreeConfig] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
@@ -264,7 +262,12 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
 
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config_cpp, max_num_tokens)
+        agent_tree_config_cpp = agent_tree_config._to_pybind(
+        ) if agent_tree_config else None
+
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config=ctx_chunk_config_cpp,
+            max_context_length=max_num_tokens,
+            agent_tree_config=agent_tree_config_cpp)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -292,6 +295,11 @@ class SimpleScheduler(RequestScheduler):
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids
         )
+
+        if os.environ.get('DEBUG_AGENT_HIERARCHY') == '1':
+            print(
+                f"has {len(fitting_requests)} reqs, micro batch scheduler only scheduled total {len(context_requests) + len(generation_requests)} requests, which is {len(context_requests)} context reqs and {len(generation_requests)} generation reqs"
+            )
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(

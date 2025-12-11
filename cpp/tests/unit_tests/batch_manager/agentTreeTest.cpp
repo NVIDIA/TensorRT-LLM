@@ -121,11 +121,11 @@ protected:
         return requests;
     }
 
-    RequestVector sortByAgentTree(
-        float agentRatio, std::optional<std::vector<std::string>> const& agentTypes, RequestVector const& requests)
+    RequestVector sortByAgentTree(float agentRatio, std::optional<std::vector<std::string>> const& agentTypes,
+        RequestVector const& requests, SizeType32 reservedCount = 0)
     {
         auto rootNode = tbat::createAgentTreeRoot(agentRatio, agentTypes);
-        return tbat::sortRequestsByAgentTree(rootNode, requests);
+        return tbat::sortAndTruncateRequestsByAgentTree(rootNode, requests, reservedCount);
     }
 
     void checkRequestSequence(

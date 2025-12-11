@@ -16,7 +16,10 @@
 
 #pragma once
 
+#include <limits>
+
 #include "common.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -39,6 +42,8 @@ struct ContextChunkingConfig
     tensorrt_llm::runtime::SizeType32 chunkUnitSize;
 };
 
+// AgentTreeConfig is defined in agentTree.h
+
 } // namespace batch_scheduler
 
 /// @brief This scheduler takes into account the desired batch size and limits of the TRT engine to schedule requests.
@@ -53,7 +58,8 @@ public:
     explicit MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
         std::optional<SizeType32> maxContextLength = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE,
+        std::optional<batch_scheduler::AgentTreeConfig> agentTreeConfig = std::nullopt);
 
     std::tuple<RequestVector, RequestVector> operator()(RequestVector& activeRequests, ReqIdsSet const& inflightReqIds,
         SizeType32 maxBatchSizeRuntime, std::optional<SizeType32> maxNumTokensRuntime) const;
@@ -83,6 +89,9 @@ private:
     /// The state until/after which the scheduler should not schedule requests
     LlmRequestState mNoScheduleUntilState;
     LlmRequestState mNoScheduleAfterState;
+
+    std::optional<batch_scheduler::AgentTreeConfig> mAgentTreeConfig;
+    std::shared_ptr<agent_tree::AgentTreeNode> mAgentTreeRoot;
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -1343,9 +1343,10 @@ def create_py_executor_instance(
             two_step_lookahead=mapping.has_pp(),
             agent_percentage=pytorch_backend_config.agent_percentage,
             agent_types=pytorch_backend_config.agent_types)
+        agent_tree_config = pytorch_backend_config.agent_tree_config
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
+                                               ctx_chunk_config, agent_tree_config)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config

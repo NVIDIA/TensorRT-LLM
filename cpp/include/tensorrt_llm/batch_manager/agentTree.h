@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +33,26 @@
 
 namespace tensorrt_llm::batch_manager
 {
+
+namespace batch_scheduler
+{
+
+struct AgentTreeConfig
+{
+    AgentTreeConfig() = default;
+
+    // normal range is [0.0, 1.0], -1.0 means random schedule between agent and chatbot.
+    float agentPercentage{-1.0f};
+
+    // agent types to schedule.
+    std::optional<std::vector<std::string>> agentTypes;
+
+    // max number of inflight sequences for agent requests.
+    runtime::SizeType32 agentInflightSeqNum{std::numeric_limits<runtime::SizeType32>::max()};
+};
+
+} // namespace batch_scheduler
+
 namespace agent_tree
 {
 
@@ -159,6 +180,7 @@ public:
 
     explicit AgentTreeNode(SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr)
         : mLevel(level)
+        , mMaxRequests(std::numeric_limits<SizeType32>::max())
     {
     }
 
@@ -175,6 +197,16 @@ public:
         return mLevel;
     }
 
+    void setMaxRequests(SizeType32 maxRequests) noexcept
+    {
+        mMaxRequests = maxRequests;
+    }
+
+    [[nodiscard]] SizeType32 getMaxRequests() const noexcept
+    {
+        return mMaxRequests;
+    }
+
 protected:
     [[nodiscard]] virtual RequestVector mergeNodesSequence(
         std::unordered_map<NodeType, RequestVector> const& typeToChildReqs, RequestVector const& reqs)
@@ -186,6 +218,7 @@ protected:
     NodeMap mTypeToChild;
     RequestVector mReqs;
     SizeType32 mLevel;
+    SizeType32 mMaxRequests;
 };
 
 class AgentChatbotNode : public AgentTreeNode
@@ -243,10 +276,18 @@ protected:
     NodeType nodeType, SizeType32 level, std::shared_ptr<NodeParams> nodeParams = nullptr);
 
 [[nodiscard]] std::shared_ptr<AgentTreeNode> createAgentTreeRoot(
-    float agentRatio, std::optional<std::vector<std::string>> const& agentTypes);
+    std::optional<batch_scheduler::AgentTreeConfig> const& agentTreeConfig);
 
-[[nodiscard]] RequestVector sortRequestsByAgentTree(
-    std::shared_ptr<AgentTreeNode> const& root, RequestVector const& requests);
+/// @brief Sort requests by agent tree hierarchy and truncate to (maxRequests - reservedCount) limit.
+/// @param root The agent tree root node.
+/// @param requests The requests to sort (should only contain non-generation requests).
+/// @param reservedCount The number of requests already reserved (e.g., generation requests
+///        that must be scheduled). The truncation limit will be (maxRequests - reservedCount).
+/// @note This function should only be called with non-generation requests.
+///       Generation requests (isGenerationInProgressState) must always be scheduled
+///       and should not be subject to truncation in overlap scheduler mode.
+[[nodiscard]] RequestVector sortAndTruncateRequestsByAgentTree(
+    std::shared_ptr<AgentTreeNode> const& root, RequestVector const& requests, SizeType32 reservedCount);
 
 [[nodiscard]] SizeType32 getLevelNum(LlmRequestPtr const& request);
 

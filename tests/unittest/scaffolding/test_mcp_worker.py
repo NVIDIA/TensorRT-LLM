@@ -433,7 +433,7 @@ async def test_scaffolding_with_chat_mcp_controller(mcp_server):
 
     finally:
         # Clean up
-        mcp_worker.shutdown()
+        await mcp_worker.shutdown()
         scaffolding_llm.shutdown(shutdown_workers=False)  # Don't shutdown workers again
 
 

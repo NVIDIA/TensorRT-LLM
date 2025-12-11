@@ -1,0 +1,302 @@
+[
+  {
+    "prompt": "收集整理目前中国9阶层实际收入和财务状况，特别研究得出中国的中产有哪些特点，实际中产人数，财力等等"
+  },
+  {
+    "prompt": "收集整理目前国际综合实力前十的保险公司的相关资料，横向比较各公司的融资情况、信誉度、过往五年的增长幅度、实际分红、未来在中国发展潜力等维度，并为我评估出最有可能在未来资产排名靠前的2-3家公司"
+  },
+  {
+    "prompt": "中国金融未来的发展趋势，未来哪一个细分领域（例如投行、pe、固收等）更有上升空间"
+  },
+  {
+    "prompt": "分析 2010 年至今的黄金走势，用思维导图告诉我黄金未来有可能的趋势，关键压力，关键支撑位置"
+  },
+  {
+    "prompt": "调研国内金融机构之间的投资借贷关系与系统性风险的联系？对不同层次或类型的借贷关系和风险建模"
+  },
+  {
+    "prompt": "请帮我整理下目前全球具身智能发展的技术路线，以及各个路线的代表性公司，需要包括这些公司的技术路径，产品进度，商业化进度，融资情况，团队情况"
+  },
+  {
+    "prompt": "在当前中国房地产市场低迷的情况下，政府税收减少，这会多大程度上影响地方政府的财政收入"
+  },
+  {
+    "prompt": "能否给我提供一份详尽的报告，分析机器学习或者深度学习在优化材料元素组合配比以实现最佳的材料性能方面的研究进展和模型应用现状。请包括活跃的研究课题组，该课题组具体研究方向，已发表的相关论文，使用的数据库分析，模型准确度评估，面临的挑战以及对应的模型可行性分析。最后，请详细分析基于现有的研究现状，评估此领域距离实现理想模型的大规模应用和产业化还有多远"
+  },
+  {
+    "prompt": "在计算化学这个领域，我们通常使用Gaussian软件模拟各种情况下分子的结构和性质计算，比如在关键词中加入'field=x+100'代表了在x方向增加了电场。但是，当体系是经典的单原子催化剂时，它属于分子催化剂，在反应环境中分子的朝向是不确定的，那么理论模拟的x方向电场和实际电场是不一致的。请问：通常情况下，理论计算是如何模拟外加电场存在的情况？"
+  },
+  {
+    "prompt": "在800V高压/碳化硅电驱/固态电池/分布式驱动等技术迭代加速的窗口期，如何构建覆盖研发制造-使用场景-残值管理的评估体系，量化不同动力系统技术路线（纯电/增程/插混/氢燃料+集中式驱动/分布式驱动）的商业化临界点？"
+  },
+  {
+    "prompt": "请总结碳钢常用缓蚀剂种类，并分析每种缓蚀剂是具有拉曼活性还是红外活性。注意如果是复合缓蚀剂需要分别分析再总结。"
+  },
+  {
+    "prompt": "收集整理近10年来国际上自来水生产及销售企业在技术创新且已经实现创新成果产业化应用方面，按技术产业化应用实现的经济收益规模前10的创新成果，列举企业名称，技术创新成果及产业化应用情况，对比分析国内同类型水务企业的情况，给出国内水务企业以实现技术创新成果产业化应用为目的可重点开展技术攻关的3-5个方向的建议"
+  },
+  {
+    "prompt": "为我调研AI算法能否提升现有电子学读出时幅修正方法"
+  },
+  {
+    "prompt": "收集整理全球数学与量子计算交叉领域的主要研究团队及其成果，横向比较其研究方向、论文产出、国际合作、资金支持、工业界合作等维度，评估哪些团队最有可能在未来5-10年内推动量子计算技术的重大突破，并预测可能产生的关键性数学理论或应用技术"
+  },
+  {
+    "prompt": "收集整理目前世界上关于量子网络的研究，横向比较各课题组的相关工作，从以下几个维度，也可以不局限于这些维度：文章发表期刊或会议的等级，课题组成员和领导者的技术背景或学术头衔，课题组经费来源，课题组横向或纵向项目等维度，并为我评估出最有潜力的可以引领未来量子网络发展的十个课题组"
+  },
+  {
+    "prompt": "收集整理目前非接触式感知领域做的最好的算法策略，并为我评估他们的输入信号与准确率"
+  },
+  {
+    "prompt": "\"“在当今软件开发行业中，低代码/无代码平台对传统开发流程的影响有多大？它们是否真正提高了开发效率，还是在特定场景下反而增加了维护成本？”\n为什么这个问题有价值？\n行业趋势：低代码/无代码开发近年来发展迅速，许多企业尝试采用它们来加快产品交付速度。 \n生产力 vs. 维护成本：这些工具宣称能降低开发门槛，但长期来看，它们是否真的能提高效率，还是在维护和扩展时带来了更多问题？ \n开发者视角 vs. 业务视角：企业管理者可能认为它们降低了成本，但开发者可能认为它们限制了可扩展性和灵活性。 \n未来发展预测：是否会有越来越多企业完全转向低代码/无代码，还是它们只适用于特定业务场景？\""
+  },
+  {
+    "prompt": "请你学习一下GCS算法的原理。目前的GCS算法主要是用于安全凸集内的路径自动求解。目前，针对凸集的生成，采用的是人工手动播种结合自动化工具的方式，在离线时生成安全区域凸集。现在我想探寻一种自动化生成安全区域的方式，来进一步优化这个GCS算法。例如，能否结合PRM算法（或改进的PRM算法），生成一个静态联通图，再结合凸算法，自动构造一个凸集，把凸集直接供给GCS算法求解。能不能帮我详细分析这个优化思路是否可行？要如何展开？或者能否提供其他的基于GSC算法的优化思路？"
+  },
+  {
+    "prompt": "prometheus 的高流失率会造成什么影响，有什么系统的方案可以解决？各家云厂商有没有现有方案？"
+  },
+  {
+    "prompt": "研究下Anthropic最新发布的Streamable HTTP的工程中的具体实现方案"
+  },
+  {
+    "prompt": "现在AI这么热门，我最感兴趣的就是人工智能在教育领域应用现状，实际能落地的场景还有在教育领域所面临的挑战，再就是反过来教育对培养人工智能高尖端人才的支撑作用如何强化，学校都有怎样的对应的培养AI人才的体系。"
+  },
+  {
+    "prompt": "中国的艺术生就业领域长期以来较为单一，主要集中在传统艺术机构、教育部门或文创企业。随着社会的发展，艺术与科技、商业、教育等领域的边界正在模糊，为艺术生提供了更广阔的职业发展空间。然请为我调研：艺术生如何突破传统就业领域的限制，实现多元化职业发展？当前社会评价体系如何影响艺术人才的发展空间与收入水平？知识产权保护与文化消费升级能否有效提升艺术人才经济待遇？不同国家在艺术人才社会地位提升方面有哪些可借鉴的经验与模式？"
+  },
+  {
+    "prompt": "我们部门正在辅导高校老师竞赛，比较想了解创新赛、青教赛的全国一等奖课程的情况和资料。"
+  },
+  {
+    "prompt": "如何增强自闭症学生课堂参与度？有哪些有效的策略可供选择？"
+  },
+  {
+    "prompt": "请为我整合近几年有关“中性粒细胞在脑缺血急性期和慢性期的功能和发展变化”的研究成果。在此基础上预测中性粒细胞各个亚群如何和其他的细胞类型发生相互作用，最终如何导向不同的临床结局。最后，为我分析未来可能需要开展的工作。"
+  },
+  {
+    "prompt": "为我调研在慢性抗原刺激下（如肿瘤微环境或HIV潜伏感染），CD8+ T细胞线粒体动力学（融合/裂变平衡）如何通过调控表观遗传重塑（如m6A修饰、乳酸介导的组蛋白乳酸化）驱动终末耗竭与组织驻留记忆（Trm）细胞命运分岔，基于代谢-表观遗传互作网络定量建模"
+  },
+  {
+    "prompt": "如何将AI心理咨询和人类心理咨询有机结合，以便为人类心理健康谋求福利？"
+  },
+  {
+    "prompt": "传统的药物研究，即便是从多组学角度出发也难以系统地，宏观地解析药物对机体产生的影响。而且个人异质性会造成其他的影响，因之，请为我调研现阶段大模型是否能模拟药物产生影响来系统性评估药物，这个方向未来会如何发展呢"
+  },
+  {
+    "prompt": "50年代至今，中国大陆中国古代文学研究头部学者知识背景差异调查\n具体做法：收集整理50年代至今从事中国古代文学学科研究的头部学者的毕业院校、院校学科总体偏向，及专业、学历、工作经历、导师的专业背景等，和不同时期的文艺方针、学术潮流等时代背景，加权计算，分析比较得出某个特定时期的学者学科背景同异，以及个人的知识构成。"
+  },
+  {
+    "prompt": "全球南方合作如何推动文明交流互鉴？从理论角度给出深入的学术分析，必须考虑以下维度：非西方现代化、后殖民主义、东方学、全球史。"
+  },
+  {
+    "prompt": "选题：中外博物馆教育的现状与未来趋势。要求1.分别总结国内外的现状与特点，特别是国外的现状要按代表性国家分别归纳。2.博物馆要进行分类总结，如按级别国家级、省级、市级、村级、或按国有和私人，分类要自成体系。3.结合科技发展趋势和教育理念发展，谈一下未来发展趋势，针对中国博物馆要详写。"
+  },
+  {
+    "prompt": "收集整理目前中国历史学界对1937-1949年（抗日战争以及战后）研究的成果和相关论著，横向对比分析这些成果的研究领域、研究视角、研究方法、理论运用、研究结论等方面，并为我预测未来最有研究潜力和研究空间的2-3个选题。"
+  },
+  {
+    "prompt": "在微电子工艺中，金属薄膜的生长可以使用多种设备，物理气相沉积设备，化学气相沉积设备，电子束蒸发沉积设备，原子层沉积设备和分子束外研设备。为我调研在如今先进制程的芯片工艺中金属薄膜的生长运用到了上面哪几种设备？分别用来沉积什么金属薄膜？为什么选择它们呢？"
+  },
+  {
+    "prompt": "在二维半导体的接触领域，科研人员为了降低接触电阻做了许多努力。以二硫化钼为例，半金属接触，纯金接触等均表现出非常小的接触电阻。但每种低电阻的接触往往有自己独特的理论解释，导致该领域一直没有一个明确的发展方向。这些降低接触电阻的方法是否有共通之处？是否有一个大一统的理论能够解释大多数降低接触电阻的方法？按照这个方法该领域将来的发展方向是什么呢？"
+  },
+  {
+    "prompt": "市政污水收集和处理大部分城市采取的模式是核拨制，但这种机制造成了效率的不足，作为政府管理部门有何种操作性比较强的方案实现高效？（考虑排水系统建设，运营，维护，改造，应急等各方面的成本，同时考虑与雨水排洪排涝之间的协作关系，如何共同运作，降低成本，实现良性循环）"
+  },
+  {
+    "prompt": "制造业离散制造（单件小批）基本上靠人的技能才能完成的，为我调研实现自动化的难度有多大"
+  },
+  {
+    "prompt": "调研问题：爵士钢琴在现代音乐创作中的创新与风格演变研究 \n背景与问题意识： 爵士钢琴，作为爵士乐的核心组成部分之一，具有独特的演奏技法与即兴创作特性。自20世纪初以来，爵士钢琴从黑色音律的诞生到今各个流派的发展，经历了多次艺术风格的革命与变迁。特别是在现代音乐创作大潮中（尤其是1950年之后），爵士钢琴不仅深受传统爵士乐风格的影响，还不断受到其他音乐流派、比如古典音乐、摇滚乐、电音等风格的冲击和融合。然而，目前对于爵士钢琴在多元化音乐背景下的创新路径与风格演变的系统性研究仍显不足。 随着全球化和音乐的跨界发展，爵士钢琴的演奏和创作不断面临着新的挑战与机会。不同文化背景下的钢琴家在演奏技法、节奏变奏、和声结构等方面的探索，使得爵士钢琴的创作呈现多样性，而这一变化趋势值得深入剖析。\n 本调研旨在探讨爵士钢琴在现代音乐创作中的创新与风格演变。通过对比分析各种创新实践及其对爵士钢琴艺术演变的推动作用，本篇调研将着重分析以下几个方面：一是爵士钢琴从经典爵士到现代爵士的风格演变；二是当代跨流派合作对爵士钢琴的艺术影响；三是技术创新（如音效处理、电子音乐的结合等）和即兴创作手法的革新对爵士钢琴艺术发展的推动。 此项调研将结合数以百计的现代演出视频、音乐创作数据以及关键演奏家访谈，构建一个多层次的分析框架，帮助阐明爵士钢琴在全球音乐创作背景下的持续创新与风格演变，更为理论和创作实践提供深入的分析视角。"
+  },
+  {
+    "prompt": "收集针对近三年内珠宝设计流行趋势变化，如高奢类品牌珠宝以及高定类竞拍品等，总结其共通点以及特色亮点。"
+  },
+  {
+    "prompt": "我是一名游戏开发，帮我分析一下不同类型游戏的用户群体画像"
+  },
+  {
+    "prompt": "中国当前的刑罚体系中，死刑、死刑缓期执行、终身监禁的数量、比例、减刑率。 你能否结合中国刑罚执行的全部数据，进行量化分析？更进一步，能否评估出中国预计什么时候会彻底废除死刑？"
+  },
+  {
+    "prompt": "收集整理目前中国电影票房前十的电影的相关资料，横向比较各电影的主题、技制作公司、题材、时长等维度，并为我评估出最有可能在未来实现高票房的电影类型"
+  },
+  {
+    "prompt": "中共中央 国务院2025年印发的《教育强国建设规划纲要（2024—2035年）》指出实施学生体质强健计划，中小学生每天综合体育活动时间不低于2小时。目前中小学生每天综合体育活动时间是多少？什么因素影响了体育活动时间？如何制定相关政策来保证该计划的实施？"
+  },
+  {
+    "prompt": "软件行业未来趋势和被AI替代的可能性"
+  },
+  {
+    "prompt": "国内城市轨道交通行业（主要指地铁）每年的碳滑板用量是多少？主要供应商的份额以及行业趋势分析"
+  },
+  {
+    "prompt": "分析《老子》历代注本中“神”的发展"
+  },
+  {
+    "prompt": "房地产行业可持续发展的动力是什么？未来10年国家在政策、资金、导向如何促进该行业有序、良性地发展。"
+  },
+  {
+    "prompt": "2025 年，有哪些因素影响着旅客选择前往不同目的地旅游"
+  },
+  {
+    "prompt": "我今年五十三岁，体重一百六十斤，为我提供一份两周的食谱，包含更科学、健康、简单易做的营养搭配（我是中国人）"
+  },
+  {
+    "prompt": "为我调研全球范围内，20-30岁的女性对口腔正畸和医美的共同需求的比重。未来有没有把正畸和医美联系起来的可能性"
+  },
+  {
+    "prompt": "收集整理有关孩子身心健康成长的相关资料，比如怎样合理安排学习、生活、兴趣爱好，以及怎样找到合适自己的目标方向"
+  },
+  {
+    "prompt": "From 2020 to 2050, how many elderly people will there be in Japan? What is their consumption potential across various aspects such as clothing, food, housing, and transportation? Based on population projections, elderly consumer willingness, and potential changes in their consumption habits, please produce a market size analysis report for the elderly demographic."
+  },
+  {
+    "prompt": "What are the investment philosophies of Duan Yongping, Warren Buffett, and Charlie Munger? "
+  },
+  {
+    "prompt": "Researching how the world's wealthiest governments invest."
+  },
+  {
+    "prompt": "In the field of FinTech, machine learning algorithms are now widely applied to asset allocation and investment decisions. Examples include classic models like Mean-Variance and Black-Litterman, as well as emerging deep learning models. While these models have shown certain advantages under different market conditions, each also has its limitations. For instance, the Mean-Variance model assumes asset returns follow a normal distribution, which often doesn't align with actual market conditions. The Black-Litterman model relies on subjective view inputs, introducing a degree of subjectivity. Although deep learning models can handle complex non-linear relationships, they suffer from poor interpretability. So, what are the core differences between these various models in terms of risk measurement, return prediction, and asset allocation? And is it possible to combine their strengths to build a more general-purpose and effective modeling framework?"
+  },
+  {
+    "prompt": "While the market features diverse quantitative strategies like multi-factor and high-frequency trading, it lacks a single, standardized benchmark for assessing their performance across multiple dimensions such as returns, risk, and adaptability to market conditions. Could we develop a general yet rigorous evaluation framework to enable accurate comparison and analysis of various advanced quant strategies?"
+  },
+  {
+    "prompt": "Is there a general method for solving a first-price sealed-bid auction with two bidders who have independent private values drawn from different distributions (i.e., ex-ante asymmetric bidders)?"
+  },
+  {
+    "prompt": "Summarize the global investments, key initiatives, and outputs related to Artificial Intelligence (AI) by major international consulting firms (e.g., Big Four, Accenture, MBB, IBM, Capgemini). Cover aspects such as AI-driven products/services, client case studies, application scenarios, strategic directions, and talent development programs."
+  },
+  {
+    "prompt": "Exploring Horizontal Gene Transfer (HGT) in Plants and animals (ie Non-Microbial Systems)\nYou could examine instances of horizontal gene transfer in eukaryotes—particularly plants and animals—and evaluate the evolutionary significance of these transfers. Its very rare and therefore must have a really interesting reason behind this adaptation!\nEspecially as this horizontal gene transfer has been well -studied in microbial systems, but not in plants and animals (this is a relatively new discovery).  Understanding  how commonly genes move between eukaryotic species and whether these transfers confer benefits would be really interesting to find out"
+  },
+  {
+    "prompt": "In ecology, how do birds achieve precise location and direction navigation during migration? What cues and disturbances influence this process?"
+  },
+  {
+    "prompt": "How to conduct comprehensive and accurate situational awareness of space targets in the cislunar space, and support the effectiveness of short-term cislunar space tracking and monitoring tasks?"
+  },
+  {
+    "prompt": "Research on the price dynamics of chub mackerel in major aquatic markets of Pacific Rim countries, and its interannual variations in weight/length. Combined with oceanographic theory, these research findings can further establish direct correlations between high-quality marine biological resources, aquatic markets, fishery economics, and the marine environment."
+  },
+  {
+    "prompt": "What are the most effective approaches to scaling ion trap quantum computing from small-scale demonstration projects to large-scale systems capable of solving real-world problems? This research should investigate the various proposed scaling strategies, assess their feasibility, and evaluate which approaches are most likely to succeed based on current technological advancements and practical implementation challenges."
+  },
+  {
+    "prompt": "(working on LN-based nonlinear photonics):\nPossible ways to mitigate the material damage of LN after plasma etching?"
+  },
+  {
+    "prompt": "Regarding the attitude control problem for UAVs, most open-source flight controllers currently implement cascaded PID control algorithms. However, a single set of PID controller parameters typically performs well only under specific flight conditions. In practical applications, UAVs operate across diverse flight states. What methods can be employed to enhance the actual control performance of PID algorithms, and how should PID parameters be optimally selected?"
+  },
+  {
+    "prompt": "As an agricultural engineering researcher focusing on 3D reconstruction and phenotypic analysis of crop grains, please develop a design report utilizing modern control theory, alongside other relevant theoretical methods and models, for the tasks of modeling, analysis, and design pertinent to my research area."
+  },
+  {
+    "prompt": "Which Obsidian plugins can effectively replicate Notion's multi-view database functionality (including Table, Kanban, Calendar, and List views)? Please provide a detailed comparison of the strengths and weaknesses of these plugins."
+  },
+  {
+    "prompt": "Summarize recent research progress in reinforcement learning focused on enabling agents to explore efficiently and proactively under conditions of sparse rewards and constraints, respectively. Additionally, analyze and discuss the potential implications and insights this research provides for trajectory planning problems."
+  },
+  {
+    "prompt": "I need to dynamically adjust Kubernetes (K8S) cluster node counts based on fluctuating business request volumes, ensuring resources are scaled up proactively before peak loads and scaled down promptly during troughs. The standard Cluster Autoscaler (CA) isn't suitable as it relies on pending pods and might not fit non-elastic node group scenarios. What are effective implementation strategies, best practices, or existing projects that address predictive or scheduled autoscaling for K8S nodes?"
+  },
+  {
+    "prompt": "Please provide a detailed explanation of the differences and connections between Google's recently released A2A protocol and the MCP protocol. Furthermore, elaborate on the innovative aspects of the A2A protocol and the specific problems it is designed to address."
+  },
+  {
+    "prompt": "Trace the evolution from Java Servlets to the Spring Boot framework. Explain the problems each iteration aimed to solve, and detail the core functionalities of the Spring framework along with essential knowledge required for developers working with it."
+  },
+  {
+    "prompt": "Acting as an expert in K-12 education research and an experienced frontline teacher, research and analyze global case studies on the practical application of AIGC (AI-Generated Content) in primary and secondary school classrooms. Identify, categorize, and analyze various application approaches and their corresponding examples. The final report should present an overall framework, detailed category discussions, practical implementation methods, future trends, and recommendations for educators."
+  },
+  {
+    "prompt": "Please write a literature review on the restructuring impact of Artificial Intelligence (AI) on the labor market. Focus on how AI, as a key driver of the Fourth Industrial Revolution, is causing significant disruptions and affecting various industries. Ensure the review only cites high-quality, English-language journal articles."
+  },
+  {
+    "prompt": "As a senior elementary school English teacher, I need assistance writing a detailed research paper on a 'New Paradigm of Holistic Empowerment in Elementary English Education and Teaching.' Please provide comprehensive content, suggest relevant keywords, and ensure the paper reflects practical, frontline teaching experience, structured to be helpful for novice teachers."
+  },
+  {
+    "prompt": "Please conduct a study and prepare a report on the 'Construction and Application of a Sports Intelligent Tutoring and Learning Guidance System Driven by Multimodal Data Fusion.'"
+  },
+  {
+    "prompt": "Could the rapeutic interventions aimed at modulating plasma metal ion concentrations represent effective preventive or therapeutic strategies against cardiovascular diseases? What types of interventions—such as supplementation—have been proposed, and is there clinical evidence supporting their feasibility and efficacy?"
+  },
+  {
+    "prompt": "The significance of the gut microbiota in maintaining normal intestinal function has emerged as a prominent focus in contemporary research, revealing both beneficial and detrimental impacts on the equilibrium of gut health. Disruption of microbial homeostasis can precipitate intestinal inflammation and has been implicated in the pathogenesis of colorectal cancer. Conversely, probiotics have demonstrated the capacity to mitigate inflammation and retard the progression of colorectal cancer. Within this domain, key questions arise: What are the predominant types of gut probiotics? What precisely constitutes prebiotics and their mechanistic role? Which pathogenic bacteria warrant concern, and what toxic metabolites do they produce? How might these findings inform and optimize our daily dietary choices?"
+  },
+  {
+    "prompt": "What is the role of need for closure on misinformation acceptance?"
+  },
+  {
+    "prompt": "Parkinson's disease has a profound impact on patients. What are the potential health warning signs associated with different stages of the disease? As family members, which specific signs should alert us to intervene or seek medical advice regarding the patient's condition? Furthermore, for patients who have undergone Deep Brain Stimulation (DBS) surgery, what daily life adjustments and support strategies can be implemented to improve their comfort and overall well-being?"
+  },
+  {
+    "prompt": "Write a paper on Middle Eastern and North African Films with Transgender Themes. Provide a broad overview with extensive references to both trans theory and film theory, and make sure to include in-depth discussion of at least three films."
+  },
+  {
+    "prompt": "Please investigate the influence of mass media on language, specifically the queer community of Japan. I am trying to see if the consumption of shoujo manga by queer Japanese young adults affects their pronoun use and sentence ending particles. Both grammatical categories are gendered in Japanese and a distinct pattern emerges in shoujo manga compared to majority use in society, so observing a minority group would give insight into the effect of media in personal expression."
+  },
+  {
+    "prompt": "Write an analysis exploring how historical narratives are being reinterpreted through contemporary political and social lenses. Focus on areas like ideologisation of history, instrumentalisation of the past and efforts to reclaim silenced narratives. Analyze how commemorative practices shape historiography and how historical memory serves current agendas. Please provide relevant examples and scholarly perspectives."
+  },
+  {
+    "prompt": "Research and analyze the diverse paths taken by various countries in Europe, Asia, and the Americas to transition into the ranks of 'developed nations' following World War II. The analysis should cover their foundational conditions, resource endowments, development strategies, and other relevant factors."
+  },
+  {
+    "prompt": "Acting as a senior hardware product manager, conduct in-depth research on tablet-style devices used for payments or SaaS applications. Your report should: 1) List major manufacturers, specific device models, and their configurations. 2) Include images of these devices. 3) Analyze the primary use cases and scenarios where these devices are deployed. 4) Investigate the market penetration, common usage scenarios, typical price ranges, and estimated installed base for such devices across different regions (North America, Japan/Korea, Southeast Asia, South America)."
+  },
+  {
+    "prompt": "Research for me how to improve the Static Noise Margin of SRAM (Static Random Access Memory) through advancements in chip manufacturing processes, to make SRAM storage signals more stable and less susceptible to bit flips?"
+  },
+  {
+    "prompt": "The primary components of a precision piezoelectric vibration isolation system include sensors, actuators, and controllers. How can system accuracy be enhanced through hardware design, structural design, manufacturing processes, and control algorithms? Additionally, how should the design and production phases be managed to ensure consistent performance across identical products?"
+  },
+  {
+    "prompt": "Conduct a research report on the manufacturing technology options for hollow motor shafts used in New Energy Vehicle (NEV) electric drive units. List all current forming techniques, compare them based on criteria such as suitable materials, cost-effectiveness, required subsequent processing steps, and other relevant factors. Finally, identify the most suitable manufacturing routes for this specific application."
+  },
+  {
+    "prompt": "Are AI fashion design tools leading to creative homogenization in the industry? How can the copyright disputes between independent designers and algorithms be resolved?"
+  },
+  {
+    "prompt": "How did Netflix manage to successfully adapt One Hundred Years of Solitude, a notoriously difficult book to bring to the screen?"
+  },
+  {
+    "prompt": "Research and analyze the latest advancements and cutting-edge theories within the field of game design. Specifically include recent developments, research, and practical design applications related to established frameworks like MDA (Mechanics-Dynamics-Aesthetics)."
+  },
+  {
+    "prompt": "Analyze the complex issue of liability allocation in accidents involving vehicles with advanced driver-assistance systems (ADAS) operating in a shared human-machine driving context. Your analysis should integrate technical principles of ADAS, existing legal frameworks, and relevant case law to systematically examine the boundaries of responsibility between the driver and the system. Conclude with proposed regulatory guidelines or recommendations."
+  },
+  {
+    "prompt": "I would like a detailed analysis of the Saint Seiya franchise (anime/manga). The analysis should be structured around the different classes of armor (Cloths, Scales, Surplices, God Robes, etc.), such as Bronze Saints, Silver Saints, Gold Saints, Marina Generals, Specters, God Warriors, etc. For each significant character within these categories, provide details on their power level, signature techniques, key appearances/story arcs, and final outcome/fate within the series."
+  },
+  {
+    "prompt": "For a research project titled 'Analysis and Study of Singles Badminton Player Actions Using Sports Videos,' please refine and optimize the following four research components: 1) Object Detection and Tracking within Badminton Videos; 2) Recognition of Technical Actions performed by Singles Players; 3) Recognition of Tactical Intent behind Singles Players' Actions; 4) Prediction of Singles Players' Subsequent Actions."
+  },
+  {
+    "prompt": "Please prepare a market research analysis of the global video editing and creation software/tool market. Include major products like those from Adobe (Premiere Pro, After Effects), CapCut, DaVinci Resolve, Final Cut Pro, and others relevant in the current landscape."
+  },
+  {
+    "prompt": "Could you provide information on recent developments in cloud-based train control systems for urban rail transit? I'm also interested in understanding the key technologies involved."
+  },
+  {
+    "prompt": "Create comprehensive, in-depth study notes for the Diamond Sutra (Vajracchedikā Prajñāpāramitā Sūtra). These notes should offer deep analysis and interpretation from various perspectives, exploring its teachings and relevance in contexts such as daily life, the workplace/career, business practices, marriage, parenting, emotional well-being, and interpersonal dynamics."
+  },
+  {
+    "prompt": "Please draft a research report analyzing future product development trends within the smart home industry. The report should conclude by identifying specific types of products, or products with particular features, that are expected to be major trends shaping the industry's future."
+  },
+  {
+    "prompt": "Find data and evidence to support or refute the hypothesis that an airport handling an annual passenger throughput of 500,000 (five hundred thousand) can generate significant and measurable socioeconomic impacts on its surrounding region."
+  },
+  {
+    "prompt": "Research Topic: Crafting Techniques for Non-Alcoholic Cocktails. Objective: Investigate current non-alcoholic cocktails to discover innovative production methods and formulations."
+  },
+  {
+    "prompt": "Research the current applications and recent scientific advancements of various light-based therapies (e.g., laser, IPL, LED) in aesthetic medicine for treating conditions such as photoaging, promoting skin whitening/brightening, and reducing hyperpigmentation (like age spots or melasma)."
+  },
+  {
+    "prompt": "Write a paper to discuss the influence of AI interaction on interpersonal relations, considering AI's potential to fundamentally change how and why individuals relate to each other."
+  }
+]

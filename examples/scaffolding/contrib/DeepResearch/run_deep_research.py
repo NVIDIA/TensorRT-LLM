@@ -3,7 +3,13 @@ import asyncio
 
 from openai import AsyncOpenAI
 
-from tensorrt_llm.scaffolding import ChatTokenCounter, QueryCollector,MCPWorker, TaskTimer, TRTOpenaiWorker
+from tensorrt_llm.scaffolding import (
+    ChatTokenCounter,
+    MCPWorker,
+    QueryCollector,
+    TaskTimer,
+    TRTOpenaiWorker,
+)
 from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
 
 
@@ -55,7 +61,7 @@ async def main():
 
     llm.shutdown()
     generation_worker.shutdown()
-    mcp_worker.shutdown()
+    await mcp_worker.shutdown()
     return
 
 

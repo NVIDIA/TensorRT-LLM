@@ -120,10 +120,10 @@ You can use any of the tools provided to you to find resources that can help ans
 
 <Available Tools>
 You have access to two main tools:
-1. **tavily_search**: For conducting web searches to gather information
+1. **web_search**: For conducting web searches to gather information
 2. **reflection**: For reflection and strategic planning during research
 
-**CRITICAL: Use reflection after each search to reflect on results and plan next steps. Do not call reflection with the tavily_search or any other tools. It should be to reflect on the results of the search.**
+**CRITICAL: Use reflection after each search to reflect on results and plan next steps. Do not call reflection with the web_search or any other tools. It should be to reflect on the results of the search.**
 </Available Tools>
 
 <Instructions>

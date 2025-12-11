@@ -171,7 +171,7 @@ def get_llm_args(
 
     # TODO: This manual cp_type conversion can be removed once cp_config
     # is refactored to a typed Pydantic model with enum coercion
-    agent_types = agent_types.split(';') if agent_types else None
+
     if cp_config is not None and "cp_type" in cp_config:
         cp_config = cp_config.copy()
         try:
