@@ -5,6 +5,7 @@ from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .save_hidden_state import SaveHiddenStatesDrafter
 from .spec_tree_manager import SpecTreeManager
+from .suffix import SuffixDrafter, SuffixResourceManager
 from .utils import (get_num_extra_kv_tokens, get_num_spec_layers,
                     get_spec_decoder, get_spec_drafter, get_spec_metadata,
                     get_spec_resource_manager, get_spec_worker,
@@ -17,6 +18,8 @@ __all__ = [
     "MTPWorker",
     "NGramDrafter",
     "NGramPoolManager",
+    "SuffixDrafter",
+    "SuffixResourceManager",
     "SaveHiddenStatesDrafter",
     "SpecMetadata",
     "get_num_extra_kv_tokens",

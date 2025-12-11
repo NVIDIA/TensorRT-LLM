@@ -15,6 +15,7 @@ from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .save_hidden_state import SaveHiddenStatesDrafter
+from .suffix import SuffixDrafter, SuffixResourceManager
 
 
 def get_spec_metadata(spec_config,
@@ -98,6 +99,7 @@ def get_spec_metadata(spec_config,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
+        spec_config.spec_dec_mode.is_suffix() or \
         spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -155,6 +157,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         )
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
+    if spec_dec_mode.is_suffix():
+        return SuffixResourceManager(spec_config, max_num_requests)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
@@ -202,6 +206,9 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
+
+    if spec_config.spec_dec_mode.is_suffix():
+        return SuffixDrafter(spec_config, spec_resource_manager)
 
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
