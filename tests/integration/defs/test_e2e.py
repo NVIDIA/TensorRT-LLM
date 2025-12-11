@@ -26,7 +26,7 @@ import pytest
 import yaml
 from defs.common import convert_weights
 from defs.trt_test_alternative import (check_call, check_call_negative_test,
-                                       check_output, print_info)
+                                       check_output, print_info, print_warning)
 
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
@@ -3236,14 +3236,14 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
                                          text=True,
                                          stderr=subprocess.STDOUT,
                                          timeout=7200)
-    except subprocess.CalledProcessError as e:
-        print("Failed:", e.returncode)
-        print(e.output)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print_warning(f"eval failed: {e.returncode}")
+        print_warning(f"eval output:\n{e.output}")
+        raise
     else:
-        if os.environ.get("SLURM_PROCID", '0') == '0':
-            print_info(f"eval output:\n{output}")
-            mmlu_accuracy = get_mmlu_accuracy(output)
-            assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+        print_info(f"eval output:\n{output}")
+        mmlu_accuracy = get_mmlu_accuracy(output)
+        assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
 
 
 @pytest.mark.skip_less_device_memory(80000)
