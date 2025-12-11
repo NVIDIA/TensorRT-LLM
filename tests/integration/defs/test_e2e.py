@@ -3241,9 +3241,10 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
         print_warning(f"eval output:\n{e.output}")
         raise
     else:
-        print_info(f"eval output:\n{output}")
-        mmlu_accuracy = get_mmlu_accuracy(output)
-        assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+        if os.environ.get("SLURM_PROCID", '0') == '0':
+            print_info(f"eval output:\n{output}")
+            mmlu_accuracy = get_mmlu_accuracy(output)
+            assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
 
 
 @pytest.mark.skip_less_device_memory(80000)
