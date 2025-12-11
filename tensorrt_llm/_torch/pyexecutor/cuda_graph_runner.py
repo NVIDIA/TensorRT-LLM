@@ -186,10 +186,6 @@ class CUDAGraphRunner:
                 short_seq_len_mode = True
             else:
                 short_seq_len_mode = False
-            if self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-                all_short_seq_len_mode = list(
-                    self.config.dist.tp_allgather(short_seq_len_mode))
-                short_seq_len_mode = all(all_short_seq_len_mode)
         else:
             # For non-sparse attention or sparse attention that does not need separate short and long CUDA graphs,
             # use the default sequence length mode.
