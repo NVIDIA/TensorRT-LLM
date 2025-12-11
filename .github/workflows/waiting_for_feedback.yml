@@ -41,7 +41,7 @@ jobs:
             // Check if commenter is repository member
             let isMember = false;
             try {
-              await github.rest.repos.checkCollaborator({({
+              await github.rest.repos.checkCollaborator({
                 owner,
                 repo,
                 username: commenter
