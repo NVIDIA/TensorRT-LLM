@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
-import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -69,6 +68,7 @@ from tensorrt_llm.version import __version__ as VERSION
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
                               maybe_transform_reasoning_effort)
+from .launcher import serve_http
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -996,9 +996,16 @@ class OpenAIServer:
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve(sockets=sockets)
+        shutdown_task = await serve_http(
+            self.app,
+            sock=sockets[0] if sockets else None,
+            host=host,
+            port=port,
+            log_level="info",
+            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+        )
+        try:
+            await shutdown_task
+        finally:
+            # No socket to close in current integration
+            pass
