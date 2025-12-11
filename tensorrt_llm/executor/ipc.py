@@ -59,6 +59,7 @@ class ZeroMqQueue:
         self._setup_done = False
         self.name = name
         self.socket = self.context.socket(socket_type)
+        self.socket.set_hwm(0)
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None

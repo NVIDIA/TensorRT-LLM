@@ -200,7 +200,9 @@ class TestRpcCorrectness:
                         ) == no + 1, f"result {future.result()} != {no + 1}"
 
     def test_incremental_task_streaming(self):
-        with RpcServerWrapper(TestRpcCorrectness.App()) as server:
+        with RpcServerWrapper(TestRpcCorrectness.App(),
+                              async_run_task=True) as server:
+
             with RPCClient(server.addr) as client:
 
                 async def test_streaming_task():
