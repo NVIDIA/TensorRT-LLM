@@ -244,7 +244,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
             # NOTE: Since we already have loaded images, for the placeholder purpose, we add data here.
             for _ in range(image_count):
-                mm_data_tracker.add_data("image", None)
+                mm_data_tracker.add_data("image", None, is_embedding=False)
             mm_placeholder_count = mm_data_tracker.placeholder_counts()
             if mm_placeholder_count:
                 # TODO: This is an assumption of not interleaving text and image. Need to extend to interleaved texts.

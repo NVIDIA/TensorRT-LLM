@@ -86,12 +86,6 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
             "data", None),
     }
 
-# Map from content part tags used to directly provide embeddings
-# to the corresponding data modality.
-MM_EMBEDDING_MAP: dict[str, str] = {
-    "image_embeds": "image",
-}
-
 
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
@@ -111,7 +105,7 @@ def _parse_chat_message_content_mm_part(
 def parse_chat_message_content_part(
     part: ChatCompletionContentPartParam,
     mm_data_tracker: MultimodalDataTracker,
-) -> Optional[Any]:
+) -> str | MultimodalData | None:
     """Parse a single part of a chat message."""
     if isinstance(part, str):
         return part
@@ -141,7 +135,9 @@ def parse_chat_message_content_part(
                 logger.error(f"Failed to load image: {str(e)}")
                 return None
 
-        return MultimodalData(modality="image", data=load_image_async())
+        return MultimodalData(modality="image",
+                              data=load_image_async(),
+                              is_embedding=False)
 
     if part_type == "image_embeds":
         str_content = cast(str, content)
@@ -153,8 +149,9 @@ def parse_chat_message_content_part(
                 logger.error(f"Failed to decode image data: {str(e)}")
                 return None
 
-        return MultimodalData(modality="image_embeds",
-                              data=decode_image_embeds_async())
+        return MultimodalData(modality="image",
+                              data=decode_image_embeds_async(),
+                              is_embedding=True)
 
     if part_type == "video_url":
         str_content = cast(str, content)
@@ -169,7 +166,9 @@ def parse_chat_message_content_part(
                 logger.error(f"Failed to load video: {str(e)}")
                 return None
 
-        return MultimodalData(modality="video", data=load_video_async())
+        return MultimodalData(modality="video",
+                              data=load_video_async(),
+                              is_embedding=False)
 
     if part_type == "audio_url":
         str_content = cast(str, content)
@@ -184,7 +183,9 @@ def parse_chat_message_content_part(
                 logger.error(f"Failed to load audio: {str(e)}")
                 return None
 
-        return MultimodalData(modality="audio", data=load_audio_async())
+        return MultimodalData(modality="audio",
+                              data=load_audio_async(),
+                              is_embedding=False)
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
 
@@ -268,8 +269,9 @@ def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
     multimodal_server_config: Optional[MultimodalServerConfig] = None
-) -> Tuple[List[ConversationMessage], Optional[Coroutine[
-        Any, Any, Optional[Dict[str, List[Any]]]]]]:
+) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
+        str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
+                                                                      int]]]:
     """Parse multiple chat messages and return conversation and coroutine."""
     conversation = []
     mm_placeholder_counts = []
@@ -283,8 +285,7 @@ def parse_chat_messages_coroutines(
             for mdata in parsed_msg["media"]:
                 mm_data_tracker.add_data(mdata["modality"],
                                          mdata["data"],
-                                         modality=MM_EMBEDDING_MAP.get(
-                                             mdata["modality"], None))
+                                         is_embedding=mdata["is_embedding"])
         mm_placeholder_count = mm_data_tracker.placeholder_counts()
         if mm_placeholder_count:
             parsed_msg["content"] = add_multimodal_placeholders(
