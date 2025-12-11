@@ -1016,7 +1016,7 @@ class PyExecutor:
                     f'{len(scheduled_batch.generation_requests)} generation requests'
                 )
 
-                can_queue = self._can_queue(scheduled_batch)
+                can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
@@ -1226,13 +1226,21 @@ class PyExecutor:
 
     def _can_queue(self, scheduled_batch):
 
+        # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
+        # Although we can pad dummpy request to make the batch non-empty, this check is the last guard to make it
+        # update previous batch correctly if we failed to pad the dummy request.
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
+            can_queue_this_rank = scheduled_batch.batch_size > 0
+            if not can_queue and can_queue_this_rank:
+                logger.warning(
+                    f"can_queue is False but can_queue_this_rank is True, Please check the padding of dummy request."
+                )
         else:
-            can_queue = scheduled_batch.batch_size > 0
+            can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
-        return can_queue
+        return can_queue, can_queue_this_rank
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
@@ -1367,7 +1375,7 @@ class PyExecutor:
 
                 finished_requests = []
 
-                can_queue = self._can_queue(scheduled_batch)
+                can_queue, _ = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1382,7 +1390,7 @@ class PyExecutor:
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
-                    can_queue = self._can_queue(scheduled_batch)
+                    can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
@@ -1598,7 +1606,8 @@ class PyExecutor:
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
-                can_queue = self._can_queue(scheduled_batch)
+                can_queue, can_queue_this_rank = self._can_queue(
+                    scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1628,7 +1637,8 @@ class PyExecutor:
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
-                    can_queue = self._can_queue(scheduled_batch)
+                    can_queue, can_queue_this_rank = self._can_queue(
+                        scheduled_batch)
 
                 if can_queue:
 
@@ -1679,7 +1689,11 @@ class PyExecutor:
                         scheduled_batch, previous_tensors_device,
                         num_accepted_tokens_device)
 
-                if self.previous_batch is not None:
+                # If the batch is not empty on this rank, but empty on other ranks,
+                # we need to delay the update of the previous batch's sample state,
+                # and let the later iteration to update it.
+                if self.previous_batch is not None and not (can_queue_this_rank
+                                                            and not can_queue):
                     self._update_requests(self.previous_batch.sample_state)
 
                     if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
@@ -1694,7 +1708,8 @@ class PyExecutor:
                                         (req, block_id,
                                          self.ctx_in_transmission_counter))
 
-                if self.drafter is not None and self.use_spec_decode:
+                if self.drafter is not None and self.use_spec_decode and not (
+                        can_queue_this_rank and not can_queue):
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
@@ -1722,7 +1737,8 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                if self.previous_batch is not None:
+                if self.previous_batch is not None and not (can_queue_this_rank
+                                                            and not can_queue):
                     self._process_previous_batch()
 
                 if can_queue:
@@ -1735,6 +1751,9 @@ class PyExecutor:
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         ctx_transmission_reqs=ctx_transmission_reqs)
+                elif not can_queue_this_rank:
+                    # If the batch is empty on this rank, we need to clear the previous batch.
+                    self.previous_batch = None
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._check_kv_transfer_timeout()
@@ -2090,12 +2109,16 @@ class PyExecutor:
 
         assert self.expected_num_active_requests >= len(self.active_requests)
         if self.kv_cache_transceiver is None:
-            num_active_request = len(self.active_requests)
+            num_active_request = len([
+                req for req in self.active_requests
+                if not req.is_generation_to_complete_state
+            ])
         else:
-            num_active_request = sum([
-                0 if req.is_disagg_generation_init_state
-                or req.is_disagg_generation_transmission_in_progress else 1
-                for req in self.active_requests
+            num_active_request = len([
+                req for req in self.active_requests
+                if not (req.is_disagg_generation_init_state
+                        or req.is_disagg_generation_transmission_in_progress
+                        or req.is_generation_to_complete_state)
             ])
 
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
