@@ -614,20 +614,13 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
     def diff = ""
 
-    try {
-        if (githubPrApiUrl != null) {
-            diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
-        } else {
-            diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
-        }
-        pipeline.echo("The change of ${filePath} is: ${diff}")
-        return diff
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception e) {
-        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
-        return ""
+    if (githubPrApiUrl != null) {
+        diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+    } else {
+        diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
     }
+    pipeline.echo("The change of ${filePath} is: ${diff}")
+    return diff
 }
 
 def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
