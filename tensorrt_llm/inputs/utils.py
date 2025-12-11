@@ -23,9 +23,9 @@ from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
-from tensorrt_llm.llmapi.deepseek_v32 import DeepseekV32Tokenizer
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
 

@@ -2188,7 +2188,7 @@ class BaseLlmArgs(StrictBaseModel):
         if self.skip_tokenizer_init:
             self.tokenizer = None
         elif self.tokenizer_mode == 'deepseek_v32':
-            from .deepseek_v32 import DeepseekV32Tokenizer
+            from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
             self.tokenizer = DeepseekV32Tokenizer.from_pretrained(
                 self.tokenizer if self.tokenizer else self.model,
                 trust_remote_code=self.trust_remote_code,
