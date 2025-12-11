@@ -291,6 +291,15 @@ def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16,
+                                                     is_swizzled_layout=False)
+    return scale_shape * 2
+
+
 _enable_piecewise_cuda_graph = True
 
 
