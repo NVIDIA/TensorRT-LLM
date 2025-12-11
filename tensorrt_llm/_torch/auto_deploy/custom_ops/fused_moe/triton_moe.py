@@ -661,7 +661,7 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # unused
-    is_gated_mlp: bool = True,
+    is_gated_mlp: bool = False,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """Triton FP8 W8A8 MoE with 2-layer MLP and ReLU^2 activation."""
@@ -760,7 +760,7 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
-    is_gated_mlp: bool = True,
+    is_gated_mlp: bool = False,
     act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)

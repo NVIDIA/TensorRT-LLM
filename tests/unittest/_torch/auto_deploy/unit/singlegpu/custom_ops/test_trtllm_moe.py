@@ -778,6 +778,10 @@ def test_trtllm_fused_moe_nvfp4(
                 block_size=NVFP4_BLOCK_SIZE,
             )
 
+        # Convert ActivationType.Silu to ActivationType.Swiglu for reference op compatibility
+        resolved_activation_type = (
+            ActivationType.Swiglu if activation_func == ActivationType.Silu else activation_func
+        )
         ref_output = torch_moe_nvfp4(
             x_dq,
             torch.cat([w3_dq, w1_dq], dim=1) if is_gated_mlp else w1_dq,
@@ -785,7 +789,7 @@ def test_trtllm_fused_moe_nvfp4(
             top_k,
             routing_weights,
             selected_experts,
-            activation_func,
+            resolved_activation_type,
         )
         return ref_output
 
