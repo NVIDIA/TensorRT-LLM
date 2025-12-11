@@ -659,6 +659,11 @@ class PyExecutor:
 
         if spec_resource_manager is not None or has_spec_config:
             stats.specdec_stats = SpecDecodingStats()
+            # Reset draft latency at the start of each iteration to prevent stale values
+            # from previous iterations when speculation is disabled
+            if self.drafter is not None and hasattr(self.drafter,
+                                                    'last_draft_latency_ms'):
+                self.drafter.last_draft_latency_ms = 0.0
 
         return stats
 
@@ -800,9 +805,10 @@ class PyExecutor:
                 stats.specdec_stats.acceptance_length = 0.0
 
             # Get draft latency from drafter if available (only for two-model mode)
+            # Only use draft latency if there were actually draft tokens in this iteration
             draft_latency_ms = 0.0
-            if self.drafter is not None and hasattr(self.drafter,
-                                                    'last_draft_latency_ms'):
+            if total_draft_tokens > 0 and self.drafter is not None and hasattr(
+                    self.drafter, 'last_draft_latency_ms'):
                 draft_latency_ms = getattr(self.drafter,
                                            'last_draft_latency_ms', 0.0)
 
