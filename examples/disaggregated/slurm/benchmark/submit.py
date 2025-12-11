@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import math
 from datetime import datetime
 
 import yaml
@@ -47,7 +48,7 @@ def save_worker_config(config, output_path, worker_type):
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
     """Calculate required nodes based on world size and server count."""
-    return (world_size + gpus_per_node - 1) // gpus_per_node * num_servers
+    return math.ceil(world_size * num_servers / gpus_per_node)
 
 
 def submit_job(config, log_dir):
@@ -162,6 +163,8 @@ def submit_job(config, log_dir):
         f'--ntasks={total_tasks}',
         f'--ntasks-per-node={hw_config["gpus_per_node"]}',
         *([] if not slurm_config['set_segment'] else [f'--segment={total_nodes}']),
+        f'--output={log_dir}/slurm-%j.out',
+        f'--error={log_dir}/slurm-%j.err',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
         # Hardware configuration

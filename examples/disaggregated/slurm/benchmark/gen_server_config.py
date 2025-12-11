@@ -51,19 +51,47 @@ if __name__ == "__main__":
     # get the ctx and gen hostnames from the hostnames file
     ctx_hostnames = []
     gen_hostnames = []
-    for hostname_file in hostnames:
+
+    # helper to get port
+    def get_port(role, index, default_port):
+        port_file = os.path.join(args.work_dir, f"{role.lower()}_port_{index}.txt")
+        if os.path.exists(port_file):
+            with open(port_file, 'r') as f:
+                return int(f.read().strip())
+        return default_port
+
+    # sort hostnames to ensure order matches indices if possible, though strict matching by ID is better
+    # The filenames are ROLE_ID.txt
+
+    ctx_urls = []
+    gen_urls = []
+
+    for hostname_file in sorted(hostnames):
         hostname_file_path = os.path.join(hostnames_folder, hostname_file)
         with open(hostname_file_path, 'r') as f:
             actual_hostname = f.read().strip()
             print(f"Hostname: {actual_hostname} in {hostname_file}")
 
-        if hostname_file.startswith("CTX"):
-            ctx_hostnames.append(actual_hostname)
-        elif hostname_file.startswith("GEN"):
-            gen_hostnames.append(actual_hostname)
+        # Parse role and id
+        # Expected format: ROLE_ID.txt
+        filename_no_ext = os.path.splitext(hostname_file)[0]
+        parts = filename_no_ext.split('_')
+        if len(parts) >= 2:
+            role_prefix = parts[0]
+            instance_id = parts[1]
 
-    print(f"ctx_hostnames: {ctx_hostnames}")
-    print(f"gen_hostnames: {gen_hostnames}")
+            port = get_port(role_prefix, instance_id, args.worker_port)
+            url = f"{actual_hostname}:{port}"
+
+            if role_prefix == "CTX":
+                ctx_urls.append(url)
+            elif role_prefix == "GEN":
+                gen_urls.append(url)
+        else:
+            print(f"Skipping malformed filename: {hostname_file}")
+
+    print(f"ctx_urls: {ctx_urls}")
+    print(f"gen_urls: {gen_urls}")
 
     # get current hostname from env
     hostname = socket.gethostname()
@@ -75,11 +103,11 @@ if __name__ == "__main__":
         'backend': 'pytorch',
         'context_servers': {
             'num_instances': args.num_ctx_servers,
-            'urls': [f'{host}:{args.worker_port}' for host in ctx_hostnames]
+            'urls': ctx_urls
         },
         'generation_servers': {
             'num_instances': args.num_gen_servers,
-            'urls': [f'{host}:{args.worker_port}' for host in gen_hostnames]
+            'urls': gen_urls
         }
     }
 
