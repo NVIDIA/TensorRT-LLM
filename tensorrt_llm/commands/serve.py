@@ -155,8 +155,6 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large: bool = False,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
-        agent_percentage: float = 0.0,
-        agent_types: Optional[str] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -166,7 +164,7 @@ def get_llm_args(
 
     # TODO: This manual cp_type conversion can be removed once cp_config
     # is refactored to a typed Pydantic model with enum coercion
-    agent_types = agent_types.split(';') if agent_types else None
+
     if cp_config is not None and "cp_type" in cp_config:
         cp_config = cp_config.copy()
         try:
@@ -246,8 +244,6 @@ def get_llm_args(
         param: value
         for param, value in cli_maybe_overrides.items()
         if is_non_default_or_required(param, value, backend)
-        "agent_percentage": agent_percentage,
-        "agent_types": agent_types,
     }
 
     return llm_args, llm_args_extra_dict

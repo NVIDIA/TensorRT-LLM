@@ -3,13 +3,11 @@ import copy
 import os
 import types
 from abc import ABC
+from enum import Enum
 from typing import Callable, List, Optional
 
 import openai
 import requests
-from enum import Enum
-import requests
-from enum import Enum
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
@@ -157,7 +155,8 @@ class OpenaiWorker(Worker):
             if "seed" not in params or params["seed"] is None:
                 params["seed"] = 42  # Fixed seed for reproducibility
 
-        if hasattr(task, "sub_request_markers") and len(task.sub_request_markers) > 0:
+        if hasattr(task, "sub_request_markers") and len(
+                task.sub_request_markers) > 0:
             params["extra_body"]["agent_hierarchy"] = [
                 task.sub_request_markers[-1]
             ]
@@ -203,10 +202,11 @@ class OpenaiWorker(Worker):
             task.messages.append(
                 AssistantMessage(content, reasoning, reasoning_content,
                                  tool_calls))
-
             if task.enable_token_counting:
                 task.prompt_tokens_num = response.usage.prompt_tokens
                 task.completion_tokens_num = response.usage.completion_tokens
+                if hasattr(response.usage, "completion_tokens_details"):
+                    task.reasoning_tokens_num = response.usage.completion_tokens_details.reasoning_tokens
 
             return TaskStatus.SUCCESS
 
@@ -406,6 +406,7 @@ class MCPWorker(Worker):
     ):
         self.urls = urls
         self.queues = [asyncio.Queue() for _ in urls]
+        self._background_tasks: List[asyncio.Task] = []
 
     @classmethod
     def init_with_urls(cls, urls: List[str]):
@@ -413,6 +414,7 @@ class MCPWorker(Worker):
         return worker
 
     async def _main_loop_async_client_iter(self, url: str, index: int):
+
         class TaskType(Enum):
             TOOL_CALL = "tool_call"
             WAIT_QUEUE = "wait_queue"
@@ -422,10 +424,14 @@ class MCPWorker(Worker):
                 await session.initialize()
                 response = await session.list_tools()
                 tools = response.tools
-                pending_dict = {asyncio.create_task(self.queues[index].get()) : (TaskType.WAIT_QUEUE, None)}
+                pending_dict = {
+                    asyncio.create_task(self.queues[index].get()):
+                    (TaskType.WAIT_QUEUE, None)
+                }
                 pending = pending_dict.keys()
                 while True:
-                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED)
 
                     for task in done:
                         task_type, obj = pending_dict[task]
@@ -433,30 +439,45 @@ class MCPWorker(Worker):
                             response = task.result()
                             tool_call = obj
                             tool_call.set_result(response.content[0].text)
-                        else: # TaskType.WAIT_QUEUE
+                        else:  # TaskType.WAIT_QUEUE
                             queue_obj = task.result()
                             if queue_obj is None:
-                                # quit
+                                # Shutdown signal received
                                 return
                             else:
                                 tool_name = queue_obj.tool_name
                                 args = queue_obj.args
                                 if tool_name in [tool.name for tool in tools]:
-                                    new_task = asyncio.create_task(session.call_tool(tool_name, args))
-                                    pending_dict[new_task] = (TaskType.TOOL_CALL, queue_obj)
+                                    new_task = asyncio.create_task(
+                                        session.call_tool(tool_name, args))
+                                    pending_dict[new_task] = (
+                                        TaskType.TOOL_CALL, queue_obj)
                                     pending.add(new_task)
                                 else:
                                     queue_obj.set_result(None)
-                            # Wait next queue object
-                            new_wait_queue_task = asyncio.create_task(self.queues[index].get())
-                            pending_dict[new_wait_queue_task] = (TaskType.WAIT_QUEUE, None)
-                            pending.add(new_wait_queue_task)
-
+                                # Wait next queue object
+                                new_wait_queue_task = asyncio.create_task(
+                                    self.queues[index].get())
+                                pending_dict[new_wait_queue_task] = (
+                                    TaskType.WAIT_QUEUE, None)
+                                pending.add(new_wait_queue_task)
 
     async def init_in_asyncio_event_loop(self):
         for index in range(len(self.urls)):
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._main_loop_async_client_iter(self.urls[index], index))
+            self._background_tasks.append(task)
+
+    async def shutdown(self):
+        """Shutdown MCP worker and wait for all background tasks to complete."""
+        # Signal all background tasks to stop
+        for queue in self.queues:
+            queue.put_nowait(None)
+        # Wait for all background tasks to complete
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks,
+                                 return_exceptions=True)
+            self._background_tasks.clear()
 
     async def call_handler(self, task: MCPCallTask) -> TaskStatus:
         tool_name = task.tool_name
@@ -471,9 +492,5 @@ class MCPWorker(Worker):
                 break
 
         return TaskStatus.SUCCESS
-
-    def shutdown(self):
-        for queue in self.queues:
-            queue.put_nowait(None)
 
     task_handlers = {MCPCallTask: call_handler}

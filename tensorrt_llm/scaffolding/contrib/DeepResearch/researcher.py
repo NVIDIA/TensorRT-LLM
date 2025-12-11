@@ -11,7 +11,7 @@ from .prompts import (
     research_system_prompt,
     research_system_prompt_prefix,
 )
-from .tools import reflection_tool, tavily_search_tool
+from .tools import reflection_tool, web_search_tool
 from .utils import get_today_str
 
 LOGGER = logging.getLogger()
@@ -74,7 +74,7 @@ class Compressor(Controller):
 @sub_request_node("Researcher")
 @drop_kv_cache_scope()
 class Researcher(Controller):
-    tools = [tavily_search_tool, reflection_tool]
+    tools = [web_search_tool, reflection_tool]
 
     def __init__(self, chat_with_tools_controller: Controller, compress_controller: Controller):
         super().__init__()

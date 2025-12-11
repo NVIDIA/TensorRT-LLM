@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -19,16 +20,15 @@ mcp = FastMCP("tavily_search")
 
 
 @mcp.tool()
-async def tavily_search(query: str) -> str:
+async def web_search(query: str) -> str:
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
     client = TavilyClient(TAVILY_API_KEY)
-    response = client.search(query=query)
 
+    response = await asyncio.to_thread(client.search, query=query)
     search_result = ""
     for result in response["results"]:
         search_result += f"{result['title']}: {result['content']}\n"
-
     return search_result
 
 

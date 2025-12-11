@@ -283,19 +283,31 @@ RequestVector ChatbotNode::mergeNodesSequence(
 }
 
 std::shared_ptr<AgentTreeNode> createAgentTreeRoot(
-    float agentRatio, std::optional<std::vector<std::string>> const& agentTypes)
+    std::optional<batch_scheduler::AgentTreeConfig> const& agentTreeConfig)
 {
-    if (!agentTypes.has_value() || agentTypes->empty())
+    if (!agentTreeConfig.has_value())
     {
         return nullptr;
     }
 
-    auto childNodeTypes = convertAgentTypes(agentTypes);
-    auto nodeParams = std::make_shared<AgentChatbotNodeParams>(agentRatio, childNodeTypes);
-    return createNode(NodeType::kAGENT_CHATBOT, ROOT_LEVEL, nodeParams);
+    auto const& config = agentTreeConfig.value();
+    if (!config.agentTypes.has_value() || config.agentTypes->empty())
+    {
+        return nullptr;
+    }
+
+    auto childNodeTypes = convertAgentTypes(config.agentTypes);
+    auto nodeParams = std::make_shared<AgentChatbotNodeParams>(config.agentPercentage, childNodeTypes);
+    auto root = createNode(NodeType::kAGENT_CHATBOT, ROOT_LEVEL, nodeParams);
+
+    // Store the max requests limit in the root node
+    root->setMaxRequests(config.agentInflightSeqNum);
+
+    return root;
 }
 
-RequestVector sortRequestsByAgentTree(std::shared_ptr<AgentTreeNode> const& root, RequestVector const& requests)
+RequestVector sortAndTruncateRequestsByAgentTree(
+    std::shared_ptr<AgentTreeNode> const& root, RequestVector const& requests, SizeType32 reservedCount)
 {
     if (requests.empty() || !root)
     {
@@ -310,6 +322,18 @@ RequestVector sortRequestsByAgentTree(std::shared_ptr<AgentTreeNode> const& root
     auto sortedRequests = root->getRequests();
 
     root->clear();
+
+    // Limit the number of returned requests based on root's maxRequests setting.
+    // reservedCount is the number of requests already reserved (e.g., generation requests
+    // that must be scheduled), so we can only accept (maxRequests - reservedCount) more.
+    auto const maxRequests = root->getMaxRequests();
+    auto const availableSlots = std::max(0, maxRequests - reservedCount);
+    if (sortedRequests.size() > static_cast<size_t>(availableSlots))
+    {
+        sortedRequests.resize(availableSlots);
+        TLLM_LOG_DEBUG("sortAndTruncateRequestsByAgentTree: Limited to %d requests (maxRequests=%d, reserved=%d)",
+            availableSlots, maxRequests, reservedCount);
+    }
 
     return sortedRequests;
 }
