@@ -128,8 +128,8 @@ if ! srun -l --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${container_mount} \
         --mpi=pmix \
-        echo "Container up." &> ${full_logdir}/container_launch.log; then
-    cleanup_on_failure "Failed to start container. Check ${full_logdir}/container_launch.log"
+        echo "Container up." &> ${full_logdir}/1_container_launch.log; then
+    cleanup_on_failure "Failed to start container. Check ${full_logdir}/1_container_launch.log"
 fi
 
 # Install TensorRT-LLM
@@ -140,8 +140,8 @@ if [ -n "${trtllm_wheel_path}" ]; then
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
         bash -c "pip install ${trtllm_wheel_path}" \
-        &> ${full_logdir}/install.log; then
-        cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/install.log for details"
+        &> ${full_logdir}/2_install.log; then
+        cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/2_install.log for details"
     fi
     echo "TensorRT-LLM wheel installation completed successfully"
 elif [ -d "${trtllm_repo}" ]; then
@@ -157,8 +157,8 @@ elif [ -d "${trtllm_repo}" ]; then
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
             bash -c "cd ${trtllm_repo} && ${build_command}" \
-            &> ${full_logdir}/build.log; then
-            cleanup_on_failure "TensorRT-LLM build failed. Check ${full_logdir}/build.log for details"
+            &> ${full_logdir}/2_build.log; then
+            cleanup_on_failure "TensorRT-LLM build failed. Check ${full_logdir}/2_build.log for details"
         fi
         echo "TensorRT-LLM build completed successfully"
     fi
@@ -168,8 +168,8 @@ elif [ -d "${trtllm_repo}" ]; then
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
         bash -c "cd ${trtllm_repo} && pip install -e ." \
-        &> ${full_logdir}/install.log; then
-        cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
+        &> ${full_logdir}/2_install.log; then
+        cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
     fi
     echo "TensorRT-LLM installation completed successfully"
 fi
@@ -178,23 +178,6 @@ fi
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
-# total_nodes_num=${#all_nodes[@]}
-# echo "all_nodes: ${all_nodes[@]}, total_nodes_num: ${total_nodes_num}"
-
-# # Split nodes between gen and ctx workers
-# gen_node_list=(${all_nodes[@]:0:${gen_nodes}})
-# ctx_node_list=(${all_nodes[@]:${gen_nodes}:${total_nodes_num}})
-
-# echo "gen_nodes: ${gen_node_list[@]}, num_nodes: ${gen_nodes}"
-# echo "ctx_nodes: ${ctx_node_list[@]}, num_nodes: ${ctx_nodes}"
-
-# rm -rf ${full_logdir}/hostnames
-# rm -rf ${full_logdir}/server_config.yaml
-
-# gen_nodes_num_in_single_server=$((${gen_nodes} / ${num_gen_servers}))
-# ctx_nodes_num_in_single_server=$((${ctx_nodes} / ${num_ctx_servers}))
-# echo "gen_nodes_num_in_single_server: ${gen_nodes_num_in_single_server}"
-# echo "ctx_nodes_num_in_single_server: ${ctx_nodes_num_in_single_server}"
 
 echo "Assigning nodes..."
 srun -l --container-name=${container_name} \
@@ -209,7 +192,7 @@ srun -l --container-name=${container_name} \
         --gen-world-size ${gen_world_size} \
         --ctx-world-size ${ctx_world_size} \
         --log-dir ${full_logdir} \
-        &> ${full_logdir}/assign_nodes.log
+        &> ${full_logdir}/3_assign_nodes.log
 
 echo "Generating start worker commands..."
 srun -l --container-name=${container_name} \
@@ -236,7 +219,7 @@ srun -l --container-name=${container_name} \
         --ctx-config-path ${ctx_config_path} \
         --gen-config-path ${gen_config_path} \
         --worker-env-var "${worker_env_var}" \
-        &> ${full_logdir}/gen_start_worker_cmds.log
+        &> ${full_logdir}/4_gen_start_worker_cmds.log
 
 start_worker_cmds_file=${full_logdir}/start_worker_cmds.txt
 echo "Starting worker commands from ${start_worker_cmds_file}..."
@@ -245,42 +228,6 @@ cat ${start_worker_cmds_file} | while read cmd; do
     eval "${cmd}"
 done
 
-# # start the gen workers
-# echo "Starting gen workers..."
-# for i in $(seq 0 $((num_gen_servers - 1))); do
-#     port=$(cat ${work_dir}/gen_port_${i}.txt)
-#     nodelist=$(cat ${work_dir}/gen_nodes_${i}.txt)
-#     num_nodes=$(echo $nodelist | tr ',' ' ' | wc -w)
-#     srun -l --nodelist=${nodelist} -N ${num_nodes} \
-#         --ntasks=$((gen_world_size)) \
-#         --ntasks-per-node=${gpus_per_node} \
-#         --container-image=${container_image} \
-#         --container-name=${container_name} \
-#         --container-mounts=${container_mount} \
-#         --mpi=pmix --overlap \
-#         bash ${work_dir}/start_worker.sh \
-#         "GEN" ${i} ${model_path} "${port}" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${gen_profile_range}" "${gen_config_path}" "${worker_env_var}" \
-#         &> ${full_logdir}/output_gen_${i}.log &
-# done
-
-# # start the ctx workers
-# echo "Starting ctx workers..."
-# for i in $(seq 0 $((num_ctx_servers - 1))); do
-#     port=$(cat ${work_dir}/ctx_port_${i}.txt)
-#     nodelist=$(cat ${work_dir}/ctx_nodes_${i}.txt)
-#     num_nodes=$(echo $nodelist | tr ',' ' ' | wc -w)
-#     srun -l --nodelist=${nodelist} -N ${num_nodes} \
-#         --ntasks=$((ctx_world_size)) \
-#         --ntasks-per-node=${gpus_per_node} \
-#         --container-image=${container_image} \
-#         --container-name=${container_name} \
-#         --container-mounts=${container_mount} \
-#         --mpi=pmix --overlap \
-#         bash ${work_dir}/start_worker.sh \
-#         "CTX" ${i} ${model_path} "${port}" "${benchmark_mode}" "${concurrency_list}" "${numa_bind}" "${full_logdir}" "${nsys_on}" "${ctx_profile_range}" "${ctx_config_path}" "${worker_env_var}" \
-#         &> ${full_logdir}/output_ctx_${i}.log &
-# done
-
 # start the server (in background)
 echo "Starting server..."
 srun -l --container-name=${container_name} \
@@ -288,7 +235,7 @@ srun -l --container-name=${container_name} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
     bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
-    &> ${full_logdir}/output_server.log &
+    &> ${full_logdir}/5_output_server.log &
 
 # Wait for server to be ready (runs synchronously)
 echo "Waiting for server to be ready..."
@@ -296,8 +243,8 @@ if ! srun -l --container-name=${container_name} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
     bash ${work_dir}/wait_server.sh ${full_logdir} \
-    &> ${full_logdir}/wait_server.log; then
-    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/wait_server.log for details"
+    &> ${full_logdir}/6_wait_server.log; then
+    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/6_wait_server.log for details"
 fi
 echo "Server is ready!"
 
@@ -310,8 +257,8 @@ if [ "${use_nv_sa_benchmark}" = "true" ]; then
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark_nv_sa.sh \
             "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/bench.log; then
-        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/bench.log for details"
+            &> ${full_logdir}/7_bench.log; then
+        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/7_bench.log for details"
     fi
 else
     echo "Using default benchmark script..."
@@ -320,8 +267,8 @@ else
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark.sh \
             "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/bench.log; then
-        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/bench.log for details"
+            &> ${full_logdir}/8_bench.log; then
+        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/8_bench.log for details"
     fi
 fi
 echo "Benchmark completed successfully"
@@ -335,8 +282,8 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
         "${model_args_extra}" "${full_logdir}/accuracy_eval" \
-        &> ${full_logdir}/accuracy_eval.log; then
-        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/accuracy_eval.log for details"
+        &> ${full_logdir}/9_accuracy_eval.log; then
+        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/9_accuracy_eval.log for details"
     fi
     echo "Accuracy evaluation completed successfully"
 fi
