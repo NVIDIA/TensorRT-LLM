@@ -12,7 +12,6 @@ All published functionality in the Release Notes has been fully tested and verif
   - Add GPT-OSS model support.
   - Add Hunyuan-Dense model support. Thanks to the contribution from @sorenwu.
   - Add Hunyuan-MoE model support. Thanks to the contribution from @qianbiaoxiang.
-  - Add Nemotron Nano VL V2 model support.
   - Add Seed-OSS model support. Thanks to the contribution from @Nekofish-L.
 
 - **Features**
