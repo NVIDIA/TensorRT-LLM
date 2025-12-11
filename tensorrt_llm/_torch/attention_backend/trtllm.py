@@ -475,7 +475,7 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
-        if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+        if get_sm_version() >= 100:
             spec_decoding_tensor_params.append(
                 self.spec_decoding_bl_tree_mask_offset)
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
@@ -603,9 +603,6 @@ class TrtllmAttentionWrapper:
             use_paged_context_fmha,
             is_mla_enable,
         )
-
-    def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
 
 
 @dataclass(kw_only=True)
@@ -1222,12 +1219,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # spec_dec mode should only be enabled for non-sm100 machines and when there's a spec-dec tree.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
-            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
+            get_sm_version() < 100 or get_sm_version() == 120)
 
         self.is_spec_dec_tree = spec_tree_manager is not None
         self.is_spec_dec_dynamic_tree = spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree
 
-        if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+        if get_sm_version() >= 100 and get_sm_version() != 120:
             if self.is_spec_dec_tree or self.is_spec_dec_dynamic_tree:
                 assert not self.is_spec_dec_tree, "Spec-dec tree is not supported on this machine. Please use a pre-Blackwell machine for a spec-dec tree."
 
@@ -1263,7 +1260,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cuda',
                 )
 
-            if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+            if get_sm_version() >= 100:
                 self.spec_decoding_param_prepare_for_blackwell()
             else:
                 self.spec_decoding_bl_tree_mask_offset = None
@@ -1373,9 +1370,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                      max_draft_len + 1)
         self.spec_decoding_generation_lengths[:self.max_num_requests].copy_(
             spec_decoding_generation_length, non_blocking=True)
-
-    def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
