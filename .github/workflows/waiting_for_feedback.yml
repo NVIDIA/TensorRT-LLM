@@ -35,12 +35,15 @@ jobs:
             }
 
             console.log(`Comment by ${commenter} on #${issueNumber} (author: ${author})`);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
-            // Check if commenter is NVIDIA org member
+            // Check if commenter is repository member
             let isMember = false;
             try {
-              await github.rest.orgs.checkMembershipForUser({
-                org: 'NVIDIA',
+              await github.rest.repos.checkCollaborator({({
+                owner,
+                repo,
                 username: commenter
               });
               isMember = true;
