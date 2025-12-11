@@ -50,17 +50,13 @@ if __name__ == "__main__":
     for hostname_file in hostnames:
         hostname_file_path = os.path.join(hostnames_folder, hostname_file)
         with open(hostname_file_path, 'r') as f:
-            actual_hostname_port = f.read().strip()
-            actual_hostname = actual_hostname_port.split(':')[0]
-            actual_port = actual_hostname_port.split(':')[1]
-            print(
-                f"Hostname: {actual_hostname}, Port: {actual_port} in {hostname_file}"
-            )
+            url = f.read().strip()
+            print(f"url: {url} in {hostname_file}")
 
-        if hostname_file.startswith("CTX"):
-            ctx_urls.append(f"{actual_hostname}:{actual_port}")
-        elif hostname_file.startswith("GEN"):
-            gen_urls.append(f"{actual_hostname}:{actual_port}")
+            if hostname_file.startswith("CTX"):
+                ctx_urls.append(url)
+            elif hostname_file.startswith("GEN"):
+                gen_urls.append(url)
 
     print(f"ctx_urls: {ctx_urls}")
     print(f"gen_urls: {gen_urls}")
