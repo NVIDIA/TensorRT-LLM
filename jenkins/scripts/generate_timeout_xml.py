@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 from html import escape
 
@@ -43,7 +44,7 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
     return classname, name, file
 
 
-def generate_timeout_xml(testList, stage_name):
+def generate_timeout_xml(stage_name, testList, outputFilePath):
     num_tests = len(testList)
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
@@ -63,30 +64,43 @@ def generate_timeout_xml(testList, stage_name):
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
             f'file="{file_escaped}" time="1.0">\n'
             f'        <error message="Test terminated unexpectedly">'
-            f' Test terminated unexpectedly\n'
-            f'        </error></testcase>'
+            f" Test terminated unexpectedly\n"
+            f"        </error></testcase>"
         )
     xmlContent += "</testsuite></testsuites>"
-    print(xmlContent)
+
+    with open(outputFilePath, "w", encoding="utf-8") as f:
+        f.write(xmlContent)
 
 
 def main():
+    # Parse command-line arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test-file-path", required=True, help="Test list file path")
     parser.add_argument("--stage-name", required=True, help="Stage name")
+    parser.add_argument("--test-file-path", required=True, help="Test list file path")
+    parser.add_argument("--output-file", required=True, help="Output file path")
     args = parser.parse_args(sys.argv[1:])
-    testFilePath = args.test_file_path
     stageName = args.stage_name
+    testFilePath = args.test_file_path
+    outputFilePath = args.output_file
 
-    if not os.path.exists(stageName + "/" + testFilePath):
-        print(f"No {testFilePath} found in {stageName}, skipping timeout XML generation")
+    full_path = os.path.join(stageName, testFilePath)
+    if not os.path.exists(full_path):
+        print(f"No {full_path} found, skipping timeout XML generation")
         return
-    timeoutTests = sh(script: "cd ${stageName} && cat ${testFilePath}", returnStdout: true).trim()
-    print(f"timeoutTests: {timeoutTests}")
-    if timeoutTests == "":
-        print(f"No timeout tests found in {testFilePath}, skipping timeout XML generation")
+
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            timeoutTests = [line.strip() for line in f if line.strip()]
+    except IOError as e:
+        print(f"Error reading {full_path}: {e}")
         return
-    generate_timeout_xml(timeoutTests.split("\n"), stageName)
+
+    if len(timeoutTests) == 0:
+        print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
+        return
+
+    generate_timeout_xml(stageName, timeoutTests, outputFilePath)
 
 
 if __name__ == "__main__":
