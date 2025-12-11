@@ -109,11 +109,7 @@ TEST_F(RequestInfoTest, Basic)
     state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
     state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, nvinfer1::DataType::kFLOAT});
 
-    boost::uuids::random_generator uuidGen;
-    std::string serverUuidStr = boost::uuids::to_string(uuidGen());
-    UuidType uuid;
-    std::copy(serverUuidStr.begin(), serverUuidStr.end(), uuid.begin());
-    RequestInfo info{1, 1, *state, uuid, 123};
+    RequestInfo info{1, *state, 123};
     auto info2 = serializeDeserialize(info);
     EXPECT_EQ(info, info2);
 }
@@ -353,17 +349,15 @@ protected:
         std::vector<CacheTransBufferManager*> bufferManagers;
         bufferManagers.push_back(mCacheTransBufferManager.get());
         boost::uuids::random_generator uuidGen;
-        UuidType uuid;
         if (isSender)
         {
-            std::string serverUuidStr = boost::uuids::to_string(uuidGen());
-            std::copy(serverUuidStr.begin(), serverUuidStr.end(), uuid.begin());
             mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false), uuid);
+                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
         }
         else
         {
             std::string serverUuidStr = boost::uuids::to_string(uuidGen());
+            UuidType uuid;
             std::copy(serverUuidStr.begin(), serverUuidStr.end(), uuid.begin());
             mReceiver = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
                 createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false), uuid);
@@ -884,7 +878,7 @@ protected:
             if (mIsContext)
             {
                 mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter(), serverUuid);
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
             }
             else
             {

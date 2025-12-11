@@ -210,44 +210,33 @@ struct ReceiveCacheResource
     }
 };
 
-RequestInfo::RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
-    executor::DataTransceiverState transState, UuidType const& serverUuid, int32_t uniqueId)
+RequestInfo::RequestInfo(
+    LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState, int32_t uniqueId)
     : mContextRequestId{contextRequestId}
-    , mGenerationRequestId{generationRequestId}
     , mTransState{std::move(transState)}
-    , mServerUuid{serverUuid}
     , mUniqueId{uniqueId}
 {
 }
 
-RequestInfo::RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
-    executor::DataTransceiverState transState, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-    UuidType const& serverUuid, int32_t uniqueId)
+RequestInfo::RequestInfo(LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState,
+    int32_t indexFromEnd, BlockKey const& lastBlockKey, int32_t uniqueId)
     : mContextRequestId{contextRequestId}
-    , mGenerationRequestId{generationRequestId}
     , mIndexFromEnd{indexFromEnd}
     , mLastBlockKey{lastBlockKey}
     , mTransState{std::move(transState)}
-    , mServerUuid{serverUuid}
     , mUniqueId{uniqueId}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mContextRequestId == rhs.mContextRequestId && mGenerationRequestId == rhs.mGenerationRequestId
-        && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey && mTransState == rhs.mTransState
-        && mServerUuid == rhs.mServerUuid && mUniqueId == rhs.mUniqueId;
+    return mContextRequestId == rhs.mContextRequestId && mIndexFromEnd == rhs.mIndexFromEnd
+        && mLastBlockKey == rhs.mLastBlockKey && mTransState == rhs.mTransState && mUniqueId == rhs.mUniqueId;
 }
 
 LlmRequest::RequestIdType RequestInfo::getContextRequestId() const noexcept
 {
     return mContextRequestId;
-}
-
-LlmRequest::RequestIdType RequestInfo::getGenerationRequestId() const noexcept
-{
-    return mGenerationRequestId;
 }
 
 executor::DataTransceiverState const& RequestInfo::getTransState() const noexcept
@@ -259,11 +248,9 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mContextRequestId, os);
-    su::serialize(requestInfo.mGenerationRequestId, os);
     su::serialize(requestInfo.mIndexFromEnd, os);
     su::serialize(requestInfo.mLastBlockKey, os);
     su::serialize(requestInfo.mTransState, os);
-    su::serialize(requestInfo.mServerUuid, os);
     su::serialize(requestInfo.mUniqueId, os);
 }
 
@@ -271,14 +258,11 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto contextRequestId = su::deserialize<decltype(mContextRequestId)>(is);
-    auto generationRequestId = su::deserialize<decltype(mGenerationRequestId)>(is);
     auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
     auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    auto serverUuid = su::deserialize<decltype(mServerUuid)>(is);
     auto uniqueId = su::deserialize<decltype(mUniqueId)>(is);
-    return RequestInfo{
-        contextRequestId, generationRequestId, std::move(transState), indexFromEnd, lastBlockKey, serverUuid, uniqueId};
+    return RequestInfo{contextRequestId, std::move(transState), indexFromEnd, lastBlockKey, uniqueId};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -286,11 +270,9 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mContextRequestId);
-    totalSize += su::serializedSize(requestInfo.mGenerationRequestId);
     totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
-    totalSize += su::serializedSize(requestInfo.mServerUuid);
     totalSize += su::serializedSize(requestInfo.mUniqueId);
     return totalSize;
 }
@@ -299,7 +281,6 @@ class CacheSender::Impl
 {
 public:
     using RequestIdType = LlmRequest::RequestIdType;
-    using SessionKey = std::pair<RequestIdType, UuidType>;
 
     Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
@@ -349,20 +330,18 @@ public:
         mSelfState.setCommState(std::move(commState));
     }
 
-    [[nodiscard]] size_t getCounterpartsCount(RequestIdType generationRequestId, UuidType const& serverUuid)
+    [[nodiscard]] size_t getCounterpartsCount(int32_t uniqueId)
     {
-        std::unique_lock<std::mutex> lock(mMtxForMap);
-        auto key = std::make_pair(generationRequestId, serverUuid);
-        auto it = mUniqueIdToSession.find(key);
+        std::scoped_lock<std::mutex> lk(mMtxForMap);
+        auto it = mUniqueIdToSession.find(uniqueId);
         TLLM_CHECK(it != mUniqueIdToSession.end());
         return it->second.getConnections().size();
     }
 
-    void release(RequestIdType generationRequestId, UuidType const& serverUuid)
+    void release(int32_t uniqueId)
     {
-        std::unique_lock<std::mutex> lk(mMtxForMap);
-        auto key = std::make_pair(generationRequestId, serverUuid);
-        auto it = mUniqueIdToSession.find(key);
+        std::scoped_lock<std::mutex> lk(mMtxForMap);
+        auto it = mUniqueIdToSession.find(uniqueId);
         TLLM_CHECK(it != mUniqueIdToSession.end());
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
@@ -418,8 +397,7 @@ public:
                 peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
-            auto key = std::make_pair(info.getGenerationRequestId(), info.getServerUuid());
-            auto it = mUniqueIdToSession.find(key);
+            auto it = mUniqueIdToSession.find(info.getUniqueId());
             if (it == mUniqueIdToSession.end())
             {
                 int uniqueId = info.getUniqueId();
@@ -428,23 +406,19 @@ public:
                     mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty(), uniqueId);
                 session.setTime(TransferSession::kTimeRequestInfo);
-                it = mUniqueIdToSession.emplace(key, std::move(session)).first;
+                it = mUniqueIdToSession.emplace(uniqueId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
         }
         return info;
     }
 
-    void sendSync(SessionKey const& sessionKey)
+    void sendSync(int32_t uniqueId)
     {
-        TransferSession* session = nullptr;
-        {
-            std::unique_lock<std::mutex> lk(mMtxForMap);
-            auto it = mUniqueIdToSession.find(sessionKey);
-            TLLM_CHECK(it != mUniqueIdToSession.end());
-            session = std::addressof(it->second);
-        }
-        mFormatter->format(*session);
+        std::scoped_lock<std::mutex> lk(mMtxForMap);
+        auto it = mUniqueIdToSession.find(uniqueId);
+        TLLM_CHECK(it != mUniqueIdToSession.end());
+        mFormatter->format(it->second);
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -456,9 +430,9 @@ public:
         bool isCurrentRequest = false;
         if (mCurrentSessionKey.has_value())
         {
-            auto ctxIdIt = mSessionKeyToContextRequestId.find(mCurrentSessionKey.value());
+            auto ctxIdIt = mUniqueIdToContextRequestId.find(mCurrentSessionKey.value());
             isCurrentRequest
-                = (ctxIdIt != mSessionKeyToContextRequestId.end() && ctxIdIt->second == llmRequest.mRequestId);
+                = (ctxIdIt != mUniqueIdToContextRequestId.end() && ctxIdIt->second == llmRequest.mRequestId);
         }
         if (it != mReadyResponses.end() && !isCurrentRequest)
         {
@@ -472,22 +446,18 @@ public:
         return isCancelled;
     }
 
-    void sendReadySignal(RequestIdType generationRequestId, UuidType const& serverUuid, bool isReady)
+    void sendReadySignal(int32_t uniqueId, bool isReady)
     {
-        TransferSession* session = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(mMtxForMap);
-            auto key = std::make_pair(generationRequestId, serverUuid);
-            auto it = mUniqueIdToSession.find(key);
-            TLLM_CHECK(it != mUniqueIdToSession.end());
-            session = std::addressof(it->second);
-        }
-        auto const& connections = session->getConnections();
+        std::scoped_lock<std::mutex> lk(mMtxForMap);
+        auto it = mUniqueIdToSession.find(uniqueId);
+        TLLM_CHECK(it != mUniqueIdToSession.end());
+        auto const& session = it->second;
+        auto const& connections = session.getConnections();
         for (size_t i = 0; i < connections.size(); i++)
         {
             TLLM_CHECK_WITH_INFO(connections.at(i) != nullptr,
-                "Connection at index %zu is null for generationRequestId %lu (total connections: %zu)", i,
-                generationRequestId, connections.size());
+                "Connection at index %zu is null for uniqueId %d (total connections: %zu)", i, uniqueId,
+                connections.size());
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
@@ -519,7 +489,7 @@ private:
     struct AsyncResponse
     {
         Response mResponse;
-        SessionKey mSessionKey;
+        int32_t mUniqueId;
     };
 
     struct AsyncSendResource
@@ -552,50 +522,50 @@ private:
                 asyncResp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            sendAndRemoveResponse(asyncResp.mSessionKey, std::move(asyncResp.mResponse));
+            sendAndRemoveResponse(asyncResp.mUniqueId, std::move(asyncResp.mResponse));
         }
     }
 
-    void sendAndRemoveResponse(SessionKey const& sessionKey, Response resp) noexcept
+    void sendAndRemoveResponse(int32_t uniqueId, Response resp) noexcept
     {
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             {
                 std::unique_lock<std::mutex> lk(mMtxForMap);
-                auto it = mUniqueIdToSession.find(sessionKey);
+                auto it = mUniqueIdToSession.find(uniqueId);
                 TLLM_CHECK(it != mUniqueIdToSession.end());
                 it->second.setLlmRequest(*resp.mRequest);
             }
-            sendSync(sessionKey);
+            sendSync(uniqueId);
             resp.mRequest->setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-            release(sessionKey.first, sessionKey.second);
+            release(uniqueId);
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
-            auto new_exception = TLLM_REQUEST_EXCEPTION(sessionKey.first, e.getErrorCode(), "%s", e.what());
+            auto new_exception = TLLM_REQUEST_EXCEPTION(uniqueId, e.getErrorCode(), "%s", e.what());
             resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s sessionKey: (%ld, ...)", e.what(), sessionKey.first);
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s uniqueId: %d", e.what(), uniqueId);
             resp.mPromise.set_exception(std::current_exception());
         }
     }
 
-    void asyncSendAndRemoveResponse(SessionKey const& sessionKey, Response resp) noexcept
+    void asyncSendAndRemoveResponse(int32_t uniqueId, Response resp) noexcept
     {
         std::unique_lock lk(mAsyncSendResource.mMtxForQueue);
-        mAsyncSendResource.mSendQueue.emplace_back(AsyncResponse{std::move(resp), sessionKey});
+        mAsyncSendResource.mSendQueue.emplace_back(AsyncResponse{std::move(resp), uniqueId});
         mAsyncSendResource.mCVforQueue.notify_one();
     }
 
     void sendResponse(std::map<RequestIdType, CacheSender::Impl::Response>::iterator it)
     {
         auto sessionKey = mCurrentSessionKey.value();
-        auto contextRequestId = mSessionKeyToContextRequestId[sessionKey];
+        auto contextRequestId = mUniqueIdToContextRequestId[sessionKey];
         auto count = --mRemainSendCount[sessionKey];
         TLLM_CHECK(count >= 0);
         if (count == 0)
@@ -611,7 +581,7 @@ private:
                     isReady = false;
                 }
             }
-            sendReadySignal(sessionKey.first, sessionKey.second, isReady);
+            sendReadySignal(sessionKey, isReady);
 
             if (isReady)
             {
@@ -641,7 +611,7 @@ private:
                     mCancelledRequests.erase(contextRequestId);
                     mRemainSendCount.erase(sessionKey);
                 }
-                mSessionKeyToContextRequestId.erase(sessionKey);
+                mUniqueIdToContextRequestId.erase(sessionKey);
                 mCurrentSessionKey = std::nullopt;
 
                 if (mReadyResponses.empty())
@@ -676,16 +646,17 @@ private:
                 {
                     return;
                 }
-                auto sessionKey = std::make_pair(requestInfo.getGenerationRequestId(), requestInfo.getServerUuid());
+                auto uniqueId = requestInfo.getUniqueId();
                 auto contextRequestId = requestInfo.getContextRequestId();
                 {
                     std::scoped_lock lk(mSenderMutex);
-                    mCurrentSessionKey = sessionKey;
-                    mSessionKeyToContextRequestId[sessionKey] = contextRequestId;
+                    mCurrentUniqueId = uniqueId;
+                    mUniqueIdToContextRequestId.insert_or_assign(uniqueId, contextRequestId);
                 }
-                if (mRemainSendCount.find(sessionKey) == mRemainSendCount.end())
+
+                if (mRemainSendCount.find(uniqueId) == mRemainSendCount.end())
                 {
-                    mRemainSendCount[sessionKey] = getCounterpartsCount(sessionKey.first, sessionKey.second);
+                    mRemainSendCount[uniqueId] = getCounterpartsCount(uniqueId);
                 }
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
@@ -756,33 +727,32 @@ private:
     [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
     {
         std::scoped_lock lk(mSenderMutex);
-        auto sessionKey = mCurrentSessionKey.value();
-        auto contextRequestId = mSessionKeyToContextRequestId[sessionKey];
+        auto uniqueId = mCurrentSessionKey.value();
+        auto contextRequestId = mUniqueIdToContextRequestId[uniqueId];
         return mReadyResponses.find(contextRequestId);
     }
 
 private:
-    std::optional<SessionKey> mCurrentSessionKey;
-    std::map<SessionKey, RequestIdType> mSessionKeyToContextRequestId;
+    std::optional<int32_t> mCurrentSessionKey;
+    std::map<int32_t, RequestIdType> mUniqueIdToContextRequestId;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
     std::map<RequestIdType, Response> mReadyResponses;
     std::mutex mSenderMutex, mCondMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
     std::condition_variable mSenderCv, mResponderCv;
     std::future<void> mResponseFuture;
-    std::map<SessionKey, int> mRemainSendCount;
+    std::map<int32_t, int> mRemainSendCount;
     AsyncSendResource mAsyncSendResource;
     std::vector<std::future<void>> mAsyncSendFutures;
     int mDeviceId{-1};
 
     executor::kv_cache::ConnectionManager* mManager;
-    std::map<std::pair<RequestIdType, UuidType>, TransferSession> mUniqueIdToSession;
+    std::map<int32_t, TransferSession> mUniqueIdToSession;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
     std::ofstream mMeasuresFile;
-    UuidType mServerUuid;
 };
 
 class CacheReceiver::Impl
@@ -875,7 +845,7 @@ public:
         int32_t uniqueId = UniqueIdClient::instance().getUniqueId(
             endpoint.value(), llmRequest.mRequestId, mServerUuid, expectedRefCount);
 
-        RequestInfo requestInfo(requestId, llmRequest.mRequestId, mSelfState, mServerUuid, uniqueId);
+        RequestInfo requestInfo(requestId, mSelfState, uniqueId);
 
         if (!mFormatter->getCacheManager()->getBlockManager().isVariableWindow())
         {
@@ -901,8 +871,7 @@ public:
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             int32_t indexFromEnd = requestedBlockSize - 1;
 
-            requestInfo = RequestInfo(
-                requestId, llmRequest.mRequestId, mSelfState, indexFromEnd, lastBlockKey, mServerUuid, uniqueId);
+            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey, uniqueId);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -1249,9 +1218,9 @@ void CacheSender::setCommState(executor::kv_cache::CommState commState)
 
 CacheSender::~CacheSender() = default;
 
-void CacheSender::sendSync(LlmRequest::RequestIdType generationRequestId, UuidType const& serverUuid)
+void CacheSender::sendSync(int32_t uniqueId)
 {
-    mImpl->sendSync(std::make_pair(generationRequestId, serverUuid));
+    mImpl->sendSync(uniqueId);
 }
 
 RequestInfo CacheSender::recvRequestInfo()
@@ -1264,10 +1233,9 @@ bool CacheSender::cancelRequest(LlmRequest const& llmRequest)
     return mImpl->cancelRequest(llmRequest);
 }
 
-void CacheSender::sendReadySignal(
-    LlmRequest::RequestIdType generationRequestId, UuidType const& serverUuid, bool isReady)
+void CacheSender::sendReadySignal(int32_t uniqueId, bool isReady)
 {
-    mImpl->sendReadySignal(generationRequestId, serverUuid, isReady);
+    mImpl->sendReadySignal(uniqueId, isReady);
 }
 
 CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager,

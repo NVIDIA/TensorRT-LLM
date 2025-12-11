@@ -182,26 +182,23 @@ class RequestInfo
 {
 public:
     /// @brief Constructor.
-    /// @param requestId The ID used in the generation phase of the current request.
+    /// @param contextRequestId The ID used in the context phase of the current request.
     /// @param transState The state of the data transceiver.
-    /// @param serverUuid The generation server UUID.
     /// @param uniqueId The unique ID for the transfer session.
-    RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
-        executor::DataTransceiverState transState, UuidType const& serverUuid, int32_t uniqueId);
+    RequestInfo(
+        LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState, int32_t uniqueId);
 
-    RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
-        executor::DataTransceiverState transState, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        UuidType const& serverUuid, int32_t uniqueId);
+    RequestInfo(LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState,
+        int32_t indexFromEnd, BlockKey const& lastBlockKey, int32_t uniqueId);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
     /// @param rhs The right operand of the operator.
     [[nodiscard]] bool operator==(RequestInfo const& rhs) const;
 
-    /// @brief Return the ID used in the generation phase of the current request.
+    /// @brief Return the ID used in the context phase of the current request.
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getContextRequestId() const noexcept;
-    [[nodiscard]] LlmRequest::RequestIdType getGenerationRequestId() const noexcept;
 
     [[nodiscard]] int32_t getIndexFromEnd() const noexcept
     {
@@ -215,13 +212,6 @@ public:
     [[nodiscard]] BlockKey const& getLastBlockKey() const noexcept
     {
         return mLastBlockKey;
-    }
-
-    /// @brief Return the server UUID.
-    /// @return The server UUID.
-    [[nodiscard]] UuidType const& getServerUuid() const noexcept
-    {
-        return mServerUuid;
     }
 
     /// @brief Return the unique ID.
@@ -246,9 +236,8 @@ public:
     [[nodiscard]] static std::size_t serializedSize(RequestInfo const& requestInfo);
 
 private:
-    // The ID used in the generation phase of the current request.
+    // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mContextRequestId;
-    LlmRequest::RequestIdType mGenerationRequestId;
     // Index from end indicating how many trailing blocks to transfer (index+1)
     int32_t mIndexFromEnd{0};
 
@@ -257,9 +246,6 @@ private:
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
-
-    // The server UUID.
-    UuidType mServerUuid;
 
     // The unique ID for the transfer session.
     int32_t mUniqueId{-1};
@@ -289,9 +275,8 @@ public:
     virtual void setCommState(executor::kv_cache::CommState commState);
 
     /// @brief Synchronously send data.
-    /// @param generationRequestId The request ID from the generation side.
-    /// @param serverUuid The server UUID.
-    virtual void sendSync(LlmRequest::RequestIdType generationRequestId, UuidType const& serverUuid);
+    /// @param uniqueId The unique ID for the transfer session.
+    virtual void sendSync(int32_t uniqueId);
 
     /// @brief Receive request information.
     /// @param llmRequest The request object to which the data belongs.
@@ -303,11 +288,9 @@ public:
     virtual bool cancelRequest(LlmRequest const& llmRequest);
 
     /// @brief Send ready signal.
-    /// @param generationRequestId The request ID from the generation side.
-    /// @param serverUuid The server UUID.
+    /// @param uniqueId The unique ID for the transfer session.
     /// @param isReady Whether the request is ready to be received.
-    virtual void sendReadySignal(
-        LlmRequest::RequestIdType generationRequestId, UuidType const& serverUuid, bool isReady);
+    virtual void sendReadySignal(int32_t uniqueId, bool isReady);
 
     /// @brief Destructor.
     virtual ~CacheSender();
