@@ -2,15 +2,13 @@
 
 import argparse
 import glob
+import json
 import math
 import os
 import shutil
 import subprocess
 import sys
 from datetime import datetime
-import argparse
-import json
-import os
 from typing import Any, Dict, List
 
 import yaml
@@ -54,6 +52,7 @@ def calculate_nodes(world_size, num_servers, gpus_per_node):
     """Calculate required nodes based on world size and server count."""
     return math.ceil(world_size * num_servers / gpus_per_node)
 
+
 def allocate_gpus(
     total_nodes: int,
     gpus_per_node: int,
@@ -73,7 +72,8 @@ def allocate_gpus(
         local_gpu_id = global_gpu_cursor % gpus_per_node
         return node_id, local_gpu_id
 
-    def assign_server(server_allocation: Dict[str, Any], world_size: int, gpus_per_node: int):
+    def assign_server(server_allocation: Dict[str, Any], world_size: int,
+                      gpus_per_node: int):
         nonlocal global_gpu_cursor
         for _ in range(world_size):
             node_id, gpu_id = get_gpu_location(gpus_per_node)
@@ -100,10 +100,13 @@ def allocate_gpus(
             assign_server(server_allocation, world_size, gpus_per_node)
             server_allocations.append(server_allocation)
 
-    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size, gpus_per_node)
-    assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size, gpus_per_node)
+    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
+                   gpus_per_node)
+    assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
+                   gpus_per_node)
 
     return allocations
+
 
 # def prepare_templates(config):
 
@@ -156,13 +159,11 @@ def submit_job(config, log_dir):
     ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
     ctx_pp_size = config['worker_config']['ctx']['pipeline_parallel_size']
     ctx_world_size = ctx_tp_size * ctx_pp_size
-    ctx_nodes = calculate_nodes(ctx_world_size, ctx_num,
-                                gpus_per_node)
+    ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
     gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
     gen_pp_size = config['worker_config']['gen']['pipeline_parallel_size']
     gen_world_size = gen_tp_size * gen_pp_size
-    gen_nodes = calculate_nodes(gen_world_size, gen_num,
-                                gpus_per_node)
+    gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
@@ -225,8 +226,10 @@ def submit_job(config, log_dir):
     start_worker_cmds = []
     for allocation in allocations:
         server_type = allocation["server_type"]
-        cuda_devices = ",".join([str(device) for device in list(allocation["nodes"].values())[0]])
-        worker_env_var = env_config['worker_env_var'] + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+        cuda_devices = ",".join(
+            [str(device) for device in list(allocation["nodes"].values())[0]])
+        worker_env_var = env_config[
+            'worker_env_var'] + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
         cmd = [
             "srun",
             "-l",
@@ -235,7 +238,8 @@ def submit_job(config, log_dir):
             "-N",
             str(len(allocation["nodes"])),
             "--ntasks",
-            str(gen_world_size) if server_type == "GEN" else str(ctx_world_size),
+            str(gen_world_size)
+            if server_type == "GEN" else str(ctx_world_size),
             "--ntasks-per-node",
             str(gpus_per_node),
             "--container-image",
@@ -258,7 +262,8 @@ def submit_job(config, log_dir):
             str(slurm_config['numa_bind']),
             log_dir,
             str(profiling_config['nsys_on']),
-            profiling_config['gen_profile_range'] if server_type == "GEN" else profiling_config['ctx_profile_range'],
+            profiling_config['gen_profile_range']
+            if server_type == "GEN" else profiling_config['ctx_profile_range'],
             gen_config_path if server_type == "GEN" else ctx_config_path,
             f'"{worker_env_var}"',
             f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
@@ -350,16 +355,14 @@ def main():
     # Process each config file
     for config_file in config_files:
         print(f"Processing: {config_file}")
-        # try:
-        #     config = load_config(config_file)
-        #     submit_job(config, args.log_dir)
-        #     print(f"Successfully submitted job for: {config_file}\n")
-        # except Exception as e:
-        #     print(f"Error processing {config_file}: {e}", file=sys.stderr)
-        #     # Continue processing other files even if one fails
-        #     continue
-        config = load_config(config_file)
-        submit_job(config, args.log_dir)
+        try:
+            config = load_config(config_file)
+            submit_job(config, args.log_dir)
+            print(f"Successfully submitted job for: {config_file}\n")
+        except Exception as e:
+            print(f"Error processing {config_file}: {e}", file=sys.stderr)
+            # Continue processing other files even if one fails
+            continue
 
 
 if __name__ == '__main__':
