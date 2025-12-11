@@ -55,6 +55,7 @@ def calculate_nodes(world_size, num_servers, gpus_per_node):
     return math.ceil(world_size * num_servers / gpus_per_node)
 
 def allocate_gpus(
+    total_nodes: int,
     gpus_per_node: int,
     num_gen_servers: int,
     num_ctx_servers: int,
@@ -63,7 +64,7 @@ def allocate_gpus(
     base_port: int = 8000,
 ) -> List[Dict[str, Any]]:
     allocations = []
-    hostnames = [f"<node{i}_placeholder>" for i in range(num_gen_servers + num_ctx_servers)]
+    hostnames = [f"<node{i}_placeholder>" for i in range(total_nodes)]
 
     global_gpu_cursor = 0
 
@@ -210,6 +211,7 @@ def submit_job(config, log_dir):
 
     # Prepare allocation template
     allocations = allocate_gpus(
+        total_nodes=total_nodes,
         gpus_per_node=gpus_per_node,
         num_gen_servers=gen_num,
         num_ctx_servers=ctx_num,
@@ -259,7 +261,7 @@ def submit_job(config, log_dir):
             profiling_config['gen_profile_range'] if server_type == "GEN" else profiling_config['ctx_profile_range'],
             gen_config_path if server_type == "GEN" else ctx_config_path,
             f'"{worker_env_var}"',
-            f"&> {log_dir}/output_{server_type}_{allocation['server_id']}.log &",
+            f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
         ]
         start_worker_cmds.append(" ".join(cmd))
 

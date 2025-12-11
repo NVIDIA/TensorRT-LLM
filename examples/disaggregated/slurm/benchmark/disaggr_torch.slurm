@@ -160,8 +160,6 @@ for i in "${!node_array[@]}"; do
     echo "Replaced $placeholder with $current_val"
 done
 
-exit
-
 echo "Starting worker commands from ${start_worker_cmds_file}..."
 cat ${start_worker_cmds_file} | while read cmd; do
     echo "Starting worker command: ${cmd}"
@@ -175,7 +173,7 @@ srun -l --container-name=${container_name} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
     bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
-    &> ${full_logdir}/5_output_server.log &
+    &> ${full_logdir}/4_output_server.log &
 
 # Wait for server to be ready (runs synchronously)
 echo "Waiting for server to be ready..."
@@ -183,8 +181,8 @@ if ! srun -l --container-name=${container_name} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
     bash ${work_dir}/wait_server.sh ${full_logdir} \
-    &> ${full_logdir}/6_wait_server.log; then
-    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/6_wait_server.log for details"
+    &> ${full_logdir}/5_wait_server.log; then
+    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/5_wait_server.log for details"
 fi
 echo "Server is ready!"
 
@@ -197,8 +195,8 @@ if [ "${use_nv_sa_benchmark}" = "true" ]; then
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark_nv_sa.sh \
             "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/7_bench.log; then
-        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/7_bench.log for details"
+            &> ${full_logdir}/6_bench.log; then
+        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/6_bench.log for details"
     fi
 else
     echo "Using default benchmark script..."
@@ -207,8 +205,8 @@ else
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark.sh \
             "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/7_bench.log; then
-        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/7_bench.log for details"
+            &> ${full_logdir}/6_bench.log; then
+        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/6_bench.log for details"
     fi
 fi
 echo "Benchmark completed successfully"
@@ -222,8 +220,8 @@ if [ "${enable_accuracy_test}" = "true" ]; then
         bash ${work_dir}/accuracy_eval.sh \
         "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
         "${model_args_extra}" "${full_logdir}/accuracy_eval" \
-        &> ${full_logdir}/8_accuracy_eval.log; then
-        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/8_accuracy_eval.log for details"
+        &> ${full_logdir}/7_accuracy_eval.log; then
+        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/7_accuracy_eval.log for details"
     fi
     echo "Accuracy evaluation completed successfully"
 fi
