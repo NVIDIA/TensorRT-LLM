@@ -3177,16 +3177,10 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
                                          text=True,
                                          stderr=subprocess.STDOUT,
                                          timeout=7200)
-<<<<<<< HEAD
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print_warning(f"eval failed: {e.returncode}")
         print_warning(f"eval output:\n{e.output}")
         raise
-=======
-    except subprocess.CalledProcessError as e:
-        print("Failed:", e.returncode)
-        print(e.output)
->>>>>>> 74d5e2ebd (update multi node tests)
     else:
         if os.environ.get("SLURM_PROCID", '0') == '0':
             print_info(f"eval output:\n{output}")
