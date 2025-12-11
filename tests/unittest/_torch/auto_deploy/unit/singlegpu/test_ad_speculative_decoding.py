@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 
+@pytest.mark.skip(reason="https://github.com/NVIDIA/TensorRT-LLM/issues/9919")
 def test_ad_speculative_decoding_smoke():
     """Test speculative decoding with AutoDeploy using the build_and_run_ad main()."""
 
