@@ -36,7 +36,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.serve.chat_utils import (MM_EMBEDDING_MAP, load_chat_template,
+from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
@@ -556,20 +556,13 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
-            if mm_data is not None:
-                # single out directly provided embeddings
-                mm_embeds = {}
-                for tag in list(mm_data.keys()):
-                    if (modality := MM_EMBEDDING_MAP.get(tag, None)) is not None:
-                        mm_embeds[modality] = mm_data.pop(tag)
-
-                if mm_data:
-                    prompt["multi_modal_data"] = mm_data
-                if mm_embeds:
-                    prompt["multi_modal_embeddings"] = mm_embeds
-                if mm_data and mm_embeds:
-                    raise ValueError("Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported.")
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_data:
+                prompt["multi_modal_data"] = mm_data
+            if mm_embeddings:
+                prompt["multi_modal_embeddings"] = mm_embeddings
+            if mm_data and mm_embeddings:
+                raise ValueError("Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported.")
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
@@ -670,7 +663,9 @@ class OpenAIServer:
                 )
             prompt = prompt_inputs(prompt)
 
-            mm_data = await mm_coroutines
+            mm_data, mm_embeddings = await mm_coroutines
+            if mm_embeddings:
+                raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
