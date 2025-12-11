@@ -76,9 +76,9 @@ int UniqueIdClient::getUniqueId(std::string const& serverEndpoint, RequestIdType
     zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
     socket.connect(serverEndpoint);
 
-    CacheTransferRequest req;
+    UniqueIdRequest req;
     std::memset(&req, 0, sizeof(req));
-    req.type = CacheTransferRequestType::kGetUniqueId;
+    req.type = UniqueIdRequestType::kGetUniqueId;
     req.payload.getUniqueId.requestId = generationRequestId;
     req.payload.getUniqueId.serverUuid = serverUuid;
     req.payload.getUniqueId.expectedRefCount = expectedRefCount;
@@ -104,9 +104,9 @@ void UniqueIdClient::releaseUniqueId(std::string const& serverEndpoint, RequestI
     zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
     socket.connect(serverEndpoint);
 
-    CacheTransferRequest req;
+    UniqueIdRequest req;
     std::memset(&req, 0, sizeof(req));
-    req.type = CacheTransferRequestType::kReleaseUniqueId;
+    req.type = UniqueIdRequestType::kReleaseUniqueId;
     req.payload.releaseUniqueId.requestId = generationRequestId;
     req.payload.releaseUniqueId.serverUuid = serverUuid;
     req.payload.releaseUniqueId.uniqueId = uniqueId;
@@ -209,9 +209,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::copy(uuid.begin(), uuid.end(), mUuid.begin());
         std::vector<char> uuidVec(mUuid.begin(), mUuid.end());
         mGroupComm->bcast(uuidVec, 0);
-        mCacheTransferServer = std::make_unique<CacheTransferServer>();
-        mCacheTransferServer->waitForReady();
-        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
+        mUniqueIdServer = std::make_unique<UniqueIdServer>();
+        mUniqueIdServer->waitForReady();
+        mUniqueIdServerEndpoint = mUniqueIdServer->getEndpoint();
     }
     else
     {
@@ -227,9 +227,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     // Broadcast endpoint
-    std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+    std::vector<char> endpointVec(mUniqueIdServerEndpoint.begin(), mUniqueIdServerEndpoint.end());
     mGroupComm->bcast(endpointVec, 0);
-    mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+    mUniqueIdServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
 
     TLLM_LOG_INFO("CacheTransceiver UUID = %s", std::string(mUuid.begin(), mUuid.end()).c_str());
 
@@ -360,15 +360,16 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
+    contextState->setUniqueIdServerEndpoint(mUniqueIdServerEndpoint);
     if (!llmRequest->hasDraftTokens())
     {
-        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
-            {}, llmRequest->mRequestId, contextState.release(), std::nullopt, mCacheTransferServerEndpoint});
+        llmRequest->setContextPhaseParams(
+            executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release(), std::nullopt});
     }
     else
     {
-        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{{}, llmRequest->mRequestId,
-            contextState.release(), *llmRequest->getDraftTokens(), mCacheTransferServerEndpoint});
+        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
+            {}, llmRequest->mRequestId, contextState.release(), *llmRequest->getDraftTokens()});
     }
 }
 

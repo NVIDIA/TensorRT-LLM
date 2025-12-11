@@ -837,8 +837,8 @@ public:
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(mSelfState.getCacheState().value(), destCacheState),
             "Disagg server does not currently support these cacheState.");
 
-        auto endpoint = llmRequest.getContextPhaseParams().value().getCacheTransferServerEndpoint();
-        TLLM_CHECK_WITH_INFO(endpoint.has_value(), "CacheTransferServer endpoint not found in ContextPhaseParams");
+        auto endpoint = contextState.getUniqueIdServerEndpoint();
+        TLLM_CHECK_WITH_INFO(endpoint.has_value(), "UniqueIdServer endpoint not found in DataTransceiverState");
         auto const& parallelConfig = mSelfState.getCacheState().value().getParallelConfig();
         auto const expectedRefCount = parallelConfig.mTensorParallelism * parallelConfig.mPipelineParallelism
             * parallelConfig.mContextParallelism;
@@ -1035,7 +1035,7 @@ private:
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
 
-        auto const endpoint = llmRequest.getContextPhaseParams().value().getCacheTransferServerEndpoint();
+        auto const endpoint = llmRequest.getDataTransceiverState().getUniqueIdServerEndpoint();
         auto const uniqueId = session.getDataContext().getTag();
         auto releaseId = [&](void*)
         {

@@ -23,13 +23,13 @@
 namespace tensorrt_llm::batch_manager
 {
 
-CacheTransferServer::CacheTransferServer()
+UniqueIdServer::UniqueIdServer()
 {
-    mThread = std::thread(&CacheTransferServer::loop, this);
-    pthread_setname_np(mThread.native_handle(), "CacheTransferServer");
+    mThread = std::thread(&UniqueIdServer::loop, this);
+    pthread_setname_np(mThread.native_handle(), "UniqueIdServer");
 }
 
-CacheTransferServer::~CacheTransferServer()
+UniqueIdServer::~UniqueIdServer()
 {
     stop();
     if (mThread.joinable())
@@ -40,12 +40,12 @@ CacheTransferServer::~CacheTransferServer()
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("CacheTransferServer destructor: failed to join thread: %s", e.what());
+            TLLM_LOG_ERROR("UniqueIdServer destructor: failed to join thread: %s", e.what());
         }
     }
 }
 
-void CacheTransferServer::loop()
+void UniqueIdServer::loop()
 {
     mContext = std::make_unique<zmq::context_t>(1);
     mSocket = std::make_unique<zmq::socket_t>(*mContext, zmq::socket_type::router);
@@ -80,14 +80,14 @@ void CacheTransferServer::loop()
         {
             if (mRunning)
             {
-                TLLM_LOG_ERROR("CacheTransferServer loop exception: %s", e.what());
+                TLLM_LOG_ERROR("UniqueIdServer loop exception: %s", e.what());
             }
         }
         catch (...)
         {
             if (mRunning)
             {
-                TLLM_LOG_ERROR("CacheTransferServer loop unknown exception");
+                TLLM_LOG_ERROR("UniqueIdServer loop unknown exception");
             }
         }
     }
@@ -100,11 +100,11 @@ void CacheTransferServer::loop()
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_ERROR("CacheTransferServer: failed to close socket: %s", e.what());
+        TLLM_LOG_ERROR("UniqueIdServer: failed to close socket: %s", e.what());
     }
 }
 
-void CacheTransferServer::handleRequest()
+void UniqueIdServer::handleRequest()
 {
     zmq::message_t identity;
     zmq::message_t request;
@@ -114,12 +114,12 @@ void CacheTransferServer::handleRequest()
 
     result = mSocket->recv(request, zmq::recv_flags::none);
     TLLM_CHECK_WITH_INFO(result.has_value(), "Failed to receive request");
-    TLLM_CHECK_WITH_INFO(request.size() == sizeof(CacheTransferRequest), "Invalid request size");
+    TLLM_CHECK_WITH_INFO(request.size() == sizeof(UniqueIdRequest), "Invalid request size");
 
-    CacheTransferRequest req = *reinterpret_cast<CacheTransferRequest*>(request.data());
+    UniqueIdRequest req = *reinterpret_cast<UniqueIdRequest*>(request.data());
     zmq::message_t response;
 
-    if (req.type == CacheTransferRequestType::kGetUniqueId)
+    if (req.type == UniqueIdRequestType::kGetUniqueId)
     {
         auto key = std::make_pair(req.payload.getUniqueId.requestId, req.payload.getUniqueId.serverUuid);
         auto it = mUniqueIdRefCount.find(key);
@@ -136,7 +136,7 @@ void CacheTransferServer::handleRequest()
         }
         response.rebuild(&uniqueId, sizeof(uniqueId));
     }
-    else if (req.type == CacheTransferRequestType::kReleaseUniqueId)
+    else if (req.type == UniqueIdRequestType::kReleaseUniqueId)
     {
         auto key = std::make_pair(req.payload.releaseUniqueId.requestId, req.payload.releaseUniqueId.serverUuid);
         auto it = mUniqueIdRefCount.find(key);

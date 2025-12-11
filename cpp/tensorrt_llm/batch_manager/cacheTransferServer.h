@@ -73,15 +73,15 @@ inline std::mutex UniqueIdGenerator::mMutex;
 inline int32_t UniqueIdGenerator::mNextId = 8192;
 inline std::set<int32_t> UniqueIdGenerator::mReleasedIds;
 
-enum class CacheTransferRequestType
+enum class UniqueIdRequestType
 {
     kGetUniqueId,
     kReleaseUniqueId
 };
 
-struct CacheTransferRequest
+struct UniqueIdRequest
 {
-    CacheTransferRequestType type;
+    UniqueIdRequestType type;
 
     union
     {
@@ -101,16 +101,16 @@ struct CacheTransferRequest
     } payload;
 };
 
-class CacheTransferServer
+class UniqueIdServer
 {
 public:
-    CacheTransferServer();
-    ~CacheTransferServer();
+    UniqueIdServer();
+    ~UniqueIdServer();
 
-    CacheTransferServer(CacheTransferServer const&) = delete;
-    CacheTransferServer& operator=(CacheTransferServer const&) = delete;
-    CacheTransferServer(CacheTransferServer&&) = delete;
-    CacheTransferServer& operator=(CacheTransferServer&&) = delete;
+    UniqueIdServer(UniqueIdServer const&) = delete;
+    UniqueIdServer& operator=(UniqueIdServer const&) = delete;
+    UniqueIdServer(UniqueIdServer&&) = delete;
+    UniqueIdServer& operator=(UniqueIdServer&&) = delete;
 
     void waitForReady()
     {

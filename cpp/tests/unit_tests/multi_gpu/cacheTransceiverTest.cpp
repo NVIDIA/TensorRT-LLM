@@ -163,9 +163,9 @@ TEST_F(CacheConfigTest, EqualTo)
     EXPECT_EQ(state0, state1);
 }
 
-TEST(CacheTransferServerTest, BasicCommunication)
+TEST(UniqueIdServerTest, BasicCommunication)
 {
-    CacheTransferServer server;
+    UniqueIdServer server;
     server.waitForReady();
 
     std::string endpoint = server.getEndpoint();
@@ -372,8 +372,8 @@ protected:
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(*mContextCommState);
         state->setCacheState(*mCacheState);
-        auto stats
-            = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt, mCacheTransferServerEndpoint);
+        state->setUniqueIdServerEndpoint(mUniqueIdServerEndpoint);
+        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
@@ -428,8 +428,8 @@ protected:
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<CacheSender> mSender;
     std::unique_ptr<CacheReceiver> mReceiver;
-    std::unique_ptr<CacheTransferServer> mCacheTransferServer;
-    std::string mCacheTransferServerEndpoint;
+    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
+    std::string mUniqueIdServerEndpoint;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
     std::vector<std::future<void>> mFutures;
@@ -445,18 +445,18 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     }
     if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
     {
-        mCacheTransferServer = std::make_unique<CacheTransferServer>();
-        mCacheTransferServer->waitForReady();
-        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
-        std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+        mUniqueIdServer = std::make_unique<UniqueIdServer>();
+        mUniqueIdServer->waitForReady();
+        mUniqueIdServerEndpoint = mUniqueIdServer->getEndpoint();
+        std::vector<char> endpointVec(mUniqueIdServerEndpoint.begin(), mUniqueIdServerEndpoint.end());
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
-        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+        mUniqueIdServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
     }
     else
     {
         std::vector<char> endpointVec;
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
-        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+        mUniqueIdServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
     }
     setUpCacheManager();
     setUpCacheTransceiver();
@@ -554,7 +554,7 @@ protected:
 
     void TearDown() override
     {
-        mCacheTransferServer.reset();
+        mUniqueIdServer.reset();
         tensorrt_llm::mpi::MpiComm::world().barrier();
     }
 
@@ -969,8 +969,8 @@ protected:
         TLLM_CHECK(mContextCommState);
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
         state->setCacheState(*mContextCacheState);
-        auto stats
-            = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt, mCacheTransferServerEndpoint);
+        state->setUniqueIdServerEndpoint(mUniqueIdServerEndpoint);
+        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
 
         auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
@@ -994,8 +994,8 @@ protected:
             mContextCacheState->getParallelConfig().mEnableAttentionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
-        auto stats
-            = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt, mCacheTransferServerEndpoint);
+        state->setUniqueIdServerEndpoint(mUniqueIdServerEndpoint);
+        auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
         auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
 
@@ -1353,8 +1353,8 @@ protected:
     std::vector<std::unique_ptr<CacheTransBufferManager>> mCacheTransBufferManagers;
     std::unique_ptr<CacheSender> mSender;
     std::unique_ptr<CacheReceiver> mReceiver;
-    std::unique_ptr<CacheTransferServer> mCacheTransferServer;
-    std::string mCacheTransferServerEndpoint;
+    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
+    std::string mUniqueIdServerEndpoint;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CacheState> mContextCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
@@ -1423,17 +1423,17 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     int rank = tensorrt_llm::mpi::MpiComm::world().getRank();
     if (rank == 0)
     {
-        mCacheTransferServer = std::make_unique<CacheTransferServer>();
-        mCacheTransferServer->waitForReady();
-        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
-        std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+        mUniqueIdServer = std::make_unique<UniqueIdServer>();
+        mUniqueIdServer->waitForReady();
+        mUniqueIdServerEndpoint = mUniqueIdServer->getEndpoint();
+        std::vector<char> endpointVec(mUniqueIdServerEndpoint.begin(), mUniqueIdServerEndpoint.end());
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
     }
     else
     {
         std::vector<char> endpointVec;
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
-        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+        mUniqueIdServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
     }
 
     if (mIsContext || mIsGeneration)
@@ -1544,17 +1544,17 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     int rank = tensorrt_llm::mpi::MpiComm::world().getRank();
     if (rank == 0)
     {
-        mCacheTransferServer = std::make_unique<CacheTransferServer>();
-        mCacheTransferServer->waitForReady();
-        mCacheTransferServerEndpoint = mCacheTransferServer->getEndpoint();
-        std::vector<char> endpointVec(mCacheTransferServerEndpoint.begin(), mCacheTransferServerEndpoint.end());
+        mUniqueIdServer = std::make_unique<UniqueIdServer>();
+        mUniqueIdServer->waitForReady();
+        mUniqueIdServerEndpoint = mUniqueIdServer->getEndpoint();
+        std::vector<char> endpointVec(mUniqueIdServerEndpoint.begin(), mUniqueIdServerEndpoint.end());
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
     }
     else
     {
         std::vector<char> endpointVec;
         tensorrt_llm::mpi::MpiComm::world().bcast(endpointVec, 0);
-        mCacheTransferServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+        mUniqueIdServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
     }
 
     if (mIsContext || mIsGeneration)

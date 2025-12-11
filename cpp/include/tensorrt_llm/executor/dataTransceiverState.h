@@ -451,9 +451,20 @@ public:
         return mCommState;
     }
 
+    void setUniqueIdServerEndpoint(std::string endpoint)
+    {
+        mUniqueIdServerEndpoint = std::move(endpoint);
+    }
+
+    [[nodiscard]] std::optional<std::string> const& getUniqueIdServerEndpoint() const noexcept
+    {
+        return mUniqueIdServerEndpoint;
+    }
+
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState
+            && mUniqueIdServerEndpoint == other.mUniqueIdServerEndpoint;
     }
 
     [[nodiscard]] std::string toString() const
@@ -467,6 +478,10 @@ public:
         {
             sstring << mCommState.value().toString();
         }
+        if (mUniqueIdServerEndpoint)
+        {
+            sstring << "UniqueIdServerEndpoint:" << mUniqueIdServerEndpoint.value();
+        }
         return sstring.str();
     }
 
@@ -474,6 +489,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
+    std::optional<std::string> mUniqueIdServerEndpoint;
 };
 
 inline std::string getLocalIpByNic(std::string const& interface, int rank)

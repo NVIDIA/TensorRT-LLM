@@ -56,7 +56,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
-class CacheTransferServer;
+class UniqueIdServer;
 
 class CacheTransceiverComm
 {
@@ -334,8 +334,8 @@ private:
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
     UuidType mUuid;
-    std::unique_ptr<CacheTransferServer> mCacheTransferServer;
-    std::string mCacheTransferServerEndpoint;
+    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
+    std::string mUniqueIdServerEndpoint;
 };
 
 } // namespace tensorrt_llm::batch_manager

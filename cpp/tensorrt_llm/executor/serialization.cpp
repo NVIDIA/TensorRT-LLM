@@ -618,6 +618,11 @@ DataTransceiverState Serialization::deserializeDataTransceiverState(std::istream
     {
         state.setCacheState(std::move(cacheState).value());
     }
+    auto uniqueIdServerEndpoint = su::deserialize<decltype(DataTransceiverState::mUniqueIdServerEndpoint)>(is);
+    if (uniqueIdServerEndpoint)
+    {
+        state.setUniqueIdServerEndpoint(std::move(uniqueIdServerEndpoint).value());
+    }
     return state;
 }
 
@@ -625,6 +630,7 @@ void Serialization::serialize(DataTransceiverState const& state, std::ostream& o
 {
     su::serialize(state.mCommState, os);
     su::serialize(state.mCacheState, os);
+    su::serialize(state.mUniqueIdServerEndpoint, os);
 }
 
 std::vector<char> Serialization::serialize(DataTransceiverState const& state)
@@ -643,6 +649,7 @@ size_t Serialization::serializedSize(DataTransceiverState const& state)
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.mCommState);
     totalSize += su::serializedSize(state.mCacheState);
+    totalSize += su::serializedSize(state.mUniqueIdServerEndpoint);
     return totalSize;
 }
 
@@ -652,17 +659,14 @@ ContextPhaseParams Serialization::deserializeContextPhaseParams(std::istream& is
     auto reqId = su::deserialize<decltype(ContextPhaseParams::mReqId)>(is);
     auto firstGenTokens = su::deserialize<decltype(ContextPhaseParams::mFirstGenTokens)>(is);
     auto draftTokens = su::deserialize<decltype(ContextPhaseParams::mDraftTokens)>(is);
-    auto cacheTransferServerEndpoint = su::deserialize<decltype(ContextPhaseParams::mCacheTransferServerEndpoint)>(is);
     auto hasState = su::deserialize<bool>(is);
     if (hasState)
     {
         auto state = std::make_unique<DataTransceiverState>();
         *state = deserializeDataTransceiverState(is);
-        return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release(), std::move(draftTokens),
-            std::move(cacheTransferServerEndpoint)};
+        return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release(), std::move(draftTokens)};
     }
-    return ContextPhaseParams{
-        std::move(firstGenTokens), reqId, nullptr, std::move(draftTokens), std::move(cacheTransferServerEndpoint)};
+    return ContextPhaseParams{std::move(firstGenTokens), reqId, nullptr, std::move(draftTokens)};
 }
 
 void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os)
@@ -670,7 +674,6 @@ void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std:
     su::serialize(contextPhaseParams.mReqId, os);
     su::serialize(contextPhaseParams.mFirstGenTokens, os);
     su::serialize(contextPhaseParams.mDraftTokens, os);
-    su::serialize(contextPhaseParams.mCacheTransferServerEndpoint, os);
     su::serialize(static_cast<bool>(contextPhaseParams.mState), os);
     if (contextPhaseParams.mState)
     {
@@ -684,7 +687,6 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
     totalSize += su::serializedSize(contextPhaseParams.mReqId);
     totalSize += su::serializedSize(contextPhaseParams.mFirstGenTokens);
     totalSize += su::serializedSize(contextPhaseParams.mDraftTokens);
-    totalSize += su::serializedSize(contextPhaseParams.mCacheTransferServerEndpoint);
     totalSize += su::serializedSize(bool{});
     if (contextPhaseParams.mState)
     {
