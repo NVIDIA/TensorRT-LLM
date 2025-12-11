@@ -42,7 +42,7 @@ class ImageEmbedsData(TypedDict):
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     """Type definition for image embeddings passed in base64-encoded PyTorch tensor format."""
     image_embeds: Required[
-        # NB: Besides "data", could support "url" and "ipc_handle" in the future.
+        # TODO: Besides "data", could support "url" and "ipc_handle" in the future.
         ImageEmbedsData]
     type: Required[Literal["image_embeds"]]
 
