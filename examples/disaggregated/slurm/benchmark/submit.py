@@ -108,9 +108,6 @@ def allocate_gpus(
     return allocations
 
 
-# def prepare_templates(config):
-
-
 def submit_job(config, log_dir):
     # Extract configurations
     slurm_config = config['slurm']
