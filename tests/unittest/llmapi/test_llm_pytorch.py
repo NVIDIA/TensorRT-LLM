@@ -29,8 +29,8 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        prompts, run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, similarity_score,
+                        skip_fp8_pre_ada, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -576,6 +576,7 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
     lora_dir = f"/code/tensorrt_llm/llama-3.3-70b-instruct_vhf-squad-lora-031925331-v3"
 
     prompt = "What is the capital of the United States?"
+    expected_output = " Washington, D.C.\nWhat is the capital of the United States? Washington, D.C."
 
     lora_config = LoraConfig(lora_dir=[lora_dir],
                              max_lora_rank=8,
@@ -592,9 +593,12 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
         output = llm.generate(prompt,
                               SamplingParams(max_tokens=50, temperature=0.0),
                               lora_request=[lora_req])
-        print(f"Generated output: {output.outputs[0].text}")
-        assert len(
-            output.outputs[0].text) > 0, "Generated output should not be empty"
+        generated_text = output.outputs[0].text
+        print(f"Generated output: {repr(generated_text)}")
+
+        similarity = similarity_score(generated_text, expected_output)
+        assert similar(generated_text, expected_output, threshold=0.8), \
+            f"Output similarity too low (similarity={similarity:.2%})!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
     finally:
         llm.shutdown()
 
