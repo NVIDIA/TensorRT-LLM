@@ -776,18 +776,10 @@ class ADEngine(ModelEngine):
         self.iter_states["num_generation_tokens"] = num_generation_tokens
 
     @nvtx_range("ad_compute_logits")
-    def _compute_logits(self, resource_manager: ResourceManager) -> List[torch.Tensor]:
+    def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
-
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        if spec_resource_manager is not None and isinstance(
-            spec_resource_manager, ADHiddenStateManager
-        ):
-            spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
         return logits.float()
@@ -816,8 +808,18 @@ class ADEngine(ModelEngine):
         self.iter_counter += 1
 
         outputs = {
-            "logits": self._compute_logits(resource_manager),
+            "logits": self._compute_logits(),
         }
+
+        # save hidden states after running model.forward() in _compute_logits()
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER
+        )
+        if spec_resource_manager is not None and isinstance(
+            spec_resource_manager, ADHiddenStateManager
+        ):
+            spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
+
         if self.mapping is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
