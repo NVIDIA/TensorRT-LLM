@@ -271,7 +271,20 @@ class Deepseekv3RoutingImpl:
                     )
                 self.is_fused = False
 
-        if not self.is_fused:
+        if self.n_group == 1 and self.n_group == 1:
+            # Edge case to reduce the computation.
+            scores, scores_with_bias = self.get_scores(logits,
+                                                       e_score_correction_bias)
+            _, topk_indices = torch.topk(scores_with_bias, k=self.top_k, dim=1)
+            topk_values = torch.gather(scores, dim=1,
+                                       index=topk_indices).type_as(scores)
+
+            # Normalize and scale.
+            topk_values_sum = torch.sum(topk_values, dim=-1,
+                                        keepdim=True) + 1e-20
+            topk_values = topk_values / topk_values_sum * self.routed_scaling_factor
+            return topk_values, topk_indices
+        elif not self.is_fused:
             scores, scores_with_bias = self.get_scores(logits,
                                                        e_score_correction_bias)
             scores_shape = list(scores_with_bias.shape)
