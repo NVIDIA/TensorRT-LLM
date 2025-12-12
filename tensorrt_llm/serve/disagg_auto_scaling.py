@@ -251,7 +251,8 @@ class DisaggClusterWorker:
     It will send heartbeat to the cluster storage every heartbeat_interval_sec seconds.
     If the worker heartbeat fails, it will re-register itself.
     """
-    LOCALHOST_IPS = ["localhost", "127.0.0.1", "0.0.0.0", "::1", "::"]
+    LOCALHOST_IPS = ["localhost", "127.0.0.1", "0.0.0.0", "::1",
+                     "::"]  # nosec B104
 
     def __init__(self, role: ServerRole, host: str, port: int,
                  config: DisaggClusterConfig, storage: ClusterStorage):

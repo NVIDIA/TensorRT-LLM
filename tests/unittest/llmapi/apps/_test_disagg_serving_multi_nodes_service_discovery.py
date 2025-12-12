@@ -27,13 +27,13 @@ DISAGG_SERVER_PORT = 8000
 
 # This test is supposed to run with 2 nodes or more
 def is_ctx_node():
-    assert len(NODE_LIST) >= 2
-    return NODE_RANK < len(NODE_LIST) // 2
+    assert len(NODE_LIST) == 2
+    return NODE_RANK == 0
 
 
 def is_gen_node():
-    assert len(NODE_LIST) >= 2
-    return NODE_RANK >= len(NODE_LIST) // 2
+    assert len(NODE_LIST) == 2
+    return NODE_RANK == 1
 
 
 def is_disagg_node():
@@ -107,6 +107,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
     }
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server
+    port = get_free_port()
     if is_ctx_node():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
@@ -114,7 +115,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
         with RemoteOpenAIServer(
             model_path,
-            port=get_free_port(),
+            port=port,
             cli_args=args,
             host="0.0.0.0",
             env=env(),
@@ -131,7 +132,7 @@ def worker(model_name: str, disagg_cluster_config: dict):
         args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
         with RemoteOpenAIServer(
             model_path,
-            port=get_free_port(),
+            port=port,
             cli_args=args,
             host="0.0.0.0",
             env=env(),
@@ -165,6 +166,7 @@ def disagg_server(disagg_cluster_config: dict):
             disagg_config=disagg_config,
             llmapi_launch=False,
             env=env(),
+            wait_ready=False,  # wait it to be ready in test body
         ) as server:
             yield server
     else:

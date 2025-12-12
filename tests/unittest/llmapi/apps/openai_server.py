@@ -154,7 +154,8 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
                  env: Optional[dict] = None,
                  llmapi_launch: bool = False,
                  disagg_config: Optional[dict] = None,
-                 log_path: Optional[str] = None) -> None:
+                 log_path: Optional[str] = None,
+                 wait_ready: bool = True) -> None:
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.host = "0.0.0.0"
@@ -182,8 +183,9 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
                                      env=env,
                                      stdout=self._get_output(),
                                      stderr=self._get_output())
-        self._wait_for_server(url=self.url_for("health"),
-                              timeout=self.MAX_SERVER_START_WAIT_S)
+        if wait_ready:
+            self._wait_for_server(url=self.url_for("health"),
+                                  timeout=self.MAX_SERVER_START_WAIT_S)
 
     def _get_extra_config(self):
         return {
