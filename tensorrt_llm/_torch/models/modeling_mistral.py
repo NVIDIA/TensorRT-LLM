@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    _is_disagg, find_input_mm_embeds, fuse_input_embeds,
+    _MULTIMODAL_ENV_NAME, _is_disagg, find_input_mm_embeds, fuse_input_embeds,
     get_multimodal_embeddings)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
@@ -366,6 +366,7 @@ class Mistral3VLM(PreTrainedModel):
             )
 
         config = model_config.pretrained_config
+        self._supports_sdpa = True
         super().__init__(config)
 
         vision_feature_layer = getattr(config, "vision_feature_layer", -1)
