@@ -142,12 +142,10 @@ class CUDAGraphRunner:
                     }) for _ in range(max_total_tokens)
             ]
 
-    def get_graph_key(
+    def _get_seq_len_mode(
             self,
             batch: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
-        batch_size = batch.batch_size
+            new_tensors_device: Optional[SampleStateTensors] = None):
         if self.sparse_config is not None and self.sparse_config.needs_separate_short_long_cuda_graphs(
         ):
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
@@ -189,6 +187,17 @@ class CUDAGraphRunner:
             # For non-sparse attention or sparse attention that does not need separate short and long CUDA graphs,
             # use the default sequence length mode.
             short_seq_len_mode = False
+        return short_seq_len_mode
+
+    def get_graph_key(
+            self,
+            batch: ScheduledRequests,
+            new_tensors_device: Optional[SampleStateTensors] = None,
+            spec_resource_manager: Optional[BaseResourceManager] = None):
+        batch_size = batch.batch_size
+
+        # Get the sequence length mode.
+        short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):

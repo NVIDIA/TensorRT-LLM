@@ -230,10 +230,10 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """
-        Whether to capture separate CUDA graphs for short and long sequences.
-        If True, the CUDA graphs will be captured for short and long sequences separately.
-        If False, the CUDA graphs will be captured for all sequences together.
-        Use seq_len_threshold to determine the threshold for separating short and long sequences.
+        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
+        If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
+        If False, capture a single unified CUDA graph for all sequences regardless of length.
+        The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
         """
         return False
 
