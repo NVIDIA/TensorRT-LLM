@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-test_slurm_jenkins_agent', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -677,7 +677,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 }
 
                 dockerArgs = "${dockerArgs} " +
-                    "--rm" +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
                     "--entrypoint=\"\" " +
