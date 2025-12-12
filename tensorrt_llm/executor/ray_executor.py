@@ -154,6 +154,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             ray.get(self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
             raise RuntimeError("RayGPUWorker died during initialization") from e
+        port = self.call_all_ray_workers("setup_tcp_store",
+                                         leader_only=True,
+                                         async_call=False)[0]
+        self.call_all_ray_workers("setup_distributed_env_and_worker",
+                                  leader_only=False,
+                                  async_call=False,
+                                  port=port)
 
     async def init_workers_async(self):
         self.create_workers(RayGPUWorker, self.worker_kwargs)
@@ -161,6 +168,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             await asyncio.gather(*self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
             raise RuntimeError("RayGPUWorker died during initialization") from e
+        port = (await asyncio.gather(*self.call_all_ray_workers(
+            "setup_tcp_store", leader_only=True, async_call=True)))[0]
+        await asyncio.gather(
+            *self.call_all_ray_workers("setup_distributed_env_and_worker",
+                                       leader_only=False,
+                                       async_call=True,
+                                       port=port))
 
     @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,
