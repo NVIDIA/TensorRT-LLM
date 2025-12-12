@@ -16,6 +16,7 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+from tensorrt_llm._torch.hostfunc import hostfunc
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -790,11 +791,33 @@ class PPCommNCCL:
             self.mapping.world_size,
             self.mapping.rank,
         )
+        self.tensor_ready_event = torch.cuda.Event()
+        self.send_stream = torch.cuda.Stream()
+        self.tensor_cache = {}
+
+    def _cache_tensor(self, tensor: torch.Tensor):
+        cache_id = id(tensor)
+        self.tensor_cache[cache_id] = tensor
+
+    @hostfunc
+    def _release_tensor(self, tensor: torch.Tensor):
+        cache_id = id(tensor)
+        del self.tensor_cache[cache_id]
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        self.nccl_comm.send(tensor, dest)
+
+        if torch.cuda.is_current_stream_capturing():
+            self.nccl_comm.send(tensor, dest)
+            return
+
+        self.tensor_ready_event.record()
+        with torch.cuda.stream(self.send_stream):
+            self.tensor_ready_event.wait()
+            self._cache_tensor(tensor)
+            self.nccl_comm.send(tensor, dest)
+            self._release_tensor(tensor)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
