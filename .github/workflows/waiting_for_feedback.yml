@@ -20,7 +20,15 @@ jobs:
         with:
           script: |
             const commenter = context.payload.comment.user.login;
+            const commenterType = context.payload.comment.user.type;
             const label = 'waiting for feedback';
+
+            // Ignore bots and CI accounts
+            const ignoredAccounts = ['tensorrt-cicd'];
+            if (commenterType === 'Bot' || ignoredAccounts.includes(commenter)) {
+              console.log(`Ignoring comment from ${commenter} (type: ${commenterType}). Skipping.`);
+              return;
+            }
 
             // Handle both issue_comment and pull_request_review_comment events
             // context.issue.number is only available for issue_comment events
