@@ -32,7 +32,7 @@ from .test_llm import (
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
 from .test_llm_kv_cache_events import create_llm
-from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
+from utils.util import (skip_gpu_memory_less_than, skip_single_gpu, skip_ray,
                         unittest_name_func, force_ampere)
 # isort: on
 
