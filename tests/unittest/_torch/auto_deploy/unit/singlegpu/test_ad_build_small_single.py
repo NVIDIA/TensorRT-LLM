@@ -207,9 +207,13 @@ def test_build_ad(model_hub_id: str, llm_extra_args: dict):
     ):
         pytest.skip(
             "Mixtral-8x7B-Instruct-v0.1 is giving an error on upgrading transformers version to 4.57.1"
+            "https://nvbugspro.nvidia.com/bug/5732942"
         )
     if model_hub_id == "Qwen/Qwen3-30B-A3B" and llm_extra_args.get("mode") != "transformers":
-        pytest.skip("Qwen3-30B-A3B is giving an error on upgrading transformers version to 4.57.1")
+        pytest.skip(
+            "Qwen3-30B-A3B is giving an error on upgrading transformers version to 4.57.1"
+            "https://nvbugspro.nvidia.com/bug/5732942"
+        )
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
