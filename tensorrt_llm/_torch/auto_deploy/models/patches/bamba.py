@@ -44,11 +44,22 @@ def _bamba_mixer_torch_forward(
     if use_caching:
         # Prepare dense metadata for cached flattened op
         seq_len_t = torch.full((batch_size,), seq_len, device=input_states.device, dtype=torch.int)
-        seq_start_t = torch.arange(
+        cu_seqlen_t = torch.arange(
             0, batch_size * seq_len, seq_len, device=input_states.device, dtype=torch.int
         )
         slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
         use_initial_states_t = torch.zeros(batch_size, device=input_states.device, dtype=torch.bool)
+        # batch_info: [num_prefill, num_prefill_tokens, num_decode]
+        # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0]
+        # For generate phase (seq_len == 1): [0, 0, batch_size]
+        if seq_len == 1:
+            batch_info_t = torch.tensor(
+                [0, 0, batch_size], device=input_states.device, dtype=torch.int32
+            )
+        else:
+            batch_info_t = torch.tensor(
+                [batch_size, batch_size * seq_len, 0], device=input_states.device, dtype=torch.int32
+            )
     if use_caching:
         hidden_states_B_C = self.act(
             torch.ops.auto_deploy.torch_cached_causal_conv1d(
@@ -56,9 +67,10 @@ def _bamba_mixer_torch_forward(
                 hidden_states_B_C,
                 self.conv1d.weight,
                 self.conv1d.bias,
-                # METADATA
+                # STANDARD METADATA
+                batch_info_t,
                 seq_len_t,
-                seq_start_t,
+                cu_seqlen_t,
                 slot_idx_t,
                 use_initial_states_t,
                 # CACHES
@@ -110,9 +122,10 @@ def _bamba_mixer_torch_forward(
             D=self.D,
             dt=dt,
             dt_bias=self.dt_bias,
-            # METADATA
+            # STANDARD METADATA
+            batch_info=batch_info_t,
             seq_len=seq_len_t,
-            seq_start=seq_start_t,
+            cu_seqlen=cu_seqlen_t,
             slot_idx=slot_idx_t,
             use_initial_states=use_initial_states_t,
             # CACHES
