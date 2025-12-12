@@ -113,7 +113,8 @@ MODEL_PATH_DICT = {
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
     "starcoder2_3b": "starcoder2-3b",
-    "starcoder_15b": "starcoder2-15b",
+    "starcoder2_7b": "starcoder2-7b",
+    "starcoder2_15b": "starcoder2-15b",
     "t5": "t5-small",  # not supported for trtllm-bench build config
     "flan_t5_base":
     "flan-t5-small",  # not supported for trtllm-bench build config
