@@ -41,19 +41,22 @@ class Recipe(BaseModel):
 
     def load_config(self) -> Dict[str, Any]:
         """Load and return the YAML config at config_path."""
+        config_relative_path = Path(self.config_path)
+        # Ensure config path is within the repo root
+        if config_relative_path.is_absolute() or ".." in config_relative_path.parts:
+            raise ValueError(f"Invalid config path: {self.config_path}")
         full_path = REPO_ROOT / self.config_path
         if not full_path.exists():
             raise FileNotFoundError(f"Config not found: {full_path}")
-        with open(full_path) as f:
-            data = yaml.safe_load(f)
-        return data if data is not None else {}
+        with open(full_path, encoding="utf-8") as f:
+            return yaml.safe_load(f)
 
 
 class RecipeList(RootModel[List[Recipe]]):
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "RecipeList":
         """Load and validate recipe list from YAML file."""
-        with open(yaml_path) as f:
+        with open(yaml_path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return cls(data)
 

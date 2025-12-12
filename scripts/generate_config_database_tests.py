@@ -158,9 +158,7 @@ def generate_condition_entry(
     return {"condition": condition, "tests": tests}
 
 
-def generate_tests(
-    test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR
-) -> dict:
+def generate_tests(test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR):
     test_list_path.parent.mkdir(parents=True, exist_ok=True)
 
     all_recipes = RecipeList.from_yaml(DATABASE_LIST_PATH)
@@ -181,7 +179,7 @@ def generate_tests(
             aggr_config, default_flow_style=False, sort_keys=False, width=120
         )
 
-        with open(config_path, "w") as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_content)
         print(f"Generated {config_path}")
 
@@ -213,7 +211,7 @@ def generate_tests(
 # ===============================================================================
 
 """
-    with open(test_list_path, "w") as f:
+    with open(test_list_path, "w", encoding="utf-8") as f:
         f.write(header)
         yaml.dump(test_list, f, default_flow_style=False, sort_keys=False, width=120)
     print(f"Generated {test_list_path}")

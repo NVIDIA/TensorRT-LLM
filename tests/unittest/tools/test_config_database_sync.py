@@ -86,6 +86,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_config_dir = Path(tmp_dir) / "configs"
             tmp_test_list_path = Path(tmp_dir) / "test_list.yml"
+            tmp_config_dir.mkdir(parents=True, exist_ok=True)
 
             generate_tests(tmp_test_list_path, tmp_config_dir)
 

@@ -63,6 +63,7 @@ MINIMIZE_METRICS = [
 # scenario, allowing the underlying config to change while still comparing against baselines
 # for the same scenario.
 SCENARIO_MATCH_FIELDS = [
+    "s_runtime",
     "s_model_name",
     "s_gpu_type",
     "l_isl",
