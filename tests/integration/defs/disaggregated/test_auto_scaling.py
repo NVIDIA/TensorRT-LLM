@@ -6,6 +6,7 @@ import sys
 import tempfile
 import traceback
 import uuid
+from functools import wraps
 
 import openai
 import pytest
@@ -31,6 +32,7 @@ def get_free_unused_port():
     max_attempts = 100
     for _ in range(max_attempts):
         port = get_free_port()
+        assert port > 0, f"get_free_port returned {port}"
         if port not in USED_PORTS:
             USED_PORTS.add(port)
             return port
@@ -212,37 +214,52 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
     return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
 
 
+# wait until decorated function returns true, otherwise sleep for interval seconds and try again
+# if timeout seconds is reached, then raise TimeoutError
+def periodic_check(timeout=300, interval=3):
+
+    def decorator(func):
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            elapsed_time = 0
+            while elapsed_time < timeout:
+                elapsed_time += interval
+                await asyncio.sleep(interval)
+                try:
+                    if ret := await func(*args, **kwargs):
+                        return ret
+                except Exception as e:
+                    print(
+                        f"Failed to check {func.__name__} after {elapsed_time} seconds: {e}"
+                    )
+            raise TimeoutError(
+                f"Timeout waiting for {func.__name__} to complete after {timeout} seconds"
+            )
+
+        return wrapper
+
+    return decorator
+
+
+@periodic_check(timeout=300, interval=3)
 async def wait_for_disagg_server_ready(port):
-    while True:
-        await asyncio.sleep(3)
-        logger.info(f"Waiting for disagg server to be ready")
-        try:
-            info_resp = requests.get(f"http://localhost:{port}/cluster_info")
-            if info_resp.status_code == 200:
-                info = info_resp.json()
-                if info["is_ready"]:
-                    break
-                logger.info(
-                    f"Waiting for disagg server to be ready: {info_resp.json()}"
-                )
-            else:
-                logger.info(
-                    f"Failed to get cluster info: {info_resp.status_code}")
-            await asyncio.sleep(3)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get cluster info: {e}")
+    info_resp = requests.get(f"http://localhost:{port}/cluster_info")
+    logger.info(
+        f"Waiting for disagg server {port} to be ready: {info_resp.json()}")
+    if info_resp.status_code == 200:
+        info = info_resp.json()
+        return info["is_ready"]
+    else:
+        logger.info(f"Failed to get cluster info: {info_resp.status_code}")
+    return False
 
 
+@periodic_check(timeout=300, interval=3)
 async def wait_for_worker_ready(port):
-    while True:
-        await asyncio.sleep(3)
-        logger.info(f"Waiting for worker {port} to be ready")
-        try:
-            info_resp = requests.get(f"http://localhost:{port}/health")
-            if info_resp.status_code == 200:
-                break
-        except requests.exceptions.RequestException as e:
-            logger.info(f"Failed to get worker info: {e}")
+    logger.info(f"Waiting for worker {port} to be ready")
+    info_resp = requests.get(f"http://localhost:{port}/health")
+    return info_resp.status_code == 200
 
 
 def verify_cluster_info(ready,
@@ -302,6 +319,17 @@ def terminate(*args, show_log_lines=30, release_port=True):
                 print(f"Process is None on port {arg.port}")
 
 
+# When we kill a server, the port is not released immediately
+# If the port is not released, the bind will fail with OSError: [Errno 98] Address already in use
+@periodic_check(timeout=300, interval=3)
+async def wait_for_port_released(port):
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", port))
+        print(f"Port {port} is released")
+        return True
+
+
 def request_completion(model_name, prompt, port):
     client = openai.OpenAI(api_key="tensorrt_llm",
                            base_url=f"http://localhost:{port}/v1")
@@ -314,7 +342,7 @@ def request_completion(model_name, prompt, port):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 @pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 async def test_service_discovery(model_name, disagg_server_config,
                                  worker_config, router, service_discovery,
@@ -344,7 +372,7 @@ async def test_service_discovery(model_name, disagg_server_config,
 )  # use only round_robin to reduce the test time, this router type doesn't matter for this test
 @pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 async def test_minimal_instances(model_name, disagg_server_config,
                                  worker_config, router, service_discovery,
                                  disagg_port, work_dir):
@@ -394,7 +422,7 @@ async def test_minimal_instances(model_name, disagg_server_config,
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
 @pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 async def test_worker_restart(model_name, disagg_server_config, worker_config,
                               router, service_discovery, disagg_port, work_dir):
     ctx_worker1 = None
@@ -422,7 +450,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                       port=disagg_port)
         print(response)
         # kill gen1, the request should fail
-        terminate(gen_worker1)
+        terminate(gen_worker1, release_port=False)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 1, 0, port=disagg_port)
         with pytest.raises(Exception):
@@ -448,7 +476,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         assert len(response.choices[0].text) >= 1
 
         # kill ctx1, the request should fail
-        terminate(ctx_worker1)
+        terminate(ctx_worker1, release_port=False)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(False, 0, 1, port=disagg_port)
         with pytest.raises(Exception):
@@ -468,10 +496,16 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         assert len(response.choices[0].text) >= 1
 
         # start ctx1 and gen1 again, we have 2 ctxs and 2 gens now
-        # Note: Do NOT start them with the same ports as the previous ones, the ports may be not released immediately after terminate,
-        # causing a port conflict and test timeout.
-        ctx_worker1 = run_ctx_worker(model_name, worker_config, work_dir)
-        gen_worker1 = run_gen_worker(model_name, worker_config, work_dir)
+        await wait_for_port_released(ctx_worker1.port)
+        await wait_for_port_released(gen_worker1.port)
+        ctx_worker1 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     port=ctx_worker1.port)
+        gen_worker1 = run_gen_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     port=gen_worker1.port)
         await wait_for_worker_ready(ctx_worker1.port)
         await wait_for_worker_ready(gen_worker1.port)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
@@ -493,7 +527,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 @pytest.mark.parametrize("router", ["round_robin"], indirect=True)
 @pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 async def test_disagg_server_restart(model_name, disagg_server_config,
                                      worker_config, router, service_discovery,
                                      disagg_port, work_dir):
@@ -516,9 +550,15 @@ async def test_disagg_server_restart(model_name, disagg_server_config,
 
         # kill disagg server, the request should fail
         terminate(disagg_server)
-        await asyncio.sleep(CHECK_STATUS_INTERVAL)
-        with pytest.raises(Exception):
-            verify_cluster_info(False, 1, 1, expected_code=500)
+        # wait for the port to be released, so we can rebind the new process to the same port
+        await wait_for_port_released(disagg_port)
+
+        with pytest.raises(requests.exceptions.RequestException):
+            verify_cluster_info(False,
+                                1,
+                                1,
+                                port=disagg_port,
+                                expected_code=500)
 
         # restart disagg server, the request should succeed
         disagg_server = run_disagg_server(disagg_server_config, work_dir,
