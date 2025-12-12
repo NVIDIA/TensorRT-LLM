@@ -635,29 +635,38 @@ def disaggregated(
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
-    metadata_server_cfg = parse_metadata_server_config_file(
-        metadata_server_config_file)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((disagg_cfg.hostname, disagg_cfg.port))
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
+            )
 
-    server = OpenAIDisaggServer(config=disagg_cfg,
-                                req_timeout_secs=request_timeout,
-                                server_start_timeout_secs=server_start_timeout,
-                                metadata_server_cfg=metadata_server_cfg,
-                                metrics_interval_secs=metrics_log_interval)
+        metadata_server_cfg = parse_metadata_server_config_file(
+            metadata_server_config_file)
 
-    # Disable GC by default
-    #   When concurrency is high, the number of Python objects increases, so
-    #   GC runs frequently and takes a long time to process. In this case,
-    #   requests are not immediately forwarded to CTX workers and GEN workers,
-    #   causing them to run with small batch sizes. Disabling GC can mitigate
-    #   this problem.
-    #   By testing this feature, we didn't observe significant RSS or VMS
-    #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-    #   increases by fewer than 1,000 after every 200,000 requests, while the
-    #   maximum value of `count0` exceeded 3,000,000 during the test.
-    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
-        gc.disable()
+        server = OpenAIDisaggServer(
+            config=disagg_cfg,
+            req_timeout_secs=request_timeout,
+            server_start_timeout_secs=server_start_timeout,
+            metadata_server_cfg=metadata_server_cfg,
+            metrics_interval_secs=metrics_log_interval)
 
-    asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
+        # Disable GC by default
+        #   When concurrency is high, the number of Python objects increases, so
+        #   GC runs frequently and takes a long time to process. In this case,
+        #   requests are not immediately forwarded to CTX workers and GEN workers,
+        #   causing them to run with small batch sizes. Disabling GC can mitigate
+        #   this problem.
+        #   By testing this feature, we didn't observe significant RSS or VMS
+        #   increment, and observed that `count0` (obtained by `gc.get_count()`)
+        #   increases by fewer than 1,000 after every 200,000 requests, while the
+        #   maximum value of `count0` exceeded 3,000,000 during the test.
+        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+            gc.disable()
+
+        asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 
 def set_cuda_device():
