@@ -319,6 +319,12 @@ class HFReplaceCachedAttn(InsertCachedAttention):
             if hasattr(submod, "_node_ref")
         )
         if needs_vlm_masks:
+            # Get model_type from config (standard HF attribute)
+            model_type = getattr(mod.config, "model_type", None)
+            # For VLMs with nested configs (e.g., Gemma3), check text_config
+            if model_type is None and hasattr(mod.config, "text_config"):
+                model_type = getattr(mod.config.text_config, "model_type", None)
+
             # Get sliding_window from config (check main config and sub-configs)
             sliding_window = getattr(mod.config, "sliding_window", None)
             if sliding_window is None:
@@ -329,7 +335,7 @@ class HFReplaceCachedAttn(InsertCachedAttention):
                         if sliding_window is not None:
                             break
             mod._gm._vlm_mask_config = {
-                "model_type": factory.get_model_type(),
+                "model_type": model_type,
                 "sliding_window": sliding_window,
             }
 

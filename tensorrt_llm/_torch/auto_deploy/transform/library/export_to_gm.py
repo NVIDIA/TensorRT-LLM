@@ -20,6 +20,26 @@ from ..interface import (
     TransformRegistry,
 )
 
+_DROP_GM_KWARGS = {
+    # HF often passes these, but we don't want them to participate in torch.export in_spec matching.
+    "attention_mask",
+    "output_attentions",
+    "output_hidden_states",
+    "return_dict",
+}
+
+
+def _ad_sanitize_gm_kwargs(mod: nn.Module, args, kwargs: Dict[str, Any]) -> None:
+    """Sanitize kwargs before calling an exported GraphModule.
+
+    Exported GraphModules created via torch.export attach an input-constraint pre-hook that
+    enforces an exact match between runtime kwargs and the exported input spec. Some HF call sites
+    pass extra kwargs that we do not want to treat as GraphModule inputs.
+    """
+    # Drop known HF-only kwargs that may be passed at runtime.
+    for k in _DROP_GM_KWARGS:
+        kwargs.pop(k, None)
+
 
 class ExportToGMConfig(TransformConfig):
     """Configuration for the export to graph module transform."""
@@ -162,6 +182,11 @@ class ExportToGM(BaseTransform):
                     patch_list=self.config.patch_list,
                 )
 
+            # We intentionally do not export `attention_mask` as a GraphModule input.
+            # Some HF call sites will still pass `attention_mask` at runtime; we will
+            # handle that separately during inference.
+            captured_kwargs.pop("attention_mask", None)
+
             # construct dynamic shapes based on the captured kwargs and the dynamic shape lookup
             dynamic_shapes = {
                 k: e_info.dynamic_shape_lookup[k] if isinstance(v, torch.Tensor) else None
@@ -184,6 +209,10 @@ class ExportToGM(BaseTransform):
                     strict=self.config.strict,
                     patch_list=self.config.patch_list,
                 )
+
+            # Ensure runtime calls from HF into this exported GraphModule do not fail due to
+            # torch.export's strict input spec checks (e.g., HF passing attention_mask).
+            sub_gm.register_forward_pre_hook(_ad_sanitize_gm_kwargs, prepend=True, with_kwargs=True)
 
             # post process the sub graph module
             e_info.post_process(sub_mod, sub_gm)

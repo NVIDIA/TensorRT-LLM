@@ -1,45 +1,65 @@
-"""Export patch for Gemma 3 VLM.
+"""A patch for Gemma3Model to pass token_type_ids to Gemma3TextModel and make mask functions export-compatible."""
 
-This patch replaces the mask generation logic in Gemma3TextModel with a custom op
-that can be properly traced and optimized by the AutoDeploy backend.
-
-Assumption: Export is done for prefill configuration where attention_mask input is None.
-The custom op generates the appropriate masks inside the graph.
-"""
+from typing import List, Optional, Union
 
 import torch
+import torch.nn as nn
 
-from transformers.models.gemma3.modeling_gemma3 import Gemma3Model, Gemma3TextModel
+from transformers import masking_utils
+from transformers.cache_utils import Cache
+from transformers.models.gemma3 import modeling_gemma3
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3Model,
+    Gemma3ModelOutputWithPast,
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+    token_type_ids_mask_function,
+)
 
-# Import to ensure the custom op is registered
-from ...custom_ops import custom_attn_mask_gen  # noqa: F401
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 
+def _noop_create_causal_mask(**kwargs):
+    """Return None to skip vmap-based mask creation during export."""
+    return None
+
+
+def _noop_create_sliding_window_causal_mask(**kwargs):
+    """Return None to skip vmap-based mask creation during export."""
+    return None
+
+
 def _gemma3_model_forward(
-    self: Gemma3Model,
+    self,
     input_ids: torch.LongTensor = None,
     pixel_values: torch.FloatTensor = None,
-    attention_mask: torch.Tensor = None,
-    position_ids: torch.LongTensor = None,
-    past_key_values=None,
-    token_type_ids: torch.LongTensor = None,
-    cache_position: torch.LongTensor = None,
-    inputs_embeds: torch.FloatTensor = None,
-    use_cache: bool = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
+    token_type_ids: Optional[torch.LongTensor] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
     **lm_kwargs,
-):
-    """Patched forward for Gemma3Model that passes attention_mask=None to language_model.
-
-    This ensures the Gemma3TextModel (language_model) uses the custom op for mask generation
-    instead of receiving a pre-computed mask dict.
-    """
-    from transformers.models.gemma3.modeling_gemma3 import Gemma3ModelOutputWithPast
-
+) -> Union[tuple, Gemma3ModelOutputWithPast]:
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-    # Replace image id with PAD if the image token is OOV, to avoid index-errors
+    output_attentions = (
+        output_attentions if output_attentions is not None else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    # Replace image id with PAD if the image token if OOV, to avoid index-errors
     if input_ids is not None and self.config.image_token_id >= self.vocab_size:
         special_image_mask = input_ids == self.config.image_token_id
         llm_input_ids = input_ids.clone()
@@ -66,139 +86,99 @@ def _gemma3_model_forward(
         )
         inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
-    # PATCH: Skip mask creation here - pass attention_mask=None and token_type_ids
-    # The Gemma3TextModel patch will use the custom op to generate masks
-    # Don't pass **lm_kwargs - those are HF training/inference args we don't need
+    # It may already have been prepared by e.g. `generate`
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # Prepare mask arguments
+        mask_kwargs = {
+            "config": self.config.get_text_config(),
+            "input_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+        if token_type_ids is not None and inputs_embeds.shape[1] != 1:
+            # We need to pass an additional mask function to account for token type ids, and it needs to be an `or`
+
+            # First find where a new image block starts: 1 if image and previous not image
+            # The images cannot attend to future images, but can attend to all prev images and to itself bidirectionally
+            is_image = (token_type_ids == 1).to(cache_position.device)
+            new_image_start = is_image & ~nn.functional.pad(is_image, (1, 0), value=0)[:, :-1]
+            image_group_ids = torch.cumsum(new_image_start.int(), dim=1) - 1
+            image_group_ids = torch.where(
+                is_image,
+                image_group_ids,
+                torch.full_like(token_type_ids, -1, device=is_image.device),
+            )
+            mask_kwargs["or_mask_function"] = token_type_ids_mask_function(
+                token_type_ids.to(cache_position.device),
+                image_group_ids,
+                self.config.mm_tokens_per_image,
+            )
+
+        # Create the masks
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        }
+
+    # Pass token_type_ids to language_model
     outputs = self.language_model(
-        attention_mask=None,  # Let TextModel generate via custom op
+        attention_mask=causal_mask_mapping,
         position_ids=position_ids,
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
         use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
         cache_position=cache_position,
-        token_type_ids=token_type_ids,  # Pass through for custom op
+        token_type_ids=token_type_ids,
+        **lm_kwargs,
     )
 
     return Gemma3ModelOutputWithPast(
         last_hidden_state=outputs.last_hidden_state,
-        past_key_values=outputs.past_key_values,
+        past_key_values=outputs.past_key_values if use_cache else None,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         image_hidden_states=image_features if pixel_values is not None else None,
     )
 
 
-def _gemma3_text_model_forward(
-    self: Gemma3TextModel,
-    input_ids: torch.LongTensor = None,
-    attention_mask: torch.Tensor = None,  # Expected to be None during export
-    position_ids: torch.LongTensor = None,
-    past_key_values=None,
-    inputs_embeds: torch.FloatTensor = None,
-    use_cache: bool = None,
-    cache_position: torch.LongTensor = None,
-    token_type_ids: torch.Tensor = None,
-    **kwargs,
-):
-    """Patched forward method for Gemma3TextModel using custom mask op.
-
-    This patched forward:
-    1. Ignores the attention_mask input (expected to be None for prefill export)
-    2. Uses a custom op for mask generation (traceable)
-    3. Directly passes the correct mask/position_embeddings to each layer
-    """
-    # Handle inputs_embeds
-    if inputs_embeds is None and input_ids is not None:
-        inputs_embeds = self.embed_tokens(input_ids)
-
-    # Ensure position_ids are set
-    if position_ids is None:
-        position_ids = cache_position.unsqueeze(0)
-
-    assert attention_mask is None, (
-        "AD Module export should not be given attention_mask as input. "
-        "It will be generated by the custom op."
-    )
-
-    # Get batch size from inputs_embeds
-    batch_size = inputs_embeds.shape[0]
-
-    # Generate masks using custom op
-    full_mask = torch.ops.autodeploy.custom_attn_mask_gen_op(
-        token_type_ids,
-        cache_position,
-        "full_attention",
-        self.config.sliding_window,
-        inputs_embeds.dtype,
-        batch_size,
-    )
-    sliding_mask = torch.ops.autodeploy.custom_attn_mask_gen_op(
-        token_type_ids,
-        cache_position,
-        "sliding_attention",
-        self.config.sliding_window,
-        inputs_embeds.dtype,
-        batch_size,
-    )
-
-    # Compute position embeddings
-    hidden_states = inputs_embeds
-
-    # Check if rotary_emb returns dict or tuple (version dependent)
-    rotary_output = self.rotary_emb(hidden_states, position_ids)
-
-    # Handle different rotary_emb return types
-    if isinstance(rotary_output, dict):
-        # Newer versions return dict with 'global' and 'local' keys
-        pos_emb_global = rotary_output.get("global", rotary_output.get("full_attention"))
-        pos_emb_local = rotary_output.get("local", rotary_output.get("sliding_attention"))
-    else:
-        # Older versions return tuple (cos, sin) - use same for both
-        pos_emb_global = rotary_output
-        pos_emb_local = rotary_output
-
-    # Forward through decoder layers
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-        # Select mask based on layer's attention type
-        layer_type = getattr(decoder_layer, "attention_type", "full_attention")
-        layer_mask = full_mask if layer_type == "full_attention" else sliding_mask
-
-        layer_outputs = decoder_layer(
-            hidden_states,
-            attention_mask=layer_mask,
-            position_embeddings_global=pos_emb_global,
-            position_embeddings_local=pos_emb_local,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            **kwargs,
-        )
-        # Decoder layer returns tuple (hidden_states, ...) - extract first element
-        hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
-
-    hidden_states = self.norm(hidden_states)
-
-    # Return in the expected format
-    from transformers.modeling_outputs import BaseModelOutputWithPast
-
-    return BaseModelOutputWithPast(last_hidden_state=hidden_states)
-
-
 @ExportPatchRegistry.register("hf_gemma3")
-class Gemma3Patch(BaseExportPatch):
-    """Patch for Gemma3Model and Gemma3TextModel for export."""
+class Gemma3ModelPatch(BaseExportPatch):
+    """Patch for Gemma3Model to pass token_type_ids and make mask functions export-compatible."""
 
     def _apply_patch(self):
-        """Apply the Gemma3 patches."""
-        # Patch Gemma3Model to pass attention_mask=None to language_model
+        """Apply the Gemma3Model patch."""
+        # Patch forward to pass token_type_ids to language_model
         self.original_values["Gemma3Model.forward"] = Gemma3Model.forward
         Gemma3Model.forward = _gemma3_model_forward
 
-        # Patch Gemma3TextModel to use custom mask op
-        self.original_values["Gemma3TextModel.forward"] = Gemma3TextModel.forward
-        Gemma3TextModel.forward = _gemma3_text_model_forward
+        # Patch mask functions to return None (avoids vmap incompatibility with torch.export)
+        # We need to patch both masking_utils AND the module-level references in modeling_gemma3
+        self.original_values["mu.create_causal_mask"] = masking_utils.create_causal_mask
+        self.original_values["mu.create_sliding_window"] = (
+            masking_utils.create_sliding_window_causal_mask
+        )
+        self.original_values["mg.create_causal_mask"] = modeling_gemma3.create_causal_mask
+        self.original_values["mg.create_sliding_window"] = (
+            modeling_gemma3.create_sliding_window_causal_mask
+        )
+
+        masking_utils.create_causal_mask = _noop_create_causal_mask
+        masking_utils.create_sliding_window_causal_mask = _noop_create_sliding_window_causal_mask
+        modeling_gemma3.create_causal_mask = _noop_create_causal_mask
+        modeling_gemma3.create_sliding_window_causal_mask = _noop_create_sliding_window_causal_mask
 
     def _revert_patch(self):
-        """Revert the Gemma3 patches."""
+        """Revert the Gemma3Model patch."""
         Gemma3Model.forward = self.original_values["Gemma3Model.forward"]
-        Gemma3TextModel.forward = self.original_values["Gemma3TextModel.forward"]
+        masking_utils.create_causal_mask = self.original_values["mu.create_causal_mask"]
+        masking_utils.create_sliding_window_causal_mask = self.original_values[
+            "mu.create_sliding_window"
+        ]
+        modeling_gemma3.create_causal_mask = self.original_values["mg.create_causal_mask"]
+        modeling_gemma3.create_sliding_window_causal_mask = self.original_values[
+            "mg.create_sliding_window"
+        ]
