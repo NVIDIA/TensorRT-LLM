@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/helixKernels.h"
 
@@ -29,8 +30,8 @@ using namespace tensorrt_llm::common;
 
 namespace cg = cooperative_groups;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 static constexpr int WARP_SIZE = 32;
@@ -240,4 +241,5 @@ INSTANTIATE_POST_PROC(__half);
 INSTANTIATE_POST_PROC(__nv_bfloat16);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -211,6 +211,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      ray_placement_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
+        default: null
+        status: prototype
       enable_sleep:
         annotation: bool
         default: False

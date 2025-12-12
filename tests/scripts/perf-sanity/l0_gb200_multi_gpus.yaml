@@ -32,7 +32,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_1k1k"
@@ -63,7 +63,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_1k1k"
@@ -94,7 +94,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   # 8k1k configs
@@ -105,7 +105,7 @@ server_configs:
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 512
-    max_num_tokens: 10304
+    max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: true
     attention_dp_config:
@@ -130,7 +130,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_8k1k"
@@ -140,7 +140,7 @@ server_configs:
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 32
-    max_num_tokens: 10304
+    max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
@@ -161,7 +161,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_8k1k"
@@ -171,7 +171,7 @@ server_configs:
     moe_expert_parallel_size: 1
     pipeline_parallel_size: 1
     max_batch_size: 4
-    max_num_tokens: 10304
+    max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
@@ -192,7 +192,7 @@ server_configs:
         iterations: 10
         isl: 8192
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   # 1k8k configs
@@ -203,7 +203,7 @@ server_configs:
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 512
-    max_num_tokens: 8192
+    max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: true
     attention_dp_config:
@@ -228,7 +228,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tep4_mtp3_1k8k"
@@ -238,7 +238,7 @@ server_configs:
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 32
-    max_num_tokens: 8192
+    max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
@@ -259,7 +259,7 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tp4_mtp3_1k8k"
@@ -269,7 +269,7 @@ server_configs:
     moe_expert_parallel_size: 1
     pipeline_parallel_size: 1
     max_batch_size: 4
-    max_num_tokens: 8192
+    max_num_tokens: 12288
     attn_backend: "TRTLLM"
     enable_attention_dp: false
     moe_config:
@@ -290,5 +290,5 @@ server_configs:
         iterations: 10
         isl: 1024
         osl: 8192
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"

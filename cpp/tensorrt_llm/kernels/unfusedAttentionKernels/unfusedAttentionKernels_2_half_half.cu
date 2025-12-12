@@ -15,10 +15,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "unfusedAttentionKernels_2_template.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -26,4 +27,5 @@ INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(half, half, KVBlockArray);
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(half, half, KVLinearBuffer);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

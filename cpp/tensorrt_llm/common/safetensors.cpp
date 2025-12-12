@@ -17,6 +17,7 @@
 #include "safetensors.h"
 #include "nlohmann/json.hpp"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <cstdint>
 #include <fstream>
@@ -25,7 +26,9 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::common::safetensors
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::safetensors
 {
 using nvinfer1::DataType;
 
@@ -164,4 +167,6 @@ std::shared_ptr<ISafeTensor> ISafeTensor::open(char const* filename)
 {
     return std::make_shared<SafeTensor>(filename);
 }
-} // namespace tensorrt_llm::common::safetensors
+} // namespace common::safetensors
+
+TRTLLM_NAMESPACE_END

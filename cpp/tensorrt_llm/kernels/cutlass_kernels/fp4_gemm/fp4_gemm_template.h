@@ -39,11 +39,13 @@
 #include "mxfp8_mxfp4_gemm_template_sm100.h"
 #include "nvfp4_nvfp4_gemm_template_sm100.h"
 #include "nvfp4_nvfp4_gemm_template_sm120.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -527,4 +529,5 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSize(
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END
