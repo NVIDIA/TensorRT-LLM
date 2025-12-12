@@ -17,6 +17,7 @@ from PIL import Image
 from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
+
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -592,6 +593,8 @@ class TextModelExportInfo(SubModuleExportInfo):
             "input_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "inputs_embeds": {0: batch_size_dynamic, 1: seq_len_dynamic},
             "position_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            "cache_position": {0: seq_len_dynamic},
+            "token_type_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
         }
 
     @classmethod

@@ -40,6 +40,7 @@ class PlanParams:
     sm_scale: Optional[float] = None
 
     causal: bool = True
+    has_custom_mask: bool = False  # Affects cache key when using VLM custom masks
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -91,6 +92,7 @@ class _FlashInferPlanner:
         kv_page_indices: torch.Tensor,
         kv_last_page_len: torch.Tensor,
         plan_params: PlanParams,
+        custom_mask: Optional[torch.Tensor] = None,
     ) -> Union[
         flashinfer.BatchPrefillWithPagedKVCacheWrapper,
         flashinfer.BatchDecodeWithPagedKVCacheWrapper,
@@ -126,11 +128,15 @@ class _FlashInferPlanner:
             return wrapper
 
         # check for re-planning
-        if plan_params != self.plan_params:
+        # NOTE: When using custom_mask, we always re-plan prefill since the mask changes per batch
+        needs_replan = (plan_params != self.plan_params) or (
+            custom_mask is not None and not plan_params.is_generate
+        )
+        if needs_replan:
             if plan_params.is_generate:
                 _plan_decode(self.decode_wrapper)
             else:
-                # plan prefill
+                # plan prefill with optional custom_mask for VLM support
                 self.prefill_wrapper.plan(
                     qo_indptr,
                     kv_page_indptr,
@@ -140,10 +146,11 @@ class _FlashInferPlanner:
                     plan_params.n_kv_heads,  # KV heads
                     plan_params.head_dim,
                     plan_params.page_size,
-                    causal=plan_params.causal,
+                    causal=plan_params.causal if custom_mask is None else False,
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
+                    custom_mask=custom_mask,  # VLM custom mask (None for standard causal)
                 )
             self.plan_params = plan_params
 
@@ -227,6 +234,10 @@ def flashinfer_mha_with_cache(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    mask_kind: str,  # "full", "sliding", or "none"
+    # VLM CUSTOM MASKS (optional, for Gemma3 etc.)
+    custom_mask_full: Optional[torch.Tensor],
+    custom_mask_sliding: Optional[torch.Tensor],
 ) -> torch.Tensor:
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
@@ -252,16 +263,30 @@ def flashinfer_mha_with_cache(
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
 
+    is_generate = s == 1
+
+    # Determine which custom mask to use (if any)
+    # Custom masks only apply during prefill, not generation
+    if mask_kind == "none" or is_generate:
+        custom_mask = None
+    elif mask_kind == "full" and custom_mask_full is not None:
+        custom_mask = custom_mask_full
+    elif mask_kind == "sliding" and custom_mask_sliding is not None:
+        custom_mask = custom_mask_sliding
+    else:
+        custom_mask = None
+
     pp = PlanParams(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         num_seq=len(qo_indptr) - 1,
-        is_generate=(s == 1),
+        is_generate=is_generate,
         page_size=k_cache.shape[1],
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
         sm_scale=scale,
+        has_custom_mask=(custom_mask is not None),
     )
 
     # Assuming k_scale = v_scale = 1.0
@@ -289,6 +314,7 @@ def flashinfer_mha_with_cache(
         paged_kv_indices,
         paged_kv_last_page_len,
         pp,
+        custom_mask=custom_mask,
     )
 
     y = wrapper.run(
@@ -322,6 +348,10 @@ def flashinfer_mha_with_cache_fake(
     scale: Optional[float],
     k_scale: float,
     v_scale: float,
+    mask_kind: str,
+    # VLM CUSTOM MASKS
+    custom_mask_full: Optional[torch.Tensor],
+    custom_mask_sliding: Optional[torch.Tensor],
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 
@@ -435,8 +465,14 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
+        # Determine mask_kind based on layer's attention type
+        # This is extracted from the source attention node's context (set during transform)
+        # Default to "none" for standard causal attention
+        mask_kind = source_attn_node.kwargs.get("mask_kind", "none")
+
         return [
             scale,  # softmax scale
             1.0,  # k_scale
             1.0,  # v_scale
+            mask_kind,  # VLM mask selection: "full", "sliding", or "none"
         ]

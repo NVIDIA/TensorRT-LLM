@@ -543,6 +543,30 @@ class ADEngine(ModelEngine):
                 for k, v in request.py_multimodal_data.items():
                     extra_args[k].append(v)
 
+        # VLM constraint check: Gemma3 with image tokens requires chunked_prefill and block_reuse disabled
+        # This is because image tokens need bidirectional attention which is incompatible with these features
+        if "token_type_ids" in extra_args:
+            # Check if any token_type_ids tensor has image tokens (value == 1)
+            has_image_tokens = any(
+                (t == 1).any() if isinstance(t, torch.Tensor) else False
+                for t in extra_args["token_type_ids"]
+            )
+            if has_image_tokens:
+                # These checks would ideally be done at config time, but we also check here
+                # since the config might not know whether images will be present at runtime
+                if hasattr(self, "_ad_config"):
+                    if getattr(self._ad_config, "enable_chunked_prefill", False):
+                        raise RuntimeError(
+                            "Gemma3 VLM with image tokens requires enable_chunked_prefill=False. "
+                            "Chunked prefill would break bidirectional attention for image tokens."
+                        )
+                    kv_cache_config = getattr(self._ad_config, "kv_cache_config", None)
+                    if kv_cache_config and getattr(kv_cache_config, "enable_block_reuse", False):
+                        raise RuntimeError(
+                            "Gemma3 VLM with image tokens requires kv_cache_config.enable_block_reuse=False. "
+                            "Block reuse could partially match image tokens, breaking attention correctness."
+                        )
+
         def _use_overlap_scheduler(request) -> bool:
             """Check if we should use overlap scheduler behavior."""
             return (
