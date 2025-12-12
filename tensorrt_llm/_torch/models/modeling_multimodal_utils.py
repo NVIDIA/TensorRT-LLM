@@ -18,7 +18,7 @@
 
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -111,7 +111,10 @@ def _cache_multimodal_embeddings(
 
 
 def get_multimodal_embeddings(
-    encoder_forward_fn,
+    encoder_forward_fn: Callable[
+        [List[MultimodalParams]],
+        Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]],
+    ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[torch.Tensor]:
@@ -313,6 +316,7 @@ def fuse_input_embeds(
     mm_token_indices: Optional[torch.IntTensor] = None,
     extra_embeds: Optional[List[torch.Tensor]] = None,
     **kwargs,
+    # TODO: make unified return type for all models
 ) -> Union[Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor]],
            Tuple[Optional[torch.IntTensor], Optional[torch.FloatTensor],
                  Optional[List[torch.FloatTensor]]]]:

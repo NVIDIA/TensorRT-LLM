@@ -397,10 +397,8 @@ class Qwen2VisionModelBase(nn.Module):
     def load_weights(self, weights: Dict):
         visual_weights = filter_weights("visual", weights)
         converted_weights = dict()
-        if isinstance(self.visual,
-                      Qwen2VisionTransformerPretrainedModel) or isinstance(
-                          self.visual,
-                          Qwen2_5_VisionTransformerPretrainedModel):
+        if isinstance(self.visual, (Qwen2VisionTransformerPretrainedModel,
+                                    Qwen2_5_VisionTransformerPretrainedModel)):
             self.visual.load_state_dict(visual_weights, strict=True)
             return
 
@@ -493,7 +491,6 @@ class Qwen2VisionModelBase(nn.Module):
         embeds = []
         if pixel_values is not None:
             embed = self.visual(pixel_values, grid_thw=image_grid_thw)
-            # print(f"embed: {embed}")
             embeds.append(embed)
 
         if pixel_values_videos is not None:
@@ -772,8 +769,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return window_index, seq_lens
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
-        # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
-        batch_size = 1
+        batch_size = 1  # NOTE: Qwen2/2.5-VL concats all the pixel_values into a single tensor, so batch_size is 1
         prompt_lens = seq_lens
         seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
         request_ids = list(range(1, batch_size + 1))
@@ -787,7 +783,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return attn_metadata
 
     @torch.inference_mode()
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
         window_index, window_seq_lens = self.get_window_index(grid_thw)
         seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
@@ -803,7 +799,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             window_seq_lens, self.window_attn_metadata)
 
         # From this point, pure GPU operation
-        hidden_states = self.patch_embed(hidden_states)
+        hidden_states = self.patch_embed(pixel_values)
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
