@@ -19,6 +19,8 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -310,6 +312,8 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -339,5 +343,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_per_tensor_scale_moe_runner", &torch_ext::fp8_per_tensor_scale_moe_runner);
+    m.impl("fp8_per_tensor_scale_moe_runner", &tensorrt_llm::torch_ext::fp8_per_tensor_scale_moe_runner);
 }

@@ -20,6 +20,7 @@
 #include "nccl.h"
 #include "userbuffers.h"
 #else
+
 using ncclWindow_t = void*;
 #endif
 
@@ -56,7 +57,7 @@ public:
 
     UserBufferAllocator() = default;
 
-    virtual void initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig);
+    virtual void initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig);
     bool isInitialized();
     UBBuffer allocate(size_t bytes);
     void deallocate(void* addr);
@@ -70,7 +71,7 @@ private:
 protected:
     std::vector<UBBuffer> mBuffers;
     bool mIsInitialized;
-    tensorrt_llm::runtime::WorldConfig mWorldConfig;
+    ::tensorrt_llm::runtime::WorldConfig mWorldConfig;
 };
 
 #else

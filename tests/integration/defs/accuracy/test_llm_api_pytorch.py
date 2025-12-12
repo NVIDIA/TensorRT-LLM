@@ -3293,7 +3293,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       True,
                       True,
                       True,
-                      marks=pytest.mark.skip_less_mpi_world_size(8))],
+                      marks=(pytest.mark.skip_less_mpi_world_size(8),
+                             pytest.mark.timeout(7200)))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                   overlap_scheduler, is_cached):
@@ -3410,7 +3411,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
@@ -3418,6 +3419,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler, torch_compile):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
+        "Need to check Ada support"
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,

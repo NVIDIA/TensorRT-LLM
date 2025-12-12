@@ -562,7 +562,7 @@ _ds_v3_lite_tp1_cfg = DisaggregatedTestConfig(
 
 _ds_v3_lite_4_gpus_cfg = DisaggregatedTestConfig(
     test_name="ds_v3_lite",
-    model_root="deepseek-v3-lite/fp8",
+    model_root="DeepSeek-V3-Lite/fp8",
     global_config={
         "backend": "pytorch",
         "free_gpu_memory_fraction": 0.7,
@@ -581,7 +581,7 @@ _ds_v3_lite_4_gpus_cfg = DisaggregatedTestConfig(
 
 _ds_v3_lite_4_gpus_helix_cfg = DisaggregatedTestConfig(
     test_name="ds_v3_lite_helix",
-    model_root="deepseek-v3-lite/bf16",
+    model_root="DeepSeek-V3-Lite/bf16",
     global_config={
         "backend": "pytorch",
         "free_gpu_memory_fraction": 0.25,

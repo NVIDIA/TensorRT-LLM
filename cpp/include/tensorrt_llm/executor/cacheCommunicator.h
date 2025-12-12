@@ -66,6 +66,7 @@ public:
     [[nodiscard]] virtual std::vector<Connection const*> getConnections(CommState const& state) = 0;
 
     [[nodiscard]] virtual CommState const& getCommState() const = 0;
+    [[nodiscard]] virtual bool isRunning() const = 0;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache
