@@ -152,6 +152,10 @@ class OpenAIServer:
         else:
             self.use_harmony = (self.model_config.model_type == "gpt_oss")
 
+        self.tool_call_id_type = "random" # default tool call id type is random
+        if self.model_config.model_type == "kimi_k2":
+            self.tool_call_id_type = "kimi_k2"
+
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
@@ -554,6 +558,7 @@ class OpenAIServer:
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
+            postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
