@@ -496,8 +496,11 @@ class MultimodalDataTracker:
 
         return _retrieve(self._data), _retrieve(self._embeddings)
 
-    def add_data(self, media_type: str, data: Union[Coroutine, Any], *,
-                 is_embedding: bool):
+    def add_data(self,
+                 media_type: str,
+                 data: Union[Coroutine, Any],
+                 *,
+                 is_embedding: bool = False):
         current_count = len(self._data[media_type]) + len(
             self._embeddings[media_type]) + 1
         placeholder = retrieve_multimodal_placeholder(self._model_type,
