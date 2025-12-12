@@ -13,50 +13,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generate aggr_server configs and test list from the config recipe database.
+"""Generate a performance regression test list from the config database.
 
 This script:
-1. Reads recipes examples/configs/database
-2. Generates aggr_server test config files per GPU type (e.g., recipe_database_b200.yaml)
-3. Generates llm_recipe_database.yml test list with condition blocks grouped by num_gpus
+1. Reads recipes from the examples/configs/database directory
+2. Generates test config files per GPU type (e.g., config_database_b200_nvl.yaml)
+3. Generates llm_config_database.yml test list with condition blocks grouped by GPU name and count
 """
 
-import argparse
 import copy
 from collections import defaultdict
 from pathlib import Path
 
 import yaml
 
-from examples.configs.database.database import DATABASE_LIST_PATH, Recipe, RecipeList
+from examples.configs.database.database import (
+    DATABASE_LIST_PATH,
+    Recipe,
+    RecipeList,
+    select_key_recipes,
+)
 
-# GPU type to condition mapping for test list
-GPU_CONDITIONS = {
-    "B200_NVL": {
-        "ranges": {
-            "compute_capability": {"gte": 10.0, "lte": 10.3},
-            "gpu_memory": {"gte": 180},
-        },
-    },
-    "H200_SXM": {
-        "ranges": {
-            "compute_capability": {"gte": 9.0, "lte": 9.0},
-            "gpu_memory": {"gte": 140},
-        },
-    },
-    "H100_SXM": {
-        "ranges": {
-            "compute_capability": {"gte": 9.0, "lte": 9.0},
-            "gpu_memory": {"gte": 80},
-        },
-    },
-}
+REPO_ROOT = Path(__file__).parent.parent
+PERF_SANITY_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity"
+TEST_LIST_PATH = (
+    REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / "llm_config_database.yml"
+)
+ITERATIONS = 10
 
-# GPU type to config file prefix mapping
-GPU_CONFIG_PREFIX = {
-    "B200_NVL": "recipe_database_b200",
-    "H200_SXM": "recipe_database_h200",
-    "H100_SXM": "recipe_database_h100",
+# GPU type to condition wildcards mapping for test list
+# Note: cpu is used to distinguish between e.g. H200_SXM and GH200
+GPU_WILDCARDS = {
+    "B200_NVL": {"gpu": ["*b200*"], "cpu": "x86_64", "linux_distribution_name": "ubuntu*"},
+    "H200_SXM": {"gpu": ["*h200*"], "cpu": "x86_64", "linux_distribution_name": "ubuntu*"},
+    "H100_SXM": {"gpu": ["*h100*"], "cpu": "x86_64", "linux_distribution_name": "ubuntu*"},
+    "GH200": {"gpu": ["*gh200*"], "cpu": "aarch64", "linux_distribution_name": "ubuntu*"},
+    "GB200": {"gpu": ["*gb200*"], "cpu": "aarch64", "linux_distribution_name": "ubuntu*"},
 }
 
 
@@ -71,7 +63,7 @@ def generate_client_name(recipe: Recipe) -> str:
     return f"con{recipe.concurrency}_isl{recipe.isl}_osl{recipe.osl}"
 
 
-def recipe_to_server_config(recipe: Recipe, llm_api_config: dict, iterations: int) -> dict:
+def recipe_to_server_config(recipe: Recipe, llm_api_config: dict) -> dict:
     """Convert a recipe + LLM API config to aggr_server format."""
     server_config = {
         "name": generate_server_name(recipe),
@@ -90,7 +82,7 @@ def recipe_to_server_config(recipe: Recipe, llm_api_config: dict, iterations: in
         {
             "name": generate_client_name(recipe),
             "concurrency": recipe.concurrency,
-            "iterations": iterations,
+            "iterations": ITERATIONS,
             "isl": recipe.isl,
             "osl": recipe.osl,
             "random_range_ratio": 0.0,  # Fixed ISL/OSL for reproducibility
@@ -102,7 +94,26 @@ def recipe_to_server_config(recipe: Recipe, llm_api_config: dict, iterations: in
     return server_config
 
 
-def group_recipes_by_gpu(recipes: RecipeList) -> dict:
+def group_recipes_by_scenario(recipes: RecipeList) -> dict:
+    """Group recipes by scenario key (model, gpu, isl, osl, num_gpus)."""
+    groups = defaultdict(list)
+    for recipe in recipes:
+        key = (recipe.model, recipe.gpu, recipe.isl, recipe.osl, recipe.num_gpus)
+        groups[key].append(recipe)
+    return groups
+
+
+def filter_to_key_recipes(recipes: RecipeList) -> list[Recipe]:
+    """Filter recipes to only key configs (min latency, balanced, max throughput)."""
+    scenario_groups = group_recipes_by_scenario(recipes)
+    key_recipes = []
+    for scenario_recipes in scenario_groups.values():
+        for recipe, _ in select_key_recipes(scenario_recipes):
+            key_recipes.append(recipe)
+    return key_recipes
+
+
+def group_recipes_by_gpu(recipes: list[Recipe]) -> dict[str, list[Recipe]]:
     """Group recipes by GPU type."""
     groups = defaultdict(list)
     for recipe in recipes:
@@ -110,7 +121,7 @@ def group_recipes_by_gpu(recipes: RecipeList) -> dict:
     return groups
 
 
-def group_recipes_by_num_gpus(recipes: list[Recipe]) -> dict:
+def group_recipes_by_num_gpus(recipes: list[Recipe]) -> dict[int, list[Recipe]]:
     """Group recipes by num_gpus within a GPU type."""
     groups = defaultdict(list)
     for recipe in recipes:
@@ -118,126 +129,95 @@ def group_recipes_by_num_gpus(recipes: list[Recipe]) -> dict:
     return groups
 
 
-def generate_aggr_config(recipes: list[Recipe], iterations: int) -> dict:
+def generate_aggr_config(recipes: list[Recipe]) -> dict[str, list[dict]]:
     """Generate aggr_server config from recipes."""
     server_configs = []
 
     for recipe in recipes:
         llm_api_config = recipe.load_config()
-        server_config = recipe_to_server_config(recipe, llm_api_config, iterations)
+        server_config = recipe_to_server_config(recipe, llm_api_config)
         server_configs.append(server_config)
 
     return {"server_configs": server_configs}
 
 
-def generate_config_name(gpu_type: str) -> str:
-    return GPU_CONFIG_PREFIX.get(gpu_type, f"recipe_database_{gpu_type.lower()}")
-
-
-def generate_test_name(config_name: str, server_name: str) -> str:
-    return f"perf/test_perf.py::test_perf[perf_sanity_upload-{config_name}-{server_name}]"
-
-
 def generate_condition_entry(
-    gpu_type: str, num_gpus: int, config_name: str, server_names: list
+    gpu_name: str, num_gpus: int, config_name: str, server_names: list
 ) -> dict:
-    base_condition = GPU_CONDITIONS.get(gpu_type, {})
-    condition = copy.deepcopy(base_condition)
-    condition["ranges"]["system_gpu_count"] = {"gte": num_gpus}
+    # using copy.deepcopy to avoid creating YAML anchors
+    wildcards = copy.deepcopy(GPU_WILDCARDS[gpu_name])
+    condition = {
+        "wildcards": wildcards,
+        "ranges": {"system_gpu_count": {"gte": num_gpus}},
+    }
 
-    tests = [generate_test_name(config_name, name) for name in server_names]
+    tests = [
+        f"perf/test_perf.py::test_perf[perf_sanity_upload-{config_name}-{name}]"
+        for name in server_names
+    ]
     return {"condition": condition, "tests": tests}
 
 
-def write_test_list_with_header(test_list_path: Path, test_list: dict):
-    """Write test list YAML with a header comment."""
+def generate_tests(
+    test_list_path: Path = TEST_LIST_PATH, test_config_dir: Path = PERF_SANITY_DIR
+) -> dict:
+    test_list_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_recipes = RecipeList.from_yaml(DATABASE_LIST_PATH)
+    recipes = filter_to_key_recipes(all_recipes)
+    print(f"Selected {len(recipes)} key recipes from {len(all_recipes)} total")
+
+    gpu_groups = group_recipes_by_gpu(recipes)
+    condition_entries = []
+    config_files = {}
+
+    for gpu_name in sorted(gpu_groups.keys()):
+        gpu_recipes = gpu_groups[gpu_name]
+        config_name = f"config_database_{gpu_name.lower()}"
+        config_path = test_config_dir / f"{config_name}.yaml"
+
+        aggr_config = generate_aggr_config(gpu_recipes)
+        config_content = yaml.dump(
+            aggr_config, default_flow_style=False, sort_keys=False, width=120
+        )
+
+        with open(config_path, "w") as f:
+            f.write(config_content)
+        print(f"Generated {config_path}")
+
+        config_files[config_path] = config_content
+
+        # Generate condition entries grouped by num_gpus
+        num_gpus_groups = group_recipes_by_num_gpus(gpu_recipes)
+        for num_gpus in sorted(num_gpus_groups.keys()):
+            server_names = [generate_server_name(r) for r in num_gpus_groups[num_gpus]]
+            entry = generate_condition_entry(gpu_name, num_gpus, config_name, server_names)
+            condition_entries.append(entry)
+
+    test_list = {
+        "version": "0.0.1",
+        "llm_config_database": condition_entries,
+    }
+
     header = """# ===============================================================================
-# Recipe Database Performance Tests (Auto-generated)
+# Config Database Performance Tests (AUTO-GENERATED)
 # ===============================================================================
-# Generated by: scripts/generate_recipe_database_tests.py
+# Generated by: scripts/generate_config_database_tests.py
 #
 # These tests use scenario-only matching (match_mode: scenario) for baselines.
 # Baselines are matched by (model, gpu, isl, osl, concurrency, num_gpus) instead
 # of full config fields, allowing configs to evolve while maintaining comparison.
 #
 # To regenerate:
-#   python scripts/generate_recipe_database_tests.py
+#   python scripts/generate_config_database_tests.py
 # ===============================================================================
 
 """
     with open(test_list_path, "w") as f:
         f.write(header)
         yaml.dump(test_list, f, default_flow_style=False, sort_keys=False, width=120)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate performance regression test list from recipe database"
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=10,
-        help="Number of benchmark iterations (default: 10)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Output directory for config files (default: tests/scripts/perf-sanity)",
-    )
-    parser.add_argument(
-        "--test-list",
-        type=Path,
-        default=None,
-        help="Output path for test list YAML (default: tests/integration/test_lists/qa/llm_recipe_database.yml)",
-    )
-    args = parser.parse_args()
-
-    # Find repo root and paths
-    script_dir = Path(__file__).parent
-    repo_root = script_dir.parent
-
-    output_dir = args.output_dir or (repo_root / "tests" / "scripts" / "perf-sanity")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    test_list_path = args.test_list or (
-        repo_root / "tests" / "integration" / "test_lists" / "qa" / "llm_recipe_database.yml"
-    )
-
-    recipes = RecipeList.from_yaml(DATABASE_LIST_PATH)
-    print(f"Loaded {len(recipes)} recipes from {DATABASE_LIST_PATH}")
-
-    gpu_groups = group_recipes_by_gpu(recipes)
-    condition_entries = []
-
-    for gpu_type in sorted(gpu_groups.keys()):
-        gpu_recipes = gpu_groups[gpu_type]
-        config_name = generate_config_name(gpu_type)
-        config_path = output_dir / f"{config_name}.yaml"
-
-        aggr_config = generate_aggr_config(gpu_recipes, args.iterations)
-
-        with open(config_path, "w") as f:
-            yaml.dump(aggr_config, f, default_flow_style=False, sort_keys=False, width=120)
-        print(f"Generated {config_path} with {len(aggr_config['server_configs'])} server configs")
-
-        # Generate condition entries grouped by num_gpus
-        num_gpus_groups = group_recipes_by_num_gpus(gpu_recipes)
-        for num_gpus in sorted(num_gpus_groups.keys()):
-            server_names = [generate_server_name(r) for r in num_gpus_groups[num_gpus]]
-            entry = generate_condition_entry(gpu_type, num_gpus, config_name, server_names)
-            condition_entries.append(entry)
-
-    test_list = {
-        "version": "0.0.1",
-        "llm_recipe_database": condition_entries,
-    }
-
-    test_list_path.parent.mkdir(parents=True, exist_ok=True)
-    write_test_list_with_header(test_list_path, test_list)
     print(f"Generated {test_list_path}")
 
 
 if __name__ == "__main__":
-    main()
+    generate_tests()

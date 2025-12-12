@@ -15,13 +15,17 @@
 
 
 from pathlib import Path
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Tuple
 
 import yaml
 from pydantic import BaseModel, Field, RootModel
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 DATABASE_LIST_PATH = Path(__file__).parent / "lookup.yaml"
+
+LOW_LATENCY_CONCURRENCY_THRESHOLD = 8
+HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD = 32
+KEY_PROFILES = {"Min Latency", "Balanced", "Max Throughput"}
 
 
 class Recipe(BaseModel):
@@ -58,3 +62,44 @@ class RecipeList(RootModel[List[Recipe]]):
 
     def __len__(self) -> int:
         return len(self.root)
+
+
+def assign_profile(num_recipes: int, idx: int, concurrency: int) -> str:
+    """Assign performance profile to a recipe based on its position in a concurrency-sorted list."""
+    if num_recipes == 1:
+        if concurrency <= LOW_LATENCY_CONCURRENCY_THRESHOLD:
+            return "Low Latency"
+        elif concurrency >= HIGH_THROUGHPUT_CONCURRENCY_THRESHOLD:
+            return "High Throughput"
+        else:
+            return "Balanced"
+    elif idx == 0:
+        return "Min Latency"
+    elif idx == num_recipes - 1:
+        return "Max Throughput"
+    elif idx in ((num_recipes - 1) // 2, num_recipes // 2):
+        return "Balanced"
+    elif idx < num_recipes // 2:
+        return "Low Latency"
+    else:
+        return "High Throughput"
+
+
+def select_key_recipes(recipes: List[Recipe]) -> List[Tuple[Recipe, str]]:
+    """Select key recipes (min latency, balanced, max throughput) from a list of recipes."""
+    if not recipes:
+        return []
+
+    sorted_recipes = sorted(recipes, key=lambda r: r.concurrency)
+    n = len(sorted_recipes)
+
+    result = []
+    seen_profiles = set()
+    for idx, recipe in enumerate(sorted_recipes):
+        profile = assign_profile(n, idx, recipe.concurrency)
+        # For n==1, keep whatever profile is assigned
+        # For n>=2, only keep key profiles and dedupe (for even n, two indices get "Balanced")
+        if n == 1 or (profile in KEY_PROFILES and profile not in seen_profiles):
+            result.append((recipe, profile))
+            seen_profiles.add(profile)
+    return result
