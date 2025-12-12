@@ -259,7 +259,7 @@ class TestForwardWithPrepareMetadataMaskGeneration:
         token_type_ids = torch.tensor([0, 1, 1, 0])
         image_token_mask = token_type_ids == 1
 
-        has_images = image_token_mask.any()
+        has_images = image_token_mask.any().item()
 
         assert has_images is True
 
@@ -268,7 +268,7 @@ class TestForwardWithPrepareMetadataMaskGeneration:
         token_type_ids = torch.tensor([0, 0, 0, 0])
         image_token_mask = token_type_ids == 1
 
-        has_images = image_token_mask.any()
+        has_images = image_token_mask.any().item()
 
         assert has_images is False
 

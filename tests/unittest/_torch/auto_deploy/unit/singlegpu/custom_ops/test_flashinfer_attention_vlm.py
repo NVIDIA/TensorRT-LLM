@@ -268,14 +268,14 @@ class TestGenerateVsPrefillPhase:
 
     def test_is_generate_true_for_s_equals_1(self):
         """s=1 should indicate generate phase."""
-        s = 4, 1
+        s = 1
         is_generate = s == 1
 
         assert is_generate is True
 
     def test_is_generate_false_for_s_greater_than_1(self):
         """s>1 should indicate prefill phase."""
-        s = 4, 128
+        s = 128
         is_generate = s == 1
 
         assert is_generate is False
