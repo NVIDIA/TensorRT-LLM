@@ -412,7 +412,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/5715568)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5721661)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/5715568)
-accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm] SKIP (https://nvbugs/5721672)
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4a8_nvfp4_fp8[CUTLASS] SKIP (https://nvbugs/5721912)
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5661926)
 unittest/_torch/auto_deploy/unit/singlegpu/custom_ops/test_flashinfer_attention_op.py::test_flashinfer_attention_op_context_input_pos[cuda-dtype0-4-8-seq6] SKIP (https://nvbugs/5721907)
