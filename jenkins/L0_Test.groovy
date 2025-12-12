@@ -1008,27 +1008,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
-                    retry_command() {
-                        local cmd=\$1
-                        local max_attempts=\${2:-3}
-                        local delay=\${3:-60}
+                    importContainerWithRetries() {
+                        local docker_uri=\$1
+                        local output_path=\$2
+                        local max_attempts=\${3:-3}
+                        local delay=\${4:-60}
                         local attempt=1
 
-                        until \$cmd
+                        rm -f "\$output_path"
+
+                        until enroot import -o "\$output_path" -- "docker://\$docker_uri"
                         do
                             if ((attempt >= max_attempts))
                             then
-                                echo "Command '\$cmd' failed after \$max_attempts attempts"
+                                echo "enroot import failed after \$max_attempts attempts"
                                 return 1
                             fi
 
-                            echo "Command '\$cmd' failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            rm -f "\$output_path"
                             sleep \$delay
                             ((attempt++))
                         done
                     }
 
-                    retry_command "enroot import -o $enrootImagePath -- docker://$container"
+                    importContainerWithRetries "$container" "$enrootImagePath"
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
