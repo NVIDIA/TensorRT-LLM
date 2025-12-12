@@ -33,6 +33,8 @@ namespace tr = tensorrt_llm::runtime;
 namespace tl = tensorrt_llm::layers;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -452,8 +454,10 @@ th::Tensor DynamicDecodeOp::forward(
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 static auto trtllmGptContextDecoderTHS
-    = torch::jit::class_<torch_ext::DynamicDecodeOp>("trtllm", "DynamicDecodeOp")
+    = torch::jit::class_<tensorrt_llm::torch_ext::DynamicDecodeOp>("trtllm", "DynamicDecodeOp")
           .def(torch::jit::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, at::ScalarType>())
-          .def("setup", &torch_ext::DynamicDecodeOp::setup)
-          .def("forward", &torch_ext::DynamicDecodeOp::forward);
+          .def("setup", &tensorrt_llm::torch_ext::DynamicDecodeOp::setup)
+          .def("forward", &tensorrt_llm::torch_ext::DynamicDecodeOp::forward);

@@ -26,6 +26,8 @@ namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
 using tensorrt_llm::common::fmtstr;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -174,6 +176,8 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -192,5 +196,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("lora_grouped_gemm", &torch_ext::lora_grouped_gemm);
+    m.impl("lora_grouped_gemm", &tensorrt_llm::torch_ext::lora_grouped_gemm);
 }
