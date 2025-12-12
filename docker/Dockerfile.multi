@@ -52,6 +52,8 @@ ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
+ARG AUXI_CUDA_VER
+ARG AUXI_CUDA_INSTALL_PATH
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
     TRT_VER=${TRT_VER} \
@@ -60,6 +62,8 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     NCCL_VER=${NCCL_VER} \
     CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
+    AUXI_CUDA_VER=${AUXI_CUDA_VER} \
+    AUXI_CUDA_INSTALL_PATH=${AUXI_CUDA_INSTALL_PATH} \
     bash ./install.sh --base --cmake --ccache --cuda_toolkit --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
     rm install_base.sh && \
     rm install_cmake.sh && \

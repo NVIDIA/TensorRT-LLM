@@ -7,6 +7,8 @@ set -ex
 # Only use when public CUDA image is not ready.
 CUDA_VER="13.0.2_580.95.05"
 CUDA_VER_SHORT="${CUDA_VER%_*}"
+AUXI_CUDA_VER=${AUXI_CUDA_VER:-}
+AUXI_CUDA_INSTALL_PATH=${AUXI_CUDA_INSTALL_PATH:-}
 
 NVCC_VERSION_OUTPUT=$(nvcc --version)
 OLD_CUDA_VER=$(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1)
@@ -33,6 +35,13 @@ reinstall_rockylinux_cuda() {
     rm -f cuda_${CUDA_VER}_linux.run
 }
 
+install_auxiliary_cuda_toolkit() {
+    local AUXI_CUDA_VER_SHORT=${AUXI_CUDA_VER%_*}
+    curl -L -o auxi_cuda_linux.sh https://developer.download.nvidia.com/compute/cuda/${AUXI_CUDA_VER_SHORT}/local_installers/cuda_${AUXI_CUDA_VER}_linux.run
+    sh auxi_cuda_linux.sh --silent --toolkit --installpath=${AUXI_CUDA_INSTALL_PATH}
+    rm -f auxi_cuda_linux.sh
+}
+
 # Install base packages depending on the base OS
 ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 case "$ID" in
@@ -48,3 +57,8 @@ case "$ID" in
     echo "Skip for other OS..."
     ;;
 esac
+
+if [ -n "$AUXI_CUDA_VER" ] && [ -n "$AUXI_CUDA_INSTALL_PATH" ]; then
+    echo "Installing auxiliary CUDA toolkit ${AUXI_CUDA_VER} to ${AUXI_CUDA_INSTALL_PATH}..."
+    install_auxiliary_cuda_toolkit
+fi
