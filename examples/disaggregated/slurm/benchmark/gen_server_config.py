@@ -19,10 +19,6 @@ if __name__ == "__main__":
                         type=str,
                         default="logs",
                         help="Work directory")
-    parser.add_argument("--worker_port",
-                        type=int,
-                        default=8336,
-                        help="Worker port")
     parser.add_argument("--server_port",
                         type=int,
                         default=8333,
@@ -49,21 +45,21 @@ if __name__ == "__main__":
     print(f"All hostnames found in {hostnames_folder}")
 
     # get the ctx and gen hostnames from the hostnames file
-    ctx_hostnames = []
-    gen_hostnames = []
+    ctx_urls = []
+    gen_urls = []
     for hostname_file in hostnames:
         hostname_file_path = os.path.join(hostnames_folder, hostname_file)
         with open(hostname_file_path, 'r') as f:
-            actual_hostname = f.read().strip()
-            print(f"Hostname: {actual_hostname} in {hostname_file}")
+            url = f.read().strip()
+            print(f"url: {url} in {hostname_file}")
 
-        if hostname_file.startswith("CTX"):
-            ctx_hostnames.append(actual_hostname)
-        elif hostname_file.startswith("GEN"):
-            gen_hostnames.append(actual_hostname)
+            if hostname_file.startswith("CTX"):
+                ctx_urls.append(url)
+            elif hostname_file.startswith("GEN"):
+                gen_urls.append(url)
 
-    print(f"ctx_hostnames: {ctx_hostnames}")
-    print(f"gen_hostnames: {gen_hostnames}")
+    print(f"ctx_urls: {ctx_urls}")
+    print(f"gen_urls: {gen_urls}")
 
     # get current hostname from env
     hostname = socket.gethostname()
@@ -75,11 +71,11 @@ if __name__ == "__main__":
         'backend': 'pytorch',
         'context_servers': {
             'num_instances': args.num_ctx_servers,
-            'urls': [f'{host}:{args.worker_port}' for host in ctx_hostnames]
+            'urls': ctx_urls
         },
         'generation_servers': {
             'num_instances': args.num_gen_servers,
-            'urls': [f'{host}:{args.worker_port}' for host in gen_hostnames]
+            'urls': gen_urls
         }
     }
 

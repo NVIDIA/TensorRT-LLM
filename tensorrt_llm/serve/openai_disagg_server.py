@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import signal
+import socket
 import traceback
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
@@ -190,13 +191,13 @@ class OpenAIDisaggServer:
     async def version(self) -> JSONResponse:
         return JSONResponse(content={"version": VERSION})
 
-    async def __call__(self, host: str, port: int):
+    async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+        await uvicorn.Server(config).serve(sockets=sockets)
 
     # TODO: rework this for service discovery, now it's only for static server list
     async def _set_steady_clock_offsets(self):
