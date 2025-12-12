@@ -64,7 +64,7 @@ For low-latency use cases:
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-latency.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -72,7 +72,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/gpt-oss-120b-latency.yaml
+```{literalinclude} ../../../examples/configs/curated/gpt-oss-120b-latency.yaml
 ---
 language: shell
 prepend: |
@@ -88,7 +88,7 @@ For max-throughput use cases:
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-throughput.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -96,7 +96,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/gpt-oss-120b-throughput.yaml
+```{literalinclude} ../../../examples/configs/curated/gpt-oss-120b-throughput.yaml
 ---
 language: shell
 prepend: |
@@ -377,3 +377,17 @@ $$
 $$
 \text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
 $$
+
+## Preconfigured Recipes
+
+The following table lists recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+
+.. include:: config_table.rst
+   :start-after: .. start-openai/gpt-oss-120b
+   :end-before: .. end-openai/gpt-oss-120b
+```

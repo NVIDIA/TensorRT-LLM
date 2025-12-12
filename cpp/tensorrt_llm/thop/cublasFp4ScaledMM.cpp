@@ -230,7 +230,7 @@ public:
         else
         {
             // Fall back to default (no algorithm specified)
-            TLLM_LOG_WARNING(
+            TLLM_LOG_DEBUG(
                 "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
                 "for shape (m=%d, n=%d, k=%d)",
                 tactic, cache.heuristics.size(), m, n, k);
