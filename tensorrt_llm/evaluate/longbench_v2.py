@@ -747,6 +747,14 @@ class LongBenchV2(Evaluator):
         'A JSON string specifying chat template arguments, used to enable features like thinking mode. Examples: '
         '\'{"enable_thinking": true}\' for Qwen3, or \'{"thinking": true}\' for DeepSeek-V3.2.'
     )
+    @click.option("--temperature",
+                  type=float,
+                  default=0.6,
+                  help="Temperature for sampling.")
+    @click.option("--top_p",
+                  type=float,
+                  default=0.95,
+                  help="Top p for sampling.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
@@ -756,14 +764,13 @@ class LongBenchV2(Evaluator):
                 output_dir: Optional[str], random_seed: int,
                 apply_chat_template: bool, system_prompt: Optional[str],
                 max_input_length: int, max_output_length: int,
-                chat_template_kwargs: Optional[dict[str, Any]]) -> None:
+                chat_template_kwargs: Optional[dict[str, Any]],
+                temperature: float, top_p: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
-        # TODO: Should control SamplingParams from the command line.
-        sampling_params = SamplingParams(
-            max_tokens=max_output_length,
-            temperature=0,
-        )
+        sampling_params = SamplingParams(max_tokens=max_output_length,
+                                         temperature=temperature,
+                                         top_p=top_p)
 
         evaluator = LongBenchV2(dataset_path=dataset_path,
                                 prompts_dir=prompts_dir,
