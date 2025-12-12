@@ -37,6 +37,8 @@ from pathlib import Path
 
 import yaml
 
+from examples.configs.database.database import DATABASE_LIST_PATH, Recipe, RecipeList
+
 # GPU type to condition mapping for test list
 GPU_CONDITIONS = {
     "B200_NVL": {
@@ -67,39 +69,23 @@ GPU_CONFIG_PREFIX = {
 }
 
 
-def load_recipes(yaml_path: Path) -> list:
-    """Load recipes from lookup.yaml."""
-    with open(yaml_path) as f:
-        return yaml.safe_load(f)
-
-
-def load_recipe_config(repo_root: Path, config_path: str) -> dict:
-    """Load the LLM API config for a recipe."""
-    full_path = repo_root / config_path
-    if not full_path.exists():
-        print(f"Warning: Config file not found: {full_path}")
-        return {}
-    with open(full_path) as f:
-        return yaml.safe_load(f) or {}
-
-
-def generate_server_name(recipe: dict) -> str:
+def generate_server_name(recipe: Recipe) -> str:
     """Generate a unique server name from recipe."""
-    model_slug = recipe["model"].replace("/", "_").replace("-", "_").replace(".", "_")
-    return f"{model_slug}_{recipe['isl']}_{recipe['osl']}_conc{recipe['concurrency']}_gpu{recipe['num_gpus']}"
+    model_slug = recipe.model.replace("/", "_").replace("-", "_").replace(".", "_")
+    return f"{model_slug}_{recipe.isl}_{recipe.osl}_conc{recipe.concurrency}_gpu{recipe.num_gpus}"
 
 
-def generate_client_name(recipe: dict) -> str:
+def generate_client_name(recipe: Recipe) -> str:
     """Generate client config name."""
-    return f"con{recipe['concurrency']}_isl{recipe['isl']}_osl{recipe['osl']}"
+    return f"con{recipe.concurrency}_isl{recipe.isl}_osl{recipe.osl}"
 
 
-def recipe_to_server_config(recipe: dict, llm_api_config: dict, iterations: int) -> dict:
+def recipe_to_server_config(recipe: Recipe, llm_api_config: dict, iterations: int) -> dict:
     """Convert a recipe + LLM API config to aggr_server format."""
     server_config = {
         "name": generate_server_name(recipe),
-        "model_name": recipe["model"],
-        "gpus": recipe["num_gpus"],
+        "model_name": recipe.model,
+        "gpus": recipe.num_gpus,
         # Enable scenario-only matching for baseline comparison
         "match_mode": "scenario",
     }
@@ -113,10 +99,10 @@ def recipe_to_server_config(recipe: dict, llm_api_config: dict, iterations: int)
     server_config["client_configs"] = [
         {
             "name": generate_client_name(recipe),
-            "concurrency": recipe["concurrency"],
+            "concurrency": recipe.concurrency,
             "iterations": iterations,
-            "isl": recipe["isl"],
-            "osl": recipe["osl"],
+            "isl": recipe.isl,
+            "osl": recipe.osl,
             "random_range_ratio": 0.0,  # Fixed ISL/OSL for reproducibility
             "backend": "openai",
             "streaming": True,
@@ -126,30 +112,28 @@ def recipe_to_server_config(recipe: dict, llm_api_config: dict, iterations: int)
     return server_config
 
 
-def group_recipes_by_gpu(recipes: list) -> dict:
+def group_recipes_by_gpu(recipes: RecipeList) -> dict:
     """Group recipes by GPU type."""
     groups = defaultdict(list)
     for recipe in recipes:
-        groups[recipe["gpu"]].append(recipe)
+        groups[recipe.gpu].append(recipe)
     return groups
 
 
-def group_recipes_by_num_gpus(recipes: list) -> dict:
+def group_recipes_by_num_gpus(recipes: list[Recipe]) -> dict:
     """Group recipes by num_gpus within a GPU type."""
     groups = defaultdict(list)
     for recipe in recipes:
-        groups[recipe["num_gpus"]].append(recipe)
+        groups[recipe.num_gpus].append(recipe)
     return groups
 
 
-def generate_aggr_config(recipes: list, repo_root: Path, iterations: int) -> dict:
+def generate_aggr_config(recipes: list[Recipe], iterations: int) -> dict:
     """Generate aggr_server config from recipes."""
     server_configs = []
 
     for recipe in recipes:
-        llm_api_config = load_recipe_config(repo_root, recipe["config_path"])
-        if not llm_api_config:
-            continue
+        llm_api_config = recipe.load_config()
         server_config = recipe_to_server_config(recipe, llm_api_config, iterations)
         server_configs.append(server_config)
 
@@ -218,25 +202,11 @@ def main():
         default=None,
         help="Output path for test list YAML (default: tests/integration/test_lists/qa/llm_recipe_database.yml)",
     )
-    parser.add_argument(
-        "--lookup-yaml",
-        type=Path,
-        default=None,
-        help="Path to lookup.yaml (default: auto-detect)",
-    )
     args = parser.parse_args()
 
     # Find repo root and paths
     script_dir = Path(__file__).parent
     repo_root = script_dir.parent
-
-    if args.lookup_yaml:
-        lookup_path = args.lookup_yaml
-    else:
-        lookup_path = repo_root / "examples" / "configs" / "database" / "lookup.yaml"
-
-    if not lookup_path.exists():
-        raise FileNotFoundError(f"lookup.yaml not found at {lookup_path}")
 
     output_dir = args.output_dir or (repo_root / "tests" / "scripts" / "perf-sanity")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -245,8 +215,8 @@ def main():
         repo_root / "tests" / "integration" / "test_lists" / "qa" / "llm_recipe_database.yml"
     )
 
-    recipes = load_recipes(lookup_path)
-    print(f"Loaded {len(recipes)} recipes from {lookup_path}")
+    recipes = RecipeList.from_yaml(DATABASE_LIST_PATH)
+    print(f"Loaded {len(recipes)} recipes from {DATABASE_LIST_PATH}")
 
     gpu_groups = group_recipes_by_gpu(recipes)
     condition_entries = []
@@ -256,7 +226,7 @@ def main():
         config_name = generate_config_name(gpu_type)
         config_path = output_dir / f"{config_name}.yaml"
 
-        aggr_config = generate_aggr_config(gpu_recipes, repo_root, args.iterations)
+        aggr_config = generate_aggr_config(gpu_recipes, args.iterations)
 
         with open(config_path, "w") as f:
             yaml.dump(aggr_config, f, default_flow_style=False, sort_keys=False, width=120)

@@ -20,10 +20,11 @@ from typing import Any, Dict, Iterator, List
 import yaml
 from pydantic import BaseModel, Field, RootModel
 
+REPO_ROOT = Path(__file__).parent.parent.parent.parent
 DATABASE_LIST_PATH = Path(__file__).parent / "lookup.yaml"
 
 
-class RecipeConstraints(BaseModel):
+class Recipe(BaseModel):
     """Recipe record for scenario list."""
 
     model: str = Field(description="Model name")
@@ -36,20 +37,15 @@ class RecipeConstraints(BaseModel):
 
     def load_config(self) -> Dict[str, Any]:
         """Load and return the YAML config at config_path."""
-        with open(self.config_path) as f:
+        full_path = REPO_ROOT / self.config_path
+        if not full_path.exists():
+            raise FileNotFoundError(f"Config not found: {full_path}")
+        with open(full_path) as f:
             data = yaml.safe_load(f)
         return data if data is not None else {}
 
 
-class Recipe(BaseModel):
-    """Recipe that describes a single scenario."""
-
-    constraints: RecipeConstraints = Field(description="Recipe constraints")
-    env_overrides: Dict[str, Any] = Field(description="Environment overrides", default_factory=dict)
-    config: Dict[str, Any] = Field(description="Configuration overrides", default_factory=dict)
-
-
-class RecipeList(RootModel[List[RecipeConstraints]]):
+class RecipeList(RootModel[List[Recipe]]):
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "RecipeList":
         """Load and validate recipe list from YAML file."""
@@ -57,7 +53,7 @@ class RecipeList(RootModel[List[RecipeConstraints]]):
             data = yaml.safe_load(f)
         return cls(data)
 
-    def __iter__(self) -> Iterator[RecipeConstraints]:
+    def __iter__(self) -> Iterator[Recipe]:
         return iter(self.root)
 
     def __len__(self) -> int:
