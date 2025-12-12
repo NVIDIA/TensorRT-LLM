@@ -783,14 +783,10 @@ class TorchDist(Distributed):
             return ret[0]
 
 
-class PPCommNCCL:
+class PPCommBase:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
-        self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-            self.mapping.world_size,
-            self.mapping.rank,
-        )
         self.tensor_ready_event = torch.cuda.Event()
         self.send_stream = torch.cuda.Stream()
         self.tensor_cache = {}
@@ -804,20 +800,41 @@ class PPCommNCCL:
         cache_id = id(tensor)
         del self.tensor_cache[cache_id]
 
+    @abstractmethod
+    def direct_send(self, tensor: torch.Tensor, dest: int):
+        raise NotImplementedError("direct_send is not implemented")
+
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
+        # NCCL send kernel in send_stream cannot be captured,
+        # so we send in the current stream instead in CUDA graph cases.
         if torch.cuda.is_current_stream_capturing():
-            self.nccl_comm.send(tensor, dest)
+            self.direct_send(tensor, dest)
             return
 
         self.tensor_ready_event.record()
         with torch.cuda.stream(self.send_stream):
             self.tensor_ready_event.wait()
+            # tensor may be released before NCCL send finished,
+            # so we cache it first and release it after send finished.
             self._cache_tensor(tensor)
-            self.nccl_comm.send(tensor, dest)
+            self.direct_send(tensor, dest)
             self._release_tensor(tensor)
+
+
+class PPCommNCCL(PPCommBase):
+
+    def __init__(self, global_mapping: Mapping):
+        super().__init__(global_mapping)
+        self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+            self.mapping.world_size,
+            self.mapping.rank,
+        )
+
+    def direct_send(self, tensor: torch.Tensor, dest: int):
+        self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
@@ -825,10 +842,10 @@ class PPCommNCCL:
         self.nccl_comm.recv(tensor, src)
 
 
-class PPCommTorch:
+class PPCommTorch(PPCommBase):
 
     def __init__(self, global_mapping: Mapping):
-        self.mapping = global_mapping
+        super().__init__(global_mapping)
         self.pg = self.mapping.pp_group_pg
         self.pg_group = self.mapping.pp_group
 
@@ -836,10 +853,7 @@ class PPCommTorch:
         assert global_rank in self.pg_group
         return self.pg_group.index(global_rank)
 
-    def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
-        if dest is None:
-            dest = self.mapping.next_pp_rank()
-
+    def direct_send(self, tensor: torch.Tensor, dest: int):
         self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
