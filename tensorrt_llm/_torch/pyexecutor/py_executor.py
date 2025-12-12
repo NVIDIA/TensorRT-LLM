@@ -184,13 +184,20 @@ class AsyncTransferManager:
         """
         request, block_id, counter = self.requests.pop(request.py_request_id)
 
+        should_terminate = False
+
         if counter == 1:
             if self.request_should_store_blocks.pop(request.py_request_id):
                 self.kv_cache_manager.unpin_blocks_by_id(block_id)
+            else:
+                should_terminate = True
+
             request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
         else:
             self.requests[request.py_request_id] = (request, block_id,
                                                     counter - 1)
+
+        return should_terminate
 
 
 class PyExecutor:
@@ -1375,7 +1382,8 @@ class PyExecutor:
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
-                self.async_transfer_manager.end_transfer(req)
+                if self.async_transfer_manager.end_transfer(req):
+                    self._terminate_request(req)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -2230,6 +2238,9 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(
                         req, should_store_blocks=disagg_should_store_blocks)
 
+                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+                        req.py_kv_transfer_start_time = time.time()
+
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
                 requests = self.previous_batch.sample_state.scheduled_requests.all_requests(
@@ -2259,7 +2270,32 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
-        self.kv_cache_transceiver.check_context_transfer_status(atLeastNum)
+        finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
+            atLeastNum)
+
+        finished_error_ids = set(finished_requests + error_requests)
+
+        for request_id in finished_requests + error_requests:
+
+            request = self.async_transfer_manager.requests_in_transfer().get(
+                request_id)
+
+            if self.async_transfer_manager.end_transfer(request):
+                self._terminate_request(request)
+
+        for request in list(
+                self.async_transfer_manager.requests_in_transfer().values()):
+            if request.py_kv_transfer_timed_out and request.py_request_id not in finished_error_ids:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                # If cancel is successful, mark as complete so it can be cleaned up
+                # Otherwise, try at next iteration
+                if is_cancelled:
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
+                    if self.async_transfer_manager.end_transfer(request):
+                        self._terminate_request(request)
+
         self._check_cache_transfer_errors("context requests")
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
@@ -2651,10 +2687,7 @@ class PyExecutor:
                 if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
                     requests_to_terminate.append(request)
                 else:
-                    if request.is_disagg_context_transmission_state:
-                        self.async_transfer_manager.begin_transfer(
-                            request, False)
-                    else:
+                    if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
