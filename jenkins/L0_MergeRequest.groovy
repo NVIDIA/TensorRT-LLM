@@ -146,12 +146,15 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
+@Field
+def GITHUB_SOURCE_REPO_AND_BRANCH = "github_source_repo_and_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (GITHUB_SOURCE_REPO_AND_BRANCH): env.githubSourceRepoAndBranch ? env.githubSourceRepoAndBranch : null,
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -1267,6 +1270,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages.remove("x86_64-linux")
         stages.remove("SBSA-linux")
         echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
+    }
+
+    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
+        stages = stages.findAll { key, value -> key.contains("Release Check") } + dockerBuildJob
+        echo "Only execute Build-Docker-Images and Release Check stages, build and update docker images and tags"
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
