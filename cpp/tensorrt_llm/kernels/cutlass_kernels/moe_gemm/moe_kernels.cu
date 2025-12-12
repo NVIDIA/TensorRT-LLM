@@ -1950,7 +1950,7 @@ constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 template <class ActivationOutputType, class GemmOutputType, class ActFn>
 __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutputType const* gemm_result,
     int64_t const* expert_first_token_offset, int64_t inter_size, int64_t num_experts_per_node,
-    ActivationParams activation_type)
+    ActivationParams activation_type, GemmOutputType const* prequant_scale, bool use_per_expert_prequant_scale)
 {
     int64_t const tid = threadIdx.x;
     int64_t const token = blockIdx.x;
@@ -1978,15 +1978,23 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
     float gate_alpha = 1.0f;
     float gate_bias = 0.0f;
     float gate_limit = std::numeric_limits<float>::infinity();
+    int expert = 0;
+    if (use_per_expert_prequant_scale || activation_type.swiglu_alpha || activation_type.swiglu_beta
+        || activation_type.swiglu_limit)
+    {
+        expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, (int64_t) token + 1) - 1;
+    }
     if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit)
     {
-        int expert
-            = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, (int64_t) token + 1) - 1;
         gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
         gate_bias = activation_type.swiglu_beta ? activation_type.swiglu_beta[expert] : 0.0f;
         gate_limit = activation_type.swiglu_limit ? activation_type.swiglu_limit[expert]
                                                   : std::numeric_limits<float>::infinity();
     }
+
+    auto prequant_scale_vec = prequant_scale ? reinterpret_cast<GemmResultElem const*>(
+                                  prequant_scale + (use_per_expert_prequant_scale ? expert * inter_size : 0))
+                                             : nullptr;
 
     ActFn fn{};
     fn.alpha = gate_alpha;
@@ -1998,6 +2006,13 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
         // BF16 isn't supported, use FP32 for activation function
         auto gate_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + inter_size_vec]);
         auto gate_act = fn(gate_value, linear_value);
+
+        // Apply prequant scale if provided
+        if (prequant_scale_vec)
+        {
+            gate_act = gate_act * arrayConvert<GemmResultElem, ComputeElem>(prequant_scale_vec[elem_index]);
+        }
+
         output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(gate_act);
     }
 }
@@ -2005,7 +2020,8 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
 template <typename ActivationOutputType, typename GemmOutputType>
 void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_result,
     int64_t const* expert_first_token_offset, int64_t inter_size, int64_t num_tokens, int64_t num_experts_per_node,
-    ActivationParams activation_type, cudaStream_t stream)
+    ActivationParams activation_type, cudaStream_t stream, bool use_per_expert_prequant_scale = false,
+    GemmOutputType const* prequant_scale = nullptr)
 {
     int64_t const blocks = num_tokens;
     int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
@@ -2018,8 +2034,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
         ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
         : nullptr;
     TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
-    fn<<<blocks, threads, 0, stream>>>(
-        output, gemm_result, expert_first_token_offset, inter_size, num_experts_per_node, activation_type);
+    fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size, num_experts_per_node,
+        activation_type, prequant_scale, use_per_expert_prequant_scale);
 }
 
 // ============================== Activation =================================
@@ -2075,7 +2091,7 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         float gate_beta = 0.0f;
         float gate_limit = std::numeric_limits<float>::infinity();
         if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale || activation_params.swiglu_alpha
-            || activation_params.swiglu_beta || activation_params.swiglu_limit || prequant_scale)
+            || activation_params.swiglu_beta || activation_params.swiglu_limit)
         {
             // TODO this is almost certainly faster as a linear scan
             expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) - 1;
@@ -3000,7 +3016,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
             : use_wfp4afp8                      ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
             : use_fp8                           ? quant_params.fp8.fc2_use_per_expert_act_scale
+            : Self::useAwq(quant_params)        ? quant_params.groupwise.fc2.use_per_expert_act_scale
                                                 : false;
+        printf(
+            "DEBUG ANT: use_awq %d, use_per_expert_act_scale %d, quant_params.groupwise.fc2.use_per_expert_act_scale "
+            "%d\n",
+            Self::useAwq(quant_params), use_per_expert_act_scale, quant_params.groupwise.fc2.use_per_expert_act_scale);
         // Activation -> (BackboneType) -> Prequant -> (T == ActType)
         // When fusing activation and prequant, the output type is directly T = =ActType
         // Else, the output type is BackboneType
@@ -3043,8 +3064,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         bool use_per_expert_act_scale = use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
         doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(intermediate_result),
             fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
-            inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr, stream,
-            static_cast<UnfusedGemmOutputType const*>(fc2_prequant_scale));
+            inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale, nullptr,
+            stream);
 
         sync_check_cuda_error(stream);
     }
@@ -3109,9 +3130,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         if (!use_ampere_activation_fusion)
         {
             using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+            bool const use_per_expert_act_scale
+                = Self::useAwq(quant_params) ? quant_params.groupwise.fc2.use_per_expert_act_scale : false;
             doGatedActivation<GatedActOutputType, UnfusedGemmOutputType>(reinterpret_cast<GatedActOutputType*>(output),
                 static_cast<UnfusedGemmOutputType const*>(intermediate_result), expert_first_token_offset, inter_size,
-                expanded_num_rows, num_experts_per_node, fc1_activation_type, stream);
+                expanded_num_rows, num_experts_per_node, fc1_activation_type, stream, use_per_expert_act_scale,
+                static_cast<UnfusedGemmOutputType const*>(fc2_prequant_scale));
 
             sync_check_cuda_error(stream);
         }

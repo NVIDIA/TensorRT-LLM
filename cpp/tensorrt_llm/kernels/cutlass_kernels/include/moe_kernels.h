@@ -315,7 +315,8 @@ struct QuantParams
     {
         struct GroupwiseGemmInputs
         {
-            void const* act_scales = nullptr; // (num_experts_per_node, hidden_size if fc1 else intermediate_size)
+            bool use_per_expert_act_scale = false;
+            void const* act_scales = nullptr; // (1 or num_experts_per_node, hidden_size or intermediate_size)
             void const* weight_scales = nullptr;
             void const* weight_zeros = nullptr;
             float const* alpha = nullptr;
@@ -401,12 +402,15 @@ struct QuantParams
     static QuantParams GroupWise(int group_size, void const* fc1_weight_scales, void const* fc2_weight_scales,
         void const* fc1_activation_scales = nullptr, void const* fc2_activation_scales = nullptr,
         void const* fc1_weight_zeros = nullptr, void const* fc2_weight_zeros = nullptr,
-        float const* fc1_alpha = nullptr, float const* fc2_alpha = nullptr)
+        float const* fc1_alpha = nullptr, float const* fc2_alpha = nullptr, bool fc1_use_per_expert_act_scale = false,
+        bool fc2_use_per_expert_act_scale = false)
     {
         QuantParams qp;
         qp.groupwise.group_size = group_size;
-        qp.groupwise.fc1 = {fc1_activation_scales, fc1_weight_scales, fc1_weight_zeros, fc1_alpha};
-        qp.groupwise.fc2 = {fc2_activation_scales, fc2_weight_scales, fc2_weight_zeros, fc2_alpha};
+        qp.groupwise.fc1
+            = {fc1_use_per_expert_act_scale, fc1_activation_scales, fc1_weight_scales, fc1_weight_zeros, fc1_alpha};
+        qp.groupwise.fc2
+            = {fc2_use_per_expert_act_scale, fc2_activation_scales, fc2_weight_scales, fc2_weight_zeros, fc2_alpha};
         return qp;
     }
 
@@ -803,12 +807,12 @@ private:
         bool min_latency_mode, bool use_awq);
 
 private:
-    bool useAwq(cutlass_kernels::QuantParams const& quant_params)
+    static bool useAwq(cutlass_kernels::QuantParams const& quant_params)
     {
         return quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales && !use_wfp4a16;
     }
 
-    bool usePrequantScaleKernel(cutlass_kernels::QuantParams const& quant_params)
+    static bool usePrequantScaleKernel(cutlass_kernels::QuantParams const& quant_params)
     {
         return useAwq(quant_params) && !std::is_same_v<T, WeightType>;
     }
