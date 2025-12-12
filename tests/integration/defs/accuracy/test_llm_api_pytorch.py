@@ -1879,13 +1879,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          torch_compile, mtp_nextn, moe_backend,
                          enable_configurable_moe, mocker):
         # Handle ENABLE_CONFIGURABLE_MOE environment variable
-        if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
+        if enable_configurable_moe == 1 and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
             pytest.skip(
-                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM backend, "
+                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
                 f"current backend is {moe_backend}")
 
         # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
+        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
+            "TRTLLM", "CUTLASS"
+        ] else "0"
         patch_mpi_pool_session_for_env(mocker,
                                        {"ENABLE_CONFIGURABLE_MOE": env_value})
 
@@ -3289,7 +3293,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       True,
                       True,
                       True,
-                      marks=pytest.mark.skip_less_mpi_world_size(8))],
+                      marks=(pytest.mark.skip_less_mpi_world_size(8),
+                             pytest.mark.timeout(7200)))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                   overlap_scheduler, is_cached):
@@ -3515,13 +3520,17 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                         attention_dp, cuda_graph, overlap_scheduler,
                         activation_dtype, enable_configurable_moe, mocker):
         # Handle ENABLE_CONFIGURABLE_MOE environment variable
-        if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
+        if enable_configurable_moe == 1 and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
             pytest.skip(
-                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM backend, "
+                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
                 f"current backend is {moe_backend}")
 
         # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
+        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
+            "TRTLLM", "CUTLASS"
+        ] else "0"
         patch_mpi_pool_session_for_env(mocker,
                                        {"ENABLE_CONFIGURABLE_MOE": env_value})
 
@@ -3983,13 +3992,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
                       enable_configurable_moe, mocker):
         # Handle ENABLE_CONFIGURABLE_MOE environment variable
-        if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
+        if enable_configurable_moe == 1 and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
             pytest.skip(
-                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM backend, "
+                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
                 f"current backend is {moe_backend}")
 
         # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
+        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
+            "TRTLLM", "CUTLASS"
+        ] else "0"
         patch_mpi_pool_session_for_env(mocker,
                                        {"ENABLE_CONFIGURABLE_MOE": env_value})
 

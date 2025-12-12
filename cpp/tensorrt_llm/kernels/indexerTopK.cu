@@ -589,6 +589,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
     int const* rowStarts, int const* rowEnds, int* outIndices, int stride0, int stride1, int const topK,
     int const offsetIndex)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     // The number of bins in the histogram.
     static constexpr int kNumBins = 2048;
 
@@ -605,6 +608,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 
     topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
         nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false>
@@ -612,6 +618,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
     int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
     int const numBlocksToMerge = 0, int const* indices = nullptr)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     // The number of bins in the histogram.
     static constexpr int kNumBins = 2048;
 
@@ -646,6 +655,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
 
     topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, multipleBlocksPerRow, mergeBlocks>(
         indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
@@ -660,28 +672,73 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     if (numColumns < kSortingAlgorithmThreshold)
     {
         // Use insertion sort
-        topKPerRowDecode<kNumThreadsPerBlock, false><<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits, seqLens, indices, stride0, stride1, topK, next_n);
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, false>;
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(
+            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
     }
     else if (numColumns < kSplitWorkThreshold)
     {
         // From this threshold, use radix sort instead
-        topKPerRowDecode<kNumThreadsPerBlock, true><<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits, seqLens, indices, stride0, stride1, topK, next_n);
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, true>;
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(
+            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
     }
     else
     {
         // Long sequences are run in two steps
         constexpr auto multipleBlocksPerRowConfig = 10;
+        auto* kernel_instance_part1 = &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
+        cudaLaunchConfig_t config_part1;
+        config_part1.gridDim = dim3(numRows, multipleBlocksPerRowConfig);
+        config_part1.blockDim = kNumThreadsPerBlock;
+        config_part1.dynamicSmemBytes = 2 * topK * sizeof(int32_t);
+        config_part1.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config_part1.numAttrs = 1;
+        config_part1.attrs = attrs;
 
-        topKPerRowDecode<kNumThreadsPerBlock, true, true>
-            <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock, 2 * topK * sizeof(int32_t), stream>>>(
-                logits, seqLens, outIndicesAux, stride0, stride1, topK, next_n, outLogitsAux);
+        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
+            next_n, outLogitsAux, 0, nullptr);
 
         constexpr int kNumThreadsPerBlockMerge = 1024;
-        topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>
-            <<<numRows, kNumThreadsPerBlockMerge, topK * sizeof(int32_t), stream>>>(outLogitsAux, seqLens, indices,
-                multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
+        auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
+        cudaLaunchConfig_t config_part2;
+        config_part2.gridDim = numRows;
+        config_part2.blockDim = kNumThreadsPerBlockMerge;
+        config_part2.dynamicSmemBytes = topK * sizeof(int32_t);
+        config_part2.stream = stream;
+        // Reuse attrs array since part1 kernel has already been launched
+        config_part2.numAttrs = 1;
+        config_part2.attrs = attrs;
+
+        cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices,
+            multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
     }
     sync_check_cuda_error(stream);
 }
