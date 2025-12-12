@@ -99,6 +99,34 @@ __device__ __inline__ __nv_bf16x8_storage_t psx_cvt_lut_prmt_fp4x8_to_bf16x8(con
     return bf16x8_raw;
 }
 
+__device__ __inline__ __nv_bf16x8_storage_t psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(
+    const __nv_fp4x8_storage_t fp4x8)
+{
+    // interleaved version
+    // input fp4x8: 7564 3120
+    // output bf16x8: 7654 3210
+
+    __nv_bf16x8_storage_t bf16x8_raw;
+    __nv_bf16x2_storage_t* bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t*>(&bf16x8_raw);
+
+    __nv_fp8x4_storage_t h_fp8x4_0to1_bits = (fp4x8 & 0xC0C0C0C0U) >> 6; // 7632
+    __nv_fp8x4_storage_t l_fp8x4_0to1_bits = (fp4x8 & 0x0C0C0C0CU) >> 2; // 5410
+
+    unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+    unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+
+    __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4);       // 7564
+    __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4);       // 3120
+
+    bf16x2_raw[0] = prmt(l_fp8x4_0to1_bits, l4b_2to9_bits, 0x5240U) << 6U; // 1 0
+    bf16x2_raw[1] = prmt(h_fp8x4_0to1_bits, l4b_2to9_bits, 0x5341U) << 6U; // 3 2
+
+    bf16x2_raw[2] = prmt(l_fp8x4_0to1_bits, h4b_2to9_bits, 0x7260U) << 6U; // 5 4
+    bf16x2_raw[3] = prmt(h_fp8x4_0to1_bits, h4b_2to9_bits, 0x7361U) << 6U; // 7 6
+
+    return bf16x8_raw;
+}
+
 template <class Collective>
 struct MixedGroupedGemmInputUtils
 {
@@ -330,7 +358,7 @@ public:
         auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
         auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
 
-        dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_);
+        dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(src_);
     }
 
     /// Utilities to dequantize A.
