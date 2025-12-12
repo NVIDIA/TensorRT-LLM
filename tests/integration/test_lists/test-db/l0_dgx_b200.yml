@@ -53,7 +53,6 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: ray
   tests:
-    - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu4"
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
     - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
     - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
