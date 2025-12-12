@@ -107,7 +107,6 @@ class MoERunner(TunableRunner):
             self.tp_size,
             self.ep_size,
             self.cluster_size,
-            self.cluster_rank,
             self.enable_alltoall,
             self.use_deepseek_fp8_block_scale,
             self.use_w4_group_scaling,

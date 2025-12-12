@@ -24,7 +24,14 @@ from tensorrt_llm.mapping import Mapping
 
 
 class DistributedTuningStrategy(enum.Enum):
-    """Strategy for distributed tuning."""
+    """
+    Strategy for distributed tuning.
+    Args:
+        BROADCAST: One rank (rank 0) tunes and broadcasts results to others
+        INDEPENDENT: Each rank tunes independently (default for non-comm ops)
+        MERGE: All ranks participate in tuning and reach merge
+        PARALLEL: All ranks participate in tuning with partial tactics
+    """
     BROADCAST = "broadcast"
     INDEPENDENT = "independent"
     MERGE = "merge"
@@ -111,10 +118,6 @@ class TuningConfig:
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
         distributed_tuning_strategy (DistributedTuningStrategy): Strategy for distributed tuning.
-            - BROADCAST: One rank (rank 0) tunes and broadcasts results to others
-            - INDEPENDENT: Each rank tunes independently (default for non-comm ops)
-            - MERGE: All ranks participate in tuning and reach merge
-            - PARALLEL: All ranks participate in tuning with partial tactics
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -252,7 +255,6 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
     Args:
         tune_mode: Whether to enable tuning mode
         cache_path: Path to save/load cache files
-        rank: Explicit rank override (if None, will auto-detect from distributed state)
     """
     autotuner = AutoTuner.get()
     rank = autotuner.mapping.rank
@@ -277,23 +279,14 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
-        if autotuner._is_distributed():
-            logger.info(
-                f"[Autotuner] Autotuning process starts on rank {rank}/{autotuner.mapping.world_size}"
-            )
-        else:
-            logger.info("[Autotuner] Autotuning process starts ...")
+        logger.info("[Autotuner] Autotuning process starts ...")
 
     try:
         yield
     finally:
         autotuner.is_tuning_mode = old_mode
         if autotune_enabled:
-            if autotuner._is_distributed():
-                logger.info(
-                    f"[Autotuner] Autotuning process ends on rank {rank}")
-            else:
-                logger.info("[Autotuner] Autotuning process ends")
+            logger.info("[Autotuner] Autotuning process ends")
 
         # save cache
         if cache_path is not None:
