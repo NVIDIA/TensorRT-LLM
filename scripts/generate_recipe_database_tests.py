@@ -16,18 +16,9 @@
 """Generate aggr_server configs and test list from the config recipe database.
 
 This script:
-1. Reads recipes from lookup.yaml
-2. Generates aggr_server-format config file per GPU type (e.g., recipe_database_b200.yaml)
+1. Reads recipes examples/configs/database
+2. Generates aggr_server test config files per GPU type (e.g., recipe_database_b200.yaml)
 3. Generates llm_recipe_database.yml test list with condition blocks grouped by num_gpus
-
-Usage:
-    python scripts/generate_recipe_database_tests.py [OPTIONS]
-
-Options:
-    --iterations NUM    Number of benchmark iterations (default: 10)
-    --output-dir DIR    Output directory for configs (default: tests/scripts/perf-sanity)
-    --test-list PATH    Output path for test list YAML
-    --lookup-yaml PATH  Path to lookup.yaml (default: auto-detect)
 """
 
 import argparse
@@ -90,10 +81,9 @@ def recipe_to_server_config(recipe: Recipe, llm_api_config: dict, iterations: in
         "match_mode": "scenario",
     }
 
-    # Copy LLM API config fields (excluding backend which is handled separately)
+    # Copy LLM API config fields
     for key, value in llm_api_config.items():
-        if key not in ["backend", "print_iter_log"]:
-            server_config[key] = value
+        server_config[key] = value
 
     # Add client configs
     server_config["client_configs"] = [
