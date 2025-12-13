@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
-from tensorrt_llm._utils import debug_print
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -33,21 +32,32 @@ from .modeling_utils import (
     register_auto_model,
 )
 
-try:
-    from transformers import ExaoneMoEConfig
-except ImportError:
-    # TODO: Remove this once we have a proper transformers package
-    from transformers import AutoConfig, PretrainedConfig
+# fmt: off
+# TODO: Remove this once we have a proper transformers package
+from transformers import AutoConfig, PretrainedConfig  # isort: skip
 
-    class ExaoneMoEConfig(PretrainedConfig):
-        model_type = "exaone_moe"
+class ExaoneMoEConfig(PretrainedConfig):
+    model_type = "exaone_moe"
 
-    print(
-        "transformers does not support 'ExaoneMoEConfig'. "
-        "Register ExaoneMoEConfig to mimic the ExaoneMoE model."
-    )
-    AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
-    # End of the config register.
+print(
+    "transformers does not support 'ExaoneMoEConfig'. "
+    "Register ExaoneMoEConfig to mimic the ExaoneMoE model."
+)
+AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
+# End of the config register.
+# fmt: on
+
+
+PRINT_DEBUG = False
+
+
+def debug_print(tag: str, x: torch.Tensor, layer_idx: Optional[int] = None):
+    if PRINT_DEBUG and not torch.cuda.is_current_stream_capturing():
+        tag = tag if layer_idx is None else f"layer.{layer_idx}.{tag}"
+        x = x.float()
+        print(
+            f"[DEBUG_PRINT] TR | {tag:20s} | l1_norm {x.abs().mean():10.4f} | mean {x.mean():10.4f}"
+        )
 
 
 def check_is_sliding(config: ExaoneMoEConfig, layer_idx: int) -> bool:
