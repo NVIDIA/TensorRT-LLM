@@ -40,14 +40,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
 
+        iter_stats_max_iterations = worker_kwargs[
+            "llm_args"].iter_stats_max_iterations if worker_kwargs.get(
+                "llm_args", None) is not None else 0
+
         super().__init__(
             num_postprocess_workers=postproc_worker_config.
             num_postprocess_workers,
             postprocess_tokenizer_dir=postproc_worker_config.
             postprocess_tokenizer_dir,
-            max_iteration_result_size=postproc_worker_config.
-            max_iteration_result_size,
             is_llm_executor=is_llm_executor,
+            iter_stats_max_iterations=iter_stats_max_iterations,
         )
 
         self._create_mpi_session(model_world_size, mpi_session)

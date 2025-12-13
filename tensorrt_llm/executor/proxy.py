@@ -50,15 +50,17 @@ class GenerationExecutorProxy(GenerationExecutor):
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
-        super().__init__(
-            num_postprocess_workers=postproc_worker_config.
-            num_postprocess_workers,
-            postprocess_tokenizer_dir=postproc_worker_config.
-            postprocess_tokenizer_dir,
-            max_iteration_result_size=postproc_worker_config.
-            max_iteration_result_size,
-            is_llm_executor=is_llm_executor,
-        )
+
+        iter_stats_max_iterations = worker_kwargs[
+            "llm_args"].iter_stats_max_iterations if worker_kwargs.get(
+                "llm_args", None) is not None else 0
+
+        super().__init__(num_postprocess_workers=postproc_worker_config.
+                         num_postprocess_workers,
+                         postprocess_tokenizer_dir=postproc_worker_config.
+                         postprocess_tokenizer_dir,
+                         is_llm_executor=is_llm_executor,
+                         iter_stats_max_iterations=iter_stats_max_iterations)
 
         self.workers_started = False
         self.worker_cls = worker_cls

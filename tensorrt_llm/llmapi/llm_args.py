@@ -2042,8 +2042,11 @@ class BaseLlmArgs(StrictBaseModel):
         })
 
     iter_stats_max_iterations: Optional[int] = Field(
-        default=None,
-        description="The maximum number of iterations for iter stats.",
+        default=16384,
+        description=
+        "Maximum number of iterations to keep in the iteration statistics history. "
+        "Defaults to 16384 iterations. "
+        "When exceeded, older statistics are automatically removed to maintain this limit.",
         status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
@@ -2105,12 +2108,6 @@ class BaseLlmArgs(StrictBaseModel):
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
         description="The path to the tokenizer directory for postprocessing.",
-        status="prototype")
-
-    max_iteration_result_size: int = Field(
-        default=16384,
-        description="Maximum size of the iteration result queue. "
-        "When the queue is full, the oldest result will be removed.",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
