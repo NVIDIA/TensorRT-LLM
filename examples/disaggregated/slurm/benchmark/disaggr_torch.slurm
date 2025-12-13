@@ -26,6 +26,7 @@ while [[ $# -gt 0 ]]; do
         --container-mount) container_mount="$2"; shift 2 ;;
         --container-image) container_image="$2"; shift 2 ;;
         --build-wheel) build_wheel="$2"; shift 2 ;;
+        --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
 
         # Accuracy evaluation
@@ -79,6 +80,14 @@ echo
 echo "Server Environment Variables:"
 echo "  server_env_var: ${server_env_var}"
 
+# Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
+if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
+    export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
+    worker_env_var="${worker_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    server_env_var="${server_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    echo "Setting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode"
+fi
+
 container_name="disaggr-test"
 
 # Function to cleanup on failure
@@ -122,6 +131,9 @@ elif [ -d "${trtllm_repo}" ]; then
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
         build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
+        if [ -n "${cuda_architectures:-}" ]; then
+            build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
+        fi
         if ! srun --container-name=${container_name} \
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
@@ -160,8 +172,15 @@ for i in "${!node_array[@]}"; do
     echo "Replaced $placeholder with $current_val"
 done
 
+# start the workers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_worker_cmds_file}..."
 cat ${start_worker_cmds_file} | while read cmd; do
+    # Skip ctx worker commands if in gen-only mode
+    # CTX appears as argument to start_worker.sh and in log filename
+    if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" = "1" ] && [[ "$cmd" == *"start_worker.sh CTX"* ]]; then
+        echo "Skipping ctx worker command (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set): ${cmd}"
+        continue
+    fi
     echo "Starting worker command: ${cmd}"
     eval "${cmd}"
 done

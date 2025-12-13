@@ -52,14 +52,23 @@ def test_compile_and_capture(model_type, model_cls, input_shape, output_shape_fn
     dynamic_shapes = generate_dynamic_shapes(batch_size, seq_shape[0])
     graph_module = torch_export_to_gm(mod, args=(sample_input,), dynamic_shapes=dynamic_shapes)
 
+    # Create a get_args_kwargs function for backends that need it
+    def get_args_kwargs(bs):
+        return (sample_input[:bs],), {}
+
     with torch.inference_mode():
         compiler_cls = CompileBackendRegistry.get(backend_cls)
-        compiled_model = compiler_cls(
-            graph_module,
-            args=(sample_input,),
-            num_batched_inputs=1,
-            max_batch_size=batch_size,
-        ).compile()
+
+        # Add get_args_kwargs_for_compile for cudagraph-based backends
+        compiler_kwargs = {
+            "args": (sample_input,),
+            "num_batched_inputs": 1,
+            "max_batch_size": batch_size,
+            "get_args_kwargs_for_compile": get_args_kwargs,
+            "cuda_graph_batch_sizes": [batch_size],
+        }
+
+        compiled_model = compiler_cls(graph_module, **compiler_kwargs).compile()
 
         assert isinstance(compiled_model, Module), "Compiled model is not a valid nn.Module."
         output = compiled_model(sample_input)

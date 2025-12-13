@@ -15,6 +15,7 @@
  */
 
 #include "fusedQKNormRopeKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
@@ -24,7 +25,9 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 // Specialization for packed_as used in this kernel.
 template <>
@@ -44,9 +47,12 @@ struct packed_as<uint, 4>
 {
     using type = uint4;
 };
-} // namespace tensorrt_llm::common
+} // namespace common
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_END
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -327,4 +333,6 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
     }
 }
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

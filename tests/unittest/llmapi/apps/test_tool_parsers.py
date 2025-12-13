@@ -23,6 +23,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
+from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
@@ -467,6 +468,149 @@ class BaseToolParserTestClass:
 
         # Should not return any calls for undefined function
         assert len(result.calls) == 0
+
+
+class TestKimiK2ToolParser(BaseToolParserTestClass):
+    """Test suite for KimiK2ToolParser class."""
+
+    def make_parser(self):
+        return KimiK2ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            'Some text <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|><|tool_calls_section_end|>',
+            detect_and_parse_single_tool=(
+                # Input text.
+                ('Normal text'
+                 '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected `normal_text`.
+                "Normal text",
+                # Expected `name`.
+                "get_weather",
+                # Expected `parameters`.
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                # Input text.
+                ('<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"LA"}<|tool_call_end|>\n'
+                 '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"query":"AI"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected names.
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=
+            ('<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>MALFORMED<|tool_call_end|><|tool_calls_section_end|>'
+             ),
+            detect_and_parse_with_parameters_key=(
+                # Input text.
+                ('<|tool_calls_section_begin|><|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"query":"test"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected `name`.
+                "search_web",
+                # Expected `parameters`.
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token=
+            "<|tool_calls_section_begin|><|tool_call_be",
+            undefined_tool=
+            '<|tool_calls_section_begin|><|tool_call_begin|>functions.undefined_func:0<|tool_call_argument_begin|>{"arg":"any value"}<|tool_call_end|><|tool_calls_section_end|>',
+        )
+
+    def test_initialization(self, parser):
+        """Test that Qwen3ToolParser initializes correctly."""
+        assert parser.bot_token == "<|tool_calls_section_begin|>"
+        assert parser.eot_token == "<|tool_calls_section_end|>"
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+
+        # Send bot token
+        parser.parse_streaming_increment("<|tool_calls_section_begin|>",
+                                         sample_tools)
+
+        # Send partial tool call with name
+        result = parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{',
+            sample_tools)
+
+        # Should send tool name
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        # Send arguments
+        result = parser.parse_streaming_increment(
+            '"location":"SF"}<|tool_call_end|>', sample_tools)
+
+        # Should stream arguments
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles multiple tool calls."""
+
+        # First tool
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>',
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|>',
+            sample_tools)
+
+        # Second tool
+        parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"arg": "any value"}<|tool_call_end|>',
+            sample_tools)
+
+        result = parser.parse_streaming_increment('<|tool_calls_section_end|>',
+                                                  sample_tools)
+        # Should have started second tool
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[0].tool_index == 1
+
+    def test_structure_info_function(self):
+        """Test structure_info returns correct lambda function."""
+        parser = KimiK2ToolParser()
+        func = parser.structure_info()
+
+        info = func("test_function")
+
+        assert isinstance(info, StructureInfo)
+        assert info.begin == '<|tool_calls_section_begin|><|tool_call_begin|>functions.test_function:0<|tool_call_argument_begin|>'
+        assert info.end == "<|tool_call_end|><|tool_calls_section_end|>"
+        assert info.trigger == "<|tool_calls_section_begin|>"
+
+    def test_structure_info_different_names(self):
+        """Test structure_info works with different function names."""
+        parser = KimiK2ToolParser()
+        func = parser.structure_info()
+
+        info1 = func("get_weather")
+        info2 = func("search_web")
+
+        assert "get_weather" in info1.begin
+        assert "search_web" in info2.begin
+        assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
+
+    def test_kimi_k2_format_compliance(self, sample_tools, parser):
+        """Test that KimiK2ToolParser follows the documented format structure."""
+
+        # Test the exact format from the docstring
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"Tokyo"}<|tool_call_end|><|tool_calls_section_end|>'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
 
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
