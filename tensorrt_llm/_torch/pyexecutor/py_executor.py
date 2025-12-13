@@ -129,7 +129,7 @@ class AsyncTransferManager:
         self.resource_manager = resource_manager
         self.kv_cache_manager = resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        self.requests: dict[int, (LlmRequest, int, int)] = dict()
+        self.requests: Dict[int, (LlmRequest, Optional[int], int)] = dict()
         self.request_should_store_blocks: dict[int, bool] = dict()
 
     def requests_in_transfer(self) -> dict[int, LlmRequest]:
@@ -192,7 +192,9 @@ class AsyncTransferManager:
             else:
                 should_terminate = True
 
-            request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            # We don't want to overwrite any error state.
+            if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
+                request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
         else:
             self.requests[request.py_request_id] = (request, block_id,
                                                     counter - 1)
