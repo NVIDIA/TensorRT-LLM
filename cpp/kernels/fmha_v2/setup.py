@@ -6417,6 +6417,8 @@ def enumerate_kernels():
     enumerate_qgmma_kernels(specs, sm=90)
     # need to add bf16 kernels if needed
     for enable_skip_softmax in [False, True]:
+        if enable_skip_softmax and 'DISABLE_SKIP_SOFTMAX' in os.environ:
+            continue
         enumerate_hgmma_flash_warpspec_kernels(
             specs, sm=90, dtype='fp16', enable_skip_softmax=enable_skip_softmax)
         enumerate_hgmma_flash_warpspec_kernels(
