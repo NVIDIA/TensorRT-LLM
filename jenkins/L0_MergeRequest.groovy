@@ -65,6 +65,7 @@ if (env.gitlabTriggerPhrase)
 boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
 
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
+boolean isRetagImageMode = gitlabParamsFromBot.get("retag_image", false)
 
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
@@ -1297,6 +1298,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
+def runRetagImage(pipeline)
+{
+    script {
+        echo "Running retag image"
+    }
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -1357,6 +1365,12 @@ pipeline {
                         stage("Release-Check") {
                             script {
                                 launchReleaseCheck(this)
+                            }
+                        }
+                    } else if (isRetagImageMode) {
+                        stage("Retag Image") {
+                            script {
+                                runRetagImage(this)
                             }
                         }
                     } else {
