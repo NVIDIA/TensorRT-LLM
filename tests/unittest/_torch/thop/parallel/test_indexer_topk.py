@@ -98,9 +98,7 @@ def compare_top_k_results(
             return False
 
         if cuda_valid.shape[0] != expected_valid:
-            print(
-                f"Row {row_idx}: Expected {expected_valid} valid indices, got {cuda_valid.shape[0]}"
-            )
+            print(f"Row {row_idx}: Expected {expected_valid} valid indices, got {cuda_valid.shape[0]}")
             return False
 
         # If no valid indices, continue
@@ -124,9 +122,7 @@ def compare_top_k_results(
         torch_values_sorted, _ = torch.sort(torch_values, descending=True)
 
         # Compare sorted values
-        if not torch.allclose(
-            cuda_values_sorted, torch_values_sorted, rtol=tolerance, atol=tolerance
-        ):
+        if not torch.allclose(cuda_values_sorted, torch_values_sorted, rtol=tolerance, atol=tolerance):
             # Additional debug: check if sets are identical
             cuda_set = set(cuda_valid.cpu().tolist())
             torch_set = set(torch_valid.cpu().tolist())
@@ -145,15 +141,11 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
     is_long = torch.rand(batch_size, device="cuda") < 0.9
     num_long = is_long.sum().item()
     if num_long > 0:
-        seq_lens[is_long] = torch.randint(
-            min_long_seq, num_tokens, (num_long,), dtype=torch.int32, device="cuda"
-        )
+        seq_lens[is_long] = torch.randint(min_long_seq, num_tokens, (num_long,), dtype=torch.int32, device="cuda")
 
     num_short = (~is_long).sum().item()
     if num_short > 0:
-        seq_lens[~is_long] = torch.randint(
-            1, min_long_seq, (num_short,), dtype=torch.int32, device="cuda"
-        )
+        seq_lens[~is_long] = torch.randint(1, min_long_seq, (num_short,), dtype=torch.int32, device="cuda")
     return seq_lens
 
 
@@ -197,27 +189,37 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     ), "CUDA top_k_per_row results don't match torch.topk"
 
 
-@pytest.mark.parametrize("batch_size", [1, 512, 2048])
+@pytest.mark.parametrize("batch_size", [1, 32])
 @pytest.mark.parametrize("index_topk", [2048, 128])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("num_tokens", [4096, 8192, 16384, 32768])
 def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
-    # Set input data
-    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-    row_ends = torch.arange(1, batch_size + 1, device="cuda", dtype=torch.int32)
+    # gen random input for the sequence length
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    num_gen_tokens = seq_lens.sum()
 
+    # gen the row_starts and row_ends (from 1 to ...)
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(1, seq_lens.max() + 1, dtype=torch.int32, device="cuda")
+    row_ends = row_indices.expand(seq_lens.size(0), -1)[
+        row_indices.expand(seq_lens.size(0), -1) <= seq_lens.unsqueeze(1)
+    ].contiguous()
+
+    # gen logits
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
 
     # Create output tensors
-    indices = torch.empty((batch_size, index_topk), dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
     # Run CUDA implementation
     torch.ops.trtllm.indexer_topk_prefill(logits, row_starts, row_ends, indices, index_topk)
+    torch.cuda.synchronize()
 
     # Run reference implementation
-    torch_indices = logits.topk(min(index_topk, max(row_ends)), dim=-1)[1]
+    max_row_len = row_ends.max().item()
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
     mask = mask_lo & mask_hi
