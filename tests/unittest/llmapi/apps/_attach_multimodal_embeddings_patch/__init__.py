@@ -24,6 +24,8 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBas
 from tensorrt_llm.inputs import ExtraProcessedInputs, TextPrompt
 from tensorrt_llm.sampling_params import SamplingParams
 
+_attach_multimodal_embeddings_orig = Qwen2VLInputProcessorBase.attach_multimodal_embeddings
+
 
 # signature taken from tensorrt_llm/inputs/registry.py
 def _attach_multimodal_embeddings(
@@ -32,6 +34,15 @@ def _attach_multimodal_embeddings(
     multimodal_embedding: dict[str, list[torch.Tensor]],
     sampling_params: SamplingParams,
 ) -> tuple[list[int], Optional[ExtraProcessedInputs]]:
+    try:
+        _attach_multimodal_embeddings_orig(self, inputs, multimodal_embedding, sampling_params)
+    except NotImplementedError:
+        pass
+    else:
+        raise ValueError(
+            "Remove this custom module, Qwen2VLInputProcessorBase implements attach_multimodal_embeddings"
+        )
+
     tempdir = tempfile.gettempdir()
     file_path = Path(tempdir) / "multimodal_embedding.pickle"
     with open(file_path, "wb") as f:
@@ -39,5 +50,4 @@ def _attach_multimodal_embeddings(
     raise ValueError(file_path)
 
 
-assert not hasattr(Qwen2VLInputProcessorBase, "attach_multimodal_embeddings")
-setattr(Qwen2VLInputProcessorBase, "attach_multimodal_embeddings", _attach_multimodal_embeddings)
+Qwen2VLInputProcessorBase.attach_multimodal_embeddings = _attach_multimodal_embeddings
