@@ -175,15 +175,16 @@ Results are automatically organized in the work directory:
 
 ### Benchmark Modes
 
-The system supports two primary benchmark modes:
+The system supports three primary benchmark modes:
 
 1. **End-to-End (e2e)**: Tests the complete disaggregated inference pipeline including both context processing and token generation phases
 2. **Generation Only (gen_only)**: Focuses solely on testing the generation phase with pre-cached KV data
+3. **Generation Only No Context (gen_only_no_context)**: Skips launching context workers entirely by setting `TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1`. This is useful when you only want to benchmark the generation phase without allocating resources for context workers.
 
 Configure the mode in the YAML file:
 ```yaml
 benchmark:
-  mode: "e2e"  # or "gen_only"
+  mode: "e2e"  # or "gen_only" or "gen_only_no_context"
 ```
 
 ### Metrics Collection

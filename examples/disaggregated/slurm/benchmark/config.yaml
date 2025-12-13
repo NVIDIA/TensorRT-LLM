@@ -11,7 +11,7 @@ slurm:
 
 # Benchmark Mode
 benchmark:
-  mode: "e2e"  # Options: e2e, gen_only
+  mode: "e2e"  # Options: e2e, gen_only, gen_only_no_context
   use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
   multi_round: 8  # Number of benchmark rounds
   benchmark_ratio: 0.8  # Benchmark ratio
@@ -34,6 +34,7 @@ environment:
   model_path: "<model_path>"
   trtllm_repo: "<trtllm_repo>"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
+  cuda_architectures: ""  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
   trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "<full_path_to_work_dir>"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
@@ -59,6 +60,11 @@ worker_config:
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     pipeline_parallel_size: 1
+    context_parallel_size: 1
+    # Uncomment this section to enable context parallelism.
+    # cp_config:
+    #   cp_type: "HELIX"
+    #   tokens_per_block: 32  # must match kv_config.tokens_per_block.
     max_batch_size: 256
     max_num_tokens: 512
     max_seq_len: 2251
@@ -83,6 +89,7 @@ worker_config:
     trust_remote_code: true
     kv_cache_config:
       enable_block_reuse: false
+      tokens_per_block: 32
       free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
@@ -103,6 +110,7 @@ worker_config:
     max_num_tokens: 4608
     max_seq_len: 1227
     tensor_parallel_size: 4
+    context_parallel_size: 1
     moe_expert_parallel_size: 4
     enable_attention_dp: true
     pipeline_parallel_size: 1

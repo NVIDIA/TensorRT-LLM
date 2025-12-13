@@ -3066,6 +3066,24 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    @model_validator(mode='after')
+    def validate_helix_tokens_per_block(self) -> 'TorchLlmArgs':
+        """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when HELIX parallelism is active."""
+        if self.context_parallel_size == 1 or self.cp_config is None or not self.cp_config:
+            return self
+
+        cp_type = self.cp_config.get('cp_type', None)
+        if cp_type is not None and str(cp_type).upper() == 'HELIX':
+            cp_tokens_per_block = self.cp_config.get('tokens_per_block', None)
+            if cp_tokens_per_block is not None:
+                kv_tokens_per_block = self.kv_cache_config.tokens_per_block
+                assert cp_tokens_per_block == kv_tokens_per_block, (
+                    f"When HELIX parallelism is active, cp_config.tokens_per_block ({cp_tokens_per_block}) "
+                    f"must match kv_cache_config.tokens_per_block ({kv_tokens_per_block})."
+                )
+
+        return self
+
     def warn_on_unstable_feature_usage(self) -> 'TorchLlmArgs':
         """Warn on unstable feature usage."""
         set_fields = self.model_dump(exclude_unset=True).keys()
