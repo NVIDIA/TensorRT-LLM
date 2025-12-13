@@ -2279,8 +2279,8 @@ class PyExecutor:
 
         for request_id in finished_requests + error_requests:
 
-            request = self.async_transfer_manager.requests_in_transfer().get(
-                request_id)
+            request = self.async_transfer_manager.requests_in_transfer(
+            )[request_id]
 
             if self.async_transfer_manager.end_transfer(request):
                 self._terminate_request(request)
