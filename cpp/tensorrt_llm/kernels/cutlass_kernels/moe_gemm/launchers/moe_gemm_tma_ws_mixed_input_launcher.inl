@@ -54,6 +54,7 @@
 #endif          // __GNUC__
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
@@ -61,8 +62,8 @@
 
 #include "moe_gemm_tma_ws_mixed_input_launcher.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -246,4 +247,5 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -1878,16 +1878,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
 
-        # Ensure helix_is_inactive_rank is on the same device as other tensors.
+        # Ensure helix_is_inactive_rank and position_ids are on the same device.
         if helix_is_inactive_rank is not None:
-            if isinstance(helix_is_inactive_rank, list):
-                helix_is_inactive_rank = torch.tensor(
-                    helix_is_inactive_rank,
-                    dtype=torch.bool,
-                    device=helix_position_offsets.device)
-            elif helix_is_inactive_rank.device.type != 'cuda':
-                helix_is_inactive_rank = helix_is_inactive_rank.to(
-                    helix_position_offsets.device)
+            assert helix_is_inactive_rank.device == helix_position_offsets.device, \
+                f"helix_is_inactive_rank must be on the same device as helix_position_offsets, " \
+                f"got {helix_is_inactive_rank.device} vs {helix_position_offsets.device}"
 
         mla_tensor_params = [helix_position_offsets, helix_is_inactive_rank]
 

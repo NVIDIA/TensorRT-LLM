@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -25,7 +26,9 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::optional<int32_t> getIntEnv(char const* name)
@@ -528,4 +531,6 @@ bool getEnvEplbForceGdrcopy()
     return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

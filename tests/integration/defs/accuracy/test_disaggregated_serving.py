@@ -863,7 +863,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
-            "cuda_graph_config": None,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128]
+            },
             "cache_transceiver_config": {
                 "backend": "UCX"
             },

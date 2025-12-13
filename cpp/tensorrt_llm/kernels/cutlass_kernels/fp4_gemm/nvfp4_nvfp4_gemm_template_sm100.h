@@ -29,17 +29,17 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
 
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
-
-#include "tensorrt_llm/common/envUtils.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
 #endif // #ifndef _WIN32
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -329,4 +329,5 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

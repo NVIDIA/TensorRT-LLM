@@ -250,14 +250,23 @@ class OpenAIDisaggregatedService(OpenAIService):
             await self._gen_router.stop_server_monitoring()
 
     async def _wait_for_all_servers_ready(self) -> None:
+        # Skip context servers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set
+        gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+
         async def check_servers_ready():
             elapsed_time = 0
             interval = self._health_check_interval_secs
             while elapsed_time < self._server_start_timeout_secs:
-                _, unready_ctx_servers = await self._ctx_client.check_ready()
+                if gen_only:
+                    unready_ctx_servers = []
+                else:
+                    _, unready_ctx_servers = await self._ctx_client.check_ready()
                 _, unready_gen_servers = await self._gen_client.check_ready()
                 if len(unready_ctx_servers) == 0 and len(unready_gen_servers) == 0:
-                    logger.info("All servers are ready")
+                    if gen_only:
+                        logger.info("Generation servers are ready (context servers skipped)")
+                    else:
+                        logger.info("All servers are ready")
                     return
                 logger.info(
                     f"Waiting for servers, context: {unready_ctx_servers}, generation: {unready_gen_servers}"
