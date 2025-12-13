@@ -14,7 +14,9 @@ from build_and_run_ad import ExperimentConfig, main
             {
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {"backend": "torch-opt"},
+                    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
+                    # "compile_model": {"backend": "torch-opt"},
+                    "compile_model": {"backend": "torch-cudagraph"},
                 },
             },
         ),

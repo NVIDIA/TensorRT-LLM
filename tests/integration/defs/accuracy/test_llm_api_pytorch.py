@@ -3302,7 +3302,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       True,
                       True,
                       True,
-                      marks=pytest.mark.skip_less_mpi_world_size(8))],
+                      marks=(pytest.mark.skip_less_mpi_world_size(8),
+                             pytest.mark.timeout(7200)))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                   overlap_scheduler, is_cached):
@@ -3419,7 +3420,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
@@ -3427,6 +3428,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler, torch_compile):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
+        "Need to check Ada support"
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
@@ -4834,3 +4837,107 @@ class TestLlama3_1_8B_Instruct_RocketKV(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+
+class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistral/Mistral-Large-3-675B"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
+        [
+            (4, 1, 4, False, True, True, "TRTLLM", False),
+        ],
+        ids=[
+            "latency_moe_trtllm",
+        ],
+    )
+    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler, moe_backend, eagle3):
+
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not eagle3)
+        spec_config = None
+        if eagle3:
+            spec_config = EagleDecodingConfig(
+                max_draft_len=2,
+                speculative_model_dir=
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
+                eagle3_one_model=True)
+        with LLM(
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
+                checkpoint_format="mistral",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config,
+                speculative_config=spec_config) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
+        [
+            (8, 1, 8, False, True, True, "DEEPGEMM", False),
+        ],
+        ids=[
+            "latency_moe_deepgemm",
+        ],
+    )
+    def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                 overlap_scheduler, moe_backend, eagle3):
+
+        if moe_backend == "DEEPGEMM" and (get_sm_version() == 120
+                                          or get_sm_version() == 121):
+            pytest.skip(
+                "MOE DEEPGEMM backend does not support SM version 120 or 121")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not eagle3)
+        spec_config = None
+        if eagle3:
+            spec_config = EagleDecodingConfig(
+                max_draft_len=2,
+                speculative_model_dir=
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
+                eagle3_one_model=True)
+        with LLM(
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
+                checkpoint_format="mistral",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config,
+                speculative_config=spec_config) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

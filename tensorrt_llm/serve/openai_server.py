@@ -112,7 +112,8 @@ class OpenAIServer:
             from tensorrt_llm._torch.pyexecutor.config_utils import \
                 load_pretrained_config
             self.model_config = load_pretrained_config(hf_tokenizer_path,
-                                                       trust_remote_code=trust_remote_code)
+                                                       trust_remote_code=trust_remote_code,
+                                                       checkpoint_format=getattr(self.llm.args, "checkpoint_format", None))
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -151,6 +152,10 @@ class OpenAIServer:
             self.use_harmony = False
         else:
             self.use_harmony = (self.model_config.model_type == "gpt_oss")
+
+        self.tool_call_id_type = "random" # default tool call id type is random
+        if self.model_config.model_type == "kimi_k2":
+            self.tool_call_id_type = "kimi_k2"
 
         # as disagg-worker
         self.disagg_cluster_storage = None
@@ -554,6 +559,7 @@ class OpenAIServer:
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
+            postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]

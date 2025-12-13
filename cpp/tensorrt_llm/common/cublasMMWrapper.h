@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -24,8 +25,8 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -185,4 +186,4 @@ public:
 
 } // namespace common
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
