@@ -16,11 +16,15 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
 #include <unordered_map>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -97,3 +101,5 @@ inline const AlgoListType fp8_algo_list = {
 
 } // namespace cublas_lut
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
