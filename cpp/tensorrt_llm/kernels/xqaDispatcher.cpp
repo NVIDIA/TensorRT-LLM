@@ -15,6 +15,7 @@
  */
 
 #include "xqaDispatcher.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -38,7 +39,9 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace
@@ -538,4 +541,6 @@ void XqaDispatcher::run(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

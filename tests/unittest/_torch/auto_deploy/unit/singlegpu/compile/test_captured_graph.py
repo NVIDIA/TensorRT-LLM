@@ -11,6 +11,7 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     _args_kwargs_flatten_spec,
 )
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 
 
 class ModelWithMultipleInputs(torch.nn.Module):
@@ -44,7 +45,7 @@ class ModelWithMultipleInputs(torch.nn.Module):
     ],
 )
 def test_round_up_to_closest(lst, value, expected):
-    assert CapturedGraph.round_up_to_closest(lst, value) == expected
+    assert _round_up_to_closest(lst, value) == expected
 
 
 @pytest.mark.parametrize("num_inputs", [1, 2, 3])
@@ -100,13 +101,19 @@ def test_cudagraph_capture_replay(
 
     compiled_model = CapturedGraph(
         graph_module,
-        cuda_graph_batch_sizes=[batch_size],
         num_batched_inputs=num_inputs,
     )
 
+    # Create a get_args_kwargs function for capture_graph
+    def get_args_kwargs(bs):
+        if model_type == "llm":
+            return tuple(x[:bs] for x in input_data[:num_inputs]), {}
+        else:  # vit
+            return tuple(x[:bs] for x in input_data[:num_inputs]), {}
+
     with torch.inference_mode():
-        # Capture graph with all inputs
-        compiled_model.capture_graph(*args)
+        # Capture graph with batch sizes
+        compiled_model.capture_graph(get_args_kwargs, [batch_size])
 
         # Ensure the graph is stored for the combined shape of all inputs
         assert combined_shape in compiled_model.cudagraphs, (

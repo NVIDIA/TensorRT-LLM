@@ -15,9 +15,10 @@
  */
 
 #include "beamSearchKernelsTemplate.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 INSTANTIATE_BEAM_SEARCH(float, 8, false);
@@ -25,4 +26,5 @@ INSTANTIATE_BEAM_SEARCH(float, 8, true);
 INSTANTIATE_BEAM_SEARCH(half, 8, false);
 INSTANTIATE_BEAM_SEARCH(half, 8, true);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

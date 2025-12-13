@@ -20,6 +20,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // __GNUC__
+#include "tensorrt_llm/common/config.h"
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -43,7 +44,9 @@
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 using namespace cute;
 
@@ -177,4 +180,6 @@ struct DeviceGemmFp8RowwiseSm100
     using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END
