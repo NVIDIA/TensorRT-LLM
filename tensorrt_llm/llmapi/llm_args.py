@@ -619,7 +619,7 @@ class DecodingBaseConfig(StrictBaseModel):
     # (N = acceptance_window) drops below this value.
     acceptance_length_threshold: Optional[float] = None
 
-    # If true, allows non-greedy sampling when speculation is used. Only applicable
+    # Prototype. If true, allows non-greedy sampling when speculation is used. Only applicable
     # to 1-model code paths; non-greedy sampling is always enabled on 2-model paths.
     allow_advanced_sampling: bool = False
 
