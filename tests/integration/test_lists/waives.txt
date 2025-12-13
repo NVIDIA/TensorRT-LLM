@@ -422,6 +422,5 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUT
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-two_model-overlap_scheduler] SKIP (https://nvbugs/5702826)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-two_model-overlap_scheduler] SKIP (https://nvbugs/5702826)
 disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin] SKIP (https://nvbugs/5726118)
-unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_streaming SKIP (https://nvbugs/5720482)
 unittest/llmapi/test_llm_pytorch.py::test_llm_reward_model SKIP (https://nvbugs/5670458)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[enable_configurable_moe-moe_backend=TRTLLM-mtp_nextn=0-ep4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True] SKIP (https://nvbugs/5727475)
