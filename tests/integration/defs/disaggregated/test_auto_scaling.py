@@ -12,6 +12,7 @@ import openai
 import pytest
 import requests
 import yaml
+from defs.conftest import llm_models_root
 
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
@@ -44,7 +45,9 @@ def get_free_unused_port():
 
 @pytest.fixture
 def model_name():
-    return "Qwen3/Qwen3-0.6B"
+    model_path = os.path.join(llm_models_root(), "Qwen3/Qwen3-8B-FP8")
+    assert os.path.exists(model_path), f"Model path {model_path} does not exist"
+    return model_path
 
 
 @pytest.fixture
