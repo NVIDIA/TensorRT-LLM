@@ -143,6 +143,9 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
+    parser.add_argument('--allow_advanced_sampling',
+                        default=False,
+                        action='store_true')
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -210,7 +213,9 @@ def setup_llm(args, **kwargs):
             eagle3_one_model=args.use_one_model,
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
-            dynamic_tree_max_topK=args.dynamic_tree_max_topK)
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK,
+            allow_advanced_sampling=args.allow_advanced_sampling)
+
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
