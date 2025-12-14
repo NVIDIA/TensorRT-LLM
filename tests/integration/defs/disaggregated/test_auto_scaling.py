@@ -44,7 +44,7 @@ def get_free_unused_port():
 
 @pytest.fixture
 def model_name():
-    return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture
