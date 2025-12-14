@@ -308,7 +308,7 @@ class MistralConfigLoader(BaseConfigLoader):
                     "language_model.model.layers.*.self_attn.q_a_proj*",
                     "language_model.model.layers.*.self_attn.kv_a_proj_with_mqa*",
                     "model.layers.*.self_attn.q_a_proj*",
-                    "model.layers.*.self_attn.kv_a_proj_with_mqa*"
+                    "model.layers.*.self_attn.kv_a_proj_with_mqa*",
                 ]
         elif hf_quant_config.get("quant_method") == "fp8":
             # Used for Eagle3 weight
