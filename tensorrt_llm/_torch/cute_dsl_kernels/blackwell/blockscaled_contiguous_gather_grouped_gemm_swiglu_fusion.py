@@ -228,10 +228,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         - Float32
         - Float16/BFloat16
         - Float8E4M3FN/Float8E5M2
-        # {$nv-internal-release begin}
         # Note: Float4E2M1FN output includes SFC generation and quantization support for internal testing.
         - Float4E2M1FN (with scale factor generation)
-        # {$nv-internal-release end}
 
     :note: Constraints:
         - MMA tiler M must be 128 or 256 (use_2cta_instrs)
@@ -659,7 +657,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.mma_inst_shape_mn,
         )
 
-        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs. # {$nv-internal-release}
+        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs.
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
@@ -696,10 +694,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             internal_type=cutlass.Int16,
         )
 
-        # {$nv-internal-release begin}
         # This modifies the layout to handle overlapping 256x(# of scale factors for a single column of B (nNSF))
         # logical blocks for SFB when cta_tile_shape_n=192.
-        # {$nv-internal-release end}
         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
             x = tma_tensor_sfb.stride[0][1]
             y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
@@ -1524,7 +1520,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 # tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, 0)]
 
-                # Apply SFB slicing hack when cta_tile_shape_n=64 # {$nv-internal-release}
+                # Apply SFB slicing hack when cta_tile_shape_n=64
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
@@ -1707,7 +1703,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
                 # Apply TMEM pointer offset hack when cta_tile_shape_n=192 or
-                # cta_tile_shape_n=64 # {$nv-internal-release}
+                # cta_tile_shape_n=64
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
