@@ -28,6 +28,7 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .result import IterationResult
+from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
                     has_event_loop)
 
@@ -36,7 +37,7 @@ __all__ = [
 ]
 
 
-class GenerationExecutorWorker(BaseWorker):
+class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
@@ -48,6 +49,8 @@ class GenerationExecutorWorker(BaseWorker):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        rpc_addr: Optional[str] = None,
+        hmac_key: Optional[bytes] = None,
     ) -> None:
         super().__init__(
             engine=engine,
@@ -61,6 +64,13 @@ class GenerationExecutorWorker(BaseWorker):
         )
 
         self.setup_engine()
+
+        # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
+        # Only set up if rpc_addr is provided (for stats RPC support)
+        if rpc_addr is not None:
+            self.rpc_addr = rpc_addr
+            self.hmac_key = hmac_key
+            self.start_rpc_server()  # Reuse from RpcWorkerMixin
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
@@ -240,6 +250,8 @@ def worker_main(
     hf_model_dir: Optional[Path] = None,
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
+    rpc_addr: Optional[str] = None,
+    hmac_key: Optional[bytes] = None,
 ) -> None:
 
     mpi_comm().barrier()
@@ -287,15 +299,20 @@ def worker_main(
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
-        mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
-                                       is_server=False,
-                                       fuse_message=True,
-                                       name="worker_stats_queue")
-        kv_cache_events_queue = FusedIpcQueue(
-            worker_queues.kv_cache_events_queue_addr,
-            is_server=False,
-            fuse_message=False,
-            name="worker_kv_cache_events_queue")
+        # Stats and kv_cache_events are now fetched via RPC, IPC queues are optional
+        mp_stats_queue = None
+        if worker_queues.stats_queue_addr is not None:
+            mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
+                                           is_server=False,
+                                           fuse_message=True,
+                                           name="worker_stats_queue")
+        kv_cache_events_queue = None
+        if worker_queues.kv_cache_events_queue_addr is not None:
+            kv_cache_events_queue = FusedIpcQueue(
+                worker_queues.kv_cache_events_queue_addr,
+                is_server=False,
+                fuse_message=False,
+                name="worker_kv_cache_events_queue")
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -322,9 +339,11 @@ def worker_main(
             assert result_queues is not None
             for q in result_queues:
                 q.put(None)
-        # Signal the stats thread in the proxy to quit
-        mp_stats_queue.put(None)
-        kv_cache_events_queue.put(None)
+        # Signal the stats/kv_cache_events threads in the proxy to quit (if using IPC)
+        if mp_stats_queue is not None:
+            mp_stats_queue.put(None)
+        if kv_cache_events_queue is not None:
+            kv_cache_events_queue.put(None)
 
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
@@ -370,7 +389,9 @@ def worker_main(
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
-            llm_args=llm_args)
+            llm_args=llm_args,
+            rpc_addr=rpc_addr,
+            hmac_key=hmac_key)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
@@ -396,11 +417,13 @@ def worker_main(
                 else:
                     worker.set_result_queue(result_queue)
 
-                # initialize the iteration result queues
-                worker._set_iteration_result_queue(worker.stats_queues,
-                                                   mp_stats_queue)
-                worker._set_iteration_result_queue(worker.kv_events_queues,
-                                                   kv_cache_events_queue)
+                # initialize the iteration result queues (only if using IPC, not RPC)
+                if mp_stats_queue is not None:
+                    worker._set_iteration_result_queue(worker.stats_queues,
+                                                       mp_stats_queue)
+                if kv_cache_events_queue is not None:
+                    worker._set_iteration_result_queue(worker.kv_events_queues,
+                                                       kv_cache_events_queue)
                 # Send ready signal with confirmation
                 ready_msg = (ready_signal, None)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):

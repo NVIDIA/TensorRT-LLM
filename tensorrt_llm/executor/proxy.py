@@ -1,9 +1,9 @@
 import atexit
 import concurrent.futures
+import os
 import threading
-import time
 import weakref
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional
 
 import torch
 import zmq
@@ -17,14 +17,17 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
+from .base_worker import BaseWorker
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
-from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+from .rpc import RPCClient
+from .rpc.rpc_common import get_unique_ipc_addr
+from .utils import (ErrorResponse, WorkerCommIpcAddrs, create_mpi_comm_session,
+                    get_spawn_proxy_process_env, is_llm_response,
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -89,18 +92,26 @@ class GenerationExecutorProxy(GenerationExecutor):
             "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
                 "llm_args", None) is not None else None
 
+        # Generate RPC address and key for stats RPC
+        self.rpc_addr = get_unique_ipc_addr()
+        self.hmac_key = os.urandom(32)
+
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
-                             is_llm_executor=False)
+                             is_llm_executor=False,
+                             rpc_addr=self.rpc_addr,
+                             hmac_key=self.hmac_key)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
-        self.dispatch_stats_thread: Optional[ManagedThread] = None
-        self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
+        self.rpc_client: Optional[RPCClient] = None
         self._start_executor_workers(worker_kwargs)
+
+        # Create RPC client after workers are started (worker starts RPC server)
+        self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
 
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
@@ -128,19 +139,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
-        self.mp_stats_queue = FusedIpcQueue(is_server=True,
-                                            fuse_message=False,
-                                            name="proxy_stats_queue")
-        self.kv_cache_events_queue = FusedIpcQueue(
-            is_server=True,
-            fuse_message=False,
-            name="proxy_kv_cache_events_queue")
+        # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
-            stats_queue_addr=self.mp_stats_queue.address,
-            kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
+            stats_queue_addr=None,
+            kv_cache_events_queue_addr=None,
         )
 
     def abort_request(self, request_id: int) -> None:
@@ -204,71 +209,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         return True  # success
 
-    def _iteration_result_task(self,
-                               queue: Union[FusedIpcQueue, IntraProcessQueue],
-                               result_singleton: IterationResult,
-                               urgent: bool = False) -> bool:
-        if not urgent:
-            time.sleep(0.2)
-
-        try:
-            data = queue.get()
-        except:
-            logger.debug(
-                "proxy.py: Error in _iteration_result_task: queue.get()")
-            return False
-
-        if data is None:
-            logger.debug("proxy.py: _iteration_result_task: data is None")
-            return False  # shutdown the thread
-
-        data = data if isinstance(data, list) else [data]
-        queue = result_singleton.queue
-        async_queues = []
-
-        while queue.full():
-            queue.get()
-
-        try:
-            for d in data:
-                if d is None:
-                    logger.debug("proxy.py: _iteration_result_task: d is None")
-                    return False
-
-                if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(d)
-                    async_queues.append(queue)
-                else:
-                    queue.put(d)
-
-            if async_queues:
-                _SyncQueue.notify_many(queue.loop, async_queues)
-
-        except AsyncQueue.EventLoopShutdownError:
-            # This happens in the last loop while the generate workflow is
-            # stopped, or when get_stats() or aget_stats() are not called by users
-            # and therefore event loop can already be closed.
-            logger.debug("proxy.py: EventLoopShutdownError")
-        except Exception as e:
-            logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
-            raise e
-
-        return True  # success
-
-    def dispatch_stats_task(self) -> bool:
-        if not self._iter_stats_result:
-            # This can happen temporarily because the WAR in tensorrt_llm/bench/benchmark/throughput.py
-            # is not synchronized with self.dispatch_stats_thread.
-            logger.debug(
-                f"Skipping stats dispatch while self._iter_stats_result=None")
-            return True  # Intended behavior, not an error
-        return self._iteration_result_task(self.mp_stats_queue,
-                                           self._iter_stats_result)
-
-    def dispatch_kv_cache_events_task(self) -> bool:
-        return self._iteration_result_task(self.kv_cache_events_queue,
-                                           self._iter_kv_events_result,
-                                           urgent=True)
+    # NOTE: _iteration_result_task, dispatch_stats_task, and dispatch_kv_cache_events_task
+    # have been removed as stats and kv_events are now fetched via RPC directly.
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:
@@ -277,24 +219,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                 weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
                 name="proxy_dispatch_result_thread")
-            self.dispatch_stats_thread = ManagedThread(
-                weakref.WeakMethod(self.dispatch_stats_task),
-                error_queue=self._error_queue,
-                name="proxy_dispatch_stats_thread")
-            self.dispatch_kv_cache_events_thread = ManagedThread(
-                weakref.WeakMethod(self.dispatch_kv_cache_events_task),
-                error_queue=self._error_queue,
-                name="proxy_dispatch_kv_cache_events_thread")
 
             self.dispatch_result_thread.start()
-
-            # Only collect stats when submission
-            # is via LLM API
-            if self._iter_stats_result:
-                self.dispatch_stats_thread.start()
-
-            if self._iter_kv_events_result:
-                self.dispatch_kv_cache_events_thread.start()
 
         self._handle_background_error()
 
@@ -387,23 +313,18 @@ class GenerationExecutorProxy(GenerationExecutor):
         ):
             self.dispatch_result_thread.stop()
             self.dispatch_result_thread.join()
-        if self.dispatch_stats_thread is not None and self.dispatch_stats_thread.is_alive(
-        ):
-            self.dispatch_stats_thread.stop()
-            self.dispatch_stats_thread.join()
-        if self.dispatch_kv_cache_events_thread is not None and self.dispatch_kv_cache_events_thread.is_alive(
-        ):
-            self.dispatch_kv_cache_events_thread.stop()
-            self.dispatch_kv_cache_events_thread.join()
 
         # step3: finish all remaining work
+
+        # close the RPC client
+        if self.rpc_client is not None:
+            self.rpc_client.close()
+            self.rpc_client = None
 
         # close all the sockets
         self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()
-        self.mp_stats_queue.close()
-        self.kv_cache_events_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
@@ -440,6 +361,97 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def get_stats(self, timeout: float) -> List[dict]:
+        """Get iteration statistics from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime stats as dict.
+        """
+        if self.rpc_client is None:
+            logger.warning("RPC client not initialized, cannot get stats")
+            return []
+
+        try:
+            stats = self.rpc_client.fetch_stats_async().remote(timeout=timeout)
+            return [BaseWorker._stats_serializer(s) for s in stats]
+        except Exception as e:
+            logger.debug(f"Error fetching stats via RPC: {e}")
+            return []
+
+    def aget_stats(self, timeout: float) -> IterationResult:
+        """Get iteration statistics from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime stats.
+        """
+        # Initialize iteration result if needed
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_stats_result is None:
+            print_colored("Iteration statistics are not available yet.\n",
+                          "yellow")
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch stats via RPC and populate the result
+        stats = self.get_stats(timeout)
+        for stat in stats:
+            self._iter_stats_result.queue.put(stat)
+
+        self._iter_stats_result.set_timeout(timeout)
+        return self._iter_stats_result
+
+    def get_kv_events(self, timeout: float) -> List[dict]:
+        """Get iteration KV events from the runtime via RPC.
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        """
+        if self.rpc_client is None:
+            logger.warning("RPC client not initialized, cannot get kv events")
+            return []
+
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_async().remote(
+                timeout=timeout)
+            return [BaseWorker._kv_cache_events_serializer(e) for e in events]
+        except Exception as e:
+            logger.debug(f"Error fetching kv events via RPC: {e}")
+            return []
+
+    def aget_kv_events(self, timeout: float) -> IterationResult:
+        """Get iteration KV events from the runtime via RPC (async).
+
+        Args:
+            timeout (float): Max wait time in seconds for the RPC call.
+
+        Returns:
+            IterationResult: An async iterable object containing runtime events.
+        """
+        # Initialize iteration result if needed
+        self._maybe_initialize_iteration_results()
+
+        if self._iter_kv_events_result is None:
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+
+        # Fetch kv events via RPC and populate the result
+        events = self.get_kv_events(timeout)
+        for event in events:
+            self._iter_kv_events_result.queue.put(event)
+
+        self._iter_kv_events_result.set_timeout(timeout)
+        return self._iter_kv_events_result
 
     def __del__(self):
         self.shutdown()

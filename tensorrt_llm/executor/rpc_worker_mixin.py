@@ -100,53 +100,19 @@ class RpcWorkerMixin:
         )
 
     async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
-        """Async version of fetch_stats using asyncio.to_thread."""
+        """Async version of fetch_stats using asyncio.to_thread.
+
+        This method is exposed via RPC and can be called directly by the proxy.
+        """
         return await asyncio.to_thread(self.fetch_stats)
 
     async def fetch_kv_cache_events_async(self, timeout: Optional[float] = None) -> list:
-        """Async version of fetch_kv_cache_events using asyncio.to_thread."""
+        """Async version of fetch_kv_cache_events using asyncio.to_thread.
+
+        This method is exposed via RPC and can be called directly by the proxy.
+        """
         return await asyncio.to_thread(self.fetch_kv_cache_events)
 
-    async def fetch_stats_loop_async(
-        self, timeout: Optional[float] = None
-    ) -> AsyncGenerator[list, None]:
-        """Stream stats in a loop until shutdown."""
-        async for data in self._generic_fetch_loop_async(
-            fetch_method=self.fetch_stats_async,
-            serializer=self._stats_serializer,
-            method_name="fetch_stats_loop_async",
-            timeout=timeout,
-        ):
-            yield data
-
-    async def fetch_kv_cache_events_loop_async(
-        self, timeout: Optional[float] = None
-    ) -> AsyncGenerator[list, None]:
-        """Stream KV cache events in a loop until shutdown."""
-        async for data in self._generic_fetch_loop_async(
-            fetch_method=self.fetch_kv_cache_events_async,
-            serializer=self._kv_cache_events_serializer,
-            method_name="fetch_kv_cache_events_loop_async",
-            timeout=timeout,
-        ):
-            yield data
-
-    async def _generic_fetch_loop_async(
-        self, fetch_method, serializer, method_name: str, timeout: Optional[float] = None
-    ) -> AsyncGenerator[list, None]:
-        """Generic method for fetching data in a loop.
-
-        Args:
-            fetch_method: The async method to call for fetching data
-            serializer: The serializer function to apply to each item
-            method_name: Name of the method for logging
-            timeout: Optional timeout between fetches
-        """
-        while not self.shutdown_event.is_set():
-            timeout = timeout or 0.1
-            await asyncio.sleep(timeout)
-            data = await fetch_method()
-            # Always yield data, even if empty, to prevent the client looks like hanging
-            # TODO: Remove the empty data to reduce the IPC overhead
-            yield [serializer(item) for item in data]
-        logger_debug(f"[worker] RpcWorker {self.rank} quitting {method_name}", color="yellow")
+    # NOTE: fetch_stats_loop_async, fetch_kv_cache_events_loop_async, and _generic_fetch_loop_async
+    # have been removed. Stats and kv_events are now fetched on-demand via direct RPC calls
+    # to fetch_stats_async and fetch_kv_cache_events_async instead of continuous loops.
