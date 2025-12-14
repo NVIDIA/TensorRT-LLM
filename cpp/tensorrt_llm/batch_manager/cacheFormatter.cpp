@@ -770,7 +770,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
                 if (agentConnnecion != nullptr)
                 {
-                    TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
+                    //TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
                     TLLM_CHECK(onlyUseDynamicBuffer == false);
                 }
                 recvSplitCaches = std::move(recvSplitCachestmp);

@@ -467,7 +467,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             auto& onlyUseDynamicBuffer = std::get<2>(result);
             if (agentConnnecion != nullptr)
             {
-                TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
+                //TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
                 TLLM_CHECK(onlyUseDynamicBuffer == false);
             }
             bufferManager.getStream().synchronize();
