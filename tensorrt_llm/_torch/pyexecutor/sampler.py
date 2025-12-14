@@ -3051,6 +3051,7 @@ class TRTLLMSampler(Sampler, AsyncWorkerMixin):
             idx = 0
             for request in reqs_with_new_tokens:
                 if request.py_return_log_probs:
+                    seq_slot = request.py_seq_slot
                     log_probs = [
                         {
                             new_tokens_host[seq_slot]: Logprob(
