@@ -156,7 +156,7 @@ From a user perspective, all of this is controlled by a high-level `sparse_atten
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_tech_blog/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="800">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_sparse_attention_framework.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Sparse attention framework in TensorRT LLM.</em></sub></p>
@@ -187,7 +187,7 @@ From an operator perspective, sparse attention in TensorRT LLM is realized insid
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_tech_blog/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="800">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_sparse_attention_op.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
@@ -238,7 +238,7 @@ In Transformer-based LLM inference, the KV cache grows linearly with sequence le
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_overview.png" width="800">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_overview.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: RocketKV Overview</em></sub></p>
@@ -262,7 +262,7 @@ To address these issues, we implemented the following optimizations:
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_prediction.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_prediction.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: RocketKV Prediction Overview</em></sub></p>
@@ -308,7 +308,7 @@ We benchmark RocketKV sparse attention against the TensorRT LLM full attention b
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_performance.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_performance.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: RocketKV vs. full attention — performance overview</em></sub></p>
@@ -325,7 +325,7 @@ Overall, RocketKV tends to be most beneficial in **max-throughput** scenarios, a
 
 <div align="center">
 <figure>
-  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sparse_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_breakdown.png" width="1000">
+  <img src="https://github.com/heyuhhh/TensorRT-LLM/blob/user/yuhangh/add_sprase_attention_tech_blog/docs/source/blogs/media/tech_blog15_rocketkv_breakdown.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: Attention Breakdowns</em></sub></p>
