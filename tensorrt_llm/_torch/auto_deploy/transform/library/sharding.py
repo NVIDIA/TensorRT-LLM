@@ -2342,7 +2342,7 @@ def detect_sharding_from_config(
                 # this is the last attention node in the graph. Take the previously found head_dim
                 assert head_dim != -1, "Head dim not found for the last attention node"
             else:
-                head_dim = next_attention_node.meta["val"].shape[2]
+                head_dim = next_attention_node.meta["val"].shape[-1]
             min_local_shape = head_dim
             layer_type = LayerType.ATTENTION
         else:
