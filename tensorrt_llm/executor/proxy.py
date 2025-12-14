@@ -143,8 +143,6 @@ class GenerationExecutorProxy(GenerationExecutor):
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
-            stats_queue_addr=None,
-            kv_cache_events_queue_addr=None,
         )
 
     def abort_request(self, request_id: int) -> None:

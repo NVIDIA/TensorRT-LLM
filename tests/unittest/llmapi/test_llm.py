@@ -2370,8 +2370,9 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         async def task1(repetition_index: int):
             results = []
             await asyncio.sleep(
-                3)  # ensure there's stats to collect for the assertion
-            async for stats in llm.get_stats_async(timeout=2):
+                4)  # ensure there's stats to collect for the assertion
+            async for stats in llm.get_stats_async(
+            ):  # it will return immediately
                 results.append(stats)
 
             assert results

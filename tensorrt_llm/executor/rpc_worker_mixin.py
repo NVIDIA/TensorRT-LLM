@@ -118,7 +118,3 @@ class RpcWorkerMixin:
         events = await asyncio.to_thread(self.fetch_kv_cache_events)
         # Serialize events before sending over RPC
         return [self._kv_cache_events_serializer(e) for e in events]
-
-    # NOTE: fetch_stats_loop_async, fetch_kv_cache_events_loop_async, and _generic_fetch_loop_async
-    # have been removed. Stats and kv_events are now fetched on-demand via direct RPC calls
-    # to fetch_stats_async and fetch_kv_cache_events_async instead of continuous loops.
