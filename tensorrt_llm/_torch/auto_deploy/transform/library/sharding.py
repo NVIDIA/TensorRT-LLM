@@ -2131,28 +2131,28 @@ def _process_ssm_sharding(
     return 1
 
 
-def _process_column_sharding(
+def _determine_fused_weight_dims(
     linear_nodes: List[Node],
     subgraph_nodes: Union[List[Node], None],
     transform_container: ShardingTransformContainer,
     min_local_shape: int = 1,
 ) -> None:
     """
-    Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
+    Determine the fused weight dims for the given linear nodes and subgraph nodes.
     """
-    config = transform_container.config
-    world_size = config.world_size
-    if subgraph_nodes is None:
-        subgraph_nodes = subgraph(linear_nodes, boundary_condition=is_any_lin_op)
+    if len(linear_nodes) != 1:
+        return None
+    linear_node = linear_nodes[0]
     fused_weight_dims = None
     # check if there are split nodes in the subgraph. They may indicate fused weights (e.g., QKV)
-    split_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.split_with_sizes]))
+    split_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.split_with_sizes]))
     if len(split_nodes) > 0:
         assert len(linear_nodes) == 1
         linear_node = linear_nodes[0]
         assert len(split_nodes) == 1, "Expecting exactly one split node for fused weights"
         fused_weight_dims = split_nodes[0].args[1]
-    slice_nodes = list(filtered_nodes(subgraph_nodes, ops=[torch.ops.aten.slice]))
+
+    slice_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice]))
     if len(slice_nodes) > 0:
         # we are probably in fused QKV case with single linear node and 3 slice nodes
         assert len(linear_nodes) == 1
@@ -2170,7 +2170,7 @@ def _process_column_sharding(
                     f"Fused weight dims {fused_weight_dims} do not sum to weight dim {weight_dim}. Skipping."
                 )
                 return
-    chunk_nodes = list(filtered_nodes(subgraph_nodes, ops=torch.ops.aten.chunk))
+    chunk_nodes = list(filtered_nodes(linear_node.users, ops=torch.ops.aten.chunk))
     if len(chunk_nodes) > 0:
         assert len(linear_nodes) == 1
         linear_node = linear_nodes[0]
@@ -2178,6 +2178,23 @@ def _process_column_sharding(
         num_chunks = chunk_nodes[0].args[1]
         weight_dim = linear_node.meta["val"].shape[2]
         fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+    return fused_weight_dims
+
+
+def _process_column_sharding(
+    linear_nodes: List[Node],
+    subgraph_nodes: Union[List[Node], None],
+    transform_container: ShardingTransformContainer,
+    rank: int,
+    world_size: int,
+    min_local_shape: int = 1,
+) -> None:
+    """
+    Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
+    """
+    if subgraph_nodes is None:
+        subgraph_nodes = subgraph(linear_nodes, boundary_condition=is_any_lin_op)
+    fused_weight_dims = _determine_fused_weight_dims(linear_nodes)
 
     # check if there are any attention nodes in the subgraph
     attention_nodes = list(filtered_nodes(subgraph_nodes, is_any_attention_op))
@@ -2222,12 +2239,9 @@ def _process_column_sharding(
         assert world_size is not None, "World size is required to update the split node params"
 
         # fused weight may either be processed by several slice nodes or a single split node
-        assert len(split_nodes) > 0 or len(slice_nodes) > 0 or len(chunk_nodes) > 0, (
-            "Expecting at least one split or slice or chunk node for fused weights"
-        )
-
-        assert len(linear_nodes) == 1, "Expecting exactly one linear node for fused weights"
         linear_node = linear_nodes[0]
+        split_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.split_with_sizes]))
+        slice_nodes = list(filtered_nodes(linear_node.users, ops=[torch.ops.aten.slice]))
         if len(split_nodes) > 0:
             user = split_nodes[0]
             orig_sizes = user.args[1]
@@ -2238,7 +2252,7 @@ def _process_column_sharding(
                 ParameterUpdateInfo(config=config, target_node=user.name, args=tuple(args))
             )
         elif len(slice_nodes) > 0:
-            for slice_node in filtered_nodes(linear_node.users, ops=torch.ops.aten.slice):
+            for slice_node in slice_nodes:
                 args = list(slice_node.args)
                 args[2] = args[2] // world_size
                 args[3] = args[3] // world_size
@@ -2292,8 +2306,6 @@ def detect_sharding_from_config(
         config = transform_container.config.manual_config
     else:
         raise ValueError(f"Unsupported sharding source: {source}")
-
-    head_dim = config["head_dim"]
     tp_plan = config["tp_plan"]
 
     # If the node is inside the attention module, we need to set min_local_shape to the
@@ -2315,12 +2327,22 @@ def detect_sharding_from_config(
     num_row_col_shards = 0
     num_attention_shards = 0
     num_ssm_shards = 0
+    head_dim = -1
 
     for lin_node in filtered_nodes(gm.graph.nodes, is_any_lin_op):
         # use node's weight name to get the module name
         module_name = extract_weight_node(lin_node).target
 
         if any(attn_name in module_name for attn_name in attn_names):
+            # find the next attention node and infer the head_dim
+            next_attention_node, _ = bfs(
+                lin_node, is_any_attention_op, attr_next="users", include_root=False
+            )
+            if next_attention_node is None:
+                # this is the last attention node in the graph. Take the previously found head_dim
+                assert head_dim != -1, "Head dim not found for the last attention node"
+            else:
+                head_dim = next_attention_node.meta["val"].shape[2]
             min_local_shape = head_dim
             layer_type = LayerType.ATTENTION
         else:
@@ -2563,7 +2585,7 @@ def detect_column_row_shard(
                 continue
             # Extract head dimension. We cannot shard below the head_dim size.
             # Assume that head_dim is the last (innermost) dimension of the tensor
-            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+            min_local_shape = attention_nodes[0].meta["val"].shape[-1]
             # if the QKV projection is fused, check if num_kv_heads is divisible by world_size
             if len(opening) == 1:
                 qkv_proj_node = opening[0]

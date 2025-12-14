@@ -83,12 +83,6 @@ transforms:
     sharding_dims: ['tp', 'ep', 'bmm']
     allreduce_strategy: 'NCCL'
     dist_backend: auto
-    manual_config:
-      tp_plan:
-        attn: gather
-        gate_proj: colwise
-        up_proj: colwise
-        down_proj: rowwise
     requires_shape_prop: true
   sharding_transform_executor:
     stage: sharding

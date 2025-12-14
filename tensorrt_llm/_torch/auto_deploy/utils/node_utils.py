@@ -232,6 +232,7 @@ def filtered_nodes(
     nodes: Iterable[Node],
     target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
     ops: Union[OperatorLike, Iterable[OperatorLike]] = None,
+    prune_dangling: bool = False,
 ) -> Iterable[Node]:
     """Iterate over nodes that are filtered by the given operations or target function.
 
@@ -264,11 +265,15 @@ def filtered_nodes(
     if callable(target) and not isinstance(target, (OpOverloadPacket, OpOverload)):
         for node in nodes:
             if target(node):
+                if prune_dangling and len(successors(node, depth=3)) < 3:
+                    continue
                 yield node
     elif isinstance(target, Iterable) and all(isinstance(t, Callable) for t in target):
         for node in nodes:
             for t in target:
                 if t(node):
+                    if prune_dangling and len(successors(node, depth=3)) < 3:
+                        continue
                     yield node
                     break
     else:
@@ -276,6 +281,8 @@ def filtered_nodes(
         operations = ops if ops is not None else target
         for node in nodes:
             if is_op(node, operations):
+                if prune_dangling and len(successors(node, depth=3)) < 3:
+                    continue
                 yield node
 
 
@@ -511,7 +518,7 @@ def bfs(
             queue_at_depth_next = []
             depth += 1
 
-    raise RuntimeError(f"Could not find node with target condition {target}.")
+    return None, -1
 
 
 def extract_output_tuple(node: Node, count: int = 2):
@@ -785,7 +792,6 @@ def get_layer_after_linear_node(
         terminating_index = len(linear_nodes)
     else:
         terminating_index = start_lin_index + len(opening_linear_nodes)
-    terminating_indices.append(terminating_index)
     if terminating_index < len(linear_nodes):
         if linear_nodes[terminating_index] != terminating_linear_node:
             # this means that the forward and backward subgraphs misalign:
@@ -793,6 +799,8 @@ def get_layer_after_linear_node(
             # terminating node is "linear node reachable" from unexpected
             # paths. Therefore, we cannot safely col-row shard this layer.
             layer_subgraph.col_row_shardable = False
+            terminating_index = linear_nodes.index(terminating_linear_node)
+    terminating_indices.append(terminating_index)
     # otherwise, we are done. We processed the last linear node.
     return layer_subgraph
 
