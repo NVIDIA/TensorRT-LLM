@@ -66,6 +66,7 @@ __global__ void fusedQKNormRopeKernel(
     int const num_heads_q,         // Number of query heads
     int const num_heads_k,         // Number of key heads
     int const num_heads_v,         // Number of value heads
+    int const rotary_dim,          // Dimension for RoPE
     float const eps,               // Epsilon for RMS normalization
     __nv_bfloat16 const* q_weight, // RMSNorm weights for query
     __nv_bfloat16 const* k_weight, // RMSNorm weights for key
@@ -184,7 +185,7 @@ __global__ void fusedQKNormRopeKernel(
 
             int dim_idx = laneId * numElemsPerThread + i;
             int half_dim = dim_idx / 2;
-            float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
+            float freq = powf(base, -2.0f * half_dim / static_cast<float>(rotary_dim));
 
             if (factor != 1.0f)
             {
@@ -212,19 +213,20 @@ __global__ void fusedQKNormRopeKernel(
     {
         // Before data exchange with in warp, we need to sync.
         __syncwarp();
+        int pairOffset = (rotary_dim / 2) / numElemsPerThread;
         // Get the data from the other half of the warp. Fill cos_vals and sin_vals.
         for (int i = 0; i < numElemsPerThread; i++)
         {
-            elements2[i] = __shfl_xor_sync(0xffffffff, elements[i], 16);
-            if (laneId < 16)
+            elements2[i] = __shfl_xor_sync(0xffffffff, elements[i], pairOffset);
+            if (laneId < pairOffset)
             {
                 elements2[i] = -elements2[i];
             }
 
             int dim_idx = laneId * numElemsPerThread + i;
-            dim_idx = (dim_idx * 2) % head_dim;
+            dim_idx = (dim_idx * 2) % rotary_dim;
             int half_dim = dim_idx / 2;
-            float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
+            float freq = powf(base, -2.0f * half_dim / static_cast<float>(rotary_dim));
 
             if (factor != 1.0f)
             {
@@ -251,9 +253,25 @@ __global__ void fusedQKNormRopeKernel(
         __syncwarp();
     }
 
-    for (int i = 0; i < numElemsPerThread; i++)
+    bool const is_full_rope = (rotary_dim == head_dim);
+    if (is_full_rope)
     {
-        elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
+        }
+    }
+    else
+    {
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            int dim_idx = laneId * numElemsPerThread + i;
+
+            if (dim_idx < rotary_dim)
+            {
+                elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
+            }
+        }
     }
 
     // Store.
@@ -284,14 +302,23 @@ __global__ void fusedQKNormRopeKernel(
     }
 
 void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
-    int const num_heads_v, int const head_dim, float const eps, void const* q_weight, void const* k_weight,
-    float const base, bool const interleave, int const* position_ids, float factor, float low, float high,
-    float attention_factor, cudaStream_t stream, bool is_qk_norm)
+    int const num_heads_v, int const head_dim, int const rotary_dim, float const eps, void const* q_weight,
+    void const* k_weight, float const base, bool const interleave, int const* position_ids, float factor, float low,
+    float high, float attention_factor, cudaStream_t stream, bool is_qk_norm)
 {
     if (factor == 1.0f)
     {
         TLLM_CHECK(attention_factor == 1.0f);
     }
+
+    TLLM_CHECK_WITH_INFO(rotary_dim % 2 == 0, "rotary_dim must be even");
+    if (!interleave)
+    {
+        // To allow warp-level pairing for partial rope
+        TLLM_CHECK_WITH_INFO(
+            (rotary_dim * 16) % head_dim == 0, "Unsupported rotary dimension for fusedQKNormRope: %d", rotary_dim);
+    }
+
     constexpr int blockSize = 256;
 
     int const warpsPerBlock = blockSize / 32;
@@ -309,7 +336,7 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     case 64:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
             fusedQKNormRopeKernel<64, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
+                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
                 reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
                 base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
         });
@@ -317,7 +344,7 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     case 128:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
             fusedQKNormRopeKernel<128, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
+                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
                 reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
                 base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
         });
@@ -325,7 +352,7 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     case 256:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
             fusedQKNormRopeKernel<256, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
+                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
                 reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
                 base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
         });

@@ -272,6 +272,8 @@ ByteDance-Seed/Seed-OSS-36B-Instruct:
   - accuracy: 90.8
 zai-org/GLM-4.6:
   - accuracy: 81.3
+  - spec_dec_algo: MTP
+    accuracy: 81.3
   - quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 88.0
