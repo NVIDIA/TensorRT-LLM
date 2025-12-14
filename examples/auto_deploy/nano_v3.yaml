@@ -1,6 +1,4 @@
 runtime: trtllm
-sampler_type: TorchSampler #TRTLLMSampler #TorchSampler
-world_size: 8
 compile_backend: torch-cudagraph
 max_batch_size: 384
 max_seq_len: 65536 # tunable
@@ -16,7 +14,7 @@ kv_cache_config:
 transforms:
   detect_sharding:
     sharding_dims: ['ep', 'bmm']
-    allreduce_strategy: 'SYMM_MEM'
+    allreduce_strategy: 'AUTO'
     manual_config:
       head_dim: 128
       tp_plan:
