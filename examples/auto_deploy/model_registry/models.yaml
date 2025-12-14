@@ -103,11 +103,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-- name: microsoft/Phi-4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: mistralai/Ministral-8B-Instruct-2410
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-- name: mistralai/Codestral-22B-v0.1
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
