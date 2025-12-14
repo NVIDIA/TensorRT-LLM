@@ -428,12 +428,22 @@ class MTPDraftModel(nn.Module):
                                                        torch.cuda.Stream]):
         super().__init__()
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3MTP
-
-        mtp_layer = DeepseekV3MTP(model_config,
-                                  layer_idx,
-                                  aux_stream_dict,
-                                  is_separate_draft_engine=True)
+        model_type = model_config.pretrained_config.model_type
+        if model_type == "glm4_moe":
+            from .modeling_glm import Glm4MTP
+            mtp_layer = Glm4MTP(model_config,
+                                layer_idx,
+                                aux_stream_dict,
+                                is_separate_draft_engine=True)
+        elif model_type in ["deepseek_v3", "deepseek_v32"]:
+            from .modeling_deepseekv3 import DeepseekV3MTP
+            mtp_layer = DeepseekV3MTP(model_config,
+                                      layer_idx,
+                                      aux_stream_dict,
+                                      is_separate_draft_engine=True)
+        else:
+            raise ValueError(
+                f"MTPDraftModel does not support model_type: {model_type}")
         setattr(self, f"layers.{layer_idx}", mtp_layer)
         self.layers = mtp_layer
         self.layer_idx = layer_idx
@@ -493,8 +503,18 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
     def load_weights(self, weights: Dict):
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3WeightLoader
-        weight_loader = DeepseekV3WeightLoader(self, is_draft_model=True)
+        model_type = self.model_config.pretrained_config.model_type
+        match model_type:
+            case "glm4_moe":
+                from .modeling_glm import Glm4WeightLoader
+                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
+            case "deepseek_v3" | "deepseek_v32":
+                from .modeling_deepseekv3 import DeepseekV3WeightLoader
+                weight_loader = DeepseekV3WeightLoader(self,
+                                                       is_draft_model=True)
+            case _:
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP")
         weight_loader.load_weights(weights)
 
     def load_weights_from_target_model(self,
