@@ -22,6 +22,9 @@ from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
 from tensorrt_llm.commands.bench import main
 from tensorrt_llm.functional import AllReduceStrategy
 
+# Disable threadleak detection - MPI executor pool inherently leaks threads on shutdown
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 class TimeoutError(Exception):
     """Exception raised when a test times out."""
@@ -52,6 +55,49 @@ def timeout(seconds):
         # Restore the old signal handler and cancel the alarm
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def prewarm_flashinfer_jit():
+    """Pre-warm FlashInfer JIT kernels before multi-GPU tests.
+
+    This prevents a race condition where multiple MPI ranks try to JIT-compile
+    FlashInfer kernels simultaneously to the same cache directory, causing
+    Ninja build failures like: "ninja: error: opening build log: No such file or directory"
+
+    By triggering the compilation in the main process first, the kernels are
+    cached and available for all worker ranks.
+    """
+    try:
+        import flashinfer
+        import flashinfer.page
+        import flashinfer.sampling
+
+        if torch.cuda.is_available():
+            # Create dummy tensors to trigger kernel JIT compilation
+            with torch.no_grad():
+                device = torch.device("cuda:0")
+
+                # Trigger page kernel compilation
+                try:
+                    # Force module loading (this triggers JIT compilation)
+                    _ = flashinfer.page.gen_page_module()
+                except Exception:
+                    pass  # Ignore errors - the import itself should trigger JIT
+
+                # Trigger sampling kernel compilation
+                try:
+                    dummy_probs = torch.softmax(torch.randn(1, 100, device=device), dim=-1)
+                    _ = flashinfer.sampling.sampling_from_probs(dummy_probs, deterministic=True)
+                except Exception:
+                    pass
+
+                torch.cuda.empty_cache()
+
+    except ImportError:
+        pass  # FlashInfer not available
+
+    yield
 
 
 @pytest.fixture(scope="module")
