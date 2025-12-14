@@ -16,7 +16,7 @@
     - [Current State](#current-state)
     - [Future Work](#future-work)
 
-## Motivation
+## Background and Motivation
 
 As Large Language Models (LLMs) are applied to increasingly complex tasks such as long-document summarization, code generation, and autonomous agents, the demand for processing long contexts and extended generation has surged. In Transformer-based models, the attention mechanism's computational complexity and memory usage grow quadratically and linearly with sequence length, respectively. This creates significant bottlenecks in both the **Context (Prefill)** and **Generation (Decode)** phases:
 
@@ -51,6 +51,14 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">StreamingLLM</td>
         </tr>
         <tr>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">DuoAttention</td>
+        </tr>
+        <tr>
             <td align="center">No</td>
             <td align="center">No</td>
             <td align="center">Yes</td>
@@ -73,6 +81,14 @@ Consequently, using sparse attention to reduce overhead in both context and gene
             <td align="center">No</td>
             <td align="center">Yes</td>
             <td align="center">Quest</td>
+        </tr>
+        <tr>
+            <td align="center">Yes</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">No</td>
+            <td align="center">Yes</td>
+            <td align="center">XAttention</td>
         </tr>
         <tr>
             <td align="center">Yes</td>
@@ -102,7 +118,7 @@ Consequently, using sparse attention to reduce overhead in both context and gene
 </table>
 </div>
 
-The table above summarizes several representative sparse attention algorithms. NSA and MoBA perform sparse computation in the context phase, but they require structural changes to the model and are therefore architecture-specific methods. For the other methods, we observe that most follow a pattern of performing KV cache compression in the context phase and sparse computation in the generation phase. Approaches such as StreamingLLM and H2O also dynamically compress (or evict) the KV cache during generation in addition to sparse computation, typically following a fixed pattern. Based on these observations, TensorRT LLM first focuses on supporting KV cache compression in the context phase and sparse computation in the generation phase, with RocketKV as the primary reference implementation. With the release of the DeepSeek V3.2 model that adopts sparse attention, we have also added support for this model. In the future, we plan to further explore and support sparse computation in the context phase and KV cache compression in the generation phase.
+The table above summarizes several representative sparse attention algorithms. DuoAttention, NSA and MoBA perform sparse computation in the context phase, but they require structural changes to the model and are therefore architecture-specific methods. For the other methods, we observe that most follow a pattern of performing KV cache compression in the context phase and sparse computation in the generation phase. Approaches such as StreamingLLM and H2O also dynamically compress (or evict) the KV cache during generation in addition to sparse computation, typically following a fixed pattern. Based on these observations, TensorRT LLM first focuses on supporting KV cache compression in the context phase and sparse computation in the generation phase, with RocketKV as the primary reference implementation. With the release of the DeepSeek V3.2 model that adopts sparse attention, we have also added support for this model. In the future, we plan to further explore and support sparse computation in the context phase and KV cache compression in the generation phase.
 
 ## Quick Start
 
