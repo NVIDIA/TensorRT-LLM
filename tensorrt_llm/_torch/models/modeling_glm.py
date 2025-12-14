@@ -1,3 +1,4 @@
+import inspect
 import math
 import os
 from typing import Dict, List, Optional, Tuple
@@ -8,14 +9,10 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0,
-    transform_sf_into_required_layout,
-)
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -29,7 +26,7 @@ from ..distributed import (
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
+from ..modules.fused_moe import MoE, MoEWeightLoadingMode, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -39,7 +36,142 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3Gate, DeepseekV3MTPHead, moe_reduce_add_shared_output
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, _load_weights_impl, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    EagerFusionConfig,
+    duplicate_kv_weight,
+    filter_weights,
+    register_auto_model,
+)
+
+
+class Glm4WeightLoader:
+    def __init__(self, model, is_draft_model: bool = False):
+        self.model = model
+        self.config = model.config
+        self.model_config = model.model_config
+        self.is_draft_model = is_draft_model
+
+    def load_weights(self, weights: Dict, allow_partial_loading: bool = False):
+        def rename_moe_weight(weights: Dict, rename_rules: Dict):
+            result = {}
+            for key, value in weights.items():
+                new_key = key
+                for old, new in rename_rules.items():
+                    new_key = new_key.replace(old, new)
+                result[new_key] = value
+            return result
+
+        params_map = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "gate_up_proj": ["gate_proj", "up_proj"],
+        }
+        all_named_modules = dict(self.model.named_modules())
+
+        tp_size = (
+            1
+            if self.model_config.mapping.enable_attention_dp
+            else self.model_config.mapping.tp_size
+        )
+        num_kv_heads = (
+            self.config.num_key_value_heads
+            if hasattr(self.config, "num_key_value_heads")
+            and self.config.num_key_value_heads is not None
+            else self.config.num_attention_heads
+        )
+
+        for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
+                names = name.split(".")
+                if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
+                    mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
+                    names[2] = str(
+                        mtp_layer_idx % self.config.num_nextn_predict_layers
+                        + self.config.num_hidden_layers
+                    )
+                    name = ".".join(names)
+
+                if names[-1] in params_map:
+                    module_weights = []
+                    for new_name in params_map[names[-1]]:
+                        fw = filter_weights(".".join(names[:-1] + [new_name]), weights)
+                        if new_name in ["k_proj", "v_proj"]:
+                            num_kv_heads_list = (
+                                [num_kv_heads] * len(fw)
+                                if isinstance(num_kv_heads, int)
+                                else num_kv_heads
+                            )
+                            fw = {
+                                k: duplicate_kv_weight(
+                                    weight=v[:],
+                                    num_kv_heads=num_kv_heads_list[i],
+                                    tensor_parallel_size=tp_size,
+                                )
+                                if k in ["weight", "bias"]
+                                else v
+                                for i, (k, v) in enumerate(fw.items())
+                            }
+                        module_weights.append(fw)
+                    module.load_weights(weights=module_weights)
+                elif names[-1] == "experts":
+                    module_weights = filter_weights(name, weights)
+                    module_weights = rename_moe_weight(
+                        module_weights,
+                        {
+                            "down_proj": "w2",
+                            "up_proj": "w3",
+                            "gate_proj": "w1",
+                        },
+                    )
+                    module.load_weights(
+                        weights=[module_weights], allow_partial_loading=allow_partial_loading
+                    )
+                elif names[-1] == "backend" and isinstance(module, MoE):
+                    # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+                    # Currently saved MoE weights don't include 'backend' in their names.
+                    # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+                    # and weights loading is done in the backend, so module name includes '.backend'.
+                    # We need to use parent module name (without .backend) to match saved weight names.
+                    # After MoE refactoring is fully complete, all paths will follow this branch.
+                    parent_name = ".".join(names[:-1])
+                    module_weights = filter_weights(parent_name, weights)
+                    module_weights = rename_moe_weight(
+                        module_weights,
+                        {
+                            "down_proj": "w2",
+                            "up_proj": "w3",
+                            "gate_proj": "w1",
+                        },
+                    )
+                    module.load_weights(
+                        weights=[module_weights], allow_partial_loading=allow_partial_loading
+                    )
+                elif names[-1] == "self_attn":
+                    continue
+                elif names[-1] == "next_layer_layernorm":
+                    continue
+                else:
+                    module_weights = filter_weights(name, weights)
+                    if hasattr(module, "load_weights"):
+                        args = inspect.getfullargspec(module.load_weights).args
+                        if "allow_partial_loading" not in args:
+                            assert not allow_partial_loading, (
+                                "allow_partial_loading is not supported for this model"
+                            )
+                            module.load_weights(weights=[module_weights])
+                        else:
+                            module.load_weights(
+                                weights=[module_weights],
+                                allow_partial_loading=allow_partial_loading,
+                            )
+                    else:
+                        for n, p in module.named_parameters():
+                            if not allow_partial_loading:
+                                assert n in module_weights
+                            if n in module_weights:
+                                p.data.copy_(module_weights[n][:])
 
 
 class Glm4Attention(QKNormRoPEAttention):
@@ -61,7 +193,7 @@ class Glm4Attention(QKNormRoPEAttention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            fuse_qk_norm_rope=False,
+            fuse_qk_norm_rope=True,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
@@ -98,7 +230,7 @@ class Glm4MoE(nn.Module):
             topk_group=config.topk_group,
             routed_scaling_factor=config.routed_scaling_factor,
             dtype=dtype,
-            fuse_routing_kernel=False,
+            fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend,
         )
@@ -872,40 +1004,11 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
             **kwargs,
         )
 
-    def load_weights(self, weights: Dict):
-        # model.layers.91.mlp.experts.75.up_proj.weight_scale_2
-        _load_weights_impl(
-            self,
-            weights,
-            params_map={
-                r"(?!.*shared_experts)(?=.*experts?)(.*?)up_proj(.*)": r"\1w3\2",
-                r"(?!.*shared_experts)(?=.*experts?)(.*?)down_proj(.*)": r"\1w2\2",
-                r"(?!.*shared_experts)(?=.*experts?)(.*?)gate_proj(.*)": r"\1w1\2",
-            },
-        )
+    def load_weights(self, weights: Dict, allow_partial_loading: bool = False):
+        weight_loader = Glm4WeightLoader(self)
+        weight_loader.load_weights(weights, allow_partial_loading=allow_partial_loading)
 
     def post_load_weights(self):
-        all_named_modules = dict(self.model.named_modules())
-        for name, module in tqdm(all_named_modules.items(), desc="Post loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
-                continue
-            else:
-                if (
-                    self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales()
-                    and is_sm_100f()
-                    and hasattr(module, "weight_scale")
-                ):
-                    weight, weight_scale = resmooth_to_fp8_e8m0(module.weight, module.weight_scale)
-                    transfromed_scale = transform_sf_into_required_layout(
-                        weight_scale,
-                        mn=weight.shape[0],
-                        k=weight.shape[1],
-                        recipe=(1, 128, 128),
-                        is_sfa=False,
-                    )
-                    module.weight = nn.Parameter(weight, requires_grad=False)
-                    module.weight_scale = nn.Parameter(transfromed_scale, requires_grad=False)
-
         for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
