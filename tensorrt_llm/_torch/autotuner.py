@@ -49,12 +49,15 @@ class DynamicTensorSpec:
         input_idx: The index of the input tensor.
         dim_idx: The index of the dimension to tune.
         gen_tuning_buckets: A tuple of values to try or a function generating values.
-        map_to_tuning_buckets: A function to map dimensions to valid values during inference.
+        map_to_tuning_buckets: A function to map dimensions to valid values during tuning.
+        map_to_runtime_buckets: A function to map dimensions to valid values during inference.
+          If None, use map_to_tuning_buckets.
     """
     input_idx: int
     dim_idx: int
     gen_tuning_buckets: Union[Tuple[int], Callable] = ()
     map_to_tuning_buckets: Callable = lambda x: x
+    map_to_runtime_buckets: Optional[Callable] = None
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -392,6 +395,7 @@ class AutoTunerProfilingCache:
         runners: List[TunableRunner],
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
+        use_tuning_mapping: bool = False,
     ) -> Tuple[bool, int, int, Dict[str, Any], OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
@@ -399,6 +403,8 @@ class AutoTunerProfilingCache:
             custom_op (str): The name of the custom operation to be tuned
             runners (List[TunableRunner]): List of candidate implementations to profile
             profile (OptimizationProfile): Optimization profile
+            use_tuning_mapping: If True, use map_to_tuning_buckets for cache key.
+                If False, use map_to_runtime_buckets for runtime cache lookups.
 
         Returns:
             A tuple containing:
@@ -406,8 +412,10 @@ class AutoTunerProfilingCache:
             runner_id is the index in the current runners list
         """
         for idx, r in enumerate(runners):
-            if (cache_key := self.get_cache_key(custom_op, r, input_shapes,
-                                                tuning_config)) in self.cache:
+            if (cache_key :=
+                    self.get_cache_key(custom_op, r, input_shapes,
+                                       tuning_config,
+                                       use_tuning_mapping)) in self.cache:
                 # Return the current index in runners list, not the cached runner_id
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
                 return True, idx, tactic, min_time
@@ -420,6 +428,7 @@ class AutoTunerProfilingCache:
         runner: TunableRunner,
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
+        use_tuning_mapping: bool = False,
     ) -> Tuple:
         return (
             custom_op,
@@ -430,6 +439,7 @@ class AutoTunerProfilingCache:
                 tuning_config.dynamic_tensor_specs,
                 tuning_config.constraint_specs,
                 tuning_config.tune_max_num_tokens,
+                use_tuning_mapping,
             ),
         )
 
@@ -841,7 +851,12 @@ class AutoTuner:
             for p in profiles:
                 tensors = self._prepare_input_tensors(p, inputs)
                 is_cache_hit, *_ = self.profiling_cache.search_cache(
-                    custom_op, runners, p.get_opt_shapes(), tuning_config)
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    use_tuning_mapping=True,
+                )
                 if not is_cache_hit:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
@@ -928,8 +943,11 @@ class AutoTuner:
                     # Record the failed profiling combinations
                     self.stats.failed_profiling_count[custom_op].add(
                         self.profiling_cache.get_cache_key(
-                            custom_op, runner, profile.get_opt_shapes(),
-                            tuning_config))
+                            custom_op,
+                            runner,
+                            profile.get_opt_shapes(),
+                            tuning_config,
+                            use_tuning_mapping=True))
 
                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                     # or some runtime error occurs during profiling.
@@ -942,8 +960,11 @@ class AutoTuner:
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
             cache_key = self.profiling_cache.get_cache_key(
-                custom_op, runners[best_runner_id], profile.get_opt_shapes(),
-                tuning_config)
+                custom_op,
+                runners[best_runner_id],
+                profile.get_opt_shapes(),
+                tuning_config,
+                use_tuning_mapping=True)
 
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
@@ -1164,6 +1185,7 @@ class AutoTuner:
         dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...],
         constraint_specs: Tuple[ConstraintSpec, ...],
         tune_max_num_tokens: int = None,
+        use_tuning_mapping: bool = False,
     ) -> Tuple:
         """Find the nearest optimization profile for given inputs
         User can define their own nearest profile generation method to reduce the host overhead.
@@ -1171,6 +1193,8 @@ class AutoTuner:
         Args:
             shapes: Tuple of input tensor shapes
             tuning_config: Tuning configuration
+            use_tuning_mapping: If True, use map_to_tuning_buckets to store tuning cache.
+                If False, use map_to_runtime_buckets for runtime cache lookups.
 
         Return:
             Tuple: A tuple containing:
@@ -1180,9 +1204,12 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in dynamic_tensor_specs:
-            base_profile[spec.input_idx][
-                spec.dim_idx] = spec.map_to_tuning_buckets(
-                    base_profile[spec.input_idx][spec.dim_idx])
+
+            bucket_mapper = spec.map_to_tuning_buckets
+            if not use_tuning_mapping and spec.map_to_runtime_buckets is not None:
+                bucket_mapper = spec.map_to_runtime_buckets
+            base_profile[spec.input_idx][spec.dim_idx] = bucket_mapper(
+                base_profile[spec.input_idx][spec.dim_idx])
 
             if tune_max_num_tokens is not None:
                 base_profile[spec.input_idx][spec.dim_idx] = min(
