@@ -1,3 +1,4 @@
+import math
 import os
 import re
 from typing import Dict, List, Optional, Tuple
@@ -5,8 +6,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
@@ -15,7 +18,13 @@ from ..attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
-from ..distributed import AllReduce, AllReduceParams, MoEAllReduce
+from ..distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    MoEAllReduce,
+    MoEAllReduceParams,
+)
 from ..model_config import ModelConfig
 from ..models.modeling_deepseekv3 import Deepseekv3MoE
 from ..modules.decoder_layer import DecoderLayer
@@ -23,7 +32,6 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_utils import (
     DecoderModel,
@@ -48,7 +56,7 @@ AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
 # fmt: on
 
 
-PRINT_DEBUG = False
+PRINT_DEBUG = True
 
 
 def debug_print(tag: str, x: torch.Tensor, layer_idx: Optional[int] = None):
@@ -169,23 +177,25 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         layer_idx: int,
     ):
         super().__init__()
+        self.model_config = model_config
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
-        self.is_quanted = (
-            model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant()
-        )
 
         self.mapping = model_config.mapping
         mapping = self.mapping
         self.enable_attention_dp = mapping.enable_attention_dp
         self.mlp_tp_size = mapping.tp_size
-
-        from tensorrt_llm._ipc_utils import can_access_peer
-
         self.is_p2p_supported = can_access_peer(mapping)
 
-        self.input_layernorm = RMSNorm(
-            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        self.fusion_config = EagerFusionConfig()
+        self.enable_fusion = os.environ.get("TRTLLM_EXAONE_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion &= not self.enable_attention_dp
+
+        # FIXME: incompatible with mixed quantization mode
+        quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
+        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
+        assert quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION, (
+            "MIXED_PRECISION is ambiguous"
         )
 
         self.allreduce = None
@@ -199,26 +209,22 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
             self.moe_allreduce = MoEAllReduce(self.mapping)
 
         # TODO(jaedeokk): Finalize parallelism and fusion configuration.
-        # has_tp = mapping.has_tp()
+        has_tp = mapping.has_tp()
+        has_pp = mapping.has_pp()
 
+        # K-EXAONE uses per-tensor scale.
         self.disable_deep_gemm = False
-        quant_config = getattr(model_config, "quant_config", None)
-        if quant_config is not None:
-            # TODO(jaedeokk): Check if
-            # ExaoneMoe fp8 has an illegal memory access issue with deep_gemm.
-            self.disable_deep_gemm = (
-                getattr(quant_config, "quant_algo", None) == QuantAlgo.FP8_BLOCK_SCALES
-            )
+        # quant_config = getattr(model_config, "quant_config", None)
+        # if quant_config is not None:
+        #     # TODO(jaedeokk): Check if
+        #     # ExaoneMoe fp8 has an illegal memory access issue with deep_gemm.
+        #     self.disable_deep_gemm = (
+        #         getattr(quant_config, "quant_algo", None) == QuantAlgo.FP8_BLOCK_SCALES
+        #     )
 
-        self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
-
-        self.disable_attn_allreduce = (
-            self.fusion_config.PRE_MOE_FUSION
-            or self.fusion_config.PRE_MLP_FUSION
-            or self.mapping.tp_size == 1
-            or self.enable_attention_dp
+        # Submodule definitions
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
 
         self.self_attn = ExaoneMoeAttention(
@@ -228,7 +234,10 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         )
 
         # MoE or Dense layer
-        if check_is_moe(config, layer_idx):
+        self.is_moe_layer = check_is_moe(config, layer_idx)
+        if self.is_moe_layer:
+            self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
+            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
             self.mlp = ExaoneMoeSparseMoEBlock(
                 num_experts=config.num_experts,
                 top_k=config.num_experts_per_tok,
@@ -243,6 +252,13 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 layer_idx=layer_idx,
             )
         else:
+            block_size = 1 if quant_config.quant_algo is None else quant_config.group_size
+            self.mlp_tp_size = self._compute_mlp_tp_size(config.intermediate_size, block_size)
+            has_mlp_tp = self.mlp_tp_size > 1
+            # TODO(jaedeokk): Enable when FP4 is available.
+            # self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
+
             self.mlp = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -251,12 +267,63 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 config=model_config,
                 layer_idx=layer_idx,
                 disable_deep_gemm=self.disable_deep_gemm,
+                reduce_output=has_mlp_tp,
             )
+
+        self.disable_attn_allreduce = (
+            self.fusion_config.PRE_MOE_FUSION
+            or self.fusion_config.PRE_MLP_FUSION
+            or self.mapping.tp_size == 1
+            or self.enable_attention_dp
+        )
 
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
-        self.mapping = model_config.mapping
+        self.next_layer_layernorm: RMSNorm = None
+
+    def _get_decoder_layer_quant_config(
+        self, model_config: ModelConfig[PretrainedConfig], layer_idx: int
+    ):
+        """
+        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
+        moe_backend only supports fp8/fp4 quantization, we need to override
+        the quant_config for the MTP layer.
+        """
+        quant_config = model_config.quant_config
+
+        layer_name = f"model.layers.{layer_idx}"
+        if quant_config.is_module_excluded_from_quantization(layer_name):
+            return QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+            )
+        else:
+            return model_config.quant_config
+
+    def _compute_mlp_tp_size(self, intermediate_size: int, block_size: int) -> int:
+        """Adopted from DeepseekV3DecoderLayer._compute_mlp_tp_size."""
+        assert intermediate_size % block_size == 0, (
+            "intermediate_size must be divisible by block_size."
+        )
+        if self.enable_attention_dp:
+            # If using attention DP, the MLP also uses DP instead of TP.
+            mlp_tp_size = 1
+        else:
+            # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
+            tp = math.gcd(
+                intermediate_size // block_size,
+                self.mapping.tp_size,
+            )
+
+            if tp > self.mapping.gpus_per_node:
+                mlp_tp_size = math.gcd(
+                    tp,
+                    self.mapping.gpus_per_node,
+                )  # Avoid costly inter-node TP
+            else:
+                mlp_tp_size = tp
+        return mlp_tp_size
 
     def forward(
         self,
@@ -266,10 +333,12 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
+        # LN has neem already applied at the previous layer except the first layer.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         debug_print("ln_out", hidden_states, self.layer_idx)
+        debug_print("residual", residual, self.layer_idx)
 
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -281,17 +350,161 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
 
         debug_print("attn_out", hidden_states, self.layer_idx)
 
-        # residual = hidden_states
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual=residual)
+        if self.mapping.tp_size == 1:
+            # TODO(jaedeokk): This is for debugging. Will remove this path.
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual=residual
+            )
 
-        debug_print("post_ln_out", hidden_states, self.layer_idx)
-        debug_print("post_ln_res", residual, self.layer_idx)
+            debug_print("post_ln_out", hidden_states, self.layer_idx)
+            debug_print("post_ln_res", residual, self.layer_idx)
+            hidden_states = self.mlp(hidden_states)
+            debug_print("mlp_out", hidden_states, self.layer_idx)
+            debug_print("layer_out", hidden_states + residual, self.layer_idx)
+            if self.next_layer_layernorm is not None:
+                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
+        else:
+            if self.is_moe_layer:
+                hidden_states, residual = self.forward_moe(
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                )
+            else:
+                hidden_states, residual = self.forward_mlp(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
 
-        hidden_states = self.mlp(hidden_states)
-        debug_print("mlp_out", hidden_states, self.layer_idx)
+        return hidden_states, residual
 
-        hidden_states = hidden_states + residual
-        debug_print("layer_out", hidden_states, self.layer_idx)
+    def forward_moe(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        def _run_moe(hidden_states, hidden_states_fp4, do_finalize):
+            return self.mlp(
+                hidden_states,
+                hidden_states_fp4,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (
+                        self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                    )
+                ),
+                do_finalize=do_finalize,
+            )
+
+        if self.fusion_config.PRE_MOE_FUSION:
+            # moe_backend can be either CUTLASS or TRTLLM here
+            # TODO: unify the two min-latency MoE backends by enabling quant fusion
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+        else:
+            # No fusion
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
+        do_finalize = self.mapping.is_multi_node() or (
+            not (
+                self.fusion_config.POST_MOE_FUSION
+                and hidden_states.shape[0] <= self.moe_allreduce.max_token
+                and self.model_config.moe_backend == "TRTLLM"
+                and self.mlp.experts.has_nvfp4
+                and self.is_p2p_supported
+            )
+        )
+
+        hidden_states = _run_moe(hidden_states, hidden_states_fp4=None, do_finalize=do_finalize)
+
+        if self.fusion_config.POST_MOE_FUSION:
+            if do_finalize:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+            else:
+                assert len(hidden_states) == 4, "hidden_states must have 4 elements"
+
+                shared_output = hidden_states[0]
+                fc2_output = hidden_states[1]
+                expert_scale_factor = hidden_states[2]
+                expanded_idx_to_permuted_idx = hidden_states[3]
+
+                moe_all_reduce_params = MoEAllReduceParams(
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    expert_scale_factor=expert_scale_factor,
+                    shared_expert_output=shared_output,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    is_cutlass_min_latency=False,
+                )
+                hidden_states, residual = self.moe_allreduce(
+                    fc2_output, all_reduce_params=moe_all_reduce_params
+                )
+        elif self.next_layer_layernorm is not None:
+            hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
+
+        return hidden_states, residual
+
+    def forward_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.fusion_config.PRE_MLP_FUSION:
+            raise NotImplementedError("FP4 has not supported yet.")
+            # act_fp4, act_sf, residual = self.allreduce(
+            #     hidden_states,
+            #     all_reduce_params=AllReduceParams(
+            #         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+            #         residual=residual,
+            #         norm_weight=self.post_attention_layernorm.weight,
+            #         scale=self.mlp.gate_up_proj.input_scale,
+            #         eps=self.post_attention_layernorm.variance_epsilon,
+            #     ),
+            # )
+            # hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        hidden_states = self.mlp(
+            hidden_states,
+            # TODO(jaedeokk): Should we move to the constructor?
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)
+            ),
+        )
+
+        if self.fusion_config.POST_MLP_FUSION:
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                ),
+            )
+        elif self.next_layer_layernorm is not None:
+            hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -339,7 +552,6 @@ class ExaoneMoeModel(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -362,10 +574,9 @@ class ExaoneMoeModel(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
-                spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
-        hidden_states = self.norm(hidden_states)
+        # The last LN already has been applied as a part of fusion.
         return hidden_states
 
 
@@ -415,5 +626,14 @@ class ExaoneMoeForCausalLM(DecoderModelForCausalLM[ExaoneMoeModel, ExaoneMoEConf
             if new_name != name:
                 weights[new_name] = weights.pop(name)
 
+        # TODO(jaedeokk): Attention DP requires exceptional handling in weight loading.
         skip_modules = skip_modules or []
         super().load_weights(weights, weight_mapper, skip_modules, allow_partial_loading)
+
+    def post_load_weights(self):
+        # For the cross-layer residual+LN fusion.
+        for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
