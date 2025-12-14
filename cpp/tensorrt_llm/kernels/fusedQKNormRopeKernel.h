@@ -33,6 +33,7 @@ void launchFusedQKNormRope(
     int const num_heads_k,   // Number of key heads
     int const num_heads_v,   // Number of value heads
     int const head_dim,      // Dimension per head
+    int const rotary_dim,    // Dimension for RoPE
     float const eps,         // Epsilon for RMS normalization
     void const* q_weight,    // RMSNorm weights for query [head_dim]
     void const* k_weight,    // RMSNorm weights for key [head_dim]
