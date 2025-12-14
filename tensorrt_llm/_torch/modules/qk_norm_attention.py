@@ -229,9 +229,14 @@ class QKNormRoPEAttention(Attention):
     def apply_qk_norm_rope(self, qkv, position_ids):
         factor, low, high, attention_factor = compute_yarn_parameters(
             self.pretrained_config)
+
+        partial_rotary_factor = self.pretrained_config.partial_rotary_factor if hasattr(
+            self.pretrained_config, "partial_rotary_factor") else 1.0
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
+
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim,
+            self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
             self.k_norm.weight,
             self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,

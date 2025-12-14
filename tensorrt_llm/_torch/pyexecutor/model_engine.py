@@ -48,7 +48,8 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
-from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
+                                  Eagle3ResourceManager, Eagle3SpecMetadata)
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
@@ -568,13 +569,12 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type is not None:
-            if cp_type in [CpType.ULYSSES, CpType.STAR]:
-                logger.info(
-                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
-                    cp_type.name)
-                return
+        if self.mapping.cp_size > 1:
+            cp_type = self.mapping.cp_config.get("cp_type", None)
+            logger.info(
+                f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
+            )
+            return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -1670,12 +1670,12 @@ class PyTorchModelEngine(ModelEngine):
                     # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
                     if not self.is_warmup and not request.is_cuda_graph_dummy:
                         position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
-                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                    if request.py_helix_is_inactive_rank:
+                        past_seen_token_num = request.seqlen_this_rank_cp
                     else:
-                        # past_seen_token_num doesn't grow on inactive ranks.
-                        past_seen_token_num = request.orig_prompt_len
+                        # Discount the token added to active rank in resource manager as it hasn't
+                        # been previously seen.
+                        past_seen_token_num = request.seqlen_this_rank_cp - 1
 
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
@@ -2014,6 +2014,11 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        if helix_is_inactive_rank is not None and len(
+                helix_is_inactive_rank) > 0:
+            helix_is_inactive_rank = torch.tensor(helix_is_inactive_rank,
+                                                  dtype=torch.bool,
+                                                  device='cuda')
         attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
@@ -2088,6 +2093,9 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
+            if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
+                spec_metadata.populate_sampling_params_for_one_model(
+                    scheduled_requests.all_requests())
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

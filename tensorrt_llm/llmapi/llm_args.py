@@ -619,6 +619,10 @@ class DecodingBaseConfig(StrictBaseModel):
     # (N = acceptance_window) drops below this value.
     acceptance_length_threshold: Optional[float] = None
 
+    # Prototype. If true, allows non-greedy sampling when speculation is used. Only applicable
+    # to 1-model code paths; non-greedy sampling is always enabled on 2-model paths.
+    allow_advanced_sampling: bool = False
+
     # Validate acceptance controls at field level so they run on model creation
     @field_validator('acceptance_window')
     @classmethod
@@ -3063,6 +3067,24 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
                 "please update the validator")
+
+        return self
+
+    @model_validator(mode='after')
+    def validate_helix_tokens_per_block(self) -> 'TorchLlmArgs':
+        """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when HELIX parallelism is active."""
+        if self.context_parallel_size == 1 or self.cp_config is None or not self.cp_config:
+            return self
+
+        cp_type = self.cp_config.get('cp_type', None)
+        if cp_type is not None and str(cp_type).upper() == 'HELIX':
+            cp_tokens_per_block = self.cp_config.get('tokens_per_block', None)
+            if cp_tokens_per_block is not None:
+                kv_tokens_per_block = self.kv_cache_config.tokens_per_block
+                assert cp_tokens_per_block == kv_tokens_per_block, (
+                    f"When HELIX parallelism is active, cp_config.tokens_per_block ({cp_tokens_per_block}) "
+                    f"must match kv_cache_config.tokens_per_block ({kv_tokens_per_block})."
+                )
 
         return self
 
