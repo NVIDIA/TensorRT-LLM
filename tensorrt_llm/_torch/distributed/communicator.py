@@ -856,6 +856,13 @@ class PPCommTorch(PPCommBase):
     def direct_send(self, tensor: torch.Tensor, dest: int):
         self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
 
+    # TODO: support async pp send for PPCommTorch
+    def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
+        if dest is None:
+            dest = self.mapping.next_pp_rank()
+
+        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
+
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
