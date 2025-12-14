@@ -4,7 +4,6 @@ from typing import List, Optional
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
-from .base_worker import BaseWorker
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .result import IterationResult
@@ -92,8 +91,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             List[dict]: A list of runtime stats as dict.
         """
         try:
+            # Stats are already serialized by the worker's fetch_stats_async()
             stats = self.rpc_client.fetch_stats_async().remote(timeout=timeout)
-            return [BaseWorker._stats_serializer(s) for s in stats]
+            return stats
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             return []
@@ -134,9 +134,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             List[dict]: A list of runtime events as dict.
         """
         try:
+            # Events are already serialized by the worker's fetch_kv_cache_events_async()
             events = self.rpc_client.fetch_kv_cache_events_async().remote(
                 timeout=timeout)
-            return [BaseWorker._kv_cache_events_serializer(e) for e in events]
+            return events
         except Exception as e:
             logger.debug(f"Error fetching kv events via RPC: {e}")
             return []

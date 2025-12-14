@@ -2175,6 +2175,21 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     if not pytorch_backend:
         llm_args_extra["fast_build"] = True
 
+    def get_stats_with_wait(llm: LLM, timeout: float = 2) -> List[dict]:
+        """Poll for stats with timeout since RPC calls return immediately."""
+        import json
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            results = llm.get_stats(timeout=0.1)
+            if results:
+                # Parse JSON strings to dicts if needed
+                return [
+                    json.loads(r) if isinstance(r, str) else r for r in results
+                ]
+            time.sleep(0.1)
+        return []
+
     with LLM_CLASS(model=llama_model_path,
                    kv_cache_config=global_kvcache_config,
                    tensor_parallel_size=tp_size,
@@ -2193,7 +2208,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                                    sampling_params=sampling_params):
             print(output)
 
-        results = llm.get_stats(2)
+        results = get_stats_with_wait(llm, 2)
 
         validate_stats(results=results,
                        pp_size=pp_size,
@@ -2203,11 +2218,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                        enable_chunked_prefill=enable_chunked_prefill,
                        enable_iter_req_stats=enable_iter_req_stats)
 
-        assert not llm.get_stats(2)
+        assert not get_stats_with_wait(llm, 0.5)
 
         # test that IterationResult()._done is properly set
         _ = llm.generate(prompts, sampling_params=sampling_params)
-        assert llm.get_stats(2)
+        assert get_stats_with_wait(llm, 2)
 
 
 @pytest.mark.parametrize("return_context_logits", [True, False])
@@ -2249,6 +2264,21 @@ def test_llm_get_queued_stats():
     max_tries = 10
     has_queue_requests = False
 
+    def get_stats_with_wait(llm, timeout: float = 2):
+        """Poll for stats with timeout since RPC calls return immediately."""
+        import json
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            results = llm.get_stats(timeout=0.1)
+            if results:
+                # Parse JSON strings to dicts if needed
+                return [
+                    json.loads(r) if isinstance(r, str) else r for r in results
+                ]
+            time.sleep(0.1)
+        return []
+
     while not has_queue_requests and max_tries > 0:
         max_tries -= 1
         # Generate outputs, which will queue requests
@@ -2256,7 +2286,7 @@ def test_llm_get_queued_stats():
                                    sampling_params=sampling_params):
             print(output)
 
-        results = llm.get_stats(2)
+        results = get_stats_with_wait(llm, 2)
 
         for index, result in enumerate(results):
             if "requestStats" in result:

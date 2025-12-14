@@ -17,7 +17,6 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
-from .base_worker import BaseWorker
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
@@ -376,8 +375,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             return []
 
         try:
+            # Stats are already serialized by the worker's fetch_stats_async()
             stats = self.rpc_client.fetch_stats_async().remote(timeout=timeout)
-            return [BaseWorker._stats_serializer(s) for s in stats]
+            return stats
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             return []
@@ -422,9 +422,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             return []
 
         try:
+            # Events are already serialized by the worker's fetch_kv_cache_events_async()
             events = self.rpc_client.fetch_kv_cache_events_async().remote(
                 timeout=timeout)
-            return [BaseWorker._kv_cache_events_serializer(e) for e in events]
+            return events
         except Exception as e:
             logger.debug(f"Error fetching kv events via RPC: {e}")
             return []

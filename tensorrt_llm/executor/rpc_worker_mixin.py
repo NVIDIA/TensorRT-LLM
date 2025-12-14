@@ -103,15 +103,21 @@ class RpcWorkerMixin:
         """Async version of fetch_stats using asyncio.to_thread.
 
         This method is exposed via RPC and can be called directly by the proxy.
+        Returns serialized stats (JSON strings) that can be sent over RPC.
         """
-        return await asyncio.to_thread(self.fetch_stats)
+        stats = await asyncio.to_thread(self.fetch_stats)
+        # Serialize stats before sending over RPC (IterationStats objects are not picklable)
+        return [self._stats_serializer(s) for s in stats]
 
     async def fetch_kv_cache_events_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_kv_cache_events using asyncio.to_thread.
 
         This method is exposed via RPC and can be called directly by the proxy.
+        Returns serialized events (JSON strings) that can be sent over RPC.
         """
-        return await asyncio.to_thread(self.fetch_kv_cache_events)
+        events = await asyncio.to_thread(self.fetch_kv_cache_events)
+        # Serialize events before sending over RPC
+        return [self._kv_cache_events_serializer(e) for e in events]
 
     # NOTE: fetch_stats_loop_async, fetch_kv_cache_events_loop_async, and _generic_fetch_loop_async
     # have been removed. Stats and kv_events are now fetched on-demand via direct RPC calls
