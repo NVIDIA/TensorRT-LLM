@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -46,7 +47,9 @@
 #include <dlfcn.h>
 #endif
 
-namespace tensorrt_llm::common::nccl_util
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::nccl_util
 {
 
 //==============================================================================
@@ -392,6 +395,8 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     return std::make_pair(tensor, buffer);
 }
 
-} // namespace tensorrt_llm::common::nccl_util
+} // namespace common::nccl_util
+
+TRTLLM_NAMESPACE_END
 
 #endif // ENABLE_MULTI_DEVICE

@@ -114,7 +114,6 @@ pipeline {
     triggers {
         parameterizedCron('''
             H 2 * * * %branchName=main;repoUrlKey=tensorrt_llm_github
-            H 3 * * * %branchName=release/1.2.0rc4.post1;repoUrlKey=tensorrt_llm_github
         ''')
     }
 

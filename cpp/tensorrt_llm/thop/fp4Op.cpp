@@ -27,6 +27,8 @@
 
 namespace th = torch;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -476,17 +478,19 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8
 
 } // namespace torch_ext
 
-static auto float_to_e2m1_and_ufp8sf_scale
-    = torch::RegisterOperators("tensorrt_llm::float_to_e2m1_and_ufp8sf_scale", &torch_ext::FloatToE2M1AndUFP8SFScale);
+TRTLLM_NAMESPACE_END
 
-static auto half_to_e2m1_and_ufp8sf_scale
-    = torch::RegisterOperators("tensorrt_llm::half_to_e2m1_and_ufp8sf_scale", &torch_ext::HalfToE2M1AndUFP8SFScale);
+static auto float_to_e2m1_and_ufp8sf_scale = torch::RegisterOperators(
+    "tensorrt_llm::float_to_e2m1_and_ufp8sf_scale", &tensorrt_llm::torch_ext::FloatToE2M1AndUFP8SFScale);
 
-static auto e2m1_and_ufp8sf_scale_to_float
-    = torch::RegisterOperators("tensorrt_llm::e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloat);
+static auto half_to_e2m1_and_ufp8sf_scale = torch::RegisterOperators(
+    "tensorrt_llm::half_to_e2m1_and_ufp8sf_scale", &tensorrt_llm::torch_ext::HalfToE2M1AndUFP8SFScale);
+
+static auto e2m1_and_ufp8sf_scale_to_float = torch::RegisterOperators(
+    "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float", &tensorrt_llm::torch_ext::E2M1AndUFP8SFScaleToFloat);
 
 static auto e2m1_and_ufp8sf_scale_to_float_v2 = torch::RegisterOperators(
-    "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float_v2", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
+    "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float_v2", &tensorrt_llm::torch_ext::E2M1AndUFP8SFScaleToFloatV2);
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -496,12 +500,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("block_scale_interleave", &torch_ext::BlockScaleInterleave);
-    m.impl("block_scale_interleave_reverse", &torch_ext::BlockScaleInterleaveReverse);
+    m.impl("block_scale_interleave", &tensorrt_llm::torch_ext::BlockScaleInterleave);
+    m.impl("block_scale_interleave_reverse", &tensorrt_llm::torch_ext::BlockScaleInterleaveReverse);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
 {
-    m.impl("block_scale_interleave", &torch_ext::BlockScaleInterleave);
-    m.impl("block_scale_interleave_reverse", &torch_ext::BlockScaleInterleaveReverse);
+    m.impl("block_scale_interleave", &tensorrt_llm::torch_ext::BlockScaleInterleave);
+    m.impl("block_scale_interleave_reverse", &tensorrt_llm::torch_ext::BlockScaleInterleaveReverse);
 }

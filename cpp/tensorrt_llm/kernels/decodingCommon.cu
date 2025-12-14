@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/decodingCommon.h"
-
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <cstdint>
@@ -25,7 +26,9 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 __global__ void curandInitialize(curandState_t* state, int const* batchSlots, int const size, uint64_t const randomSeed)
@@ -235,4 +238,6 @@ template void invokeScatterDecodingParams(
 template void invokeScatterDecodingParams(
     int32_t const* src, int32_t scalar, int32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

@@ -6,7 +6,8 @@ enable_chunked_prefill: true
 attn_backend: flashinfer
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
-free_mem_ratio: 0.9
+# TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9884
+free_mem_ratio: 0.88
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
 kv_cache_config:
   # disable kv_cache reuse since not supported for hybrid/ssm models

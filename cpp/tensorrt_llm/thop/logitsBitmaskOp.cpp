@@ -18,6 +18,8 @@
 #include "tensorrt_llm/kernels/logitsBitmask.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -95,6 +97,8 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("logits_bitmask(Tensor(a!) logits, Tensor bitmask, Tensor? token_mask=None, Tensor? d2t=None) -> ()");
@@ -102,5 +106,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("logits_bitmask", &torch_ext::logitsBitmask);
+    m.impl("logits_bitmask", &tensorrt_llm::torch_ext::logitsBitmask);
 }

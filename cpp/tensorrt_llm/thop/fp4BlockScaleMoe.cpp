@@ -22,6 +22,8 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 namespace btg = batchedGemm::trtllm::gen;
@@ -576,17 +578,20 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
+    m.class_<tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
         .def(torch::init<>())
-        .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
-    m.class_<torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run);
+    m.class_<tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
-        .def("get_valid_configs", &torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &torch_ext::FP8FP4BlockScaleMoeRunner::run);
+        .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::run);
 }
 
 // Accepts both CPU and CUDA tensors
-static auto shuffle_matrix = torch::RegisterOperators("trtllm::shuffle_matrix", &torch_ext::shuffleMatrix);
+static auto shuffle_matrix
+    = torch::RegisterOperators("trtllm::shuffle_matrix", &tensorrt_llm::torch_ext::shuffleMatrix);
