@@ -1,4 +1,5 @@
 import os
+from operator import attrgetter
 
 import pytest
 import torch
@@ -50,11 +51,7 @@ class AllgatherPGTest:
         else:
             raise RuntimeError("torch.distributed is not initialized")
 
-        module = torch
-        op_path = ['ops', 'trtllm', 'allgather_pg']
-        for attr in op_path:
-            module = getattr(module, attr)
-        allgather_pg_op = module
+        allgather_pg_op = attrgetter('ops.trtllm.allgather_pg')(torch)
         output = allgather_pg_op(test_tensor, sizes, mapping.tp_group,
                                  mapping.tp_group_pg.boxed())
 
@@ -108,11 +105,7 @@ class ReducescatterPGTest:
         else:
             raise RuntimeError("torch.distributed is not initialized")
 
-        module = torch
-        op_path = ['ops', 'trtllm', 'reducescatter_pg']
-        for attr in op_path:
-            module = getattr(module, attr)
-        reducescatter_pg_op = module
+        reducescatter_pg_op = attrgetter('ops.trtllm.reducescatter_pg')(torch)
         output = reducescatter_pg_op(test_tensor, sizes, mapping.tp_group,
                                      mapping.tp_group_pg.boxed())
 
@@ -166,11 +159,7 @@ class AllreducePGTest:
         else:
             raise RuntimeError("torch.distributed is not initialized")
 
-        module = torch
-        op_path = ['ops', 'trtllm', 'allreduce_pg']
-        for attr in op_path:
-            module = getattr(module, attr)
-        allreduce_pg_op = module
+        allreduce_pg_op = attrgetter('ops.trtllm.allreduce_pg')(torch)
         output = allreduce_pg_op(
             input=test_tensor,
             residual=None,
@@ -251,6 +240,11 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
                 AllgatherPGTest.options(runtime_env=runtime_env).remote(
                     rank, world_size))
 
+        ray.get([
+            remotePGTest.__ray_ready__.remote()
+            for remotePGTest in remotePGTests
+        ])
+
         if var_len:
             results = ray.get([
                 remotePGTest.run_allgather_pg_op.remote(test_tensor,
@@ -264,12 +258,10 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
                                                         expected_result, sizes)
                 for remotePGTest in remotePGTests
             ])
-    except Exception as e:
+    finally:
         if ray.is_initialized():
             ray.shutdown()
-        raise e
 
-    ray.shutdown()
     for r in results:
         assert r is True
 
@@ -332,6 +324,11 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
                 ReducescatterPGTest.options(runtime_env=runtime_env).remote(
                     rank, world_size))
 
+        ray.get([
+            remotePGTest.__ray_ready__.remote()
+            for remotePGTest in remotePGTests
+        ])
+
         if var_len:
             results = ray.get([
                 remotePGTest.run_reducescatter_pg_op.remote(
@@ -346,12 +343,10 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
                 for remotePGTest, expected_result in zip(
                     remotePGTests, expected_result_list)
             ])
-    except Exception as e:
+    finally:
         if ray.is_initialized():
             ray.shutdown()
-        raise e
 
-    ray.shutdown()
     for r in results:
         assert r is True
 
@@ -397,17 +392,19 @@ def test_allreduce_pg_op(seq_len, hidden_size):
                 AllreducePGTest.options(runtime_env=runtime_env).remote(
                     rank, world_size))
 
+        ray.get([
+            remotePGTest.__ray_ready__.remote()
+            for remotePGTest in remotePGTests
+        ])
+
         results = ray.get([
             remotePGTest.run_allreduce_pg_op.remote(test_tensor,
                                                     expected_result)
             for remotePGTest in remotePGTests
         ])
-    except Exception as e:
+    finally:
         if ray.is_initialized():
             ray.shutdown()
-        raise e
-
-    ray.shutdown()
 
     for r in results:
         assert r is True
