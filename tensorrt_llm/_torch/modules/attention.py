@@ -154,6 +154,7 @@ class Attention(nn.Module):
         attn_output_gate: Optional[bool] = None,
         use_custom_cublas_mm: bool = False,
         reduce_output: bool = True,
+        use_qk_norm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -174,6 +175,7 @@ class Attention(nn.Module):
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
             attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
+            use_qk_norm (bool): whether to normalize Q and K before attention computation.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -300,6 +302,11 @@ class Attention(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm)
+
+        self.use_qk_norm = use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(tp_size * self.q_size, eps=1e-6, dtype=dtype)
+            self.k_norm = RMSNorm(tp_size * self.kv_size, eps=1e-6, dtype=dtype)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -584,6 +591,12 @@ class Attention(nn.Module):
             torch.Tensor: The output tensor.
         """
         qkv = self.qkv_proj(hidden_states)
+
+        if self.use_qk_norm:
+            q, k, v = self.split_qkv(qkv)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            qkv = torch.cat([q, k, v], dim=-1)
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
