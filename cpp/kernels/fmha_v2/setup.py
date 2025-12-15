@@ -3516,7 +3516,8 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mAlibiSupported;
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
-    bool mReturnSoftmaxStats;{launcher_line}
+    bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;{launcher_line}
 }};
 
 extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[];
@@ -3612,7 +3613,8 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mAlibiSupported;
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
-    bool mReturnSoftmaxStats;{launcher_line}
+    bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;{launcher_line}
 }};
 
 extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {{
