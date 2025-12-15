@@ -261,7 +261,7 @@ def submit_job(config, log_dir):
             str(allocation["port"]),
             config['benchmark']['mode'],
             config['benchmark']['concurrency_list'],
-            str(slurm_config['numa_bind']),
+            str(slurm_config['numa_bind']).lower(),
             log_dir,
             str(profiling_config['nsys_on']).lower(),
             profiling_config['gen_profile_range']
