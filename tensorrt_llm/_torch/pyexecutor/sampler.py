@@ -968,6 +968,23 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
 
+    def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
+        """
+        Check if we can use the fast argmax path for greedy sampling.
+        """
+
+        # Check if all requests use greedy sampling and don't require features
+        # that the fast path skips
+        for req in requests:
+            # vocab_size doesn't affect greediness check
+            if _request_strategy(req, vocab_size=2**31) != GREEDY:
+                return False
+
+            # Fast path skips logprobs handling
+            if req.py_return_log_probs:
+                return False
+        return True
+
     @staticmethod
     def _meet_max_token_stop_criteria(
         request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX
@@ -1883,6 +1900,34 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             tokens += d2t
 
     @staticmethod
+    @nvtx_range("fast_greedy_sample_kernel")
+    def _fast_greedy_sample_kernel(
+        logits_cuda: torch.Tensor,
+        new_tokens_cuda: torch.Tensor,
+        batch_dest_indices: torch.Tensor,
+        max_beam_width: int,
+        d2t: torch.Tensor | None,
+    ) -> None:
+        """Applies fast greedy sampling to the logits.
+
+        Performs argmax, applies d2t translation if present, and scatters
+        tokens into the output buffer. All operations are in-place.
+        """
+        # Simple argmax for greedy sampling
+        next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
+
+        # Apply draft-to-target token translation if present (for Eagle3)
+        if d2t is not None:
+            next_tokens += d2t[next_tokens]
+
+        # Scatter tokens into output buffer
+        batch_dest_indices_expanded = batch_dest_indices.unsqueeze(1).expand(-1, max_beam_width)
+        next_tokens_expanded = next_tokens.unsqueeze(1).expand(-1, max_beam_width)
+        new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
+            0, batch_dest_indices_expanded, next_tokens_expanded
+        )
+
+    @staticmethod
     def _apply_embedding_bias(
         logits: torch.Tensor,
         requests: list[LlmRequest],
@@ -2372,6 +2417,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
         ]
 
+    @nvtx_range("_write_finish_reasons")
     def _write_finish_reasons(
         self,
         requests: list[LlmRequest],
@@ -2636,6 +2682,36 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             sampling_requests_metadata.req_num_steps,
             sampling_requests_metadata.req_num_beams,
         )
+
+        # Fast path for greedy sampling
+        if self._can_use_fast_greedy_path(requests):
+            # Compute destination indices on CPU (same pattern as _unbatch_sampling_results)
+            batch_destination_indexer = _UnpackedStepIndexer(
+                seq_slots=seq_slots,
+                num_steps=sampling_requests_metadata.req_num_generated_tokens,
+                steps_dim_size=new_tokens_cuda.size(0),
+                slots_dim_size=new_tokens_cuda.size(1),
+                dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
+                index_dtype=torch.int64,
+            )
+            batch_dest_indices_cuda = batch_destination_indexer[:].to(
+                new_tokens_cuda.device, non_blocking=True
+            )
+
+            # Get d2t tensor if present
+            d2t = model_outputs.get("d2t", None)
+
+            # Run compiled kernel for argmax, d2t application, and scatter
+            self._fast_greedy_sample_kernel(
+                logits_cuda,
+                new_tokens_cuda,
+                batch_dest_indices_cuda,
+                self.max_beam_width,
+                d2t,
+            )
+
+            new_tokens_host = self._copy_to_host(new_tokens_cuda)
+            return new_tokens_host
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
