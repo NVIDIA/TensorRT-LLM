@@ -774,6 +774,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config=model_config.spec_config,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
+                else:
+                    raise ValueError(
+                        f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
+                    )
                 self.draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
 
