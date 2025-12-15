@@ -221,7 +221,22 @@ void initBindings(nb::module_& m)
         .def_ro("tokens", &tle::KVCacheStoredBlockData::tokens)
         .def_ro("lora_id", &tle::KVCacheStoredBlockData::loraId)
         .def_ro("cache_level", &tle::KVCacheStoredBlockData::cacheLevel)
-        .def_ro("priority", &tle::KVCacheStoredBlockData::priority);
+        .def_ro("priority", &tle::KVCacheStoredBlockData::priority)
+        .def_prop_ro("mm_keys",
+            [](tle::KVCacheStoredBlockData const& self)
+            {
+                // Convert std::vector<MmKey> to Python list of tuples (bytes, int)
+                // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+                nb::list result;
+                for (auto const& mmKey : self.mmKeys)
+                {
+                    auto const& hashArray = mmKey.first;
+                    auto offset = mmKey.second;
+                    nb::bytes hashBytes(reinterpret_cast<char const*>(hashArray.data()), hashArray.size());
+                    result.append(nb::make_tuple(hashBytes, offset));
+                }
+                return result;
+            });
 
     nb::class_<tle::KVCacheStoredData>(executor_kv_cache, "KVCacheStoredData")
         .def_ro("parent_hash", &tle::KVCacheStoredData::parentHash)

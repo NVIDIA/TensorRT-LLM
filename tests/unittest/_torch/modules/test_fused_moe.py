@@ -852,12 +852,23 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         [DefaultMoeRoutingMethod],
     ),
 )
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_fp8_blockwise_deepgemm(dtype,
                                           num_experts,
                                           seq_len,
                                           hidden_size,
                                           RoutingMethodCls,
+                                          enable_configurable_moe,
+                                          mocker,
                                           mapping=None):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
+
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
     INTERMEDIATE_SIZE = 256
@@ -921,14 +932,20 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
-    fused_moe = DeepGemmFusedMoE(
-        num_experts=NUM_EXPERTS,
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+    pretrained_config.torch_dtype = dtype
+
+    fused_moe = create_moe(
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
+                                 mapping=mapping,
+                                 moe_backend="DEEPGEMM"),
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])

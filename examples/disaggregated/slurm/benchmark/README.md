@@ -31,7 +31,7 @@ slurm:
   job_name: "<job_name>"
   extra_args: ""  # Additional SLURM arguments (e.g., "--gres=gpu:4 --exclude=node1")
   set_segment: true # Optional: whether to set the segment for the job
-  numa_bind: true  # Enable NUMA binding for GB200 NVL72
+  numa_bind: true  # Enable NUMA binding for GB200/GB300 NVL72
 ```
 
 ### 2. Benchmark Configuration
