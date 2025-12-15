@@ -703,8 +703,8 @@ inline TllmGenFmhaKernel const* getTllmFmhaKernels(
 {
 
 #if !defined(EXCLUDE_SM_100) || !defined(EXCLUDE_SM_103)
-    return TllmFmhaKernelFactory::Get().getKernels(
-        sTllmGenFmhaKernelMetaInfos, sTllmGenFmhaKernelMetaInfosSize, dtypeQ, dtypeKv, dtypeOut, sm);
+    return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
+        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100
