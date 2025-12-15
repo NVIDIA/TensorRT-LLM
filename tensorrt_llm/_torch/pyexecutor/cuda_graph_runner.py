@@ -1,11 +1,12 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
 
 import torch
 
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
+                                          DecodingBaseConfig)
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs.multimodal import MultimodalParams
@@ -14,13 +15,17 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
+from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import make_weak_ref, piecewise_cuda_graph
+from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
+from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
+KeyType: TypeAlias = Tuple[int, int, bool, bool]
 
 
 @dataclass
@@ -71,6 +76,7 @@ class CUDAGraphRunnerConfig:
     mapping: Optional[Mapping]
     dist: Optional[MPIDist]
     kv_cache_manager_key: Any
+    sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
 
 class CUDAGraphRunner:
@@ -93,11 +99,12 @@ class CUDAGraphRunner:
         self.max_supported_batch_size = config.max_cuda_graph_batch_size
         self.max_beam_width = config.max_beam_width
         self.spec_config = config.spec_config
+        self.sparse_config = config.sparse_attention_config
 
-        self.graphs: Dict[Tuple[int, int, int], torch.cuda.CUDAGraph] = {}
-        self.graph_outputs: Dict[Tuple[int, int, int],
+        self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
-        self.graph_metadata: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
 
@@ -135,17 +142,70 @@ class CUDAGraphRunner:
                     }) for _ in range(max_total_tokens)
             ]
 
+    def _get_seq_len_mode(
+            self,
+            batch: ScheduledRequests,
+            new_tensors_device: Optional[SampleStateTensors] = None):
+        if self.sparse_config is not None and self.sparse_config.needs_separate_short_long_cuda_graphs(
+        ):
+            # Some sparse attention algorithms need to use different forward paths for short and long sequences.
+            # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
+            # computational overhead. To support this feature, we need to capture separate CUDA graphs for short
+            # and long sequences. We need to first collect the sequence length of the requests and then determine
+            # the sequence length mode. For long sequences, use the default maximum sequence length. For short
+            # sequences, use the sequence length threshold as the maximum sequence length.
+            total_seq_lens = []
+            new_tokens_device, next_draft_tokens_device = None, None
+            if new_tensors_device is not None:
+                new_tokens_device = new_tensors_device.new_tokens
+                if isinstance(new_tensors_device, SampleStateTensorsMTP):
+                    next_draft_tokens_device = new_tensors_device.next_draft_tokens
+            overlap_scheduler_enabled = new_tokens_device is not None
+            for request in batch.generation_requests:
+                is_spec_request = get_draft_token_length(
+                    request) > 0 or next_draft_tokens_device is not None
+                num_draft_tokens = self.spec_config.max_draft_len if is_spec_request else 0
+                # First draft
+                if request.py_is_first_draft:
+                    total_seq_len = len(request.get_tokens(0))
+                # With overlap scheduler disabled or dummy request or not assigned to a batch,
+                elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
+                    total_seq_len = request.max_beam_num_tokens + num_draft_tokens
+                # Other cases
+                else:
+                    total_seq_len = request.max_beam_num_tokens + num_draft_tokens + 1
+                total_seq_lens.append(total_seq_len)
+            # Determine the sequence length mode.
+            from ..speculative import get_num_extra_kv_tokens
+            num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
+            max_seq_len = max(total_seq_lens)
+            if max_seq_len <= self.sparse_config.seq_len_threshold - num_extra_kv_tokens:
+                short_seq_len_mode = True
+            else:
+                short_seq_len_mode = False
+        else:
+            # For non-sparse attention or sparse attention that does not need separate short and long CUDA graphs,
+            # use the default sequence length mode.
+            short_seq_len_mode = False
+        return short_seq_len_mode
+
     def get_graph_key(
             self,
             batch: ScheduledRequests,
+            new_tensors_device: Optional[SampleStateTensors] = None,
             spec_resource_manager: Optional[BaseResourceManager] = None):
         batch_size = batch.batch_size
+
+        # Get the sequence length mode.
+        short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
+
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
             # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
             # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = (batch_size, draft_len, spec_resource_manager.is_first_draft)
+            key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
+                   short_seq_len_mode)
         else:
             # With dynamic spec decode, the draft length maybe zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -155,7 +215,7 @@ class CUDAGraphRunner:
             draft_len = max(draft_len_list)
             assert len(
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
-            key = (batch_size, draft_len, False)
+            key = (batch_size, draft_len, False, short_seq_len_mode)
         return key
 
     def __del__(self):
@@ -168,6 +228,7 @@ class CUDAGraphRunner:
         attn_metadata: Any,
         spec_metadata: Optional[Any] = None,
         draft_tokens_cuda: Optional[torch.Tensor] = None,
+        new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[int, int, bool]]]:
         """
@@ -198,7 +259,8 @@ class CUDAGraphRunner:
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
-        key = self.get_graph_key(batch, spec_resource_manager)
+        key = self.get_graph_key(batch, new_tensors_device,
+                                 spec_resource_manager)
 
         if key in self.graphs:
             return self.graph_metadata[key][
@@ -220,7 +282,7 @@ class CUDAGraphRunner:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
 
-    def needs_capture(self, key: Tuple[int, int, int]):
+    def needs_capture(self, key: KeyType):
         return key not in self.graph_outputs
 
     def get_graph_pool(self):
@@ -233,7 +295,7 @@ class CUDAGraphRunner:
         return self.memory_pool
 
     def capture(self,
-                key: Tuple[int, int, int],
+                key: KeyType,
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
@@ -270,8 +332,7 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def _setup_spec_decoding_and_forward(key: Tuple[int, int, int],
-                                             forward_fn: Callable,
+        def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
             is_first_draft = key[2]
             needs_kv_cache_recompute = True if enable_spec_decode and self.config.spec_config.spec_dec_mode.needs_kv_cache_recompute(
@@ -302,7 +363,7 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
-    def replay(self, key: Tuple[int, int, int],
+    def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         stored_meta = self.graph_metadata[key]
