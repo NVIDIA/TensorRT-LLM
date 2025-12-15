@@ -142,7 +142,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 ## MTP optimization - Relaxed Acceptance
@@ -201,7 +201,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 ## Evaluation

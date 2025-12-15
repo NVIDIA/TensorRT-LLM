@@ -46,7 +46,7 @@ trtllm-serve  \
 <model_folder_path> \
 --backend pytorch \
 --trust_remote_code \
---extra_llm_api_options lora-extra-llm-api-config.yml
+--config lora-extra-llm-api-config.yml
 ```
 
 ```

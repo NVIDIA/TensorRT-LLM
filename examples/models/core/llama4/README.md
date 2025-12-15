@@ -50,7 +50,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --ep_size 8 \
     --num_postprocess_workers 2 \
     --trust_remote_code \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 
@@ -101,7 +101,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --tp_size 8 \
     --ep_size 1 \
     --trust_remote_code \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 
@@ -147,7 +147,7 @@ trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --ep_size 2 \
     --num_postprocess_workers 2 \
     --trust_remote_code \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 

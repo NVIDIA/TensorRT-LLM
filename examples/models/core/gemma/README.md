@@ -705,7 +705,7 @@ trtllm-serve \
   --ep_size 2 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./ctx-extra-llm-api-config.yml \
+  --config ./ctx-extra-llm-api-config.yml \
   &> output_ctx_8001 &
 ```
 
@@ -728,7 +728,7 @@ trtllm-serve \
   --ep_size 2 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  --config ./gen-extra-llm-api-config.yml \
   &> output_gen_8002 &
 ```
 

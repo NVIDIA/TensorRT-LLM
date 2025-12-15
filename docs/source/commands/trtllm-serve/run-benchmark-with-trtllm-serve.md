@@ -7,7 +7,7 @@ This step-by-step tutorial covers the following topics for running online servin
  * Methodology Introduction
  * Launch the OpenAI-Compatible Server with NGC container
  * Run the performance benchmark
- * Using `extra_llm_api_options`
+ * Using `--config`
  * Multimodal Serving and Benchmarking
 
 ## Table of Contents
@@ -57,9 +57,9 @@ For benchmarking purposes, first create a bash script using the following code a
 ```bash
 #! /bin/bash
 model_path=/path/to/llama3.1_70B
-extra_llm_api_file=/tmp/extra-llm-api-config.yml
+config_file=/tmp/config.yml
 
-cat << EOF > ${extra_llm_api_file}
+cat << EOF > ${config_file}
 enable_attention_dp: false
 print_iter_log: true
 cuda_graph_config:
@@ -77,7 +77,7 @@ trtllm-serve ${model_path} \
     --tp_size 1 \
     --ep_size 1 \
     --trust_remote_code \
-    --extra_llm_api_options ${extra_llm_api_file}
+    --config ${config_file}
 ```
 > [!NOTE]
 > The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -215,8 +215,8 @@ $$
 
 To get more detailed metrics besides the key metrics above, there is an [experimental tool](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown) for request time breakdown.
 
-## About `extra_llm_api_options`
-   trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.
+## About `--config`
+   trtllm-serve provides `--config` to **overwrite** the parameters specified by trtllm-serve.
    Generally, We create a YAML file that contains various performance switches.
    e.g
    ```yaml

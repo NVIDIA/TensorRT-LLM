@@ -717,7 +717,7 @@ trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
   --tp ${num_gpus}\
   --ep ${ep_size} \
   --kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
-  --extra_llm_api_options ${path_config} \
+  --config ${path_config} \
   --concurrency ${concurrency} \
   --num_requests $(( concurrency * 5 )) \
   --warmup 0 \
@@ -756,7 +756,7 @@ EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml
 To serve the model using `trtllm-serve`:
 
 ```bash
-trtllm-serve Qwen3-30B-A3B/ --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen3-30B-A3B/ --port 8000 --config ${EXTRA_LLM_API_FILE}
 ```
 
 To query the server, you can start with a `curl` command:
@@ -781,7 +781,7 @@ export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
 export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml"
 
-trtllm-serve Qwen3-30B-A3B/ --port 8001 --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_ctx &
+trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ${EXTRA_LLM_API_FILE} &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
@@ -792,7 +792,7 @@ export TRTLLM_DIR=/app/tensorrt_llm
 export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml"
 
 for port in {8002..8003}; do \
-trtllm-serve Qwen3-30B-A3B/ --port ${port} --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
+trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
 done
 ```
 

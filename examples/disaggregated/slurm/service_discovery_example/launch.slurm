@@ -63,11 +63,11 @@ srun --container-image=${container_image} \
      --container-mounts=${mount_paths} \
      -N 2 --ntasks-per-node=4 \
      --mpi=pmix \
-     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port ${ctx_port} --extra_llm_api_options ${work_path}/ctx_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role context" &
+     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port ${ctx_port} --config ${work_path}/ctx_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role context" &
 
 # Launch a generation with `tp_size=4` using one 4-GPU node.
 srun --container-image=${container_image} \
      --container-mounts=${mount_paths} \
      -N 1 --ntasks-per-node=4 \
      --mpi=pmix \
-     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port ${gen_port} --extra_llm_api_options ${work_path}/gen_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role generation" &
+     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port ${gen_port} --config ${work_path}/gen_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role generation" &

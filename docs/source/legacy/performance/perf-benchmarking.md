@@ -419,7 +419,7 @@ To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following comm
 run `trtllm-bench build`; the `throughput` benchmark initializes the backend by tuning against the
 dataset provided via `--dataset` (or the other build mode settings described [above](#other-build-modes)).
 Note that CUDA graph is enabled by default. You can add additional pytorch config with
-`--extra_llm_api_options` followed by the path to a YAML file. For more details, please refer to the
+`--config` followed by the path to a YAML file. For more details, please refer to the
 help text by running the command with `--help`.
 
 ```{tip}
@@ -511,7 +511,7 @@ The generated dataset will include LoRA request metadata. Below is an example of
 
 **LoRA Configuration**
 
-Create an `extra-llm-api-options.yaml` file with LoRA configuration:
+Create a `config.yaml` file with LoRA configuration:
 
 ```yaml
 lora_config:
@@ -535,7 +535,7 @@ lora_config:
 trtllm-bench --model /path/to/base/model \
   throughput \
   --dataset synthetic_lora_data.json \
-  --extra_llm_api_options extra-llm-api-options.yaml
+  --config config.yaml
 ```
 
 ```{note}

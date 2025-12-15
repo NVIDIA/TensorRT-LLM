@@ -1566,7 +1566,7 @@ trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
     --max_batch_size 1024 \
     --trust_remote_code \
     --num_postprocess_workers 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 ### Run performance benchmarks

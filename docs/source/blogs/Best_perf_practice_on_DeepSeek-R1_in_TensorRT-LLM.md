@@ -157,7 +157,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 Explanation:
@@ -168,7 +168,7 @@ Explanation:
 - `--max_batch_size`: Max batch size in each rank.
 - `--tp`: Tensor parallel size.
 - `--ep`: Expert parallel size.
-- `--extra_llm_api_options`: Used to specify some extra config. The content of the file is as follows:
+- `--config`: Used to specify extra YAML configuration. The content of the file is as follows:
 
 #### Expected Results
 The perf can be different when using different datasets and different machines.
@@ -218,7 +218,7 @@ trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
      throughput
      --dataset ${YOUR_DATA_PATH}
      --tp 8  --ep 8
-     --extra_llm_api_options ./extra-llm-api-config.yml
+     --config ./extra-llm-api-config.yml
      --max_batch_size 896
      --max_num_tokens 2048
      --kv_cache_free_gpu_mem_fraction 0.93
@@ -290,7 +290,7 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --num_requests 49152 \
     --concurrency 3072 \
     --kv_cache_free_gpu_mem_fraction 0.85 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 #### Expected Result Format
@@ -329,7 +329,7 @@ trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     --tp 8 \
     --ep 4 \
     --concurrency 1 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 #### Expected Result Format
@@ -384,7 +384,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --num_requests 5120 \
     --concurrency 1024 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./extra-llm-api-config.yml
 ```
 
 #### Expected Result Format

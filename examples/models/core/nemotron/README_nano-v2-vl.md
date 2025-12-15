@@ -63,7 +63,7 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
 --max_num_tokens 131072 \
 --trust_remote_code \
 --media_io_kwargs "{\"video\": {\"fps\": 2, \"num_frames\": 128} }" \
---extra_llm_api_options extra-llm-api-config.yml
+--config extra-llm-api-config.yml
 
 # CMD to launch serve with EVS (video_pruning_ratio=0.9).
 TLLM_VIDEO_PRUNING_RATIO=0.9 trtllm-serve  \
@@ -75,7 +75,7 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\
 --max_num_tokens 131072 \
 --trust_remote_code \
 --media_io_kwargs "{\"video\": {\"fps\": 2, \"num_frames\": 128} }" \
---extra_llm_api_options extra-llm-api-config.yml
+--config extra-llm-api-config.yml
 ```
 
 # Known issue:

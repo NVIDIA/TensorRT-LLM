@@ -19,5 +19,5 @@ trtllm-serve \
     --trust_remote_code \
     --max_batch_size 1024 --max_num_tokens 8192 \
     --tp_size 8 --ep_size 8 --pp_size 1 \
-    --extra_llm_api_options ./extra-llm-api-config.yml \
+    --config ./extra-llm-api-config.yml \
     --reasoning_parser deepseek-r1
