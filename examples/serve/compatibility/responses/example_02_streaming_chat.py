@@ -81,7 +81,7 @@ print()
 
 print("Prompt: Write a haiku about artificial intelligence\n")
 
-# Create a streaming chat completion
+# Create a streaming responses
 stream = client.responses.create(
     model=model,
     input="Write a haiku about artificial intelligence",

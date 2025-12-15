@@ -14,7 +14,7 @@
 # limitations under the License.
 
 #!/usr/bin/env python3
-"""Example 5: JSON Mode with Schema.
+"""Example 4: JSON Mode with Schema.
 
 Demonstrates structured output generation with JSON schema validation.
 
@@ -36,7 +36,7 @@ models = client.models.list()
 model = models.data[0].id
 
 print("=" * 80)
-print("Example 5: JSON Mode with Schema")
+print("Example 4: JSON Mode with Schema")
 print("=" * 80)
 print()
 
@@ -63,7 +63,7 @@ print()
 print("Note: JSON schema support requires xgrammar and compatible model configuration.\n")
 
 try:
-    # Create chat completion with JSON schema
+    # Create responses with JSON schema
     response = client.responses.create(
         model=model,
         instructions="You are a helpful assistant that outputs JSON.",

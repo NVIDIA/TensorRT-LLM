@@ -14,7 +14,7 @@
 # limitations under the License.
 
 #!/usr/bin/env python3
-"""Example 6: Tool/Function Calling.
+"""Example 5: Tool/Function Calling.
 
 Demonstrates tool calling with function definitions and responses.
 
@@ -37,7 +37,7 @@ model = models.data[0].id
 TOOL_CALL_SUPPORTED_MODELS = ["Qwen3", "GPT-OSS", "Kimi K2"]
 
 print("=" * 80)
-print("Example 6: Tool/Function Calling")
+print("Example 5: Tool/Function Calling")
 print("=" * 80)
 print()
 print(
