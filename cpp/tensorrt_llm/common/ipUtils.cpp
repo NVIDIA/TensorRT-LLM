@@ -29,7 +29,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::string getLocalIpByNic(std::string const& interface, int rank)
@@ -219,4 +221,6 @@ std::string getLocalIp(std::string interface, int rank)
     }
     return localIP;
 }
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END
