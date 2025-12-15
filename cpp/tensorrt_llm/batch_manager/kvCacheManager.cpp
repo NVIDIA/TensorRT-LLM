@@ -284,6 +284,11 @@ tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
     return mMemoryPoolBlockIndex.get();
 }
 
+std::vector<MmKey> KVCacheBlock::getExtraKeys() const
+{
+    return mBlockKey.extraKeys;
+}
+
 bool KVCacheBlock::isPrimary() const
 {
     return mMemoryPoolBlockIndex.isPrimary();

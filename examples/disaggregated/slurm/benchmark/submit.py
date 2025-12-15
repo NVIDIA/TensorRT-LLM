@@ -26,10 +26,10 @@ def parse_args():
                        '--dir',
                        type=str,
                        help='Directory containing YAML configuration files')
-    group.add_argument('--log-dir',
-                       type=str,
-                       default=None,
-                       help='Log directory')
+    parser.add_argument('--log-dir',
+                        type=str,
+                        default=None,
+                        help='Log directory')
     return parser.parse_args()
 
 
@@ -133,6 +133,7 @@ def submit_job(config, log_dir):
     # Set default environment configuration for backward compatibility
     env_config.setdefault('trtllm_repo', '')
     env_config.setdefault('build_wheel', False)
+    env_config.setdefault('cuda_architectures', '')
     env_config.setdefault('trtllm_wheel_path', '')
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
@@ -153,14 +154,20 @@ def submit_job(config, log_dir):
                               {}).get('num_nextn_predict_layers', 0)
 
     # Calculate nodes based on world sizes
-    ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
-    ctx_pp_size = config['worker_config']['ctx']['pipeline_parallel_size']
-    ctx_world_size = ctx_tp_size * ctx_pp_size
+    ctx_tp_size = config['worker_config']['ctx'].get('tensor_parallel_size', 1)
+    ctx_cp_size = config['worker_config']['ctx'].get('context_parallel_size', 1)
+    ctx_pp_size = config['worker_config']['ctx'].get('pipeline_parallel_size',
+                                                     1)
+    ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
-    gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
-    gen_pp_size = config['worker_config']['gen']['pipeline_parallel_size']
-    gen_world_size = gen_tp_size * gen_pp_size
+
+    gen_tp_size = config['worker_config']['gen'].get('tensor_parallel_size', 1)
+    gen_cp_size = config['worker_config']['gen'].get('context_parallel_size', 1)
+    gen_pp_size = config['worker_config']['gen'].get('pipeline_parallel_size',
+                                                     1)
+    gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
+
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
@@ -256,9 +263,9 @@ def submit_job(config, log_dir):
             str(allocation["port"]),
             config['benchmark']['mode'],
             config['benchmark']['concurrency_list'],
-            str(slurm_config['numa_bind']),
+            str(slurm_config['numa_bind']).lower(),
             log_dir,
-            str(profiling_config['nsys_on']),
+            str(profiling_config['nsys_on']).lower(),
             profiling_config['gen_profile_range']
             if server_type == "GEN" else profiling_config['ctx_profile_range'],
             gen_config_path if server_type == "GEN" else ctx_config_path,
@@ -284,6 +291,7 @@ def submit_job(config, log_dir):
         *([] if not slurm_config['set_segment'] else [f'--segment={total_nodes}']),
         f'--output={log_dir}/slurm-%j.out',
         f'--error={log_dir}/slurm-%j.err',
+        f'--gpus-per-node={hw_config["gpus_per_node"]}',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
 
@@ -299,6 +307,7 @@ def submit_job(config, log_dir):
         '--benchmark-ratio', str(config['benchmark']['benchmark_ratio']),
         '--streaming', str(config['benchmark']['streaming']).lower(),
         '--use-nv-sa-benchmark', str(config['benchmark']['use_nv_sa_benchmark']).lower(),
+        '--benchmark-mode', config['benchmark']['mode'],
 
         # Environment and paths
         '--dataset-file', config['benchmark']['dataset_file'],
@@ -309,6 +318,7 @@ def submit_job(config, log_dir):
         '--container-mount', env_config['container_mount'],
         '--container-image', env_config['container_image'],
         '--build-wheel', str(env_config['build_wheel']).lower(),
+        '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
 
         # Accuracy evaluation

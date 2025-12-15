@@ -43,6 +43,9 @@ struct HelixPostProcParams
 template <typename T>
 void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
+template <typename T>
+void helixPostProcessNative(HelixPostProcParams<T> const& params, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

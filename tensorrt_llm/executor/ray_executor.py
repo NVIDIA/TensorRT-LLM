@@ -13,7 +13,7 @@ from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
                                       placement_group)
 
 from tensorrt_llm._ray_utils import unwrap_ray_errors
-from tensorrt_llm._utils import get_free_port, nvtx_range_debug
+from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..llmapi.utils import logger_debug
@@ -76,7 +76,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.world_size = model_world_size
             self.tp_size = tp_size
             self.master_address = ray.util.get_node_ip_address()
-            self.master_port = get_free_port()
 
             self.worker_kwargs = dict(
                 **worker_kwargs,
@@ -126,7 +125,6 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         runtime_env["env_vars"].update({
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
-            "MASTER_PORT": str(self.master_port)
         })
 
         placement_groups, self.bundle_indices = self._get_placement_group(
@@ -156,6 +154,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             ray.get(self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
             raise RuntimeError("RayGPUWorker died during initialization") from e
+        port = self.call_all_ray_workers("setup_tcp_store",
+                                         leader_only=True,
+                                         async_call=False)[0]
+        self.call_all_ray_workers("setup_distributed_env_and_worker",
+                                  leader_only=False,
+                                  async_call=False,
+                                  port=port)
 
     async def init_workers_async(self):
         self.create_workers(RayGPUWorker, self.worker_kwargs)
@@ -163,6 +168,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             await asyncio.gather(*self._get_worker_ready_futures())
         except ray.exceptions.ActorDiedError as e:
             raise RuntimeError("RayGPUWorker died during initialization") from e
+        port = (await asyncio.gather(*self.call_all_ray_workers(
+            "setup_tcp_store", leader_only=True, async_call=True)))[0]
+        await asyncio.gather(
+            *self.call_all_ray_workers("setup_distributed_env_and_worker",
+                                       leader_only=False,
+                                       async_call=True,
+                                       port=port))
 
     @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,

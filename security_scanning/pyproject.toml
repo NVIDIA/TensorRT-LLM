@@ -74,6 +74,7 @@ openai-harmony = "0.0.4"
 nvidia-cutlass-dsl = "4.3.1"
 plotly = "^6.5.0"
 partial-json-parser = "^0.2.1.1.post7"
+mistral-common = "1.8.6"
 
 
 [build-system]

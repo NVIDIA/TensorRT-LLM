@@ -2212,6 +2212,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
 # Test cases that use enable_configurable_moe parameter and need ID conversion
 TESTS_WITH_CONFIGURABLE_MOE = [
     "TestDeepSeekV3Lite::test_nvfp4_4gpus",
+    "TestDeepSeekV3Lite::test_fp8_block_scales",
     "TestGPTOSS::test_w4_4gpus",
     "TestGPTOSS::test_w4_4gpus_online_eplb",
     "TestQwen3_30B_A3B::test_w4a8_mxfp4",
