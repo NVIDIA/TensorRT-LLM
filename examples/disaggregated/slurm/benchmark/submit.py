@@ -261,7 +261,7 @@ def submit_job(config, log_dir):
             config['benchmark']['concurrency_list'],
             str(slurm_config['numa_bind']),
             log_dir,
-            str(profiling_config['nsys_on']),
+            str(profiling_config['nsys_on']).lower(),
             profiling_config['gen_profile_range']
             if server_type == "GEN" else profiling_config['ctx_profile_range'],
             gen_config_path if server_type == "GEN" else ctx_config_path,
