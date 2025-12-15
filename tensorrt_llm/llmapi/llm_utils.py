@@ -666,6 +666,19 @@ class CachedModelLoader:
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
+            # Download speculative model if it is from HuggingFace Hub
+            if (self.model_loader.speculative_model_obj is not None
+                    and self.model_loader.speculative_model_obj.is_hub_model):
+                spec_model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=self.model_loader.speculative_model_obj.model_name,
+                    revision=None)
+                spec_model_dir = spec_model_dirs[0]
+                self.model_loader.speculative_model_obj.model_dir = spec_model_dir
+                # Update llm_args so PyTorch executor gets the local path
+                if self.llm_args.speculative_config is not None:
+                    self.llm_args.speculative_config.speculative_model_dir = spec_model_dir
+
             if self.llm_args.quant_config.quant_algo is not None:
                 logger.warning(
                     "QuantConfig for pytorch backend is ignored. You can load"
