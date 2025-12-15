@@ -492,11 +492,33 @@ with csv_file_path.open("w", newline="") as f:
     for row in csv_data:
         csv_writer.writerow(row)
 js_header_config = [{"name": problem["text"]} for problem in problem_set]
+js_header_config = []
+for problem in problem_set:
+    innermost_children = js_header_config
+    for k, msg_prefix in [
+        ("batch_size", "b="),
+        ("seq_len_q", "q="),
+        ("seq_len_kv_cache", "past="),
+    ]:
+        if len(run_args[k + "_list"]) > 1:
+            if len(innermost_children) == 0 or problem["spec"][k] != innermost_children[-1][k]:
+                innermost_children.append(
+                    {
+                        "name": msg_prefix + str(problem["spec"][k]),
+                        "children": [],
+                        k: problem["spec"][k],
+                    }
+                )
+            innermost_children = innermost_children[-1]["children"]
+    innermost_children.append({"name": problem["text"]})
 loader = jinja2.FileSystemLoader(Path(__file__).parent)
 template = jinja2.Environment(loader=loader).get_template("template.html")
 with html_file_path.open("w") as f:
     configText = (
-        "Run:\n" + json.dumps(run_args, indent=4) + "\n\nParse:\n" + json.dumps(args.__dict__)
+        "Run:\n"
+        + json.dumps(run_args, indent=4)
+        + "\n\nParse:\n"
+        + json.dumps(args.__dict__, indent=4)
     )
     f.write(template.render(headerConfig=js_header_config, rawData=js_data, configText=configText))
 
