@@ -258,12 +258,11 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
                                                         expected_result, sizes)
                 for remotePGTest in remotePGTests
             ])
+        for r in results:
+            assert r is True
     finally:
         if ray.is_initialized():
             ray.shutdown()
-
-    for r in results:
-        assert r is True
 
 
 @pytest.mark.gpu2
@@ -343,12 +342,11 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
                 for remotePGTest, expected_result in zip(
                     remotePGTests, expected_result_list)
             ])
+        for r in results:
+            assert r is True
     finally:
         if ray.is_initialized():
             ray.shutdown()
-
-    for r in results:
-        assert r is True
 
 
 @pytest.mark.gpu2
@@ -402,9 +400,8 @@ def test_allreduce_pg_op(seq_len, hidden_size):
                                                     expected_result)
             for remotePGTest in remotePGTests
         ])
+        for r in results:
+            assert r is True
     finally:
         if ray.is_initialized():
             ray.shutdown()
-
-    for r in results:
-        assert r is True
