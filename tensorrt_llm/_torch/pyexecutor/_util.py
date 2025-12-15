@@ -907,7 +907,8 @@ def create_py_executor_instance(
         max_seq_len=max_seq_len,
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
-        execution_stream=execution_stream)
+        execution_stream=execution_stream,
+        iter_stats_max_iterations=llm_args.iter_stats_max_iterations)
 
 
 def create_torch_sampler_args(
