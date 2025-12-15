@@ -36,25 +36,29 @@ namespace tensorrt_llm::batch_manager
 {
 
 using RequestIdType = LlmRequest::RequestIdType;
+// UUID is a 36-character string in the format of "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
 static constexpr size_t kUuidSize = 36;
 using UuidType = std::array<char, kUuidSize>;
+// Type alias for unique transfer IDs used in KV cache transfer operations.
+using TransferTagType = int;
+static constexpr TransferTagType kInvalidTransferTag = 0;
 
-class UniqueIdGenerator
+class TransferTagGenerator
 {
 public:
-    static int32_t get()
+    static uint64_t get()
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!mReleasedIds.empty())
         {
-            int32_t id = *mReleasedIds.begin();
+            uint64_t id = *mReleasedIds.begin();
             mReleasedIds.erase(mReleasedIds.begin());
             return id;
         }
         return mNextId++;
     }
 
-    static void release(int32_t id)
+    static void release(uint64_t id)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (id < mNextId)
@@ -64,53 +68,54 @@ public:
     }
 
 private:
-    static int32_t mNextId;
-    static std::set<int32_t> mReleasedIds;
+    static uint64_t mNextId;
+    static std::set<uint64_t> mReleasedIds;
     static std::mutex mMutex;
 };
 
-inline std::mutex UniqueIdGenerator::mMutex;
-inline int32_t UniqueIdGenerator::mNextId = 8192;
-inline std::set<int32_t> UniqueIdGenerator::mReleasedIds;
+inline std::mutex TransferTagGenerator::mMutex;
+// 8192 is chosen to avoid conflicts with other MPI tags.
+inline uint64_t TransferTagGenerator::mNextId = 8192;
+inline std::set<uint64_t> TransferTagGenerator::mReleasedIds;
 
-enum class UniqueIdRequestType
+enum class TransferTagRequestType
 {
-    kGetUniqueId,
-    kReleaseUniqueId
+    kGetTransferTag,
+    kReleaseTransferTag
 };
 
-struct UniqueIdRequest
+struct TransferTagRequest
 {
-    UniqueIdRequestType type;
+    TransferTagRequestType type;
 
     union
     {
         struct
         {
-            RequestIdType requestId;
-            UuidType serverUuid;
+            RequestIdType receiverTransferId;
+            UuidType receiverServerUuid;
             int32_t expectedRefCount;
-        } getUniqueId;
+        } getTransferTag;
 
         struct
         {
-            RequestIdType requestId;
-            UuidType serverUuid;
-            int32_t uniqueId;
-        } releaseUniqueId;
+            RequestIdType receiverTransferId;
+            UuidType receiverServerUuid;
+            uint64_t transferTag;
+        } releaseTransferTag;
     } payload;
 };
 
-class UniqueIdServer
+class TransferTagServer
 {
 public:
-    UniqueIdServer();
-    ~UniqueIdServer();
+    TransferTagServer();
+    ~TransferTagServer();
 
-    UniqueIdServer(UniqueIdServer const&) = delete;
-    UniqueIdServer& operator=(UniqueIdServer const&) = delete;
-    UniqueIdServer(UniqueIdServer&&) = delete;
-    UniqueIdServer& operator=(UniqueIdServer&&) = delete;
+    TransferTagServer(TransferTagServer const&) = delete;
+    TransferTagServer& operator=(TransferTagServer const&) = delete;
+    TransferTagServer(TransferTagServer&&) = delete;
+    TransferTagServer& operator=(TransferTagServer&&) = delete;
 
     void waitForReady()
     {
@@ -134,7 +139,7 @@ private:
 
     std::unique_ptr<zmq::context_t> mContext;
     std::unique_ptr<zmq::socket_t> mSocket;
-    std::map<std::pair<RequestIdType, UuidType>, std::pair<int32_t, int32_t>> mUniqueIdRefCount;
+    std::map<std::pair<RequestIdType, UuidType>, std::pair<int32_t, uint64_t>> mTransferTagRefCount;
     std::string mEndpoint;
     std::atomic<bool> mRunning{true};
     std::thread mThread;

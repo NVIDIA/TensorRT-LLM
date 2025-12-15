@@ -56,7 +56,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
-class UniqueIdServer;
+class TransferTagServer;
 
 class CacheTransceiverComm
 {
@@ -211,27 +211,27 @@ private:
     c10::intrusive_ptr<c10d::ProcessGroup> mPgComm;
 };
 
-class UniqueIdClient
+class TransferTagClient
 {
 public:
-    static UniqueIdClient& instance()
+    static TransferTagClient& instance()
     {
-        static UniqueIdClient instance;
+        static TransferTagClient instance;
         return instance;
     }
 
-    int getUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
-        UuidType const& serverUuid, int32_t expectedRefCount);
-    void releaseUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
-        UuidType const& serverUuid, int uniqueId);
+    uint64_t getTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+        UuidType const& receiverServerUuid, int32_t expectedRefCount);
+    void releaseTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+        UuidType const& receiverServerUuid, uint64_t transferTag);
 
 private:
-    UniqueIdClient();
-    ~UniqueIdClient();
+    TransferTagClient();
+    ~TransferTagClient();
 
     // Prevent copying
-    UniqueIdClient(UniqueIdClient const&) = delete;
-    UniqueIdClient& operator=(UniqueIdClient const&) = delete;
+    TransferTagClient(TransferTagClient const&) = delete;
+    TransferTagClient& operator=(TransferTagClient const&) = delete;
 
     std::unique_ptr<zmq::context_t> mContext;
     std::mutex mMutex;
@@ -334,8 +334,8 @@ private:
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
     UuidType mUuid;
-    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
-    std::string mUniqueIdServerEndpoint;
+    std::unique_ptr<TransferTagServer> mTransferTagServer;
+    std::string mTransferTagServerEndpoint;
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -84,7 +84,8 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
         runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordTiming = false, int32_t uniqueId = -1)
+        LlmRequest const* llmRequest = nullptr, bool recordTiming = false,
+        TransferTagType transferTag = kInvalidTransferTag)
         : mConnections(std::move(connections))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
@@ -93,7 +94,7 @@ public:
         , mRequest(llmRequest)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
-        , mUniqueId(uniqueId)
+        , mTransferTag(transferTag)
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
@@ -141,9 +142,9 @@ public:
         return mLastBlockKey;
     }
 
-    [[nodiscard]] int32_t getUniqueId() const
+    [[nodiscard]] int32_t getTransferTag() const
     {
-        return mUniqueId;
+        return mTransferTag;
     }
 
 private:
@@ -156,7 +157,7 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
-    int32_t mUniqueId{-1};
+    TransferTagType mTransferTag{kInvalidTransferTag};
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
@@ -182,14 +183,14 @@ class RequestInfo
 {
 public:
     /// @brief Constructor.
-    /// @param contextRequestId The ID used in the context phase of the current request.
+    /// @param senderTransferId The ID used in the context phase of the current request.
     /// @param transState The state of the data transceiver.
-    /// @param uniqueId The unique ID for the transfer session.
-    RequestInfo(
-        LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState, int32_t uniqueId);
+    /// @param transferTag The unique ID for the transfer session.
+    RequestInfo(LlmRequest::RequestIdType senderTransferId, executor::DataTransceiverState transState,
+        TransferTagType transferTag);
 
-    RequestInfo(LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState,
-        int32_t indexFromEnd, BlockKey const& lastBlockKey, int32_t uniqueId);
+    RequestInfo(LlmRequest::RequestIdType senderTransferId, executor::DataTransceiverState transState,
+        int32_t indexFromEnd, BlockKey const& lastBlockKey, TransferTagType transferTag);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -198,7 +199,7 @@ public:
 
     /// @brief Return the ID used in the context phase of the current request.
     /// @return The request ID.
-    [[nodiscard]] LlmRequest::RequestIdType getContextRequestId() const noexcept;
+    [[nodiscard]] LlmRequest::RequestIdType getSenderTransferId() const noexcept;
 
     [[nodiscard]] int32_t getIndexFromEnd() const noexcept
     {
@@ -216,9 +217,9 @@ public:
 
     /// @brief Return the unique ID.
     /// @return The unique ID.
-    [[nodiscard]] int32_t getUniqueId() const noexcept
+    [[nodiscard]] int32_t getTransferTag() const noexcept
     {
-        return mUniqueId;
+        return mTransferTag;
     }
 
     /// @brief Serialization.
@@ -237,7 +238,7 @@ public:
 
 private:
     // The ID used in the context phase of the current request.
-    LlmRequest::RequestIdType mContextRequestId;
+    LlmRequest::RequestIdType mSenderTransferId;
     // Index from end indicating how many trailing blocks to transfer (index+1)
     int32_t mIndexFromEnd{0};
 
@@ -248,7 +249,7 @@ private:
     executor::DataTransceiverState mTransState;
 
     // The unique ID for the transfer session.
-    int32_t mUniqueId{-1};
+    TransferTagType mTransferTag{kInvalidTransferTag};
 };
 
 class CacheSender
@@ -275,8 +276,8 @@ public:
     virtual void setCommState(executor::kv_cache::CommState commState);
 
     /// @brief Synchronously send data.
-    /// @param uniqueId The unique ID for the transfer session.
-    virtual void sendSync(int32_t uniqueId);
+    /// @param transferTag The unique ID for the transfer session.
+    virtual void sendSync(TransferTagType transferTag);
 
     /// @brief Receive request information.
     /// @param llmRequest The request object to which the data belongs.
@@ -288,9 +289,9 @@ public:
     virtual bool cancelRequest(LlmRequest const& llmRequest);
 
     /// @brief Send ready signal.
-    /// @param uniqueId The unique ID for the transfer session.
+    /// @param transferTag The unique ID for the transfer session.
     /// @param isReady Whether the request is ready to be received.
-    virtual void sendReadySignal(int32_t uniqueId, bool isReady);
+    virtual void sendReadySignal(TransferTagType transferTag, bool isReady);
 
     /// @brief Destructor.
     virtual ~CacheSender();

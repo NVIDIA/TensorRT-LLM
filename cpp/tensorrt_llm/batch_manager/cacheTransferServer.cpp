@@ -23,13 +23,13 @@
 namespace tensorrt_llm::batch_manager
 {
 
-UniqueIdServer::UniqueIdServer()
+TransferTagServer::TransferTagServer()
 {
-    mThread = std::thread(&UniqueIdServer::loop, this);
-    pthread_setname_np(mThread.native_handle(), "UniqueIdServer");
+    mThread = std::thread(&TransferTagServer::loop, this);
+    pthread_setname_np(mThread.native_handle(), "TransferTagServer");
 }
 
-UniqueIdServer::~UniqueIdServer()
+TransferTagServer::~TransferTagServer()
 {
     stop();
     if (mThread.joinable())
@@ -40,12 +40,12 @@ UniqueIdServer::~UniqueIdServer()
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("UniqueIdServer destructor: failed to join thread: %s", e.what());
+            TLLM_LOG_ERROR("TransferTagServer destructor: failed to join thread: %s", e.what());
         }
     }
 }
 
-void UniqueIdServer::loop()
+void TransferTagServer::loop()
 {
     mContext = std::make_unique<zmq::context_t>(1);
     mSocket = std::make_unique<zmq::socket_t>(*mContext, zmq::socket_type::router);
@@ -80,14 +80,14 @@ void UniqueIdServer::loop()
         {
             if (mRunning)
             {
-                TLLM_LOG_ERROR("UniqueIdServer loop exception: %s", e.what());
+                TLLM_LOG_ERROR("TransferTagServer loop exception: %s", e.what());
             }
         }
         catch (...)
         {
             if (mRunning)
             {
-                TLLM_LOG_ERROR("UniqueIdServer loop unknown exception");
+                TLLM_LOG_ERROR("TransferTagServer loop unknown exception");
             }
         }
     }
@@ -100,11 +100,11 @@ void UniqueIdServer::loop()
     }
     catch (std::exception const& e)
     {
-        TLLM_LOG_ERROR("UniqueIdServer: failed to close socket: %s", e.what());
+        TLLM_LOG_ERROR("TransferTagServer: failed to close socket: %s", e.what());
     }
 }
 
-void UniqueIdServer::handleRequest()
+void TransferTagServer::handleRequest()
 {
     zmq::message_t identity;
     zmq::message_t request;
@@ -114,38 +114,41 @@ void UniqueIdServer::handleRequest()
 
     result = mSocket->recv(request, zmq::recv_flags::none);
     TLLM_CHECK_WITH_INFO(result.has_value(), "Failed to receive request");
-    TLLM_CHECK_WITH_INFO(request.size() == sizeof(UniqueIdRequest), "Invalid request size");
+    TLLM_CHECK_WITH_INFO(request.size() == sizeof(TransferTagRequest), "Invalid request size");
 
-    UniqueIdRequest req = *reinterpret_cast<UniqueIdRequest*>(request.data());
+    TransferTagRequest req = *reinterpret_cast<TransferTagRequest*>(request.data());
     zmq::message_t response;
 
-    if (req.type == UniqueIdRequestType::kGetUniqueId)
+    if (req.type == TransferTagRequestType::kGetTransferTag)
     {
-        auto key = std::make_pair(req.payload.getUniqueId.requestId, req.payload.getUniqueId.serverUuid);
-        auto it = mUniqueIdRefCount.find(key);
-        int32_t uniqueId;
-        if (it == mUniqueIdRefCount.end())
+        auto key = std::make_pair(
+            req.payload.getTransferTag.receiverTransferId, req.payload.getTransferTag.receiverServerUuid);
+        auto it = mTransferTagRefCount.find(key);
+        uint64_t transferTag;
+        if (it == mTransferTagRefCount.end())
         {
-            uniqueId = UniqueIdGenerator::get();
-            it = mUniqueIdRefCount.emplace(key, std::make_pair(req.payload.getUniqueId.expectedRefCount, uniqueId))
+            transferTag = TransferTagGenerator::get();
+            it = mTransferTagRefCount
+                     .emplace(key, std::make_pair(req.payload.getTransferTag.expectedRefCount, transferTag))
                      .first;
         }
         else
         {
-            uniqueId = it->second.second;
+            transferTag = it->second.second;
         }
-        response.rebuild(&uniqueId, sizeof(uniqueId));
+        response.rebuild(&transferTag, sizeof(transferTag));
     }
-    else if (req.type == UniqueIdRequestType::kReleaseUniqueId)
+    else if (req.type == TransferTagRequestType::kReleaseTransferTag)
     {
-        auto key = std::make_pair(req.payload.releaseUniqueId.requestId, req.payload.releaseUniqueId.serverUuid);
-        auto it = mUniqueIdRefCount.find(key);
-        TLLM_CHECK_WITH_INFO(it != mUniqueIdRefCount.end(), "Unique ID not found");
+        auto key = std::make_pair(
+            req.payload.releaseTransferTag.receiverTransferId, req.payload.releaseTransferTag.receiverServerUuid);
+        auto it = mTransferTagRefCount.find(key);
+        TLLM_CHECK_WITH_INFO(it != mTransferTagRefCount.end(), "Unique ID not found");
         it->second.first--;
         if (it->second.first == 0)
         {
-            UniqueIdGenerator::release(it->second.second);
-            mUniqueIdRefCount.erase(it);
+            TransferTagGenerator::release(it->second.second);
+            mTransferTagRefCount.erase(it);
         }
         response.rebuild(0);
     }

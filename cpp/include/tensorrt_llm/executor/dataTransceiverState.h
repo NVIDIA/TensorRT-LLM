@@ -451,20 +451,20 @@ public:
         return mCommState;
     }
 
-    void setUniqueIdServerEndpoint(std::string endpoint)
+    void setTransferTagServerEndpoint(std::string endpoint)
     {
-        mUniqueIdServerEndpoint = std::move(endpoint);
+        mTransferTagServerEndpoint = std::move(endpoint);
     }
 
-    [[nodiscard]] std::optional<std::string> const& getUniqueIdServerEndpoint() const noexcept
+    [[nodiscard]] std::optional<std::string> const& getTransferTagServerEndpoint() const noexcept
     {
-        return mUniqueIdServerEndpoint;
+        return mTransferTagServerEndpoint;
     }
 
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
         return mCacheState == other.mCacheState && mCommState == other.mCommState
-            && mUniqueIdServerEndpoint == other.mUniqueIdServerEndpoint;
+            && mTransferTagServerEndpoint == other.mTransferTagServerEndpoint;
     }
 
     [[nodiscard]] std::string toString() const
@@ -478,9 +478,9 @@ public:
         {
             sstring << mCommState.value().toString();
         }
-        if (mUniqueIdServerEndpoint)
+        if (mTransferTagServerEndpoint)
         {
-            sstring << "UniqueIdServerEndpoint:" << mUniqueIdServerEndpoint.value();
+            sstring << "TransferTagServerEndpoint:" << mTransferTagServerEndpoint.value();
         }
         return sstring.str();
     }
@@ -489,7 +489,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
-    std::optional<std::string> mUniqueIdServerEndpoint;
+    std::optional<std::string> mTransferTagServerEndpoint;
 };
 
 inline std::string getLocalIpByNic(std::string const& interface, int rank)

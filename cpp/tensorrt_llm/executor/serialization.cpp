@@ -618,10 +618,10 @@ DataTransceiverState Serialization::deserializeDataTransceiverState(std::istream
     {
         state.setCacheState(std::move(cacheState).value());
     }
-    auto uniqueIdServerEndpoint = su::deserialize<decltype(DataTransceiverState::mUniqueIdServerEndpoint)>(is);
+    auto uniqueIdServerEndpoint = su::deserialize<decltype(DataTransceiverState::mTransferTagServerEndpoint)>(is);
     if (uniqueIdServerEndpoint)
     {
-        state.setUniqueIdServerEndpoint(std::move(uniqueIdServerEndpoint).value());
+        state.setTransferTagServerEndpoint(std::move(uniqueIdServerEndpoint).value());
     }
     return state;
 }
@@ -630,7 +630,7 @@ void Serialization::serialize(DataTransceiverState const& state, std::ostream& o
 {
     su::serialize(state.mCommState, os);
     su::serialize(state.mCacheState, os);
-    su::serialize(state.mUniqueIdServerEndpoint, os);
+    su::serialize(state.mTransferTagServerEndpoint, os);
 }
 
 std::vector<char> Serialization::serialize(DataTransceiverState const& state)
@@ -649,7 +649,7 @@ size_t Serialization::serializedSize(DataTransceiverState const& state)
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.mCommState);
     totalSize += su::serializedSize(state.mCacheState);
-    totalSize += su::serializedSize(state.mUniqueIdServerEndpoint);
+    totalSize += su::serializedSize(state.mTransferTagServerEndpoint);
     return totalSize;
 }
 

@@ -25,5 +25,6 @@ if [ "$ID" == "ubuntu" ]; then
   install_triton_deps
 else
   rm -rf /opt/tritonserver
-  echo "Skip Triton installation for non-Ubuntu base image"
+  echo "Skip Triton installation for non-Ubuntu base image, only install boost"
+  install_boost
 fi

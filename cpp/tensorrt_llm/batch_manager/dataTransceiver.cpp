@@ -211,32 +211,32 @@ struct ReceiveCacheResource
 };
 
 RequestInfo::RequestInfo(
-    LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState, int32_t uniqueId)
-    : mContextRequestId{contextRequestId}
+    LlmRequest::RequestIdType senderTransferId, executor::DataTransceiverState transState, TransferTagType transferTag)
+    : mSenderTransferId{senderTransferId}
     , mTransState{std::move(transState)}
-    , mUniqueId{uniqueId}
+    , mTransferTag{transferTag}
 {
 }
 
-RequestInfo::RequestInfo(LlmRequest::RequestIdType contextRequestId, executor::DataTransceiverState transState,
-    int32_t indexFromEnd, BlockKey const& lastBlockKey, int32_t uniqueId)
-    : mContextRequestId{contextRequestId}
+RequestInfo::RequestInfo(LlmRequest::RequestIdType senderTransferId, executor::DataTransceiverState transState,
+    int32_t indexFromEnd, BlockKey const& lastBlockKey, TransferTagType transferTag)
+    : mSenderTransferId{senderTransferId}
     , mIndexFromEnd{indexFromEnd}
     , mLastBlockKey{lastBlockKey}
     , mTransState{std::move(transState)}
-    , mUniqueId{uniqueId}
+    , mTransferTag{transferTag}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mContextRequestId == rhs.mContextRequestId && mIndexFromEnd == rhs.mIndexFromEnd
-        && mLastBlockKey == rhs.mLastBlockKey && mTransState == rhs.mTransState && mUniqueId == rhs.mUniqueId;
+    return mSenderTransferId == rhs.mSenderTransferId && mIndexFromEnd == rhs.mIndexFromEnd
+        && mLastBlockKey == rhs.mLastBlockKey && mTransState == rhs.mTransState && mTransferTag == rhs.mTransferTag;
 }
 
-LlmRequest::RequestIdType RequestInfo::getContextRequestId() const noexcept
+LlmRequest::RequestIdType RequestInfo::getSenderTransferId() const noexcept
 {
-    return mContextRequestId;
+    return mSenderTransferId;
 }
 
 executor::DataTransceiverState const& RequestInfo::getTransState() const noexcept
@@ -247,33 +247,33 @@ executor::DataTransceiverState const& RequestInfo::getTransState() const noexcep
 void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
-    su::serialize(requestInfo.mContextRequestId, os);
+    su::serialize(requestInfo.mSenderTransferId, os);
     su::serialize(requestInfo.mIndexFromEnd, os);
     su::serialize(requestInfo.mLastBlockKey, os);
     su::serialize(requestInfo.mTransState, os);
-    su::serialize(requestInfo.mUniqueId, os);
+    su::serialize(requestInfo.mTransferTag, os);
 }
 
 RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
-    auto contextRequestId = su::deserialize<decltype(mContextRequestId)>(is);
+    auto senderTransferId = su::deserialize<decltype(mSenderTransferId)>(is);
     auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
     auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    auto uniqueId = su::deserialize<decltype(mUniqueId)>(is);
-    return RequestInfo{contextRequestId, std::move(transState), indexFromEnd, lastBlockKey, uniqueId};
+    auto transferTag = su::deserialize<decltype(mTransferTag)>(is);
+    return RequestInfo{senderTransferId, std::move(transState), indexFromEnd, lastBlockKey, transferTag};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
 {
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
-    totalSize += su::serializedSize(requestInfo.mContextRequestId);
+    totalSize += su::serializedSize(requestInfo.mSenderTransferId);
     totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
-    totalSize += su::serializedSize(requestInfo.mUniqueId);
+    totalSize += su::serializedSize(requestInfo.mTransferTag);
     return totalSize;
 }
 
@@ -330,19 +330,19 @@ public:
         mSelfState.setCommState(std::move(commState));
     }
 
-    [[nodiscard]] size_t getCounterpartsCount(int32_t uniqueId)
+    [[nodiscard]] size_t getCounterpartsCount(TransferTagType transferTag)
     {
         std::scoped_lock<std::mutex> lk(mMtxForMap);
-        auto it = mUniqueIdToSession.find(uniqueId);
-        TLLM_CHECK(it != mUniqueIdToSession.end());
+        auto it = mTransferTagToSession.find(transferTag);
+        TLLM_CHECK(it != mTransferTagToSession.end());
         return it->second.getConnections().size();
     }
 
-    void release(int32_t uniqueId)
+    void release(TransferTagType transferTag)
     {
         std::scoped_lock<std::mutex> lk(mMtxForMap);
-        auto it = mUniqueIdToSession.find(uniqueId);
-        TLLM_CHECK(it != mUniqueIdToSession.end());
+        auto it = mTransferTagToSession.find(transferTag);
+        TLLM_CHECK(it != mTransferTagToSession.end());
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             if (!mMeasuresFile.is_open())
@@ -354,7 +354,7 @@ public:
             }
             it->second.exportMeasure(mMeasuresFile, true);
         }
-        mUniqueIdToSession.erase(it);
+        mTransferTagToSession.erase(it);
     }
 
     [[nodiscard]] RequestInfo recvRequestInfo()
@@ -397,27 +397,27 @@ public:
                 peerRelativeRanks.begin(), peerRelativeRanks.end(), info.getTransState().getCommState()->getSelfIdx()));
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
-            auto it = mUniqueIdToSession.find(info.getUniqueId());
-            if (it == mUniqueIdToSession.end())
+            auto it = mTransferTagToSession.find(info.getTransferTag());
+            if (it == mTransferTagToSession.end())
             {
-                int uniqueId = info.getUniqueId();
+                TransferTagType transferTag = info.getTransferTag();
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{uniqueId, mTerminate}, mSelfState, info.getTransState(),
+                    DataContext{static_cast<int>(transferTag), mTerminate}, mSelfState, info.getTransState(),
                     mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                    !common::getEnvKVCacheTimeOutputPath().empty(), uniqueId);
+                    !common::getEnvKVCacheTimeOutputPath().empty(), transferTag);
                 session.setTime(TransferSession::kTimeRequestInfo);
-                it = mUniqueIdToSession.emplace(uniqueId, std::move(session)).first;
+                it = mTransferTagToSession.emplace(transferTag, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
         }
         return info;
     }
 
-    void sendSync(int32_t uniqueId)
+    void sendSync(TransferTagType transferTag)
     {
         std::scoped_lock<std::mutex> lk(mMtxForMap);
-        auto it = mUniqueIdToSession.find(uniqueId);
-        TLLM_CHECK(it != mUniqueIdToSession.end());
+        auto it = mTransferTagToSession.find(transferTag);
+        TLLM_CHECK(it != mTransferTagToSession.end());
         mFormatter->format(it->second);
     }
 
@@ -430,9 +430,9 @@ public:
         bool isCurrentRequest = false;
         if (mCurrentSessionKey.has_value())
         {
-            auto ctxIdIt = mUniqueIdToContextRequestId.find(mCurrentSessionKey.value());
+            auto ctxIdIt = mTransferTagToSenderTransferId.find(mCurrentSessionKey.value());
             isCurrentRequest
-                = (ctxIdIt != mUniqueIdToContextRequestId.end() && ctxIdIt->second == llmRequest.mRequestId);
+                = (ctxIdIt != mTransferTagToSenderTransferId.end() && ctxIdIt->second == llmRequest.mRequestId);
         }
         if (it != mReadyResponses.end() && !isCurrentRequest)
         {
@@ -446,18 +446,18 @@ public:
         return isCancelled;
     }
 
-    void sendReadySignal(int32_t uniqueId, bool isReady)
+    void sendReadySignal(TransferTagType transferTag, bool isReady)
     {
         std::scoped_lock<std::mutex> lk(mMtxForMap);
-        auto it = mUniqueIdToSession.find(uniqueId);
-        TLLM_CHECK(it != mUniqueIdToSession.end());
+        auto it = mTransferTagToSession.find(transferTag);
+        TLLM_CHECK(it != mTransferTagToSession.end());
         auto const& session = it->second;
         auto const& connections = session.getConnections();
         for (size_t i = 0; i < connections.size(); i++)
         {
             TLLM_CHECK_WITH_INFO(connections.at(i) != nullptr,
-                "Connection at index %zu is null for uniqueId %d (total connections: %zu)", i, uniqueId,
-                connections.size());
+                "Connection at index %zu is null for transferTag %lu (total connections: %zu)", i,
+                static_cast<unsigned long>(transferTag), connections.size());
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
@@ -489,7 +489,7 @@ private:
     struct AsyncResponse
     {
         Response mResponse;
-        int32_t mUniqueId;
+        TransferTagType mTransferTag;
     };
 
     struct AsyncSendResource
@@ -522,50 +522,51 @@ private:
                 asyncResp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            sendAndRemoveResponse(asyncResp.mUniqueId, std::move(asyncResp.mResponse));
+            sendAndRemoveResponse(asyncResp.mTransferTag, std::move(asyncResp.mResponse));
         }
     }
 
-    void sendAndRemoveResponse(int32_t uniqueId, Response resp) noexcept
+    void sendAndRemoveResponse(TransferTagType transferTag, Response resp) noexcept
     {
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             {
                 std::unique_lock<std::mutex> lk(mMtxForMap);
-                auto it = mUniqueIdToSession.find(uniqueId);
-                TLLM_CHECK(it != mUniqueIdToSession.end());
+                auto it = mTransferTagToSession.find(transferTag);
+                TLLM_CHECK(it != mTransferTagToSession.end());
                 it->second.setLlmRequest(*resp.mRequest);
             }
-            sendSync(uniqueId);
+            sendSync(transferTag);
             resp.mRequest->setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-            release(uniqueId);
+            release(transferTag);
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
-            auto new_exception = TLLM_REQUEST_EXCEPTION(uniqueId, e.getErrorCode(), "%s", e.what());
+            auto new_exception = TLLM_REQUEST_EXCEPTION(transferTag, e.getErrorCode(), "%s", e.what());
             resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s uniqueId: %d", e.what(), uniqueId);
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s transferTag: %lu", e.what(),
+                static_cast<unsigned long>(transferTag));
             resp.mPromise.set_exception(std::current_exception());
         }
     }
 
-    void asyncSendAndRemoveResponse(int32_t uniqueId, Response resp) noexcept
+    void asyncSendAndRemoveResponse(TransferTagType transferTag, Response resp) noexcept
     {
         std::unique_lock lk(mAsyncSendResource.mMtxForQueue);
-        mAsyncSendResource.mSendQueue.emplace_back(AsyncResponse{std::move(resp), uniqueId});
+        mAsyncSendResource.mSendQueue.emplace_back(AsyncResponse{std::move(resp), transferTag});
         mAsyncSendResource.mCVforQueue.notify_one();
     }
 
     void sendResponse(std::map<RequestIdType, CacheSender::Impl::Response>::iterator it)
     {
         auto sessionKey = mCurrentSessionKey.value();
-        auto contextRequestId = mUniqueIdToContextRequestId[sessionKey];
+        auto senderTransferId = mTransferTagToSenderTransferId[sessionKey];
         auto count = --mRemainSendCount[sessionKey];
         TLLM_CHECK(count >= 0);
         if (count == 0)
@@ -576,7 +577,7 @@ private:
             bool isReady = true;
             {
                 std::scoped_lock lk(mSenderMutex);
-                if (mCancelledRequests.find(contextRequestId) != mCancelledRequests.end())
+                if (mCancelledRequests.find(senderTransferId) != mCancelledRequests.end())
                 {
                     isReady = false;
                 }
@@ -603,15 +604,15 @@ private:
             {
                 // TODO: if the generation does not require the kv cache, the request will
                 // not be removed from mCancelledRequests. This should be handled by timeout.
-                auto it = mReadyResponses.find(contextRequestId);
+                auto it = mReadyResponses.find(senderTransferId);
                 TLLM_CHECK(it != mReadyResponses.end());
                 {
                     std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
-                    mCancelledRequests.erase(contextRequestId);
+                    mCancelledRequests.erase(senderTransferId);
                     mRemainSendCount.erase(sessionKey);
                 }
-                mUniqueIdToContextRequestId.erase(sessionKey);
+                mTransferTagToSenderTransferId.erase(sessionKey);
                 mCurrentSessionKey = std::nullopt;
 
                 if (mReadyResponses.empty())
@@ -646,17 +647,17 @@ private:
                 {
                     return;
                 }
-                auto uniqueId = requestInfo.getUniqueId();
-                auto contextRequestId = requestInfo.getContextRequestId();
+                auto transferTag = requestInfo.getTransferTag();
+                auto senderTransferId = requestInfo.getSenderTransferId();
                 {
                     std::scoped_lock lk(mSenderMutex);
-                    mCurrentUniqueId = uniqueId;
-                    mUniqueIdToContextRequestId.insert_or_assign(uniqueId, contextRequestId);
+                    mCurrentSessionKey = transferTag;
+                    mTransferTagToSenderTransferId.insert_or_assign(transferTag, senderTransferId);
                 }
 
-                if (mRemainSendCount.find(uniqueId) == mRemainSendCount.end())
+                if (mRemainSendCount.find(transferTag) == mRemainSendCount.end())
                 {
-                    mRemainSendCount[uniqueId] = getCounterpartsCount(uniqueId);
+                    mRemainSendCount[transferTag] = getCounterpartsCount(transferTag);
                 }
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
@@ -727,27 +728,27 @@ private:
     [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
     {
         std::scoped_lock lk(mSenderMutex);
-        auto uniqueId = mCurrentSessionKey.value();
-        auto contextRequestId = mUniqueIdToContextRequestId[uniqueId];
-        return mReadyResponses.find(contextRequestId);
+        auto transferTag = mCurrentSessionKey.value();
+        auto senderTransferId = mTransferTagToSenderTransferId[transferTag];
+        return mReadyResponses.find(senderTransferId);
     }
 
 private:
-    std::optional<int32_t> mCurrentSessionKey;
-    std::map<int32_t, RequestIdType> mUniqueIdToContextRequestId;
+    std::optional<TransferTagType> mCurrentSessionKey;
+    std::map<TransferTagType, RequestIdType> mTransferTagToSenderTransferId;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
     std::map<RequestIdType, Response> mReadyResponses;
     std::mutex mSenderMutex, mCondMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
     std::condition_variable mSenderCv, mResponderCv;
     std::future<void> mResponseFuture;
-    std::map<int32_t, int> mRemainSendCount;
+    std::map<TransferTagType, int> mRemainSendCount;
     AsyncSendResource mAsyncSendResource;
     std::vector<std::future<void>> mAsyncSendFutures;
     int mDeviceId{-1};
 
     executor::kv_cache::ConnectionManager* mManager;
-    std::map<int32_t, TransferSession> mUniqueIdToSession;
+    std::map<TransferTagType, TransferSession> mTransferTagToSession;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
@@ -837,15 +838,15 @@ public:
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(mSelfState.getCacheState().value(), destCacheState),
             "Disagg server does not currently support these cacheState.");
 
-        auto endpoint = contextState.getUniqueIdServerEndpoint();
-        TLLM_CHECK_WITH_INFO(endpoint.has_value(), "UniqueIdServer endpoint not found in DataTransceiverState");
+        auto endpoint = contextState.getTransferTagServerEndpoint();
+        TLLM_CHECK_WITH_INFO(endpoint.has_value(), "TransferTagServer endpoint not found in DataTransceiverState");
         auto const& parallelConfig = mSelfState.getCacheState().value().getParallelConfig();
         auto const expectedRefCount = parallelConfig.mTensorParallelism * parallelConfig.mPipelineParallelism
             * parallelConfig.mContextParallelism;
-        int32_t uniqueId = UniqueIdClient::instance().getUniqueId(
+        TransferTagType transferTag = TransferTagClient::instance().getTransferTag(
             endpoint.value(), llmRequest.mRequestId, mServerUuid, expectedRefCount);
 
-        RequestInfo requestInfo(requestId, mSelfState, uniqueId);
+        RequestInfo requestInfo(requestId, mSelfState, transferTag);
 
         if (!mFormatter->getCacheManager()->getBlockManager().isVariableWindow())
         {
@@ -871,7 +872,7 @@ public:
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             int32_t indexFromEnd = requestedBlockSize - 1;
 
-            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey, uniqueId);
+            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey, transferTag);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -917,9 +918,10 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(counterPartConnections), DataContext{requestInfo.getUniqueId(), mTerminate},
-            mSelfState, contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
-            requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty());
+        return TransferSession(std::move(counterPartConnections),
+            DataContext{static_cast<int>(requestInfo.getTransferTag()), mTerminate}, mSelfState, contextState,
+            resource->mBufferManager, requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
+            !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -1035,14 +1037,14 @@ private:
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
 
-        auto const endpoint = llmRequest.getDataTransceiverState().getUniqueIdServerEndpoint();
-        auto const uniqueId = session.getDataContext().getTag();
+        auto const endpoint = llmRequest.getDataTransceiverState().getTransferTagServerEndpoint();
+        auto const transferTag = session.getDataContext().getTag();
         auto releaseId = [&](void*)
         {
             if (endpoint.has_value())
             {
-                UniqueIdClient::instance().releaseUniqueId(
-                    endpoint.value(), llmRequest.mRequestId, mServerUuid, uniqueId);
+                TransferTagClient::instance().releaseTransferTag(
+                    endpoint.value(), llmRequest.mRequestId, mServerUuid, transferTag);
             }
         };
         std::unique_ptr<void, decltype(releaseId)> scopeGuard{reinterpret_cast<void*>(1), std::move(releaseId)};
@@ -1218,9 +1220,9 @@ void CacheSender::setCommState(executor::kv_cache::CommState commState)
 
 CacheSender::~CacheSender() = default;
 
-void CacheSender::sendSync(int32_t uniqueId)
+void CacheSender::sendSync(TransferTagType transferTag)
 {
-    mImpl->sendSync(uniqueId);
+    mImpl->sendSync(transferTag);
 }
 
 RequestInfo CacheSender::recvRequestInfo()
@@ -1233,9 +1235,9 @@ bool CacheSender::cancelRequest(LlmRequest const& llmRequest)
     return mImpl->cancelRequest(llmRequest);
 }
 
-void CacheSender::sendReadySignal(int32_t uniqueId, bool isReady)
+void CacheSender::sendReadySignal(TransferTagType transferTag, bool isReady)
 {
-    mImpl->sendReadySignal(uniqueId, isReady);
+    mImpl->sendReadySignal(transferTag, isReady);
 }
 
 CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager,

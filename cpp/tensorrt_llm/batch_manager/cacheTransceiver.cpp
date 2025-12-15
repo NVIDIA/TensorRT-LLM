@@ -63,25 +63,25 @@ namespace tensorrt_llm::batch_manager
 
 std::mutex CacheTransceiver::mDllMutex;
 
-UniqueIdClient::UniqueIdClient()
+TransferTagClient::TransferTagClient()
 {
     mContext = std::make_unique<zmq::context_t>(1);
 }
 
-int UniqueIdClient::getUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
-    UuidType const& serverUuid, int32_t expectedRefCount)
+uint64_t TransferTagClient::getTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+    UuidType const& receiverServerUuid, int32_t expectedRefCount)
 {
     std::lock_guard<std::mutex> lock(mMutex);
 
     zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
     socket.connect(serverEndpoint);
 
-    UniqueIdRequest req;
+    TransferTagRequest req;
     std::memset(&req, 0, sizeof(req));
-    req.type = UniqueIdRequestType::kGetUniqueId;
-    req.payload.getUniqueId.requestId = generationRequestId;
-    req.payload.getUniqueId.serverUuid = serverUuid;
-    req.payload.getUniqueId.expectedRefCount = expectedRefCount;
+    req.type = TransferTagRequestType::kGetTransferTag;
+    req.payload.getTransferTag.receiverTransferId = receiverTransferId;
+    req.payload.getTransferTag.receiverServerUuid = receiverServerUuid;
+    req.payload.getTransferTag.expectedRefCount = expectedRefCount;
 
     zmq::message_t requestMsg(&req, sizeof(req));
     socket.send(requestMsg, zmq::send_flags::none);
@@ -89,27 +89,27 @@ int UniqueIdClient::getUniqueId(std::string const& serverEndpoint, RequestIdType
     zmq::message_t responseMsg;
     (void) socket.recv(responseMsg, zmq::recv_flags::none);
     TLLM_CHECK_WITH_INFO(
-        responseMsg.size() == sizeof(int), "UniqueIdClient received invalid response size: %zu", responseMsg.size());
+        responseMsg.size() == sizeof(int), "TransferTagClient received invalid response size: %zu", responseMsg.size());
 
-    int uniqueId;
-    std::memcpy(&uniqueId, responseMsg.data(), sizeof(int));
-    return uniqueId;
+    uint64_t transferTag;
+    std::memcpy(&transferTag, responseMsg.data(), sizeof(uint64_t));
+    return transferTag;
 }
 
-void UniqueIdClient::releaseUniqueId(std::string const& serverEndpoint, RequestIdType const& generationRequestId,
-    UuidType const& serverUuid, int uniqueId)
+void TransferTagClient::releaseTransferTag(std::string const& serverEndpoint, RequestIdType const& receiverTransferId,
+    UuidType const& receiverServerUuid, uint64_t transferTag)
 {
     std::lock_guard<std::mutex> lock(mMutex);
 
     zmq::socket_t socket(*mContext, zmq::socket_type::dealer);
     socket.connect(serverEndpoint);
 
-    UniqueIdRequest req;
+    TransferTagRequest req;
     std::memset(&req, 0, sizeof(req));
-    req.type = UniqueIdRequestType::kReleaseUniqueId;
-    req.payload.releaseUniqueId.requestId = generationRequestId;
-    req.payload.releaseUniqueId.serverUuid = serverUuid;
-    req.payload.releaseUniqueId.uniqueId = uniqueId;
+    req.type = TransferTagRequestType::kReleaseTransferTag;
+    req.payload.releaseTransferTag.receiverTransferId = receiverTransferId;
+    req.payload.releaseTransferTag.receiverServerUuid = receiverServerUuid;
+    req.payload.releaseTransferTag.transferTag = transferTag;
 
     zmq::message_t requestMsg(&req, sizeof(req));
     socket.send(requestMsg, zmq::send_flags::none);
@@ -118,7 +118,7 @@ void UniqueIdClient::releaseUniqueId(std::string const& serverEndpoint, RequestI
     (void) socket.recv(responseMsg, zmq::recv_flags::none);
 }
 
-UniqueIdClient::~UniqueIdClient()
+TransferTagClient::~TransferTagClient()
 {
     try
     {
@@ -209,9 +209,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::copy(uuid.begin(), uuid.end(), mUuid.begin());
         std::vector<char> uuidVec(mUuid.begin(), mUuid.end());
         mGroupComm->bcast(uuidVec, 0);
-        mUniqueIdServer = std::make_unique<UniqueIdServer>();
-        mUniqueIdServer->waitForReady();
-        mUniqueIdServerEndpoint = mUniqueIdServer->getEndpoint();
+        mTransferTagServer = std::make_unique<TransferTagServer>();
+        mTransferTagServer->waitForReady();
+        mTransferTagServerEndpoint = mTransferTagServer->getEndpoint();
     }
     else
     {
@@ -227,9 +227,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     // Broadcast endpoint
-    std::vector<char> endpointVec(mUniqueIdServerEndpoint.begin(), mUniqueIdServerEndpoint.end());
+    std::vector<char> endpointVec(mTransferTagServerEndpoint.begin(), mTransferTagServerEndpoint.end());
     mGroupComm->bcast(endpointVec, 0);
-    mUniqueIdServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
+    mTransferTagServerEndpoint.assign(endpointVec.begin(), endpointVec.end());
 
     TLLM_LOG_INFO("CacheTransceiver UUID = %s", std::string(mUuid.begin(), mUuid.end()).c_str());
 
@@ -360,7 +360,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
-    contextState->setUniqueIdServerEndpoint(mUniqueIdServerEndpoint);
+    contextState->setTransferTagServerEndpoint(mTransferTagServerEndpoint);
     if (!llmRequest->hasDraftTokens())
     {
         llmRequest->setContextPhaseParams(
