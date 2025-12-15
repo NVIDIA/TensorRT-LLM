@@ -78,10 +78,8 @@ if __name__ == "__main__":
         'port': args.server_port,
         'backend': 'pytorch',
         'context_servers': {
-            'num_instances':
-            0 if gen_only else args.num_ctx_servers,
-            'urls': [] if gen_only else
-            [f'{host}:{args.worker_port}' for host in ctx_hostnames]
+            'num_instances': 0 if gen_only else args.num_ctx_servers,
+            'urls': [] if gen_only else ctx_urls
         },
         'generation_servers': {
             'num_instances': args.num_gen_servers,
