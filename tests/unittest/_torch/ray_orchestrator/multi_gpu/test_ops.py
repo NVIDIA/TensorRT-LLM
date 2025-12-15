@@ -29,7 +29,6 @@ class AllgatherPGTest:
         self.local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
 
         torch.cuda.set_device(self.local_gpu)
-        self.local_device = torch.device(f"cuda:{self.local_gpu}")
 
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
@@ -39,8 +38,8 @@ class AllgatherPGTest:
 
     @torch.inference_mode()
     def run_allgather_pg_op(self, test_tensor, expected_result, sizes):
-        test_tensor = test_tensor.to(self.local_device)
-        expected_result = expected_result.to(self.local_device)
+        test_tensor = test_tensor.cuda()
+        expected_result = expected_result.cuda()
 
         mapping = Mapping(world_size=self.world_size,
                           gpus_per_node=self.world_size,
@@ -83,7 +82,6 @@ class ReducescatterPGTest:
         self.local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
 
         torch.cuda.set_device(self.local_gpu)
-        self.local_device = torch.device(f"cuda:{self.local_gpu}")
 
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
@@ -93,8 +91,8 @@ class ReducescatterPGTest:
 
     @torch.inference_mode()
     def run_reducescatter_pg_op(self, test_tensor, expected_result, sizes):
-        test_tensor = test_tensor.to(self.local_device)
-        expected_result = expected_result.to(self.local_device)
+        test_tensor = test_tensor.cuda()
+        expected_result = expected_result.cuda()
 
         mapping = Mapping(world_size=self.world_size,
                           gpus_per_node=self.world_size,
@@ -137,7 +135,6 @@ class AllreducePGTest:
         self.local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
 
         torch.cuda.set_device(self.local_gpu)
-        self.local_device = torch.device(f"cuda:{self.local_gpu}")
 
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
@@ -147,8 +144,8 @@ class AllreducePGTest:
 
     @torch.inference_mode()
     def run_allreduce_pg_op(self, test_tensor, expected_result):
-        test_tensor = test_tensor.to(self.local_device)
-        expected_result = expected_result.to(self.local_device)
+        test_tensor = test_tensor.cuda()
+        expected_result = expected_result.cuda()
 
         mapping = Mapping(world_size=self.world_size,
                           gpus_per_node=self.world_size,
