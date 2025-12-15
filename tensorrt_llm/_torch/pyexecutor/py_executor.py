@@ -2628,9 +2628,23 @@ class PyExecutor:
     def _pause_requests(self, requests_to_pause):
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not.
+        MAX_PAUSES_PER_STEP = 8
         max_input_len = self.max_input_len
+        pauses_remaining = MAX_PAUSES_PER_STEP
+
         for req in requests_to_pause:
+            if pauses_remaining <= 0:
+                break
+
+            if getattr(req, "_paused", False):
+                continue
+
+            if req.request_id in self.inflight_req_ids:
+                continue
+
             req.pause(max_input_len)
+            req._paused = True
+            pauses_remaining -= 1
             self._terminate_request(req)
 
     def _add_inflight_ids(self, scheduled_requests):
