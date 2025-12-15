@@ -2,6 +2,7 @@
 """Compare performance test results between different backends (UCX vs NIXL)."""
 
 import argparse
+import os
 import re
 import sys
 
@@ -44,7 +45,15 @@ def compare_backends(csv_path, threshold=5.0, default_backend="NIXL"):
     Returns:
         DataFrame: Comparison results
     """
+    if not os.path.exists(csv_path):
+        print(f"CSV file not found: {csv_path}")
+        sys.exit(0)
+
     # Read CSV file
+    if not os.path.exists(csv_path):
+        print(f"CSV file not found: {csv_path}")
+        sys.exit(0)
+
     df = pd.read_csv(csv_path)
 
     if len(df) == 0:

@@ -62,6 +62,7 @@ private:
     zmq::socket_t mZmqRepSocket;
     std::string mZmqRepEndpoint;
     std::thread mZmqRepThread;
+    std::atomic<bool> mIsRunning{true};
 
     UcxConnection::ConnectionIdType getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
     UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
@@ -85,6 +86,8 @@ public:
     {
         return mRank;
     }
+
+    [[nodiscard]] bool isRunning() const override;
 };
 
 #if defined(__clang__)

@@ -32,7 +32,7 @@ from ..conftest import get_llm_root, llm_models_root, trt_environment
 from .open_search_db_utils import (add_id, get_history_data, get_job_info,
                                    post_new_perf_data, prepare_baseline_data,
                                    prepare_regressive_test_cases,
-                                   print_regressive_test_cases)
+                                   write_regressive_test_cases)
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfAggrScriptTestCmds,
@@ -113,7 +113,8 @@ MODEL_PATH_DICT = {
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
     "starcoder2_3b": "starcoder2-3b",
-    "starcoder_15b": "starcoder2-15b",
+    "starcoder2_7b": "starcoder2-7b",
+    "starcoder2_15b": "starcoder2-15b",
     "t5": "t5-small",  # not supported for trtllm-bench build config
     "flan_t5_base":
     "flan-t5-small",  # not supported for trtllm-bench build config
@@ -605,17 +606,11 @@ class ServerConfig:
     def to_cmd(self,
                output_dir: str,
                numa_bind: bool = False,
-               disagg_serving_type: str = "",
-               hostname: str = "localhost",
-               port: int = 8000) -> List[str]:
+               disagg_serving_type: str = "") -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
         config_filename = f"extra-llm-api-config.{self.name}.yml"
-        if "CTX" in disagg_serving_type:
-            config_filename = f"extra-llm-api-config.{self.name}.ctx.yml"
-        elif "GEN" in disagg_serving_type:
-            config_filename = f"extra-llm-api-config.{self.name}.gen.yml"
         config_path = os.path.join(output_dir, config_filename)
 
         numa_bind_cmd = []
@@ -623,9 +618,8 @@ class ServerConfig:
             numa_bind_cmd = ["numactl", "-m 0,1"]
 
         cmd = numa_bind_cmd + [
-            "trtllm-serve", self.model_path, "--host", hostname, "--port",
-            str(port), "--backend", "pytorch", "--extra_llm_api_options",
-            config_path
+            "trtllm-serve", self.model_path, "--backend", "pytorch",
+            "--extra_llm_api_options", config_path
         ]
         return cmd
 
@@ -759,7 +753,7 @@ class ClientConfig:
         self.model_path = ""
         self.env_vars = env_vars
 
-    def to_cmd(self, need_hostname: bool = True) -> List[str]:
+    def to_cmd(self) -> List[str]:
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(
             model_dir) else self.model_name
@@ -775,9 +769,6 @@ class ClientConfig:
             "--percentile-metrics", "ttft,tpot,itl,e2el", "--max-concurrency",
             str(self.concurrency)
         ]
-        if need_hostname:
-            hostname_port = ["--host", "localhost", "--port", "8000"]
-            benchmark_cmd.extend(hostname_port)
         if self.backend:
             benchmark_cmd.append("--backend")
             benchmark_cmd.append(self.backend)
@@ -949,7 +940,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
 
     # Create ctx_server config data
     ctx_server_config_data = {
-        'name': 'ctx_server',
+        'name': 'ctx',
         'model_name': model_name,
         'gpus': hardware.get('gpus_per_ctx_server'),
         'gpus_per_node': hardware.get('gpus_per_node'),
@@ -958,7 +949,7 @@ def parse_multi_node_disagg_config_file(config_file_path: str,
 
     # Create gen_server config data
     gen_server_config_data = {
-        'name': 'gen_server',
+        'name': 'gen',
         'model_name': model_name,
         'gpus': hardware.get('gpus_per_gen_server'),
         'gpus_per_node': hardware.get('gpus_per_node'),
@@ -1749,7 +1740,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             for client_config in client_configs:
                 server_cmds.append(server_cmd)
                 server_envs.append(server_env)
-                client_cmd = client_config.to_cmd(need_hostname=True)
+                client_cmd = client_config.to_cmd()
                 client_env = client_config.to_env()
                 client_cmds.append(client_cmd)
                 client_envs.append(client_env)
@@ -1765,14 +1756,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         disagg_server_envs = []
         benchmark_cmds = []
         benchmark_envs = []
-        # Create hostnames directory
-        hostnames_dir = os.path.join(output_dir, "hostnames")
-        if not os.path.exists(hostnames_dir):
-            os.makedirs(hostnames_dir, exist_ok=True)
-
+        cmd_idx = 0
         for disagg_config in self._config.disagg_configs:
             disagg_serving_type = disagg_config['disagg_serving_type']
-            hostname = disagg_config['hostname']
+            disagg_config['hostname']
             numa_bind = disagg_config['numa_bind']
             ctx_server_cmd = None
             ctx_server_env = None
@@ -1783,18 +1770,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd = None
             benchmark_env = None
             if "CTX" in disagg_serving_type or "GEN" in disagg_serving_type:
-                # Write hostname to hostnames folder
-                hostname_file = os.path.join(hostnames_dir,
-                                             f"{disagg_serving_type}.txt")
-                with open(hostname_file, 'w') as f:
-                    f.write(hostname)
-                # Generate CTX or GEN server commands if this is a CTX or GEN node
                 is_ctx = "CTX" in disagg_serving_type
                 server_config = disagg_config[
                     'ctx_server'] if is_ctx else disagg_config['gen_server']
                 server_cmd = server_config.to_cmd(output_dir, numa_bind,
-                                                  disagg_serving_type, hostname,
-                                                  8336)
+                                                  disagg_serving_type)
                 server_env = server_config.to_env()
                 if is_ctx:
                     ctx_server_cmd = server_cmd
@@ -1804,7 +1784,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     gen_server_env = server_env
                 # Generate extra-llm-api-config.yml
                 config_content = server_config.generate_extra_llm_api_config()
-                config_filename = f"extra-llm-api-config.{server_config.name}.{'ctx' if is_ctx else 'gen'}.yml"
+                config_filename = f"extra-llm-api-config.{server_config.name}.yml"
                 config_path = os.path.join(output_dir, config_filename)
                 with open(config_path, 'w') as f:
                     f.write(config_content)
@@ -1813,15 +1793,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # Generate DISAGG server command if this is the DISAGG server node
                 disagg_server_cmd = [
                     "trtllm-serve", "disaggregated", "-c",
-                    f"{output_dir}/server_config.yaml", "-t",
+                    f"{output_dir}/server_config.{cmd_idx}.yaml", "-t",
                     str(timeout), "-r",
                     str(timeout)
                 ]
                 disagg_server_env = to_env_dict(disagg_config['server_env_var'])
             elif "BENCHMARK" in disagg_serving_type:
                 # Generate benchmark command if this is the BENCHMARK server node
-                benchmark_cmd = disagg_config['client'].to_cmd(
-                    need_hostname=False)
+                benchmark_cmd = disagg_config['client'].to_cmd()
                 benchmark_env = disagg_config['client'].to_env()
             ctx_server_cmds.append(ctx_server_cmd)
             ctx_server_envs.append(ctx_server_env)
@@ -1831,6 +1810,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             disagg_server_envs.append(disagg_server_env)
             benchmark_cmds.append(benchmark_cmd)
             benchmark_envs.append(benchmark_env)
+            cmd_idx += 1
         return ctx_server_cmds, ctx_server_envs, gen_server_cmds, gen_server_envs, disagg_server_cmds, disagg_server_envs, benchmark_cmds, benchmark_envs
 
     def get_trtllm_build_command(self, engine_dir, checkpoint_dir) -> list:
@@ -1933,6 +1913,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                          "llama-7b-hf")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
+
         if self._config.num_loras > 0:
             istdev = 16
             ostdev = 24
@@ -1958,14 +1939,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "python3", prepare_data_script, f"--stdout",
-                    f"--rand-task-id 0 {nloras-1}",
-                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    f"--rand-task-id 0 {nloras-1}", f"--lora-dir={lora_dir}",
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
 
             else:
@@ -1978,12 +1958,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             if self._build_script == 'trtllm-bench':
                 data_cmd += [
-                    "python3", prepare_data_script, "--stdout",
-                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
+                    "trtllm-bench", f"--model={tokenizer_dir}",
+                    "prepare-dataset", "--output", f"{dataset_path}",
+                    "token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
                     f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                    f" > {dataset_path}"
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
             else:
                 data_cmd += [
@@ -2542,7 +2522,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             post_new_perf_data(new_baseline_data_dict, new_data_dict,
                                regressive_data_list)
 
-        print_regressive_test_cases(regressive_data_list)
+        perf_result_output_dir = os.path.join(self._output_dir,
+                                              self._test_param_labels)
+        write_regressive_test_cases(regressive_data_list, new_data_dict,
+                                    perf_result_output_dir)
 
     def _get_engine_dir(self) -> str:
         """

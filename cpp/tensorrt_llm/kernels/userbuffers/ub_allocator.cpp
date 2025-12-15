@@ -26,7 +26,7 @@ UserBufferAllocator& UserBufferAllocator::Instance()
     return _;
 }
 
-void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
+void UserBufferAllocator::initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
     if (!isInitialized())
     {

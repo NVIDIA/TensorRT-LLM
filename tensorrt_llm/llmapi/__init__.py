@@ -1,3 +1,4 @@
+from .._torch.async_llm import AsyncLLM
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
@@ -23,6 +24,7 @@ from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'AsyncLLM',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',

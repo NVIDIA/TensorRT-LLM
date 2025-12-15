@@ -6,7 +6,7 @@ from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch._ops import OpOverload, OpOverloadPacket
-from torch.fx import Graph, GraphModule, Node
+from torch.fx import GraphModule, Node
 
 from .logger import ad_logger
 
@@ -346,12 +346,6 @@ def is_dist_op(node: Node) -> bool:
         torch.ops.auto_deploy.trtllm_dist_all_reduce,
     }
     return is_op(node, dist_ops)
-
-
-def get_all_input_output_nodes(graph: Graph) -> Tuple[List[Node], List[Node]]:
-    input_nodes: List[Node] = graph.find_nodes(op="placeholder")
-    output_nodes: List[Node] = graph.find_nodes(op="output")
-    return (input_nodes, output_nodes)
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):

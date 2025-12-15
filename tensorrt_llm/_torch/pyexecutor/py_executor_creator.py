@@ -281,6 +281,17 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if not spec_config.allow_advanced_sampling:
+            logger.warning(
+                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+            )
+        elif spec_config.spec_dec_mode.is_mtp_one_model():
+            logger.warning(
+                "Advanced sampling is not supported for MTP yet - this will be added soon."
+            )
+
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
         llm_args.disable_overlap_scheduler = True

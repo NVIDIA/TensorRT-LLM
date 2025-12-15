@@ -319,6 +319,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 {
     while (true)
     {
+        if (!mIsRunning)
+        {
+            return nullptr;
+        }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -491,6 +495,11 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
     while (true)
     {
 
+        if (!mIsRunning)
+        {
+            return;
+        }
+
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -587,6 +596,13 @@ std::string const& AgentConnectionManager::getAgentName() const
 
 AgentConnectionManager::~AgentConnectionManager()
 {
+    mIsRunning = false;
     m_Agent->deregisterMemory(mRegMemDescs);
 }
+
+bool AgentConnectionManager::isRunning() const
+{
+    return mIsRunning;
+}
+
 } // namespace tensorrt_llm::executor::kv_cache
