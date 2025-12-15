@@ -143,8 +143,6 @@ transforms:
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
-  update_in_out_nodes:
-    stage: cache_init
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer

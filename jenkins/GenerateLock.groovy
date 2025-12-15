@@ -42,7 +42,7 @@ def getGitCredentialId (String repoUrlKey) {
     if (repoUrlKey == "tensorrt_llm_internal") {
         return 'svc_tensorrt_gitlab_api_token_no_username_as_string'
     } else {
-        return 'github-token-trtllm-ci'
+        return 'github-cred-trtllm-ci'
     }
 }
 

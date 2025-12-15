@@ -852,12 +852,23 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         [DefaultMoeRoutingMethod],
     ),
 )
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_fp8_blockwise_deepgemm(dtype,
                                           num_experts,
                                           seq_len,
                                           hidden_size,
                                           RoutingMethodCls,
+                                          enable_configurable_moe,
+                                          mocker,
                                           mapping=None):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
+
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
     INTERMEDIATE_SIZE = 256
@@ -921,14 +932,20 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
-    fused_moe = DeepGemmFusedMoE(
-        num_experts=NUM_EXPERTS,
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+    pretrained_config.torch_dtype = dtype
+
+    fused_moe = create_moe(
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
+                                 mapping=mapping,
+                                 moe_backend="DEEPGEMM"),
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
@@ -1361,14 +1378,18 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
                          if x == 0 else "enable_configurable_moe")
 def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
 
-    if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
-        pytest.skip("ENABLE_CONFIGURABLE_MOE=1, only TRTLLM backend is enabled")
+    if enable_configurable_moe == 1 and moe_backend not in [
+            "TRTLLM", "CUTLASS"
+    ]:
+        pytest.skip(
+            "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
+        )
 
     mocker.patch.dict(
         os.environ, {
             "ENABLE_CONFIGURABLE_MOE":
-            "1"
-            if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
+            "1" if enable_configurable_moe == 1
+            and moe_backend in ["TRTLLM", "CUTLASS"] else "0"
         })
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
@@ -1532,15 +1553,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
                          ids=lambda x: ""
                          if x == 0 else "enable_configurable_moe")
 def test_fused_moe_w4a8_nvfp4_fp8(moe_backend, enable_configurable_moe, mocker):
-    if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
-        pytest.skip("ENABLE_CONFIGURABLE_MOE=1, only TRTLLM backend is enabled")
-
-    mocker.patch.dict(
-        os.environ, {
-            "ENABLE_CONFIGURABLE_MOE":
-            "1"
-            if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
-        })
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     dtype = torch.bfloat16
     mapping = Mapping()
@@ -1962,15 +1978,10 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
                                enable_configurable_moe, mocker):
 
-    if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
-        pytest.skip("ENABLE_CONFIGURABLE_MOE=1, only TRTLLM backend is enabled")
-
-    mocker.patch.dict(
-        os.environ, {
-            "ENABLE_CONFIGURABLE_MOE":
-            "1"
-            if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
-        })
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     if moe_backend == "CUTLASS" and hidden_unpadded % 128 != 0:
         pytest.skip()
@@ -2237,15 +2248,10 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
 def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
                            enable_configurable_moe, mocker):
 
-    if enable_configurable_moe == 1 and moe_backend != "TRTLLM":
-        pytest.skip("ENABLE_CONFIGURABLE_MOE=1, only TRTLLM backend is enabled")
-
-    mocker.patch.dict(
-        os.environ, {
-            "ENABLE_CONFIGURABLE_MOE":
-            "1"
-            if enable_configurable_moe == 1 and moe_backend == "TRTLLM" else "0"
-        })
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     mapping = Mapping()
     mapping.rank = mpi_rank()

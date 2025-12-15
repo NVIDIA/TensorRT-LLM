@@ -22,7 +22,8 @@ import sys
 import time
 from datetime import datetime
 
-from defs.trt_test_alternative import print_info
+import yaml
+from defs.trt_test_alternative import print_info, print_warning
 
 _project_root = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '../../../..'))
@@ -337,11 +338,38 @@ def get_history_data(new_data_dict, gpu_type, match_keys):
     def get_latest_data(data_list):
         if not data_list:
             return None
-        time_format = "%b %d, %Y @ %H:%M:%S.%f"
-        # Find the item with the maximum ts_created value
-        latest_data = max(
-            data_list,
-            key=lambda x: datetime.strptime(x["ts_created"], time_format))
+
+        # Supported timestamp formats
+        time_formats = [
+            "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO 8601: 2025-12-11T06:25:25.338Z
+            "%Y-%m-%dT%H:%M:%SZ",  # ISO 8601 without ms: 2025-12-11T06:25:25Z
+            "%Y-%m-%dT%H:%M:%S.%f",  # ISO 8601 without Z: 2025-12-11T06:25:25.338
+            "%Y-%m-%dT%H:%M:%S",  # ISO 8601 basic: 2025-12-11T06:25:25
+            "%b %d, %Y @ %H:%M:%S.%f",  # OpenSearch format: Dec 11, 2025 @ 06:25:25.338
+        ]
+
+        def parse_timestamp(timestamp):
+            if isinstance(timestamp, (int, float)):
+                # Handle milliseconds timestamp
+                if timestamp > 1e12:
+                    timestamp = timestamp / 1000
+                return datetime.fromtimestamp(timestamp)
+            if isinstance(timestamp, datetime):
+                return timestamp
+
+            timestamp_str = str(timestamp)
+            for fmt in time_formats:
+                try:
+                    return datetime.strptime(timestamp_str, fmt)
+                except ValueError:
+                    continue
+
+            print_warning(f"Unable to parse timestamp: {timestamp_str}")
+            return datetime.fromtimestamp(0)
+
+        # Find the item with the maximum @timestamp value
+        latest_data = max(data_list,
+                          key=lambda x: parse_timestamp(x.get("@timestamp", 0)))
         return latest_data
 
     history_baseline_dict = {}
@@ -494,10 +522,20 @@ def post_new_perf_data(new_baseline_data_dict, new_data_dict,
         print_info(f"Fail to post data to {TEST_INFO_PROJECT_NAME}, error: {e}")
 
 
-def print_regressive_test_cases(regressive_data_list):
+def write_regressive_test_cases(regressive_data_list, new_data_dict,
+                                perf_result_output_dir):
     """
-    Print regressive test cases
+    Write regressive test cases to regressive.yaml
     """
-    print_info(f"Found {len(regressive_data_list)} regressive test cases")
-    for data in regressive_data_list:
-        print_info(f"Regressive test case: {data}")
+    regression_yaml_path = os.path.join(perf_result_output_dir,
+                                        "regression.yaml")
+    with open(regression_yaml_path, 'w') as f:
+        yaml.dump(regressive_data_list, f, default_flow_style=False)
+
+    perf_data_yaml_path = os.path.join(perf_result_output_dir, "perf_data.yaml")
+    with open(perf_data_yaml_path, 'w') as f:
+        yaml.dump(list(new_data_dict.values()), f, default_flow_style=False)
+
+    if len(regressive_data_list) > 0:
+        print_warning(
+            f"Found {len(regressive_data_list)} regressive test cases")

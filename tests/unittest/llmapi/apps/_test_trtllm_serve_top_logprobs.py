@@ -110,7 +110,7 @@ async def test_chat_completion_top1_logprobs(async_client: openai.AsyncOpenAI,
         "content": "You are a helpful assistant."
     }, {
         "role": "user",
-        "content": "What is the capital of France?"
+        "content": "What is the capital of France? please in detail."
     }]
     # Test top_logprobs=1
     chat_completion = await async_client.chat.completions.create(

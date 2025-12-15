@@ -26,6 +26,7 @@ l0_a10:
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
   - unittest/others/test_time_breakdown.py
+  - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
@@ -74,9 +75,10 @@ l0_a10:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_llm_args.py
-  - unittest/llmapi/test_additional_model_outputs.py
+  - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   # executor
   - unittest/executor/test_rpc.py
+  - unittest/executor/test_ipc.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
@@ -94,6 +96,9 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
   - llmapi/test_llm_api_connector.py::test_connector_multi_request
+  # third-party policy checks CPU-only
+  - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
+  - thirdparty/test_git_modules.py::test_gitmodules
 - condition:
     ranges:
       system_gpu_count:

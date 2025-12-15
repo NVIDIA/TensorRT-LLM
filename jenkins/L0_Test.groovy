@@ -459,7 +459,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String jobUID){
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         def cleanupCommands = [
-            "rm -rf /lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
             "rm -rf ${jobWorkspace} || true",
         ].join(" && ")
         Utils.exec(
@@ -510,7 +510,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
         def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
-            "rm -rf /lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
         ].join(" && ")
         Utils.exec(
             pipeline,
@@ -565,12 +565,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
-                // Specific for OCI machines
-                def mounts = [
-                    "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                    "/home/svc_tensorrt:/home/svc_tensorrt",
-                    "/home/svc_tensorrt/.cache:/root/.cache"
-                ].join(",")
+                def mounts = getMountListForSlurmTest(cluster, false).join(",")
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
@@ -630,6 +625,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
                     }
                     counter++
+                    // If entrypoint script fails to start, do not poll for agent connection
+                    try {
+                        SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        // If the exception is about job being inactive, enrich it with log path
+                        if (e.message.contains("is no longer active")) {
+                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        }
+                        // Otherwise, log the error but continue (SSH might be temporarily unavailable)
+                        pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
+                    }
                 }
             }
 
@@ -822,6 +830,42 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
+def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
+{
+    def mounts = []
+
+    // mounts for SLURM job submission and logs
+    if (useSbatch) {
+        mounts += [
+            "/home/svc_tensorrt/bloom/scripts",
+        ]
+    } else {
+        mounts += [
+            "/home/svc_tensorrt/bloom/scripts",
+            "/home/svc_tensorrt/slurm-logs",
+        ]
+    }
+
+    // data/cache mounts
+    if (cluster.containerRuntime == ContainerRuntime.DOCKER) {
+        mounts += [
+            "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro",
+        ]
+    } else if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
+        if (!cluster.scratchPath) {
+            throw new Exception("Scratch path is not set for cluster: ${cluster.name}")
+        }
+        mounts += [
+            "${cluster.scratchPath}:/scratch.trt_llm_data:ro",
+            "/home/svc_tensorrt/.cache:/root/.cache",
+        ]
+    } else {
+        throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
+    }
+
+    return mounts
+}
+
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
@@ -959,7 +1003,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
-                def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
+                def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -971,39 +1015,37 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime == ContainerRuntime.ENROOT) {
-                    mounts = [
-                        "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci:/scratch.trt_llm_data:ro",
-                        "/home/svc_tensorrt/bloom/scripts",
-                        "/home/svc_tensorrt/.cache:/root/.cache",
-                    ].join(",")
-
-                    def enrootImagePath = "/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
+                    def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
                     containerImageArg = enrootImagePath
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
-                    retry_command() {
-                        local cmd=\$1
-                        local max_attempts=\${2:-3}
-                        local delay=\${3:-60}
+                    importContainerWithRetries() {
+                        local docker_uri=\$1
+                        local output_path=\$2
+                        local max_attempts=\${3:-3}
+                        local delay=\${4:-60}
                         local attempt=1
 
-                        until \$cmd
+                        rm -f "\$output_path"
+
+                        until enroot import -o "\$output_path" -- "docker://\$docker_uri"
                         do
                             if ((attempt >= max_attempts))
                             then
-                                echo "Command '\$cmd' failed after \$max_attempts attempts"
+                                echo "enroot import failed after \$max_attempts attempts"
                                 return 1
                             fi
 
-                            echo "Command '\$cmd' failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            rm -f "\$output_path"
                             sleep \$delay
                             ((attempt++))
                         done
                     }
 
-                    retry_command "enroot import -o $enrootImagePath -- docker://$container"
+                    importContainerWithRetries "$container" "$enrootImagePath"
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -2903,8 +2945,8 @@ def launchTestJobs(pipeline, testFilter)
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
-        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
-        "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
+        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4-lbd", "l0_dgx_b200", 1, 1, 4, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8-lbd", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-trtllm", "l0_dgx_b200", 2, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
