@@ -13,12 +13,13 @@ from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    ShardingTransformConfig,
     ShardingTransformContainer,
     SplitDimension,
     WeightShardingInfo,
 )
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.commands.bench import main
 from tensorrt_llm.functional import AllReduceStrategy
 
@@ -268,16 +269,20 @@ def test_allreduce_strategy_propagation(strategy):
 
     # Create sharding config with specified strategy
     rank, world_size = 0, 4
-    sharding_container = ShardingTransformContainer(
-        rank=rank, world_size=world_size, allreduce_strategy=AllReduceStrategy[strategy]
+
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        stage="sharding",
+        allreduce_strategy=AllReduceStrategy[strategy],
     )
+    sharding_container = ShardingTransformContainer(config=config)
 
     # Add transforms: column shard linear1, row shard linear2 (triggers allreduce)
     sharding_container.add(
         WeightShardingInfo(
             target_node=linear1_node.name,
-            rank=rank,
-            world_size=world_size,
+            config=config,
             split_dim=SplitDimension.COLUMN,
             dist_op=None,
         )
@@ -285,8 +290,7 @@ def test_allreduce_strategy_propagation(strategy):
     sharding_container.add(
         WeightShardingInfo(
             target_node=linear2_node.name,
-            rank=rank,
-            world_size=world_size,
+            config=config,
             split_dim=SplitDimension.ROW,
             dist_op="all_reduce",
         )
@@ -295,8 +299,9 @@ def test_allreduce_strategy_propagation(strategy):
     # Verify transforms have the strategy injected
     assert len(sharding_container.weight_sharding_transforms) == 2
     for transform in sharding_container.weight_sharding_transforms:
-        assert transform.allreduce_strategy == AllReduceStrategy[strategy], (
-            f"Transform {transform.target_node} should have strategy {strategy}, got {transform.allreduce_strategy}"
+        assert transform.config.allreduce_strategy == AllReduceStrategy[strategy], (
+            f"Transform {transform.target_node} should have strategy {strategy}, "
+            f"got {transform.config.allreduce_strategy}"
         )
 
     # Apply transforms
