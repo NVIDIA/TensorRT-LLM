@@ -63,7 +63,7 @@ class EnvManager:
     @staticmethod
     def get_slurm_set_segment() -> bool:
         gpu_type = EnvManager.get_gpu_type()
-        gpu_type_support_segment = {"GB200": True, "GB300": False}
+        gpu_type_support_segment = {"GB200": True, "GB300": True}
         return gpu_type_support_segment.get(gpu_type, False)
 
     @staticmethod
