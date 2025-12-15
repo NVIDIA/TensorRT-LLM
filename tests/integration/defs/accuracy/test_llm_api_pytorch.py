@@ -5374,7 +5374,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                  pipeline_parallel_size=1,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
-                 max_seq_len=16384,
+                 max_seq_len=4096,
                  **pytorch_config,
                  enable_attention_dp=attention_dp) as llm:
 
