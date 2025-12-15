@@ -299,6 +299,8 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
 Syntax
 ------
 
+This syntax section lists all command line arguments for ``trtllm-serve``'s subcommands. Some of the arguments are companied with a stability tag indicating their development status. Refer to our `API Reference <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html>`__ for details
+
 .. click:: tensorrt_llm.commands.serve:main
    :prog: trtllm-serve
    :nested: full

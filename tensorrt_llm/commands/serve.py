@@ -42,6 +42,11 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 _child_p_global: Optional[subprocess.Popen] = None
 
 
+def help_info_with_stability_tag(help_str: str, tag: str) -> str:
+    """Append stability info to help string."""
+    return f":tag:`{tag}` {help_str}"
+
+
 def _signal_handler_cleanup_child(signum, frame):
     """Signal handler to clean up the child process."""
     global _child_p_global
@@ -262,27 +267,33 @@ class ChoiceWithAlias(click.Choice):
 @click.option("--tokenizer",
               type=str,
               default=None,
-              help="Path | Name of the tokenizer."
-              "Specify this value only if using TensorRT engine as model.")
+              help=help_info_with_stability_tag("Path | Name of the tokenizer.",
+                                                "beta"))
 @click.option(
     "--custom_tokenizer",
     type=str,
     default=None,
-    help=
-    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
-    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). [Experimental]"
-)
+    help=help_info_with_stability_tag(
+        "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+        "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
+        "prototype"))
 @click.option("--host",
               type=str,
               default="localhost",
-              help="Hostname of the server.")
-@click.option("--port", type=int, default=8000, help="Port of the server.")
+              help=help_info_with_stability_tag("Hostname of the server.",
+                                                "beta"))
+@click.option("--port",
+              type=int,
+              default=8000,
+              help=help_info_with_stability_tag("Port of the server.", "beta"))
 @click.option(
     "--backend",
     type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
                          {"trt": "tensorrt"}),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.")
+    help=help_info_with_stability_tag(
+        "The backend to use to serve the model. Default is pytorch backend.",
+        "beta"))
 @click.option(
     "--custom_module_dirs",
     type=click.Path(exists=True,
@@ -291,143 +302,170 @@ class ChoiceWithAlias(click.Choice):
                     resolve_path=True),
     default=None,
     multiple=True,
-    help="Paths to custom module directories to import.",
+    help=help_info_with_stability_tag(
+        "Paths to custom module directories to import.", "Prototype"),
 )
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
-              help="The logging level.")
+              help=help_info_with_stability_tag("The logging level.", "stable"))
 @click.option("--max_beam_width",
               type=int,
               default=BuildConfig.model_fields["max_beam_width"].default,
-              help="Maximum number of beams for beam search decoding.")
+              help=help_info_with_stability_tag(
+                  "Maximum number of beams for beam search decoding.", "beta"))
 @click.option("--max_batch_size",
               type=int,
               default=BuildConfig.model_fields["max_batch_size"].default,
-              help="Maximum number of requests that the engine can schedule.")
+              help=help_info_with_stability_tag(
+                  "Maximum number of requests that the engine can schedule.",
+                  "beta"))
 @click.option(
     "--max_num_tokens",
     type=int,
     default=BuildConfig.model_fields["max_num_tokens"].default,
-    help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
+    help=help_info_with_stability_tag(
+        "Maximum number of batched input tokens after padding is removed in each batch.",
+        "beta"))
 @click.option(
     "--max_seq_len",
     type=int,
     default=BuildConfig.model_fields["max_seq_len"].default,
-    help="Maximum total length of one request, including prompt and outputs. "
-    "If unspecified, the value is deduced from the model config.")
+    help=help_info_with_stability_tag(
+        "Maximum total length of one request, including prompt and outputs. "
+        "If unspecified, the value is deduced from the model config.", "beta"))
 @click.option("--tensor_parallel_size",
               "--tp_size",
               type=int,
               default=1,
-              help='Tensor parallelism size.')
+              help=help_info_with_stability_tag('Tensor parallelism size.',
+                                                'beta'))
 @click.option("--pipeline_parallel_size",
               "--pp_size",
               type=int,
               default=1,
-              help='Pipeline parallelism size.')
+              help=help_info_with_stability_tag('Pipeline parallelism size.',
+                                                'beta'))
 @click.option("--context_parallel_size",
               "--cp_size",
               type=int,
               default=1,
-              help='Context parallelism size.')
+              help=help_info_with_stability_tag('Context parallelism size.',
+                                                'beta'))
 @click.option("--moe_expert_parallel_size",
               "--ep_size",
               type=int,
               default=None,
-              help="expert parallelism size")
+              help=help_info_with_stability_tag("expert parallelism size",
+                                                "beta"))
 @click.option("--moe_cluster_parallel_size",
               "--cluster_size",
               type=int,
               default=None,
-              help="expert cluster parallelism size")
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
+              help=help_info_with_stability_tag(
+                  "expert cluster parallelism size", "beta"))
+@click.option(
+    "--gpus_per_node",
+    type=int,
+    default=None,
+    help=help_info_with_stability_tag(
+        "Number of GPUs per node. Default to None, and it will be detected automatically.",
+        "beta"))
 @click.option("--free_gpu_memory_fraction",
               "--kv_cache_free_gpu_memory_fraction",
               type=float,
               default=0.9,
-              help="Free GPU memory fraction reserved for KV Cache, "
-              "after allocating model weights and buffers.")
-@click.option(
-    "--num_postprocess_workers",
-    type=int,
-    default=0,
-    help="[Experimental] Number of workers to postprocess raw responses "
-    "to comply with OpenAI protocol.")
+              help=help_info_with_stability_tag(
+                  "Free GPU memory fraction reserved for KV Cache, "
+                  "after allocating model weights and buffers.", "beta"))
+@click.option("--num_postprocess_workers",
+              type=int,
+              default=0,
+              help=help_info_with_stability_tag(
+                  "Number of workers to postprocess raw responses "
+                  "to comply with OpenAI protocol.", "prototype"))
 @click.option("--trust_remote_code",
               is_flag=True,
               default=False,
-              help="Flag for HF transformers.")
+              help=help_info_with_stability_tag("Flag for HF transformers.",
+                                                "beta"))
 @click.option("--revision",
               type=str,
               default=None,
-              help="The revision to use for the HuggingFace model "
-              "(branch name, tag name, or commit id).")
+              help=help_info_with_stability_tag(
+                  "The revision to use for the HuggingFace model "
+                  "(branch name, tag name, or commit id).", "beta"))
 @click.option(
     "--config",
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-    "Can be specified as either --config or --extra_llm_api_options.")
+    help=help_info_with_stability_tag(
+        "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+        "Can be specified as either --config or --extra_llm_api_options.",
+        "prototype"))
 @click.option(
     "--reasoning_parser",
     type=click.Choice(ReasoningParserFactory.parsers.keys()),
     default=None,
-    help="[Experimental] Specify the parser for reasoning models.",
+    help=help_info_with_stability_tag(
+        "Specify the parser for reasoning models.", "prototype"),
 )
 @click.option(
     "--tool_parser",
     type=click.Choice(ToolParserFactory.parsers.keys()),
     default=None,
-    help="[Experimental] Specify the parser for tool models.",
+    help=help_info_with_stability_tag("Specify the parser for tool models.",
+                                      "prototype"),
 )
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
-              help="Path to metadata server config file")
+              help=help_info_with_stability_tag(
+                  "Path to metadata server config file", "prototype"))
 @click.option(
     "--server_role",
     type=str,
     default=None,
-    help="Server role. Specify this value only if running in disaggregated mode."
-)
+    help=help_info_with_stability_tag(
+        "Server role. Specify this value only if running in disaggregated mode.",
+        "prototype"))
 @click.option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
     default=False,
-    help=
-    "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
-)
+    help=help_info_with_stability_tag(
+        "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.",
+        "prototype"))
 @click.option("--otlp_traces_endpoint",
               type=str,
               default=None,
-              help="Target URL to which OpenTelemetry traces will be sent.")
+              help=help_info_with_stability_tag(
+                  "Target URL to which OpenTelemetry traces will be sent.",
+                  "prototype"))
 @click.option("--disagg_cluster_uri",
               type=str,
               default=None,
-              help="URI of the disaggregated cluster.")
+              help=help_info_with_stability_tag(
+                  "URI of the disaggregated cluster.", "prototype"))
 @click.option("--enable_chunked_prefill",
               is_flag=True,
               default=False,
-              help="Enable chunked prefill")
+              help=help_info_with_stability_tag("Enable chunked prefill",
+                                                "prototype"))
 @click.option("--media_io_kwargs",
               type=str,
               default=None,
-              help="Keyword arguments for media I/O.")
+              help=help_info_with_stability_tag(
+                  "Keyword arguments for media I/O.", "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
-              help="[Experimental] Specify a custom chat template. "
-              "Can be a file path or one-liner template string")
+              help=help_info_with_stability_tag(
+                  "Specify a custom chat template. "
+                  "Can be a file path or one-liner template string",
+                  "prototype"))
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
