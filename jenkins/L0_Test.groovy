@@ -489,14 +489,6 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
 
         Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
 
-        CloudManager.destroyNode(nodeName)
-
-        Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
-
-        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
-
         Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(
@@ -504,6 +496,14 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
                 "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
         )
+
+        CloudManager.destroyNode(nodeName)
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
