@@ -19,6 +19,11 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+try:
+    from ray.util.placement_group import PlacementGroup
+except ImportError:
+    PlacementGroup = None
+
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -614,6 +619,10 @@ class DecodingBaseConfig(StrictBaseModel):
     # (N = acceptance_window) drops below this value.
     acceptance_length_threshold: Optional[float] = None
 
+    # Prototype. If true, allows non-greedy sampling when speculation is used. Only applicable
+    # to 1-model code paths; non-greedy sampling is always enabled on 2-model paths.
+    allow_advanced_sampling: bool = False
+
     # Validate acceptance controls at field level so they run on model creation
     @field_validator('acceptance_window')
     @classmethod
@@ -1084,6 +1093,65 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+
+class RayPlacementConfig(StrictBaseModel):
+    """
+    Configuration for Ray GPU workers placement.
+    This config is only used with AsyncLLM for RL scenarios.
+    """
+    defer_workers_init: bool = Field(
+        default=False,
+        description="Defer Ray worker initialization until async setup.")
+
+    placement_groups: Optional[List[Any]] = Field(
+        default=None,
+        description="List of Ray placement groups, one per node. "
+        "Each element must be a ray.util.placement_group.PlacementGroup instance."
+    )
+
+    placement_bundle_indices: Optional[List[List[int]]] = Field(
+        default=None,
+        description="List of bundle indices for each placement group. "
+        "Outer list corresponds to placement_groups, inner list contains bundle indices for that group."
+    )
+
+    per_worker_gpu_share: Optional[float] = Field(
+        default=None,
+        description="GPU fraction per worker for colocation scenarios. "
+        "Example: 0.1 means 10 actors can share one GPU. Defaults to 1.0 (one actor per GPU)."
+    )
+
+    @model_validator(mode='after')
+    def validate_ray_placement(self) -> 'RayPlacementConfig':
+        has_pgs = self.placement_groups is not None
+        has_indices = self.placement_bundle_indices is not None
+
+        if has_pgs != has_indices:
+            raise ValueError(
+                "placement_groups and placement_bundle_indices must be provided together"
+            )
+
+        if has_pgs:
+            if len(self.placement_groups) != len(self.placement_bundle_indices):
+                raise ValueError(
+                    f"placement_groups length ({len(self.placement_groups)}) must equal "
+                    f"placement_bundle_indices length ({len(self.placement_bundle_indices)})"
+                )
+            if PlacementGroup is not None:
+                for i, pg in enumerate(self.placement_groups):
+                    if not isinstance(pg, PlacementGroup):
+                        raise TypeError(
+                            f"placement_groups[{i}] must be a Ray PlacementGroup, "
+                            f"got {type(pg).__name__}")
+
+        if self.per_worker_gpu_share is not None:
+            if not (0 < self.per_worker_gpu_share <= 1.0):
+                raise ValueError(
+                    f"per_worker_gpu_share must be between 0 and 1.0, "
+                    f"got {self.per_worker_gpu_share}")
+
+        return self
 
 
 class PybindMirror(ABC):
@@ -1962,8 +2030,16 @@ class BaseLlmArgs(StrictBaseModel):
     env_overrides: Optional[Dict[str, str]] = Field(
         default=None,
         description=
-        "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand.",
+        "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
         status="prototype")
+
+    @field_validator('env_overrides', mode='before')
+    @classmethod
+    def coerce_env_overrides_to_str(cls, v):
+        """Coerce env_overrides values to strings for os.environ compatibility."""
+        if v is None:
+            return v
+        return {str(k): str(val) for k, val in v.items()}
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
@@ -2032,6 +2108,8 @@ class BaseLlmArgs(StrictBaseModel):
     @field_validator("gpus_per_node", mode='before')
     @classmethod
     def validate_gpus_per_node(cls, v, info):
+        if os.getenv("RAY_LOCAL_WORLD_SIZE") is not None:
+            return info.data.get("tensor_parallel_size")
         if v is None:
             logger.warning(
                 f"Using default gpus_per_node: {torch.cuda.device_count()}")
@@ -2750,6 +2828,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
+    ray_placement_config: Optional[RayPlacementConfig] = Field(
+        default=None,
+        description=
+        "Placement config for RayGPUWorker. Only used with AsyncLLM and orchestrator_type='ray'.",
+        exclude=True,
+        status="prototype")
+
     enable_sleep: bool = Field(
         default=False,
         description=
@@ -2985,6 +3070,24 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    @model_validator(mode='after')
+    def validate_helix_tokens_per_block(self) -> 'TorchLlmArgs':
+        """Validate that cp_config.tokens_per_block matches kv_cache_config.tokens_per_block when HELIX parallelism is active."""
+        if self.context_parallel_size == 1 or self.cp_config is None or not self.cp_config:
+            return self
+
+        cp_type = self.cp_config.get('cp_type', None)
+        if cp_type is not None and str(cp_type).upper() == 'HELIX':
+            cp_tokens_per_block = self.cp_config.get('tokens_per_block', None)
+            if cp_tokens_per_block is not None:
+                kv_tokens_per_block = self.kv_cache_config.tokens_per_block
+                assert cp_tokens_per_block == kv_tokens_per_block, (
+                    f"When HELIX parallelism is active, cp_config.tokens_per_block ({cp_tokens_per_block}) "
+                    f"must match kv_cache_config.tokens_per_block ({kv_tokens_per_block})."
+                )
+
+        return self
+
     def warn_on_unstable_feature_usage(self) -> 'TorchLlmArgs':
         """Warn on unstable feature usage."""
         set_fields = self.model_dump(exclude_unset=True).keys()
@@ -3056,6 +3159,14 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
                 f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_ray_placement_config(self) -> 'TorchLlmArgs':
+        if self.ray_placement_config is not None and self.orchestrator_type != "ray":
+            raise ValueError(
+                "ray_placement_config is only supported with orchestrator_type='ray'"
             )
         return self
 

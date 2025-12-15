@@ -273,22 +273,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_num_experts=self.expert_size_per_partition,
             tile_tokens_dim=tile_size,
         )
-        x, x_sf = torch.ops.trtllm.moe_permute(
-            input=x.view(torch.float4_e2m1fn_x2),
-            input_sf=x_sf,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_tokens_dim=tile_size,
-            top_k=self.routing_method.experts_per_token,
-        )
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_swiglu_blackwell(
+
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
             weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
             alpha=self.quant_scales.fc1_global,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,

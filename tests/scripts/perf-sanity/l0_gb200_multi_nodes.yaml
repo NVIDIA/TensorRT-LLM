@@ -13,7 +13,7 @@ server_configs:
     moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     max_batch_size: 512
-    max_num_tokens: 2112
+    max_num_tokens: 3136
     attn_backend: "TRTLLM"
     enable_attention_dp: true
     attention_dp_config:
@@ -35,7 +35,7 @@ server_configs:
         iterations: 12
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"
 
   - name: "r1_fp4_v2_tep8_mtp3"
@@ -67,5 +67,5 @@ server_configs:
         iterations: 12
         isl: 1024
         osl: 1024
-        random_range_ratio: 0.8
+        random_range_ratio: 0.2
         backend: "openai"

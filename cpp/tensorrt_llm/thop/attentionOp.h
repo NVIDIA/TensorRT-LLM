@@ -19,6 +19,10 @@
 #include <optional>
 #include <torch/extension.h>
 
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -69,3 +73,5 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer);
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

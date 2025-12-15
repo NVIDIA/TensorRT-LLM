@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion::moe
 {
 template <int NRanks>
 struct LamportComm
@@ -770,4 +773,6 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
 #undef MOE_FINALIZE_DISPATCH1
 }
 
-}; // namespace tensorrt_llm::kernels::ar_fusion::moe
+}; // namespace kernels::ar_fusion::moe
+
+TRTLLM_NAMESPACE_END

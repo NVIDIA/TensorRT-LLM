@@ -32,6 +32,8 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 std::tuple<at::Tensor, at::Tensor> noaux_tc_op(th::Tensor const& scores, th::Tensor const& bias, int64_t n_group,
@@ -157,6 +159,8 @@ std::tuple<at::Tensor, at::Tensor> noaux_tc_op(th::Tensor const& scores, th::Ten
 
 } // end namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -166,5 +170,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("noaux_tc_op", &torch_ext::noaux_tc_op);
+    m.impl("noaux_tc_op", &tensorrt_llm::torch_ext::noaux_tc_op);
 }
