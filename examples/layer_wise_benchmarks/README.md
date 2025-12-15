@@ -15,6 +15,9 @@ pip install -e ../..
 **Step 3:** In the container, run benchmarks and generate profiles:
 
 ```bash
+# Set autotune cache path
+export TLLM_AUTOTUNER_CACHE_PATH=autotuner_cache/cache
+
 # Run DeepSeek-R1 NVFP4
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml
@@ -48,7 +51,7 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WID
 # Scale TEP=16 to 4 GPUs: reduce the number of attention heads and experts
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
 
-# Run Qwen3-Next (balanced routing is not implemented)
+# Run Qwen3-Next
 NP=2 ./mpi_launch.sh ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --batch-size 4
 NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --batch-size 512
 
@@ -93,6 +96,9 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
+# Set autotune cache path
+export TLLM_AUTOTUNER_CACHE_PATH=autotuner_cache/cache
+
 # Run DeepSeek-R1 NVFP4 with wide ep: uses MNNVL A2A if applicable
 SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
@@ -104,7 +110,7 @@ SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowL
 
 # You can run 4-GPU and 8-GPU tasks without reallocate the slurm job
 SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gtx.yaml
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gen.yaml
 ```
 
 ### Batched run
