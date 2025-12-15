@@ -16,7 +16,6 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._torch.hostfunc import hostfunc
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -783,26 +782,16 @@ class TorchDist(Distributed):
             return ret[0]
 
 
-class PPCommBase:
+class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
+        self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+            self.mapping.world_size,
+            self.mapping.rank,
+        )
         self.tensor_ready_event = torch.cuda.Event()
         self.send_stream = torch.cuda.Stream()
-        self.tensor_cache = {}
-
-    def _cache_tensor(self, tensor: torch.Tensor):
-        cache_id = id(tensor)
-        self.tensor_cache[cache_id] = tensor
-
-    @hostfunc
-    def _release_tensor(self, tensor: torch.Tensor):
-        cache_id = id(tensor)
-        del self.tensor_cache[cache_id]
-
-    @abstractmethod
-    def direct_send(self, tensor: torch.Tensor, dest: int):
-        raise NotImplementedError("direct_send is not implemented")
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
@@ -811,30 +800,13 @@ class PPCommBase:
         # NCCL send kernel in send_stream cannot be captured,
         # so we send in the current stream instead in CUDA graph cases.
         if torch.cuda.is_current_stream_capturing():
-            self.direct_send(tensor, dest)
+            self.nccl_comm.send(tensor, dest)
             return
 
         self.tensor_ready_event.record()
         with torch.cuda.stream(self.send_stream):
             self.tensor_ready_event.wait()
-            # tensor may be released before NCCL send finished,
-            # so we cache it first and release it after send finished.
-            self._cache_tensor(tensor)
-            self.direct_send(tensor, dest)
-            self._release_tensor(tensor)
-
-
-class PPCommNCCL(PPCommBase):
-
-    def __init__(self, global_mapping: Mapping):
-        super().__init__(global_mapping)
-        self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-            self.mapping.world_size,
-            self.mapping.rank,
-        )
-
-    def direct_send(self, tensor: torch.Tensor, dest: int):
-        self.nccl_comm.send(tensor, dest)
+            self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
@@ -842,10 +814,10 @@ class PPCommNCCL(PPCommBase):
         self.nccl_comm.recv(tensor, src)
 
 
-class PPCommTorch(PPCommBase):
+class PPCommTorch:
 
     def __init__(self, global_mapping: Mapping):
-        super().__init__(global_mapping)
+        self.mapping = global_mapping
         self.pg = self.mapping.pp_group_pg
         self.pg_group = self.mapping.pp_group
 
@@ -853,21 +825,22 @@ class PPCommTorch(PPCommBase):
         assert global_rank in self.pg_group
         return self.pg_group.index(global_rank)
 
-    def direct_send(self, tensor: torch.Tensor, dest: int):
-        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
-
-    # TODO: support async pp send for PPCommTorch
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
-        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
+        work = self.pg.send([tensor], self._global_to_local_rank(dest), tag=0)
+        # Send operation cannot be captured without blocking wait,
+        # so we block the current stream in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            work.block_current_stream()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
 
-        self.pg.recv([tensor], self._global_to_local_rank(src), tag=0).wait()
+        work = self.pg.recv([tensor], self._global_to_local_rank(src), tag=0)
+        work.block_current_stream()
 
 
 _pp_comm = None
