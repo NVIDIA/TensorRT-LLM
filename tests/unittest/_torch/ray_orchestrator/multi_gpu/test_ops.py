@@ -23,6 +23,12 @@ class AllgatherPGTest:
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
         assert len(ray.get_gpu_ids()) == 1
+        self.gpu = int(ray.get_gpu_ids()[0])
+        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        self.local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
+
+        torch.cuda.set_device(self.local_gpu)
+        self.local_device = torch.device(f"cuda:{self.local_gpu}")
 
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
@@ -32,9 +38,8 @@ class AllgatherPGTest:
 
     @torch.inference_mode()
     def run_allgather_pg_op(self, test_tensor, expected_result, sizes):
-        torch.cuda.set_device(0)
-        test_tensor = test_tensor.cuda(0)
-        expected_result = expected_result.cuda(0)
+        test_tensor = test_tensor.to(self.local_device)
+        expected_result = expected_result.to(self.local_device)
 
         mapping = Mapping(world_size=self.world_size,
                           gpus_per_node=self.world_size,
@@ -76,6 +81,12 @@ class ReducescatterPGTest:
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
         assert len(ray.get_gpu_ids()) == 1
+        self.gpu = int(ray.get_gpu_ids()[0])
+        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        self.local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
+
+        torch.cuda.set_device(self.local_gpu)
+        self.local_device = torch.device(f"cuda:{self.local_gpu}")
 
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
@@ -85,9 +96,8 @@ class ReducescatterPGTest:
 
     @torch.inference_mode()
     def run_reducescatter_pg_op(self, test_tensor, expected_result, sizes):
-        torch.cuda.set_device(0)
-        test_tensor = test_tensor.cuda(0)
-        expected_result = expected_result.cuda(0)
+        test_tensor = test_tensor.to(self.local_device)
+        expected_result = expected_result.to(self.local_device)
 
         mapping = Mapping(world_size=self.world_size,
                           gpus_per_node=self.world_size,
@@ -129,6 +139,12 @@ class AllreducePGTest:
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
         assert len(ray.get_gpu_ids()) == 1
+        self.gpu = int(ray.get_gpu_ids()[0])
+        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        self.local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
+
+        torch.cuda.set_device(self.local_gpu)
+        self.local_device = torch.device(f"cuda:{self.local_gpu}")
 
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
@@ -138,9 +154,8 @@ class AllreducePGTest:
 
     @torch.inference_mode()
     def run_allreduce_pg_op(self, test_tensor, expected_result):
-        torch.cuda.set_device(0)
-        test_tensor = test_tensor.cuda(0)
-        expected_result = expected_result.cuda(0)
+        test_tensor = test_tensor.to(self.local_device)
+        expected_result = expected_result.to(self.local_device)
 
         mapping = Mapping(world_size=self.world_size,
                           gpus_per_node=self.world_size,
@@ -205,10 +220,17 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
         test_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
         expected_result = test_tensor.repeat(world_size, 1)
         sizes = None
+
+    runtime_env = {
+        "env_vars": {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+        }
+    }
     ray_init_args = {
         "include_dashboard": False,
         "namespace": "test_allgather_pg_op",
-        "ignore_reinit_error": True
+        "ignore_reinit_error": True,
+        "runtime_env": runtime_env
     }
 
     try:
@@ -279,10 +301,17 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
             for i in range(world_size)
         ]
         sizes = None
+
+    runtime_env = {
+        "env_vars": {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+        }
+    }
     ray_init_args = {
         "include_dashboard": False,
         "namespace": "test_reducescatter_pg_op",
-        "ignore_reinit_error": True
+        "ignore_reinit_error": True,
+        "runtime_env": runtime_env
     }
 
     try:
@@ -338,10 +367,16 @@ def test_allreduce_pg_op(seq_len, hidden_size):
     test_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
     expected_result = test_tensor * world_size
 
+    runtime_env = {
+        "env_vars": {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+        }
+    }
     ray_init_args = {
         "include_dashboard": False,
         "namespace": "test_allreduce_pg_op",
-        "ignore_reinit_error": True
+        "ignore_reinit_error": True,
+        "runtime_env": runtime_env
     }
 
     try:
