@@ -22,7 +22,7 @@ from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import (
 from tensorrt_llm.commands.bench import main
 from tensorrt_llm.functional import AllReduceStrategy
 
-# Disable threadleak detection - MPI executor pool inherently leaks threads on shutdown
+# needed since LLM API uses MPI executor pool internally for TP>1, which leaks a thread on shutdown
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 

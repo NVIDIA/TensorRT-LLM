@@ -12,6 +12,9 @@ from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimiz
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
+# needed since MPI executor pool leaks a thread (_manager_spawn) on shutdown
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 class RMSNorm(torch.nn.Module):
     """Implementation of LlamaRMSNorm."""
