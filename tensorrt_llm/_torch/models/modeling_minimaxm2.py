@@ -104,6 +104,7 @@ class MiniMaxM2Attention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
+            use_qk_norm=True,
         )
 
 
