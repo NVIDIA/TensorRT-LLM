@@ -312,13 +312,13 @@ class MistralConfigLoader(BaseConfigLoader):
                 ]
         elif hf_quant_config.get("quant_method") == "fp8":
             # Used for Eagle3 weight
-            if hf_quant_config.get("weight_block_size", []):
+            if hf_quant_config.get("weight_block_size"):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.exclude_modules = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
-                block_size = hf_quant_config.get("weight_block_size", [])
-                assert tuple(block_size) == (128, 128), (
-                    "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                block_size = hf_quant_config.get("weight_block_size")
+                assert block_size is not None and tuple(block_size) == (128, 128), (
+                    f"FP8_BLOCK_SCALES only supports block_size=(128,128), current block_size: {block_size}"
                 )
                 quant_config.group_size = block_size[0]
 
@@ -337,7 +337,7 @@ class MistralConfigLoader(BaseConfigLoader):
             quant_config_dict=layer_quant_config,
             **kwargs,
         )
-        from ...modeling_mistral_large3 import Mistral3Gate
+        from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
         model_config._frozen = True

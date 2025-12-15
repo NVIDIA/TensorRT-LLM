@@ -386,7 +386,7 @@ class MistralLarge3DraftModel(DecoderModel):
 
     def __init__(
         self,
-        model_config,
+        model_config: ModelConfig,
         start_layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ) -> None:
@@ -761,6 +761,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         # FIXME There is a known issue on TRTLLM moe backend + FP8 blockwise
                         logger.warning(
                             "Switching moe_backend of draft model to DEEPGEMM for FP8_BLOCK_SCALES quantization on SM100"
+                            "This is a workaround for the known issue on TRTLLM moe backend + FP8 blockwise"
                         )
                         self.draft_config._frozen = False
                         self.draft_config.moe_backend = "DEEPGEMM"
