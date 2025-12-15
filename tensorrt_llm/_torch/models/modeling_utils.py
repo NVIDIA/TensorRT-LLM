@@ -853,9 +853,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
+    device_id = local_mpi_rank()
 
     def load_single_module(name, module):
-        torch.cuda.set_device(local_mpi_rank())
+        torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
@@ -979,9 +980,10 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     if params_map is not None:
         weights = weight_mapper.rename_by_params_map(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
+    device_id = local_mpi_rank()
 
     def load_single_module(name, module):
-        torch.cuda.set_device(local_mpi_rank())
+        torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
             if weight_mapper.should_skip_module(name):
                 return
