@@ -69,6 +69,7 @@ class GenerationTask(Task):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     user: Optional[str] = None
+    ignore_eos: bool = False
 
     # sampling params
     top_k: Optional[int] = None
