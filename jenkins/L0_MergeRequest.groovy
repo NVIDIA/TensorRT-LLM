@@ -843,17 +843,17 @@ def collectTestResults(pipeline, testFilter)
 
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true, sleepInSecs: 5)
             sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
             sh "cat result_file_names.txt"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat result_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat result_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true, sleepInSecs: 5)
             sh "ls -l | grep \"tar.gz\" || true"
             resultFileNumber = sh(script: "cat result_file_names.txt | wc -l", returnStdout: true)
             resultFileDownloadedNumber = sh(script: "ls -l | grep \"tar.gz\" | wc -l", returnStdout: true)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT)
             if (testFilter[(IS_POST_MERGE)]) {
                 try {
                     sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
