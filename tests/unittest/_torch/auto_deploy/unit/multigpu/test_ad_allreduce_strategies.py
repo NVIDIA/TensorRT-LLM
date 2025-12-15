@@ -74,6 +74,20 @@ def prewarm_flashinfer_jit():
         import flashinfer.sampling
 
         if torch.cuda.is_available():
+            # Prevent concurrent JIT warmup across multiple pytest processes (e.g., xdist).
+            try:
+                import fcntl  # Linux-only
+            except ImportError:
+                fcntl = None
+
+            lock_f = None
+            if fcntl is not None:
+                import pathlib
+                import tempfile
+
+                lock_path = pathlib.Path(tempfile.gettempdir()) / "flashinfer_jit_prewarm.lock"
+                lock_f = open(lock_path, "w")
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             # Create dummy tensors to trigger kernel JIT compilation
             with torch.no_grad():
                 device = torch.device("cuda:0")
@@ -82,17 +96,25 @@ def prewarm_flashinfer_jit():
                 try:
                     # Force module loading (this triggers JIT compilation)
                     _ = flashinfer.page.gen_page_module()
-                except Exception:
-                    pass  # Ignore errors - the import itself should trigger JIT
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+
+                    warnings.warn(f"FlashInfer page-kernel prewarm failed: {exc!r}", RuntimeWarning)
 
                 # Trigger sampling kernel compilation
                 try:
                     dummy_probs = torch.softmax(torch.randn(1, 100, device=device), dim=-1)
                     _ = flashinfer.sampling.sampling_from_probs(dummy_probs, deterministic=True)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+
+                    warnings.warn(
+                        f"FlashInfer sampling-kernel prewarm failed: {exc!r}", RuntimeWarning
+                    )
 
                 torch.cuda.empty_cache()
+            if lock_f is not None:
+                lock_f.close()
 
     except ImportError:
         pass  # FlashInfer not available
