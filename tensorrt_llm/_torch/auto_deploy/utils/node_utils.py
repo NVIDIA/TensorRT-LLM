@@ -2,6 +2,8 @@
 
 import operator
 from dataclasses import dataclass
+from enum import Enum
+from functools import partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -29,12 +31,23 @@ OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
 
 
+class LayerType(Enum):
+    """Enum for layer type."""
+
+    ATTENTION = "attention"
+    MAMBA = "mamba"
+    MLP = "mlp"
+    MOE = "moe"
+    MLA = "mla"
+    UNKNOWN = "unknown"
+
+
 class LayerSubgraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     opening_nodes: List[Node]
     subgraph_nodes: List[Node]
     terminating_node: Union[Node, None]
-    col_row_shardable: bool
+    layer_type: LayerType
 
 
 @dataclass
@@ -719,8 +732,21 @@ def subgraph(
     return subgraph_nodes
 
 
+def get_weight_shape(
+    node: Node, dim: Optional[int] = None
+) -> Optional[Union[int, Tuple[int, ...]]]:
+    """Get the shape of the weight node."""
+    if not is_any_lin_op(node):
+        return None
+    if dim is None:
+        return extract_weight_node(node).meta["val"].shape
+    return extract_weight_node(node).meta["val"].shape[dim]
+
+
 def get_layer_after_linear_node(
-    linear_nodes: List[Node], terminating_indices: List[int]
+    linear_nodes: List[Node],
+    terminating_indices: List[int],
+    match_on_shapes: bool = True,
 ) -> LayerSubgraph:
     """
     Get the next model layer.
@@ -731,17 +757,55 @@ def get_layer_after_linear_node(
     linear_nodes[start_lin_index] does not have a corresponding single sink linear node, it will
     be classified as "unprocessed", and the next linear node is picked as a candidate to open
     a new layer.
+
+    match_on_shapes explanation: We assume that the opening linear weights have shape [hidden, embedding],
+       where, while hidden may vary from layer to layer (e.g., MLP, MoE, latent projections) may have
+       different hidden sizes, the embedding size is the property of the model across all layers.
+       Similarly, the unique closing linear weight should have shape [embedding, hidden], to map back
+       from the hidden space to the embedding space.
+       If match_on_shapes is True, we require that the opening_layer.shape[-1] == closing_layer.shape[0]
+       If match_on_shapes is False, we only require the topological connectivity and uniqueness of
+       closing_layer being the only sink.
+    Why it matters: For MLA, activation X goes through the latent space projection, following:
+        Q = norm(X @ W_q_a) @ W_q_b   # <- two linear projections
+        KV = norm(X @ W_kv_a) @ W_kv_b  # <- two linear projections
+        Without match_on_shapes, we would treat norm(X @ W_q_a) @ W_q_b as entire MLP layer and apply
+        column-row sharding to it. That would result with Q not being sharded, but replicated (after MLP all-reduce),
+        and the entire attention computation being replicated.
+        With match_on_shapes, the entire MLA will be treated as a single layer, with the o_proj as the
+        unique closing linear node.
+
+    Args:
+        linear_nodes: List of linear nodes in the graph.
+        terminating_indices: List of indices of terminating linear nodes.
+        match_on_shapes: If True, the layer is matched on shapes of the nodes.
+            If False, the layer is matched on the nodes themselves.
+    Returns:
+        LayerSubgraph: The layer subgraph.
     """
 
-    def boundary_condition(node: Node) -> bool:
-        return (
-            is_any_lin_op(node)
-            or is_any_moe_op(node)
-            or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
-        )
+    def boundary_condition(
+        node: Node, embd: Optional[int] = None, dim: Optional[int] = None
+    ) -> bool:
+        if embd is not None and dim is not None:
+            return (
+                # match on embedding size
+                (is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd)
+                or is_any_moe_op(node)
+                or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+            )
+        else:
+            return (
+                is_any_lin_op(node)
+                or is_any_moe_op(node)
+                or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+            )
 
-    def filter_condition(node: Node) -> bool:
-        return is_any_lin_op(node)
+    def filter_condition(node: Node, embd: Optional[int] = None, dim: Optional[int] = None) -> bool:
+        if embd is not None and dim is not None:
+            return is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd
+        else:
+            return is_any_lin_op(node)
 
     lin_nodes_in_subgraph = []
     start_lin_index = terminating_indices[-1] + 1
@@ -752,8 +816,15 @@ def get_layer_after_linear_node(
                 opening_nodes=[],
                 subgraph_nodes=[],
                 terminating_node=None,
-                col_row_shardable=False,
+                layer_type=LayerType.UNKNOWN,
             )
+        if match_on_shapes:
+            # get embedding size of the opening linear node
+            embd = get_weight_shape(linear_nodes[start_lin_index], dim=-1)
+            # partial init boundary_condition and filter_condition
+            boundary_condition = partial(boundary_condition, embd=embd, dim=0)
+            filter_condition = partial(filter_condition, embd=embd, dim=0)
+
         forward_subgraph = subgraph(
             sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
         )
@@ -761,27 +832,42 @@ def get_layer_after_linear_node(
         start_lin_index += 1
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
+
+    # for backward pass, match embedding on the dim=0
+    if match_on_shapes:
+        boundary_condition = partial(boundary_condition, embd=embd, dim=-1)
+        filter_condition = partial(filter_condition, embd=embd, dim=-1)
     backward_subgraph = subgraph(
         sinks=[terminating_linear_node], boundary_condition=boundary_condition
     )
     # get all opening linear nodes
-    opening_linear_nodes = list(filtered_nodes(backward_subgraph, is_any_lin_op))
+    opening_linear_nodes = list(filtered_nodes(backward_subgraph, filter_condition))
     # opening nodes must succeed last terminating node
     last_terminating_index = terminating_indices[-1]
     opening_linear_nodes = [
         n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
     ]
-    # check if the layer is col-row shardable
-    col_row_shardable = True
-    reduction_nodes = [n for n in backward_subgraph if has_shape(n) and shape(n)[-1] == 1]
-    if len(reduction_nodes) > 0:
-        col_row_shardable = False
+
+    ssm_nodes = list(filtered_nodes(backward_subgraph, is_any_ssm_op))
+    attention_nodes = list(filtered_nodes(backward_subgraph, is_any_attention_op))
+    intermediate_lin_nodes = list(
+        filtered_nodes(set(backward_subgraph).difference(opening_linear_nodes), is_any_lin_op)
+    )
+
+    layer_type = LayerType.MLP
+    if len(ssm_nodes) > 0:
+        layer_type = LayerType.SSM
+    if len(attention_nodes) > 0:
+        layer_type = LayerType.ATTENTION
+    if len(intermediate_lin_nodes) > 0:
+        assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
+        layer_type = LayerType.MLA
 
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,
         subgraph_nodes=backward_subgraph,
         terminating_node=terminating_linear_node,
-        col_row_shardable=col_row_shardable,
+        layer_type=layer_type,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
         "Linear node not found in opening linear nodes"
@@ -798,7 +884,6 @@ def get_layer_after_linear_node(
             # there are more opening nodes that we started with, so our
             # terminating node is "linear node reachable" from unexpected
             # paths. Therefore, we cannot safely col-row shard this layer.
-            layer_subgraph.col_row_shardable = False
             terminating_index = linear_nodes.index(terminating_linear_node)
     terminating_indices.append(terminating_index)
     # otherwise, we are done. We processed the last linear node.

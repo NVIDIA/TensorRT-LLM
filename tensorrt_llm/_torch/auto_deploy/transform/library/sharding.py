@@ -35,6 +35,7 @@ from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
+    LayerType,
     bfs,
     extract_param_names_from_node,
     extract_weight_node,
@@ -98,15 +99,6 @@ class DistBackend(Enum):
     AUTO = "auto"
     TRTLLM = "trtllm"
     TORCH = "torch"
-
-
-class LayerType(Enum):
-    """Enum for layer type."""
-
-    ATTENTION = "attention"
-    MAMBA = "mamba"
-    MLP = "mlp"
-    MOE = "moe"
 
 
 class MLPType(Enum):
@@ -2133,9 +2125,6 @@ def _process_ssm_sharding(
 
 def _determine_fused_weight_dims(
     linear_nodes: List[Node],
-    subgraph_nodes: Union[List[Node], None],
-    transform_container: ShardingTransformContainer,
-    min_local_shape: int = 1,
 ) -> None:
     """
     Determine the fused weight dims for the given linear nodes and subgraph nodes.
@@ -2185,13 +2174,13 @@ def _process_column_sharding(
     linear_nodes: List[Node],
     subgraph_nodes: Union[List[Node], None],
     transform_container: ShardingTransformContainer,
-    rank: int,
-    world_size: int,
     min_local_shape: int = 1,
 ) -> None:
     """
     Parse the column sharding from the candidate nodes and update the view and split nodes accordingly.
     """
+    config = transform_container.config
+    world_size = config.world_size
     if subgraph_nodes is None:
         subgraph_nodes = subgraph(linear_nodes, boundary_condition=is_any_lin_op)
     fused_weight_dims = _determine_fused_weight_dims(linear_nodes)
@@ -2541,31 +2530,20 @@ def detect_column_row_shard(
         layer_subgraph = layer.subgraph_nodes
         nodes_linear = opening + [closing]
 
-        ssm_nodes = list(filtered_nodes(layer_subgraph, is_any_ssm_op))
         attention_nodes = list(filtered_nodes(layer_subgraph, is_any_attention_op))
         min_local_shape = 1
-        layer_type = (
-            LayerType.MAMBA
-            if len(ssm_nodes) > 0
-            else LayerType.ATTENTION
-            if len(attention_nodes) > 0
-            else LayerType.MLP
-        )
 
-        if transfrom_container.simple_shard_only or not layer.col_row_shardable:
+        if config.simple_shard_only:
             ad_logger.debug(
-                f"Forcing Simple Shard on nodes: {nodes_linear} with layer type: {layer_type}"
+                f"Forcing Simple Shard on nodes: {nodes_linear} with layer type: {layer.layer_type}"
             )
             num_simple_shards += _process_simple_shard(
-                nodes_linear, transform_container, layer_type=layer_type
+                nodes_linear, transform_container, layer_type=layer.layer_type
             )
             continue
 
-        if len(ssm_nodes) > 0:
+        if layer.layer_type == LayerType.MAMBA:
             # Mamba layers need special handling due to the fused weights for in_proj and conv1d
-            assert len(ssm_nodes) == 1, "Expected exactly one SSM node in layer subgraph"
-            assert len(opening) == 1, "Expected exactly one opening node in Mamba layer"
-            ad_logger.debug(f"Found SSM nodes in layer subgraph: {ssm_nodes}")
             num_ssm_shards += _process_ssm_sharding(
                 gm,
                 opening[0],
@@ -2573,16 +2551,8 @@ def detect_column_row_shard(
             )
             continue
 
-        if len(attention_nodes) > 0:
+        if layer.layer_type == LayerType.ATTENTION:
             ad_logger.debug(f"Found attention nodes in layer subgraph: {attention_nodes}")
-            if len(attention_nodes) > 1:
-                # Column-row shard boundary region detection is probably wrong - there should be
-                # only one attention operation. Fall back to simple shard.
-                ad_logger.debug(f"More than one attention node: {attention_nodes}")
-                num_simple_shards += _process_simple_shard(
-                    nodes_linear, transform_container, layer_type=layer_type
-                )
-                continue
             # Extract head dimension. We cannot shard below the head_dim size.
             # Assume that head_dim is the last (innermost) dimension of the tensor
             min_local_shape = attention_nodes[0].meta["val"].shape[-1]
@@ -2604,7 +2574,7 @@ def detect_column_row_shard(
                         num_simple_shards += _process_simple_shard(
                             nodes_linear,
                             transform_container,
-                            layer_type=layer_type,
+                            layer_type=layer.layer_type,
                         )
                         # TODO: handle the case where num_kv_heads is not divisible by world_size
                         continue
@@ -2625,11 +2595,11 @@ def detect_column_row_shard(
                 config=config,
                 dist_op="all_reduce",
                 min_local_shape=min_local_shape,
-                layer_type=layer_type,
+                layer_type=layer.layer_type,
             )
         ):
             num_column_row_shards += 1
-            if layer_type == LayerType.ATTENTION:
+            if layer.layer_type == LayerType.ATTENTION:
                 num_attention_shards += 1
 
     # simple shard remaining linear nodes
