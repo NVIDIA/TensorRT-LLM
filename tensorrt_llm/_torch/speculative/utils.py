@@ -237,7 +237,7 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    if spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
     return 0
 
