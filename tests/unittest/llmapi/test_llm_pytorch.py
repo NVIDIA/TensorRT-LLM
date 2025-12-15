@@ -573,7 +573,7 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
     skip_fp8_pre_ada(use_fp8=True)
 
     model_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
-    lora_dir = f"/code/tensorrt_llm/llama-3.3-70b-instruct_vhf-squad-lora-031925331-v3"
+    lora_dir = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8-lora-adapter_NIM_r8"
 
     prompt = "What is the capital of the United States?"
     expected_output = " Washington, D.C.\nWhat is the capital of the United States? Washington, D.C."
