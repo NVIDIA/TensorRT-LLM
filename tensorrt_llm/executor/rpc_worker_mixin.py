@@ -50,8 +50,9 @@ class RpcWorkerMixin:
         """Submits a request to the worker."""
         with nvtx_range_debug("RpcWorker.submit", color="blue", category="Worker"):
             logger_debug(f"[worker] Submitting request {request.id}", color="green")
-            super().submit(request)
+            result = super().submit(request)
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
+            return result
 
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         """Fetch responses from the response queue (blocking)."""
