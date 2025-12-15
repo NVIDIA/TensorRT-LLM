@@ -26,7 +26,7 @@ def parse_args():
                        '--dir',
                        type=str,
                        help='Directory containing YAML configuration files')
-    group.add_argument('--log-dir',
+    parser.add_argument('--log-dir',
                        type=str,
                        default=None,
                        help='Log directory')
@@ -154,16 +154,18 @@ def submit_job(config, log_dir):
                               {}).get('num_nextn_predict_layers', 0)
 
     # Calculate nodes based on world sizes
-    ctx_tp_size = config['worker_config']['ctx']['tensor_parallel_size']
-    ctx_cp_size = config['worker_config']['ctx']['context_parallel_size']
-    ctx_pp_size = config['worker_config']['ctx']['pipeline_parallel_size']
+    ctx_tp_size = config['worker_config']['ctx'].get('tensor_parallel_size', 1)
+    ctx_cp_size = config['worker_config']['ctx'].get('context_parallel_size', 1)
+    ctx_pp_size = config['worker_config']['ctx'].get('pipeline_parallel_size', 1)
     ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
-    gen_tp_size = config['worker_config']['gen']['tensor_parallel_size']
-    gen_cp_size = config['worker_config']['gen']['context_parallel_size']
-    gen_pp_size = config['worker_config']['gen']['pipeline_parallel_size']
+
+    gen_tp_size = config['worker_config']['gen'].get('tensor_parallel_size', 1)
+    gen_cp_size = config['worker_config']['gen'].get('context_parallel_size', 1)
+    gen_pp_size = config['worker_config']['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
+
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
@@ -303,6 +305,7 @@ def submit_job(config, log_dir):
         '--benchmark-ratio', str(config['benchmark']['benchmark_ratio']),
         '--streaming', str(config['benchmark']['streaming']).lower(),
         '--use-nv-sa-benchmark', str(config['benchmark']['use_nv_sa_benchmark']).lower(),
+        '--benchmark-mode', config['benchmark']['mode'],
 
         # Environment and paths
         '--dataset-file', config['benchmark']['dataset_file'],
