@@ -25,13 +25,15 @@
 #include <torch/types.h>
 #include <vector>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
-namespace mnnvl_throughput
+namespace moe_comm
 {
 
-// TODO: Is Alignment necessary?obu guo
+// TODO: Is Alignment necessary?
 // Helper function to align offset to specified byte boundary
 inline size_t alignOffset(size_t offset, size_t alignment)
 {
@@ -78,13 +80,13 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens)
     // topk_target_ranks: [maxNumTokens, kMaxTopK]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[TOPK_TARGET_RANKS_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::mnnvl_throughput::kMaxTopK)
+    offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
         * SIZEOF_INT32;
 
     // topk_send_indices: [maxNumTokens, kMaxTopK]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[TOPK_SEND_INDICES_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::mnnvl_throughput::kMaxTopK)
+    offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
         * SIZEOF_INT32;
 
     // payload data
@@ -165,11 +167,11 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
     std::vector<torch::Tensor> const& inputPayloads, torch::Tensor const& workspace, torch::Tensor const& metainfo,
     int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK, int64_t numExperts)
 {
-    using tensorrt_llm::kernels::mnnvl_throughput::PayloadDescriptor;
-    using tensorrt_llm::kernels::mnnvl_throughput::MoeA2ADispatchParams;
-    using tensorrt_llm::kernels::mnnvl_throughput::moe_a2a_dispatch_launch;
-    using tensorrt_llm::kernels::mnnvl_throughput::kMaxTopK;
-    using tensorrt_llm::kernels::mnnvl_throughput::kMaxPayloads;
+    using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
+    using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
+    using tensorrt_llm::kernels::moe_comm::moe_a2a_dispatch_launch;
+    using tensorrt_llm::kernels::moe_comm::kMaxTopK;
+    using tensorrt_llm::kernels::moe_comm::kMaxPayloads;
 
     // Validate inputs
     CHECK_INPUT(tokenSelectedExperts, torch::kInt32);
@@ -237,7 +239,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t> moeA2ADispatchOp(torch::Tensor c
     int64_t sizePerRank = workspace.size(1);
     int64_t requiredSize = offsets[PAYLOAD_DATA_OFFSET_INDEX] + totalBytesNeeded;
     TORCH_CHECK(sizePerRank >= requiredSize,
-        "Workspace size per rank insufficient. "
+        "Workspace size per rank insufficient for dispatch. "
         "Need at least ",
         requiredSize, " bytes (", offsets[PAYLOAD_DATA_OFFSET_INDEX], " for auxiliary data + ", totalBytesNeeded,
         " for payloads), but got ", sizePerRank);
@@ -344,9 +346,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace)
 {
-    using tensorrt_llm::kernels::mnnvl_throughput::MoeA2ACombineParams;
-    using tensorrt_llm::kernels::mnnvl_throughput::moe_a2a_combine_launch;
-    using tensorrt_llm::kernels::mnnvl_throughput::kMaxTopK;
+    using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
+    using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
+    using tensorrt_llm::kernels::moe_comm::kMaxTopK;
 
     // Validate inputs
     CHECK_TH_CUDA(payload);
@@ -404,8 +406,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     int64_t payloadSize = payload.numel() * payload.element_size();
     TORCH_CHECK(combinePayloadOffset >= 0 && combinePayloadOffset + payloadSize <= sizePerRank,
-        "workspace does not contain enough space for the payload region for combine. combine payload offset=",
-        combinePayloadOffset, ", payload size needed=", payloadSize, ", workspace size per rank=", sizePerRank);
+        "Workspace size per rank insufficient for combine. "
+        "Need at least ",
+        combinePayloadOffset + payloadSize, " bytes (", combinePayloadOffset, " for offset + ", payloadSize,
+        " for payload), but got ", sizePerRank);
 
     // Create output tensor (local on current rank), no need for initialization
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
@@ -474,8 +478,8 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
     uint8_t* rankWorkSpacePtr = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     int* recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
 
-    tensorrt_llm::kernels::mnnvl_throughput::moe_a2a_sanitize_expert_ids_launch(expert_ids.data_ptr<int32_t>(),
-        recv_counters, static_cast<int32_t>(invalid_expert_id), ep_size, runtime_max_tokens_per_rank, top_k,
+    tensorrt_llm::kernels::moe_comm::moe_a2a_sanitize_expert_ids_launch(expert_ids.data_ptr<int32_t>(), recv_counters,
+        static_cast<int32_t>(invalid_expert_id), ep_size, runtime_max_tokens_per_rank, top_k,
         at::cuda::getCurrentCUDAStream());
 }
 
@@ -508,9 +512,18 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
     return t;
 }
 
-} // namespace mnnvl_throughput
+// Return the size of auxiliary data in workspace
+int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens)
+{
+    MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens));
+    return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+}
+
+} // namespace moe_comm
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 // PyTorch bindings
 TORCH_LIBRARY_FRAGMENT(trtllm, module)
@@ -536,13 +549,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int "
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
+    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens) -> int",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
 {
-    module.impl("moe_a2a_dispatch", &torch_ext::mnnvl_throughput::moeA2ADispatchOp);
-    module.impl("moe_a2a_combine", &torch_ext::mnnvl_throughput::moeA2ACombineOp);
-    module.impl("moe_a2a_initialize", &torch_ext::mnnvl_throughput::moeA2AInitializeOp);
-    module.impl("moe_a2a_sanitize_expert_ids", &torch_ext::mnnvl_throughput::moeA2ASanitizeExpertIdsOp);
-    module.impl("moe_a2a_get_combine_payload_tensor", &torch_ext::mnnvl_throughput::moeA2AGetCombinePayloadTensorOp);
+    module.impl("moe_a2a_dispatch", &tensorrt_llm::torch_ext::moe_comm::moeA2ADispatchOp);
+    module.impl("moe_a2a_combine", &tensorrt_llm::torch_ext::moe_comm::moeA2ACombineOp);
+    module.impl("moe_a2a_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2AInitializeOp);
+    module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
+    module.impl(
+        "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
 }

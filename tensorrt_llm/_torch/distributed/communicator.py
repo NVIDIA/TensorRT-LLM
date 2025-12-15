@@ -1,8 +1,9 @@
+import copy
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -341,9 +342,24 @@ class MPIDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
+        self.create_cp_comm()
+        # Repurpose CP ranks to TP for Helix so that the right comms are created.
+        mapping_with_cp = None
+        if self.mapping.has_cp_helix():
+            logger.info(
+                f"[MPIDist::__init__] Repurposing CP ranks to TP for Helix.")
+            mapping_with_cp = copy.deepcopy(self.mapping)
+            self.mapping = self.mapping.repurpose_helix_cp_to_tp()
+
         self.create_tp_comm()
         self.create_pp_comm()
-        self.create_cp_comm()
+
+        # Restore the original mapping.
+        if mapping_with_cp is not None:
+            logger.info(
+                f"[MPIDist::__init__] Restoring original mapping undoing Helix manipulation."
+            )
+            self.mapping = mapping_with_cp
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
@@ -405,8 +421,8 @@ class MPIDist(Distributed):
     def pp_allgather(self, obj):
         return self.pp_comm.allgather(obj)
 
-    def pp_gather(self, obj):
-        return self.pp_comm.gather(obj)
+    def pp_gather(self, obj, root=0):
+        return self.pp_comm.gather(obj, root=root)
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
@@ -766,8 +782,7 @@ class TorchDist(Distributed):
             return ret[0]
 
 
-# TODO: rename to PPCommNCCL
-class PPComm:
+class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
@@ -775,11 +790,23 @@ class PPComm:
             self.mapping.world_size,
             self.mapping.rank,
         )
+        self.tensor_ready_event = torch.cuda.Event()
+        self.send_stream = torch.cuda.Stream()
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        self.nccl_comm.send(tensor, dest)
+
+        # NCCL send kernel in send_stream cannot be captured,
+        # so we send in the current stream instead in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            self.nccl_comm.send(tensor, dest)
+            return
+
+        self.tensor_ready_event.record()
+        with torch.cuda.stream(self.send_stream):
+            self.tensor_ready_event.wait()
+            self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
@@ -802,13 +829,18 @@ class PPCommTorch:
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
-        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
+        work = self.pg.send([tensor], self._global_to_local_rank(dest), tag=0)
+        # Send operation cannot be captured without blocking wait,
+        # so we block the current stream in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            work.block_current_stream()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
 
-        self.pg.recv([tensor], self._global_to_local_rank(src), tag=0).wait()
+        work = self.pg.recv([tensor], self._global_to_local_rank(src), tag=0)
+        work.block_current_stream()
 
 
 _pp_comm = None
@@ -820,7 +852,7 @@ def init_pp_comm(mapping):
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
     else:
-        _pp_comm = PPComm(mapping)
+        _pp_comm = PPCommNCCL(mapping)
 
 
 @TorchDist.log_op
@@ -833,3 +865,19 @@ def pp_recv(tensor):
 def pp_send(tensor):
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_recv_tensors", mutates_args=("tensors", ))
+def pp_recv_tensors(tensors: List[torch.Tensor]) -> None:
+    """
+    Receive tensors from previous pp rank.
+    """
+    for tensor in tensors:
+        pp_recv(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_send_tensors", mutates_args=("tensors", ))
+def pp_send_tensors(tensors: List[torch.Tensor]) -> None:
+    """Send tensors to next pp rank."""
+    for tensor in tensors:
+        pp_send(tensor)

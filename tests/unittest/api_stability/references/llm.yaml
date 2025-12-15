@@ -107,8 +107,16 @@ methods:
         annotation: bool
         default: False
         status: beta
+      disable_flashinfer_sampling:
+        annotation: bool
+        default: False
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
+        status: beta
+        default: null
+      nvfp4_gemm_config:
+        annotation: tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig
         status: beta
         default: null
       attn_backend:
@@ -119,6 +127,10 @@ methods:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
         status: beta
+      sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False
@@ -199,9 +211,17 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      ray_placement_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
+        default: null
+        status: prototype
       enable_sleep:
         annotation: bool
         default: False
+        status: prototype
+      env_overrides:
+        annotation: Optional[Dict[str, str]]
+        default: null
         status: prototype
     return_annotation: None
   generate:

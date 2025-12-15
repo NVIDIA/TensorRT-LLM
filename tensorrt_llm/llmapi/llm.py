@@ -8,7 +8,7 @@ import time
 import weakref
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, List, Literal, Optional, Sequence, Union, cast
 
 import transformers
 from tqdm import tqdm
@@ -17,7 +17,8 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
-from tensorrt_llm.inputs.registry import DefaultInputProcessor
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -135,6 +136,9 @@ class BaseLLM:
         logger.set_level("info")  # force display the backend
 
         try:
+            env_overrides = kwargs.get("env_overrides", None)
+            self._process_env_overrides(env_overrides)
+
             backend = kwargs.get('backend', None)
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
@@ -189,7 +193,7 @@ class BaseLLM:
         self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
-            if get_device_count(
+            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
                     f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
@@ -225,7 +229,6 @@ class BaseLLM:
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
-
             self._build_model()
 
         except Exception:
@@ -455,8 +458,10 @@ class BaseLLM:
                         inputs, sampling_params)
             elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
-                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
-                    inputs, mm_embedding_info, sampling_params)
+                prompt_token_ids, extra_processed_inputs = cast(
+                    self.input_processor,
+                    BaseMultimodalInputProcessor).attach_multimodal_embeddings(
+                        inputs, mm_embedding_info, sampling_params)
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -586,6 +591,25 @@ class BaseLLM:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
         '''
         return self._executor.aget_kv_events(timeout=timeout)
+
+    def _process_env_overrides(self,
+                               env_overrides: Optional[dict[str, str]]) -> None:
+        if env_overrides is None:
+            return
+        logger.info("Processing LLM API environment variable overrides")
+        # TODO: If an env var is cached at import-time in code, overriding os.environ will
+        # unfortunately not update wherever the var is used.
+        # This is a known issue and only way to fix it is at every such usage to access it
+        # from os.environ on-demand.
+        for key, value in env_overrides.items():
+            str_value = str(value)
+            if key in os.environ:
+                old_value = os.environ[key]
+                os.environ[key] = str_value
+                logger.info(f"Overriding {key}: '{old_value}' -> '{str_value}'")
+            else:
+                os.environ[key] = str_value
+                logger.info(f"Setting {key}='{str_value}'")
 
     def _prepare_sampling_params(
             self,
@@ -766,6 +790,17 @@ class BaseLLM:
             self.mpi_session.shutdown()
             self.mpi_session = None
 
+    def _check_health(self) -> bool:
+        """Check if the LLM is healthy.
+
+        Returns:
+            bool: True if the executor is running and not shutdown, False otherwise.
+        """
+        if hasattr(self, "_executor") and self._executor is not None:
+            return not self._executor.is_shutdown()
+
+        return False
+
     @staticmethod
     def _shutdown_wrapper(self_ref):
         # Retrieve the instance if it still exists
@@ -776,7 +811,10 @@ class BaseLLM:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+    def __exit__(
+        self, exc_type, exc_value, traceback
+    ) -> Literal[
+            False]:  # https://github.com/microsoft/pyright/issues/7009#issuecomment-1894135045
         del exc_value, traceback
         self.shutdown()
         return False  # propagate exceptions

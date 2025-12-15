@@ -110,10 +110,15 @@ class DemoEngine(ADEngine):
                     extra_args[k].append(v)
 
         sequence_info.reset()
+        page_assignments = self._assign_pages(total_lens)
+        cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
+            page_assignments
+        )
         sequence_info.nest_sequences(
             input_ids=input_ids,
             input_pos=0,
-            page_assignments=self._assign_pages(total_lens),
+            cache_loc=cache_loc,
+            pages_per_seq=pages_per_seq,
             slot_idx=list(range(len(input_ids))),
             **extra_args,
         )
@@ -142,10 +147,15 @@ class DemoEngine(ADEngine):
             seq_lens_current = sequence_info.seq_len
             input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]
             total_lens_next = [ip + len(t_ids) for ip, t_ids in zip(input_pos_next, token_ids)]
+            page_assignments = self._assign_pages(total_lens_next)
+            cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
+                page_assignments
+            )
             sequence_info.nest_sequences(
                 token_ids,
                 input_pos=input_pos_next,
-                page_assignments=self._assign_pages(total_lens_next),
+                cache_loc=cache_loc,
+                pages_per_seq=pages_per_seq,
             )
 
             # nest new tokens and run stop check

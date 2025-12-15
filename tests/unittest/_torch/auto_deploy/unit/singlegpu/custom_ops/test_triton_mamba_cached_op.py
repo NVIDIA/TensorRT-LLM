@@ -121,7 +121,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
     ssm_state_cache_triton = ssm_state_cache_torch.clone()
 
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
-    seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
     use_initial_states = torch.tensor([0] * batch, device=device).to(torch.bool)
     cu_seqlens = torch.cat(
         [
@@ -134,7 +134,8 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         torch.arange(len(lens), device=device, dtype=torch.int32),
         seq_len,
     ).view(1, -1)
-    batch_info_tensor = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32)
+    # batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info_tensor = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
@@ -144,11 +145,15 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         D,
         dt,
         dt_bias,
+        # STANDARD METADATA
+        batch_info_tensor,
         seq_len,
-        seq_start,
+        cu_seqlen,
         slot_idx,
         use_initial_states,
+        # CACHES
         ssm_state_cache_torch,
+        # CONSTANTS
         time_step_limit,
         chunk_size,
     )
@@ -162,16 +167,18 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         D,
         dt,
         dt_bias,
-        seq_len,
-        seq_start,
+        # STANDARD METADATA
+        batch_info_tensor,
+        cu_seqlens,
         slot_idx,
         use_initial_states,
-        cu_seqlens,
+        # EXTRA METADATA
         None,  # chunk indices
         None,  # chunk offsets
         seq_idx_prefill,
-        batch_info_tensor,
+        # CACHES
         ssm_state_cache_triton,
+        # CONSTANTS
         time_step_limit,
         chunk_size,
     )

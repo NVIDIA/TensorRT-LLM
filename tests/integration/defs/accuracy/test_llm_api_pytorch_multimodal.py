@@ -192,3 +192,56 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+
+class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
+    MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct-fuse-vision-lora"
+    MAX_NUM_TOKENS = 25600
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|USER|>"
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=32,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-27b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
+    MAX_NUM_TOKENS = 25600
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
+    )
+
+    # Gemma3 VLM needs KV cache reuse disabled for custom mask support.
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+    )
+
+    def test_auto_dtype(self):
+        # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_seq_len=8704,  # 8192 + 512.
+            kv_cache_config=self.kv_cache_config,
+            attn_backend="FLASHINFER",
+            enable_chunked_prefill=False,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)

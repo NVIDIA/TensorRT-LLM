@@ -78,9 +78,7 @@ using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
-
-// Type alias for multimodal hash key (hash array + start offset)
-using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
+using MmKey = tensorrt_llm::executor::MmKey;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
@@ -324,6 +322,8 @@ public:
     void setHash();
 
     size_t getHash() const;
+
+    std::vector<MmKey> getExtraKeys() const;
 
 private:
     // Linear ID of block independent of pool
@@ -824,6 +824,9 @@ public:
         return mBufferManager;
     }
 
+    //! \brief Sync internal streams used by transfer manager with buffer manager stream
+    void syncTransferManagerWithBufferManager();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1313,6 +1316,9 @@ public:
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Sync internal streams used by transfer manager with buffer manager stream
+    void syncTransferManagerWithBufferManager();
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1584,6 +1590,7 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
+    virtual void syncTransferManagerWithBufferManager() = 0;
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
     virtual void resetReuseState() = 0;
@@ -1963,6 +1970,11 @@ public:
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         return mBlockManager.getPoolLayerIdx(layer_idx);
+    }
+
+    void syncTransferManagerWithBufferManager() override
+    {
+        mBlockManager.syncTransferManagerWithBufferManager();
     }
 
     //! \brief Perform per-iteration bookkeeping

@@ -230,6 +230,7 @@ class LlamaAttention(Attention):
         self,
         model_config: ModelConfig[LlamaConfig],
         layer_idx: Optional[int] = None,
+        use_custom_cublas_mm: bool = False,
     ):
         config = model_config.pretrained_config
         super().__init__(
@@ -245,6 +246,7 @@ class LlamaAttention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
 
@@ -600,7 +602,7 @@ class Llama4DecoderLayer(DecoderLayer):
                         ))
 
                 # Unpack the allreduce output
-                if self.next_attn is not None and self.is_nvfp4:
+                if self.post_feed_forward_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = allreduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
@@ -618,6 +620,7 @@ class LlamaDecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[LlamaConfig],
         layer_idx: int,
+        use_custom_cublas_mm: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
@@ -634,6 +637,7 @@ class LlamaDecoderLayer(DecoderLayer):
         self.self_attn = LlamaAttention(
             model_config,
             layer_idx=layer_idx,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         self.mlp = GatedMLP(
@@ -643,6 +647,7 @@ class LlamaDecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -791,7 +796,7 @@ class LlamaDecoderLayer(DecoderLayer):
                         scale=scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-                if self.next_attn is not None and self.is_nvfp4:
+                if self.post_mlp_fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     act_fp4, act_sf, residual = all_reduce_output
                     hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
                 else:
@@ -889,6 +894,8 @@ class LlamaModel(DecoderModel):
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
 
+        self.use_custom_cublas_mm = get_sm_version() == 121
+
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
         self.has_custom_embed_tokens = False
@@ -909,6 +916,7 @@ class LlamaModel(DecoderModel):
                 vocab_size,
                 config.hidden_size,
                 dtype=config.torch_dtype,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             )
         else:
             self.embed_tokens = Embedding(
@@ -918,6 +926,7 @@ class LlamaModel(DecoderModel):
                 mapping=model_config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             )
 
         if self.has_custom_embed_tokens:
@@ -932,7 +941,8 @@ class LlamaModel(DecoderModel):
                 self.embed_tokens.weight.data.copy_(x)
 
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(model_config, layer_idx)
+            LlamaDecoderLayer(model_config, layer_idx,
+                              self.use_custom_cublas_mm)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -1054,8 +1064,13 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
                  model_path: str,
                  config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True):
-        super().__init__()
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         self._config = config
         self._dtype = self._config.torch_dtype
         self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(

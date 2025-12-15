@@ -42,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     LlmRequest,
     ScheduledRequests,
     SimpleGroupedStrategySampler,
+    StrategyMetadata,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
@@ -49,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+    BeamSearch,
     Greedy,
     Strategy,
     TemperatureOnly,
@@ -81,6 +83,12 @@ class TestStrategySelection:
 
     class MockLlmRequest:
         sampling_config: SamplingConfig
+        is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
+
+        def get_beam_width_by_iter(
+            self, for_next_iteration: bool
+        ) -> int:  # Torch sampler accesses this, but it does not affect this test
+            return self.sampling_config.beam_width
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -97,6 +105,7 @@ class TestStrategySelection:
     def _build_mock_llm_request(self, params: SamplingParams) -> LlmRequest:
         request = self.MockLlmRequest()
         request.sampling_config = SamplingConfig(params._get_sampling_config())
+        request.is_context_init_state = False  # Not used in this test
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -327,6 +336,7 @@ class TestStrategySelection:
                 max_num_sequences=12,
                 max_beam_width=1,
                 max_total_draft_tokens=3,
+                disable_overlap_scheduler=False,
             )
         )
 
@@ -420,8 +430,15 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
     @contextmanager
     def _test_runner(is_warmup: bool) -> Generator[Callable[[], None], None, None]:
+        draft_len_req1 = draft_len
+        draft_len_req2 = draft_len + 1  # test with different draft lens
+
         class ContextRequestMock:
-            def __init__(self, return_context_logits: bool):
+            def __init__(self, is_last_context_chunk: bool, return_context_logits: bool):
+                self.is_context_init_state = True
+                self.is_last_context_chunk = is_last_context_chunk
+                self.py_draft_tokens = torch.tensor([], dtype=torch.int32, device=device)
+                self.sampling_config = SamplingConfig(beam_width=1)
                 self._return_context_logits = return_context_logits
 
             @property
@@ -429,7 +446,10 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 return self._return_context_logits
 
         class GenRequestMock:
-            pass
+            def __init__(self, draft_len: int):
+                self.is_context_init_state = False
+                self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
+                self.sampling_config = SamplingConfig(beam_width=1)
 
         class ScheduledRequestsMock:
             @property
@@ -438,9 +458,24 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                     [
                         # NB: One request with py_return_context_logits is enough
                         #     to trigger tested code.
-                        cast(LlmRequest, ContextRequestMock(True)),
-                        cast(LlmRequest, ContextRequestMock(False)),
-                        cast(LlmRequest, ContextRequestMock(True)),
+                        cast(
+                            LlmRequest,
+                            ContextRequestMock(
+                                is_last_context_chunk=True, return_context_logits=True
+                            ),
+                        ),
+                        cast(
+                            LlmRequest,
+                            ContextRequestMock(
+                                is_last_context_chunk=True, return_context_logits=False
+                            ),
+                        ),
+                        cast(
+                            LlmRequest,
+                            ContextRequestMock(
+                                is_last_context_chunk=True, return_context_logits=True
+                            ),
+                        ),
                     ]
                     if with_ctx
                     else []
@@ -452,14 +487,18 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 #     is not empty.
                 return (
                     [
-                        cast(LlmRequest, GenRequestMock()),
-                        cast(LlmRequest, GenRequestMock()),
+                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req1)),
+                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req2)),
                     ]
                     if with_gen
                     else []
                 )
 
-        vocab_size = 12
+            def all_requests(self) -> list[LlmRequest]:
+                return self.context_requests + self.generation_requests
+
+        expected_num_requests = with_ctx * 3 + with_gen * 2
+        expected_req_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
 
         num_context_logits_prefix_sum = [
             0,
@@ -473,9 +512,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 else []
             ),
         ]
-        draft_len_req1 = draft_len
-        draft_len_req2 = draft_len + 1  # test with different draft lens
-        req_num_generation_steps = [
+        expected_req_num_generation_steps = [
             *(
                 [
                     1,  # context req. 1
@@ -494,11 +531,19 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 else []
             ),
         ]
-        req_num_generation_steps_tensor = torch.tensor(req_num_generation_steps, dtype=torch.int32)
-        num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
+        expected_req_num_generation_steps_tensor = torch.tensor(
+            expected_req_num_generation_steps, dtype=torch.int32
+        )
+
+        expected_req_offsets = torch.cumsum(expected_req_num_generation_steps_tensor, dim=0).roll(1)
+        expected_req_offsets[0] = 0
+
+        # num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
         generation_requests_total_steps = (draft_len_req1 + 1) + (
             draft_len_req2 + 1
         )  # cf. req_num_generation_steps
+
+        vocab_size = 12
 
         num_total_steps = num_context_logits_prefix_sum[-1] + generation_requests_total_steps
         all_logits = torch.empty((num_total_steps, vocab_size))
@@ -527,8 +572,14 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 ),  # gen logits from gen. req. 2
             ]
 
+        expected_logits = all_logits[expected_logit_indices]
+
         @dataclass
         class UutResult:
+            req_num_generated_tokens: torch.Tensor
+            req_num_beams: torch.Tensor
+            req_num_steps: torch.Tensor
+            req_offsets: torch.Tensor
             selected_logits: torch.Tensor
 
         @dataclass
@@ -538,22 +589,36 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         res = UutResultWrapper()
 
         def _uut(res=res):
-            selected_logits = TorchSampler._select_generated_logits(
+            (
+                sampling_requests_metadata,
+                selected_logits,
+            ) = TorchSampler._select_generated_logits(
                 cast(ScheduledRequests, ScheduledRequestsMock()),
                 all_logits_cuda,
-                req_num_generation_steps=req_num_generation_steps_tensor,
                 num_context_logits_prefix_sum=num_context_logits_prefix_sum,
-                generation_requests_total_steps=generation_requests_total_steps,
-                num_logits_to_keep=num_logits_to_keep,
             )
-            res.result = UutResult(selected_logits=selected_logits)
+            res.result = UutResult(
+                req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
+                req_num_beams=sampling_requests_metadata.req_num_beams,
+                req_num_steps=sampling_requests_metadata.req_num_steps,
+                req_offsets=sampling_requests_metadata.req_offsets,
+                selected_logits=selected_logits,
+            )
 
         yield _uut
 
-        # Check logits
+        # Check results
         assert res.result is not None
-        selected_logits = res.result.selected_logits
-        torch.testing.assert_close(selected_logits.to("cpu"), all_logits[expected_logit_indices])
+
+        torch.testing.assert_close(
+            res.result.req_num_generated_tokens.to("cpu"), expected_req_num_generation_steps_tensor
+        )
+        torch.testing.assert_close(res.result.req_num_beams.to("cpu"), expected_req_num_beams)
+        torch.testing.assert_close(
+            res.result.req_num_steps.to("cpu"), expected_req_num_generation_steps_tensor
+        )
+        torch.testing.assert_close(res.result.req_offsets.to("cpu"), expected_req_offsets)
+        torch.testing.assert_close(res.result.selected_logits.to("cpu"), expected_logits)
 
     _run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
@@ -616,6 +681,7 @@ class RequestCase:
             # so we can test that write_finish_reasons uses seq_slots correctly
             max_num_sequences=MAX_NUM_SEQUENCES,
             max_beam_width=1,
+            disable_overlap_scheduler=False,
         )
         sampler = TorchSampler(args=sampler_args)
 
@@ -781,7 +847,9 @@ class TestBatchedSampling:
         }
 
         # Check that all relevant strategies are covered
-        assert Union[*BASE_CASES.keys()] == Strategy
+        # Beam search is tested in test_beam_search.py instead of here.
+        # It's added here to pass the assert statement, without testing it.
+        assert Union[*BASE_CASES.keys(), BeamSearch] == Strategy
 
         test_cases = []
 
@@ -945,15 +1013,11 @@ class TestBatchedSampling:
     def mock_requests(
         self,
         sampling_params_list: list[SamplingParams],
-        with_draft_logits: bool,
-        vocab_size: int,
         seq_slot_assignment: tuple[list[int], int],
         draft_lens: list[int],
     ) -> ScheduledRequests:
         return self._build_mock_requests(
             sampling_params_list=sampling_params_list,
-            with_draft_logits=with_draft_logits,
-            vocab_size=vocab_size,
             seq_slot_assignment=seq_slot_assignment,
             draft_lens=draft_lens,
         )
@@ -962,8 +1026,6 @@ class TestBatchedSampling:
         self,
         sampling_params_list: list[SamplingParams],
         *,
-        with_draft_logits: bool,
-        vocab_size: int,
         seq_slot_assignment: tuple[list[int], int],
         draft_lens: list[int],
     ) -> ScheduledRequests:
@@ -975,21 +1037,9 @@ class TestBatchedSampling:
                 self,
                 sampling_params_list: list[SamplingParams],
                 *,
-                with_draft_logits: bool,
                 draft_lens: list[int],
             ):
                 self._sampling_params_list = sampling_params_list
-                self._with_draft_logits = with_draft_logits
-
-                def _attach_draft_logits(req: LlmRequest) -> LlmRequest:
-                    draft_len = len(req.py_draft_tokens)
-                    if draft_len and with_draft_logits:
-                        req.py_draft_logits = torch.testing.make_tensor(  # type: ignore
-                            (draft_len, vocab_size),
-                            dtype=torch.float32,
-                            device="cuda",
-                        )
-                    return req
 
                 # NB:
                 #   -  stop words are tested in test_write_finish_reasons
@@ -999,24 +1049,22 @@ class TestBatchedSampling:
                 #   -  py_return_log_probs is tested elsewhere
                 #   -  code paths gated by py_return_context_logits tested in test_select_generated_logits
                 self._gen_requests = [
-                    _attach_draft_logits(
-                        LlmRequest(
-                            request_id=seq_slot,
-                            max_new_tokens=(2 * draft_len),  # not used by tested code
-                            input_tokens=[12],  # not used by tested code
-                            sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
-                            seq_slot=seq_slot,
-                            is_streaming=False,  # not relevant for tested code
-                            draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
-                                torch.testing.make_tensor(
-                                    (draft_len,),
-                                    dtype=torch.int32,
-                                    device="cpu",
-                                ).tolist()
-                                if draft_len
-                                else None
-                            ),
-                        )
+                    LlmRequest(
+                        request_id=seq_slot,
+                        max_new_tokens=(2 * draft_len),  # not used by tested code
+                        input_tokens=[12],  # not used by tested code
+                        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                        seq_slot=seq_slot,
+                        is_streaming=False,  # not relevant for tested code
+                        draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
+                            torch.testing.make_tensor(
+                                (draft_len,),
+                                dtype=torch.int32,
+                                device="cpu",
+                            ).tolist()
+                            if draft_len
+                            else None
+                        ),
                     )
                     for sampling_params, seq_slot, draft_len in zip(
                         sampling_params_list, seq_slots, draft_lens
@@ -1040,9 +1088,7 @@ class TestBatchedSampling:
         with torch.inference_mode(True):
             return cast(
                 ScheduledRequests,
-                ScheduledRequestsMock(
-                    sampling_params_list, with_draft_logits=with_draft_logits, draft_lens=draft_lens
-                ),
+                ScheduledRequestsMock(sampling_params_list, draft_lens=draft_lens),
             )
 
     @pytest.fixture(scope="function")
@@ -1099,7 +1145,8 @@ class TestBatchedSampling:
                 max_beam_width=1,  # currently the only supported value
                 max_num_sequences=num_seq_slots,
                 max_total_draft_tokens=max_draft_len,
-                disable_flash_infer_sampling=(not use_flashinfer),
+                disable_flashinfer_sampling=(not use_flashinfer),
+                disable_overlap_scheduler=False,
             )
         )
 
@@ -1184,20 +1231,17 @@ class TestBatchedSampling:
             "max_draft_len",
             "draft_lens",
             "sampling_params_list",
-            "with_draft_logits",
             "params_label",
             "allow_zero_draft_len",
             "vocab_size",
         ),
         [
-            # NB: with_draft_logits=True and non-zero draft len ensures that
-            #     LlmRequest.py_target_probs is set.
+            # NB: non-zero draft len ensures that LlmRequest.py_target_probs is set.
             pytest.param(
                 use_flashinfer,
                 3,
                 [3] * len(sampling_params_list),
                 sampling_params_list,
-                True,
                 params_label,
                 False,
                 vocab_size,
@@ -1225,7 +1269,6 @@ class TestBatchedSampling:
         allow_zero_draft_len: bool,  # used by fixtures
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
-        with_draft_logits: bool,
     ):
         """Validate probabilities returned by sample_async.
 
@@ -1255,9 +1298,7 @@ class TestBatchedSampling:
                 # requests.
                 uut_mock_requests = self._build_mock_requests(
                     sampling_params_list=sampling_params_list,
-                    vocab_size=vocab_size,
                     seq_slot_assignment=seq_slot_assignment,
-                    with_draft_logits=with_draft_logits,
                     draft_lens=draft_lens,
                 )
             else:
@@ -1427,11 +1468,8 @@ class TestBatchedSampling:
         )
         mock_requests_with_probs = self._build_mock_requests(
             sampling_params_list=sampling_params_list,
-            vocab_size=vocab_size,
             seq_slot_assignment=seq_slot_assignment,
-            # NB: with_draft_logits=True and non-zero draft len ensures that
-            #     LlmRequest.py_target_probs is set.
-            with_draft_logits=True,
+            # NB: non-zero draft len ensures that LlmRequest.py_target_probs is set.
             draft_lens=([draft_len_with_probs] * len(sampling_params_list)),
         )
         # zero-pad logits to draft_len_with_probs
@@ -1489,6 +1527,7 @@ class TestBatchedSampling:
                 group_logit_indices: Optional[torch.Tensor] = None,
                 generator: Optional[torch.Generator] = None,
                 return_probs: bool,
+                group_metadata: StrategyMetadata | None = None,
             ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
                 assert issubclass(group_key, sampling_utils_flashinfer._StrategyImpls.StrategyImpl)
                 assert generator is sampler.get_generator(logits.device)
@@ -1526,7 +1565,14 @@ class TestBatchedSampling:
                     num_context_logits_prefix_sum,
                     resource_manager,
                 )
-                assert flashinfer_keys_seen
+
+                # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
+                # will be empty when all requests are greedy
+                all_greedy = all(
+                    _request_strategy(req, vocab_size=2**31) == GREEDY
+                    for req in scheduled_requests.all_requests()
+                )
+                assert flashinfer_keys_seen or all_greedy
                 return res
 
             patch_ctx.setattr(sampler, "sample_async", _sample_async)
@@ -1631,6 +1677,37 @@ class TestBatchedSampling:
             return mock_tokens
 
         patch_ctx.setattr(flashinfer.sampling, "sampling_from_logits", _mock_flashinfer_from_logits)
+
+        def _mock_flashinfer_top_k(
+            probs: torch.Tensor,
+            *,
+            top_k: torch.Tensor,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+        ) -> torch.Tensor:
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=top_k[row_idx],
+                        top_p=None,
+                        temperature=None,
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(flashinfer.sampling, "top_k_sampling_from_probs", _mock_flashinfer_top_k)
 
         def _mock_flashinfer_top_p(
             probs: torch.Tensor,
@@ -1818,6 +1895,12 @@ class TestBatchedSampling:
 
         # Perform G-test (asymptotically approximated by Pearson's chi-square test) to
         # check that sampled tokens are consistent with the expected probs.
+        #
+        # NB: Need to use FP64 to avoid negative test statistic values.
+        test_token_counts_ma = test_token_counts_ma.astype(np.float64)
+        test_expected_counts_ma = test_expected_counts_ma.astype(np.float64)
+        test_expected_counts_ma /= test_expected_counts_ma.sum(axis=-1, keepdims=True)
+        test_expected_counts_ma *= num_samples
         test_result = power_divergence(
             f_obs=test_token_counts_ma,
             f_exp=test_expected_counts_ma,
@@ -1847,7 +1930,6 @@ class TestBatchedSampling:
             "use_flashinfer",
             "max_draft_len",
             "sampling_params_list",
-            "with_draft_logits",
             "allow_zero_draft_len",
             "bypass_sampling",
             "vocab_size",
@@ -1857,7 +1939,6 @@ class TestBatchedSampling:
                 use_flashinfer,
                 max_draft_len,
                 sampling_params_list,
-                with_draft_logits,
                 allow_zero_draft_len,
                 # Run full sampling test only for uniform batches, with/without probs, but skip
                 # sampling statistics when varying draft lens etc. to validate batch handling:
@@ -1868,14 +1949,13 @@ class TestBatchedSampling:
                 id=(
                     f"{'FlashInfer' if use_flashinfer else 'Torch'}"
                     f"-draft_len={0 if allow_zero_draft_len else 1}..{max_draft_len}"
-                    f"-return_probs={with_draft_logits}-{params_label}"
+                    f"-{params_label}"
                 ),
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
             for (
                 use_flashinfer,
                 is_mixed,
-                with_draft_logits,
                 max_draft_len,
                 allow_zero_draft_len,
                 _build_test_cases,
@@ -1883,7 +1963,6 @@ class TestBatchedSampling:
             ) in product(
                 [False, True],
                 [False, True],
-                [True, False],
                 [0, 3],
                 [False, True],
                 [_build_test_cases],
@@ -1895,8 +1974,7 @@ class TestBatchedSampling:
                 include_uniform=(not is_mixed),
                 include_mixed=is_mixed,
             )
-            if (allow_zero_draft_len or max_draft_len > 0)
-            and (not with_draft_logits or max_draft_len > 0)
+            if allow_zero_draft_len or max_draft_len > 0
         ],
     )
     def test_samples(
@@ -1908,7 +1986,6 @@ class TestBatchedSampling:
         vocab_size: int,
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
-        with_draft_logits: bool,
         max_draft_len: int,
         use_flashinfer: bool,
         allow_zero_draft_len: bool,  # used by fixtures
@@ -2038,7 +2115,7 @@ class TestBatchedSampling:
                 probs = probs[: (draft_len + 1)]
 
                 # check probs are returned only when needed
-                should_return_probs = draft_len and with_draft_logits
+                should_return_probs = bool(draft_len)
                 assert (
                     hasattr(req, "py_target_probs") and req.py_target_probs is not None
                 ) == should_return_probs
@@ -2205,7 +2282,7 @@ class TestBatchedSampling:
             first_token = rng.integers(123456)
             batch_next_tokens_cuda_int = torch.arange(
                 first_token, first_token + total_steps, dtype=torch.int32, device="cuda"
-            )
+            ).unsqueeze(1)  # Add a dimension for beam width
 
             batched_sampling_result = _BatchedSamplingResult(
                 batch_req_indices=batch_req_indices.clone(),
@@ -2227,7 +2304,7 @@ class TestBatchedSampling:
                 new_tokens_host = sampler._unbatch_sampling_results(
                     batched_sampling_result=batched_sampling_result,
                     new_tokens_cuda=new_tokens_cuda,
-                    req_num_steps=req_num_steps,
+                    req_num_generated_tokens=req_num_steps,
                     seq_slots=seq_slots_tensor,
                 )
                 res.result = UutResult(new_tokens_host=new_tokens_host)
@@ -2258,8 +2335,8 @@ class TestBatchedSampling:
                 steps = draft_lens[req_idx] + 1
                 seq_slot = seq_slots[req_idx]
                 req_tokens = batch_next_tokens_cuda_int[input_offset : (input_offset + steps)]
-                torch.testing.assert_close(new_tokens_cuda[:steps, seq_slot, 0], req_tokens)
-                torch.testing.assert_close(new_tokens_host[:steps, seq_slot, 0], req_tokens.cpu())
+                torch.testing.assert_close(new_tokens_cuda[:steps, seq_slot], req_tokens)
+                torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens.cpu())
                 input_offset += steps
 
         _run_test_with_warmup(_uut_provider, max_sync_s=0.2)

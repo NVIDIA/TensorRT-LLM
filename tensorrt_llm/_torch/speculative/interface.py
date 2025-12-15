@@ -1,13 +1,36 @@
 import copy
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import List, Optional, Type
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..pyexecutor.resource_manager import BaseResourceManager
+
+# Environment variable name for forcing the number of accepted tokens in speculative decoding
+FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+
+def get_force_num_accepted_tokens() -> int:
+    """
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.
+
+    Returns:
+        int: The forced number of accepted tokens, or 0 if not set or invalid.
+    """
+    env_value = os.environ.get(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR, "0")
+    try:
+        return int(env_value)
+    except ValueError:
+        logger.warning(
+            f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid integer, "
+            f"got '{env_value}'. Using default value 0.")
+        return 0
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -113,29 +136,36 @@ class SpeculativeDecodingMode(IntEnum):
             # 1-model has separate logic for handling draft tokens
             return False
 
-        if issubclass(attention_backend,
-                      TrtllmAttention) and self.is_mtp_eagle():
-            # TRTLLM MLA does not work with the chunked context mode.
-            return False
-
         return not issubclass(attention_backend,
-                              TrtllmAttention) or get_sm_version() != 100
+                              TrtllmAttention) or get_sm_version() < 90
 
     def attention_need_spec_dec_mode(
-        self,
-        spec_resource_manager: BaseResourceManager,
-        is_draft_model: bool,
-        attention_backend: Type[AttentionBackend],
-        use_chain_drafter: bool,
-        is_spec_dec_tree: bool,
+            self,
+            spec_resource_manager: Optional[BaseResourceManager],
+            is_draft_model: bool,
+            attention_backend: Type[AttentionBackend],
+            use_chain_drafter: bool,  # CDL
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
+        Args:
+            spec_resource_manager: the resource manager for the spec-dec mode.
+            is_draft_model: whether the model is a draft model.
+            attention_backend: the attention backend.
+            use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
-        return self.is_eagle3_one_model() or (
-            self.is_eagle3() and spec_resource_manager.is_first_draft
-            and is_trtllm_attention and use_chain_drafter and is_draft_model)
+
+        # Always use the multi-token query mode for 1-model.
+        # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
+        # the target model (verification) or on the first draft for CDL based speculation.
+        use_case_1 = self.is_eagle3_one_model()
+        use_case_2 = (not is_draft_model or
+                      (spec_resource_manager is not None
+                       and spec_resource_manager.is_first_draft
+                       and use_chain_drafter)) and is_trtllm_attention
+
+        return use_case_1 or use_case_2
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
@@ -199,6 +229,13 @@ class SpecMetadata:
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
+    # For non-greedy sampling on 1-model.
+    allow_advanced_sampling: bool = False
+    # Sampling parameters for non-greedy sampling (per-request)
+    temperatures: Optional[torch.Tensor] = None
+    top_ks: Optional[torch.Tensor] = None
+    top_ps: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         pass
 
@@ -234,3 +271,83 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
+
+    def populate_sampling_params_for_one_model(
+            self, requests: list["LlmRequest"]) -> None:
+        """
+        Set up topp/topk/temperatures for 1-model sampler.
+        """
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
+        ):
+            return
+
+        if self.temperatures is None:
+            # Ensures determinism across ranks.
+            torch.manual_seed(0)
+
+        temperatures = []
+        top_ks = []
+        top_ps = []
+
+        # Need to use a very small value for temperature when disabled to avoid division by 0
+        DISABLE_TEMP_VAL = 1e-5
+        # Very large values disable topk.
+        DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
+        DISABLE_TOPP_VAL = 1.0
+
+        for request in requests:
+            sampling_config = request.sampling_config
+            temp = sampling_config.temperature
+            temp_val = temp[0] if temp is not None and len(temp) > 0 else None
+
+            tk = sampling_config.top_k
+            tk_val = tk[0] if tk is not None and len(tk) > 0 else None
+
+            tp = sampling_config.top_p
+            tp_val = tp[0] if tp is not None and len(tp) > 0 else None
+
+            # Context requests have no draft tokens yet.
+            num_tokens = 1 + self.max_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+
+            is_greedy = SamplingParams.params_imply_greedy_decoding(
+                temperature=temp_val,
+                top_k=tk_val,
+                top_p=tp_val,
+                use_beam_search=False)
+
+            temp_val = DISABLE_TEMP_VAL if is_greedy or temp_val is None or temp_val == 0 else temp_val
+            tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val
+            tp_val = DISABLE_TOPP_VAL if is_greedy or tp_val is None else tp_val
+
+            temperatures.extend(temp_val for _ in range(num_tokens))
+            top_ks.extend(tk_val for _ in range(num_tokens))
+            top_ps.extend(tp_val for _ in range(num_tokens))
+
+        if self.temperatures is None:
+            self.temperatures = torch.ones(
+                (self.max_draft_len + 1) * self.max_num_requests,
+                dtype=torch.float32,
+                device='cuda')
+            self.top_ks = torch.zeros(
+                (self.max_draft_len + 1) * self.max_num_requests,
+                dtype=torch.int32,
+                device='cuda')
+            self.top_ps = torch.ones(
+                (self.max_draft_len + 1) * self.max_num_requests,
+                dtype=torch.float32,
+                device='cuda')
+
+        self.temperatures[:len(temperatures)].copy_(torch.tensor(
+            temperatures, dtype=torch.float32, pin_memory=True),
+                                                    non_blocking=True)
+        self.top_ks[:len(top_ks)].copy_(torch.tensor(top_ks,
+                                                     dtype=torch.int32,
+                                                     pin_memory=True),
+                                        non_blocking=True)
+        self.top_ps[:len(top_ps)].copy_(torch.tensor(top_ps,
+                                                     dtype=torch.float32,
+                                                     pin_memory=True),
+                                        non_blocking=True)

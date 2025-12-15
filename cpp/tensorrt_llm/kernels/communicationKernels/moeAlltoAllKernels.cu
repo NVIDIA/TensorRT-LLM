@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/vec_dtypes.cuh"
@@ -23,7 +24,9 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::mnnvl_throughput
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::moe_comm
 {
 
 #define ENABLE_DEBUG_PRINT 0
@@ -45,9 +48,27 @@ namespace tensorrt_llm::kernels::mnnvl_throughput
 #define SWITCH_TOP_K(top_k, TOP_K, ...)                                                                                \
     switch (top_k)                                                                                                     \
     {                                                                                                                  \
+    case 16:                                                                                                           \
+    {                                                                                                                  \
+        constexpr int TOP_K = 16;                                                                                      \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
+    case 10:                                                                                                           \
+    {                                                                                                                  \
+        constexpr int TOP_K = 10;                                                                                      \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     case 8:                                                                                                            \
     {                                                                                                                  \
         constexpr int TOP_K = 8;                                                                                       \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
+    case 6:                                                                                                            \
+    {                                                                                                                  \
+        constexpr int TOP_K = 6;                                                                                       \
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
@@ -605,6 +626,90 @@ __device__ void vectorized_combine_impl(
             // Load directly into the per-k accumulator; reduce across k below
             acc[k].load(recv_buffer + base_token + offset);
         }
+        if constexpr (TOP_K == 16)
+        {
+            T* a0 = reinterpret_cast<T*>(&acc[0]);
+            T* a1 = reinterpret_cast<T*>(&acc[1]);
+            T* a2 = reinterpret_cast<T*>(&acc[2]);
+            T* a3 = reinterpret_cast<T*>(&acc[3]);
+            T* a4 = reinterpret_cast<T*>(&acc[4]);
+            T* a5 = reinterpret_cast<T*>(&acc[5]);
+            T* a6 = reinterpret_cast<T*>(&acc[6]);
+            T* a7 = reinterpret_cast<T*>(&acc[7]);
+            T* a8 = reinterpret_cast<T*>(&acc[8]);
+            T* a9 = reinterpret_cast<T*>(&acc[9]);
+            T* a10 = reinterpret_cast<T*>(&acc[10]);
+            T* a11 = reinterpret_cast<T*>(&acc[11]);
+            T* a12 = reinterpret_cast<T*>(&acc[12]);
+            T* a13 = reinterpret_cast<T*>(&acc[13]);
+            T* a14 = reinterpret_cast<T*>(&acc[14]);
+            T* a15 = reinterpret_cast<T*>(&acc[15]);
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a1[j];
+                a2[j] += a3[j];
+                a4[j] += a5[j];
+                a6[j] += a7[j];
+                a8[j] += a9[j];
+                a10[j] += a11[j];
+                a12[j] += a13[j];
+                a14[j] += a15[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a2[j];
+                a4[j] += a6[j];
+                a8[j] += a10[j];
+                a12[j] += a14[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a4[j];
+                a8[j] += a12[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a8[j];
+            }
+        }
+        else if constexpr (TOP_K == 10)
+        {
+            T* a0 = reinterpret_cast<T*>(&acc[0]);
+            T* a1 = reinterpret_cast<T*>(&acc[1]);
+            T* a2 = reinterpret_cast<T*>(&acc[2]);
+            T* a3 = reinterpret_cast<T*>(&acc[3]);
+            T* a4 = reinterpret_cast<T*>(&acc[4]);
+            T* a5 = reinterpret_cast<T*>(&acc[5]);
+            T* a6 = reinterpret_cast<T*>(&acc[6]);
+            T* a7 = reinterpret_cast<T*>(&acc[7]);
+            T* a8 = reinterpret_cast<T*>(&acc[8]);
+            T* a9 = reinterpret_cast<T*>(&acc[9]);
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a1[j];
+                a2[j] += a3[j];
+                a4[j] += a5[j];
+                a6[j] += a7[j];
+                a8[j] += a9[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a2[j];
+                a4[j] += a6[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a4[j];
+                a0[j] += a8[j];
+            }
+        }
 
         // Reduce acc[TOP_K] into acc[0]
         if constexpr (TOP_K == 8)
@@ -634,6 +739,28 @@ __device__ void vectorized_combine_impl(
 #pragma unroll
             for (int j = 0; j < elems_per_vec; ++j)
             {
+                a0[j] += a4[j];
+            }
+        }
+        else if constexpr (TOP_K == 6)
+        {
+            T* a0 = reinterpret_cast<T*>(&acc[0]);
+            T* a1 = reinterpret_cast<T*>(&acc[1]);
+            T* a2 = reinterpret_cast<T*>(&acc[2]);
+            T* a3 = reinterpret_cast<T*>(&acc[3]);
+            T* a4 = reinterpret_cast<T*>(&acc[4]);
+            T* a5 = reinterpret_cast<T*>(&acc[5]);
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a1[j];
+                a2[j] += a3[j];
+                a4[j] += a5[j];
+            }
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                a0[j] += a2[j];
                 a0[j] += a4[j];
             }
         }
@@ -958,4 +1085,6 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
         expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
 }
 
-} // namespace tensorrt_llm::kernels::mnnvl_throughput
+} // namespace kernels::moe_comm
+
+TRTLLM_NAMESPACE_END

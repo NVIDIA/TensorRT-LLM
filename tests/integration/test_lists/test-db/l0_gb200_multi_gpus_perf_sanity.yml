@@ -1,0 +1,19 @@
+version: 0.0.1
+l0_gb200_multi_gpus_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb200*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_gpus-r1_fp4_v2_dep4_mtp1_1k1k]
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_gpus-r1_fp4_v2_tep4_mtp3_1k1k]
+  - perf/test_perf.py::test_perf[perf_sanity_upload-l0_gb200_multi_gpus-r1_fp4_v2_tp4_mtp3_1k1k]

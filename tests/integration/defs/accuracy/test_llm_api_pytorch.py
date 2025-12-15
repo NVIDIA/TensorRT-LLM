@@ -13,9 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 
 import pytest
 import torch
+from mpi4py.futures import MPIPoolExecutor
+
+
+def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
+    """
+    Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
+
+    Uses MPIPoolExecutor's built-in `env` parameter instead of `initializer` to avoid
+    segfault issues during process cleanup (UCX memory cache conflicts with PyTorch
+    tensor cleanup during Py_FinalizeEx).
+
+    Args:
+        mocker: pytest-mock mocker fixture
+        env_vars: Dictionary of environment variable name -> value to propagate
+    """
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    def patched_start_mpi_pool(self):
+        assert not self.mpi_pool, 'MPI session already started'
+        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
+                                        path=sys.path,
+                                        env=env_vars)
+
+    mocker.patch.object(MpiPoolSession, '_start_mpi_pool',
+                        patched_start_mpi_pool)
+
+
 from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
@@ -23,9 +51,11 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
+                                 DeepSeekSparseAttentionConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+                                 RocketSparseAttentionConfig, SamplingParams,
+                                 TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -122,11 +152,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
                             torch_compile):
-        if torch_compile and pp_size > 1:
-            pytest.skip(
-                "Pipeline parallel with torch.compile is not supported yet.\n"
-                "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
-                "discarded at graph breaks.")
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
@@ -164,7 +189,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=torch_compile,
         )
         if fp8kv:
-            pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="fp8")
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                dtype="fp8",
+                free_gpu_memory_fraction=
+                0.8,  # Prevent cublas/cublasLt handle allocation memory insufficient errors
+            )
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 **pytorch_config) as llm:
@@ -199,7 +228,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=torch_compile,
         )
         if fp8kv:
-            pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="fp8")
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                dtype="fp8",
+                free_gpu_memory_fraction=
+                0.8,  # Prevent cublas/cublasLt handle allocation memory insufficient errors
+            )
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 tensor_parallel_size=tp_size,
@@ -232,10 +265,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3(self, overlap_scheduler, eagle3_one_model):
+    @parametrize_with_ids("sampler_async_worker", [True, False])
+    def test_eagle3(self, overlap_scheduler, eagle3_one_model,
+                    sampler_async_worker):
         pytorch_config = dict(
             max_batch_size=
             1,  # add max_batch_size to avoid error in overlap scheduler
+            sampler_force_async_worker=sampler_async_worker,
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=1,
                                               enable_padding=True),
@@ -255,8 +291,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with LLM(model=target_model_dir,
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
-                 speculative_config=spec_config,
-                 build_config=None) as llm:
+                 speculative_config=spec_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -264,9 +299,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_ngram(self):
+        max_bs = 16
+
         pytorch_config = dict(
             disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[i for i in range(1, max_bs + 1)]),
         )
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
@@ -284,9 +322,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
-                 max_batch_size=16) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+                 max_batch_size=max_bs) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -399,6 +435,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("disable_overlap_scheduler", [False, True])
     @parametrize_with_ids(
         "enable_cuda_graph,enable_padding",
@@ -408,7 +445,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             (True, True),  # CUDA Graph with padding
         ])
     def test_auto_dtype_beam_search(self, enable_cuda_graph, enable_padding,
-                                    disable_overlap_scheduler):
+                                    disable_overlap_scheduler,
+                                    sampler_async_worker):
         max_beam_width = 2
         sampling_params = SamplingParams(n=max_beam_width,
                                          best_of=max_beam_width,
@@ -433,6 +471,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 max_batch_size=max_beam_width,
                 max_seq_len=2048,
                 max_beam_width=max_beam_width,
+                sampler_force_async_worker=sampler_async_worker,
                 disable_overlap_scheduler=disable_overlap_scheduler,
                 cuda_graph_config=cuda_graph_config,
         ) as llm:
@@ -442,6 +481,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="beam_width=2")
 
     @skip_pre_hopper
+    @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("disable_overlap_scheduler", [False, True])
     @parametrize_with_ids(
         "enable_cuda_graph,enable_padding",
@@ -451,7 +491,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             (True, True),  # CUDA Graph with padding
         ])
     def test_fp8_beam_search(self, enable_cuda_graph, enable_padding,
-                             disable_overlap_scheduler):
+                             disable_overlap_scheduler, sampler_async_worker):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
         max_beam_width = 2
         sampling_params = SamplingParams(n=max_beam_width,
@@ -477,6 +517,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_seq_len=2048,
             max_beam_width=max_beam_width,
             disable_overlap_scheduler=disable_overlap_scheduler,
+            sampler_force_async_worker=sampler_async_worker,
             cuda_graph_config=cuda_graph_config,
         )
 
@@ -507,14 +548,17 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("sampler_async_worker", [True, False])
     @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
     @pytest.mark.parametrize("pp_size", [2, 4], ids=["pp2", "pp4"])
-    def test_return_logits_pp(self, pp_size, disable_overlap_scheduler):
+    def test_return_logits_pp(self, pp_size, disable_overlap_scheduler,
+                              sampler_async_worker):
         prompts = ["A B C"]
 
         llm = LLM(model=self.MODEL_PATH,
                   pipeline_parallel_size=pp_size,
-                  disable_overlap_scheduler=disable_overlap_scheduler)
+                  disable_overlap_scheduler=disable_overlap_scheduler,
+                  sampler_force_async_worker=sampler_async_worker)
 
         sampling_params = SamplingParams(max_tokens=8,
                                          return_context_logits=True,
@@ -564,7 +608,6 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(7200)
-@pytest.mark.skip_less_host_memory(1000000)
 @pytest.mark.skip_less_device_memory(80000)
 # 1TB is basic requirement for large model tests. CG4 120G only has 800G host memory, and 480G is shared with GPUs. the test will cause the system crash.
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
@@ -593,7 +636,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         pytorch_config = dict(
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
                  max_batch_size=16,
@@ -653,15 +696,15 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    def test_fp8_tp2pp2(self):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+    def test_fp4_tp2pp2(self):
+        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=2,
                  pipeline_parallel_size=2,
                  max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             sampling_params = SamplingParams(
                 max_tokens=256,
                 temperature=0.0,
@@ -1105,6 +1148,41 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 disable_overlap_scheduler=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip(
+        reason=
+        "Currently failing due to accuracy drop, https://nvbugspro.nvidia.com/bug/5674665"
+    )
+    def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 disable_overlap_scheduler=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def test_auto_dtype_vswa_reuse_partial_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1274,6 +1352,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_bfloat16_2_model_mtp(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       mtp_eagle_one_model=False,
+                                       speculative_model_dir=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
@@ -1289,9 +1386,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler,
                             torch_compile):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
-
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
             pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
@@ -1334,8 +1428,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
+    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                             ids=lambda x: ""
+                             if x == 0 else "enable_configurable_moe")
     def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
-                              overlap_scheduler, torch_compile):
+                              overlap_scheduler, torch_compile,
+                              enable_configurable_moe, mocker):
+        # Patch MpiPoolSession to propagate env vars to MPI worker processes
+        env_value = "1" if enable_configurable_moe == 1 else "0"
+        patch_mpi_pool_session_for_env(mocker,
+                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
+
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -1390,8 +1493,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         overlap_scheduler,
         torch_compile,
     ):
-        if torch_compile and attention_dp:
-            pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = (TorchCompileConfig(
             enable_fullgraph=True,
@@ -1479,6 +1580,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     @skip_ray
+    @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -1494,9 +1596,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
-                                    overlap_scheduler, torch_compile):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
+                                    overlap_scheduler, torch_compile,
+                                    sampler_async_worker):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1509,6 +1610,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(
                 backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
+            sampler_force_async_worker=sampler_async_worker,
         )
 
         if fp8kv:
@@ -1557,8 +1659,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         overlap_scheduler,
         torch_compile,
     ):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = (TorchCompileConfig(
             enable_fullgraph=True,
@@ -1781,11 +1881,28 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
+    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                             ids=lambda x: ""
+                             if x == 0 else "enable_configurable_moe")
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
-                         torch_compile, mtp_nextn, moe_backend):
-        if torch_compile and pp_size > 1:
-            pytest.skip("PP with torch.compile is not supported yet.")
+                         torch_compile, mtp_nextn, moe_backend,
+                         enable_configurable_moe, mocker):
+        # Handle ENABLE_CONFIGURABLE_MOE environment variable
+        if enable_configurable_moe == 1 and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
+            pytest.skip(
+                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
+                f"current backend is {moe_backend}")
+
+        # Patch MpiPoolSession to propagate env vars to MPI worker processes
+        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
+            "TRTLLM", "CUTLASS"
+        ] else "0"
+        patch_mpi_pool_session_for_env(mocker,
+                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
+
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
@@ -2049,6 +2166,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "TRTLLM",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
             pytest.param(8,
                          1,
                          8,
@@ -2124,9 +2253,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         ],
         ids=[
             "latency", "latency_trtllmgen", "latency_adp_lmtp",
-            "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp",
-            "throughput_pp4_mtp"
+            "latency_trtllmgen_adp_lmtp", "latency_adp_lmtp_tp4", "throughput",
+            "throughput_tp8", "throughput_tp4", "throughput_mtp",
+            "throughput_bs8_mtp", "throughput_pp4_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, enable_lm_head_tp_in_adp,
@@ -2158,6 +2287,139 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
+                 speculative_config=mtp_config) as llm:
+
+            assert llm.args.moe_config.backend == moe_backend
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # This covers the case with relatively large seqlen in the generation phase.
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            # Commented out because GPQA takes too long to run
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        [
+            #  Use a larger batch_size to speed up the tests
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "TRTLLM",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         1,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         1,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         True,
+                         True,
+                         8,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+        ],
+        ids=[
+            "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
+            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp"
+        ])
+    def test_nvfp4_multi_gpus_sm120(self, tp_size, pp_size, ep_size, mtp_nextn,
+                                    fp8kv, attention_dp, cuda_graph,
+                                    overlap_scheduler, max_batch_size,
+                                    moe_backend):
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
 
             assert llm.args.moe_config.backend == moe_backend
@@ -2278,8 +2540,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
-    @pytest.mark.skipif(get_sm_version() >= 100,
-                        reason="https://nvbugs/5547584 WNF")
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -2392,31 +2652,32 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
+        ids=[
+            "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
+            "latency_default", "skip_indexer"
+        ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size, moe_backend):
+                            max_batch_size, moe_backend, skip_indexer):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            # TODO: Support block reuse for DeepSeek-V3.2
-            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.6,
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                             tokens_per_block=64)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            # TODO: Support block reuse for DeepSeek-V3.2
-            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                            free_gpu_memory_fraction=0.7,
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                             tokens_per_block=64)
 
         pytorch_config = dict(
@@ -2432,6 +2693,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 )
             kv_cache_config.dtype = "fp8"
 
+        dsa_config = None
+        if skip_indexer:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                skip_indexer_for_short_seqs=True)
+
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -2443,7 +2709,79 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
+                 speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config) as llm:
+
+            # GPQA Diamond takes too long to run, we enable it only for fp8kv.
+            if fp8kv:
+                task = GPQADiamond(self.MODEL_NAME)
+                task.evaluate(llm,
+                              extra_evaluator_kwargs=dict(
+                                  apply_chat_template=True,
+                                  chat_template_kwargs=dict(thinking=True)))
+            else:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device(8)
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,skip_indexer",
+        [
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True),
+        ],
+        ids=[
+            "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
+            "skip_indexer"
+        ])
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
+                              attention_dp, cuda_graph, overlap_scheduler,
+                              max_batch_size, moe_backend, skip_indexer):
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
+        moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        tokens_per_block=64)
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True,
+            max_batch_size=max_batch_size) if cuda_graph else None
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+            moe_config=moe_config,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        dsa_config = None
+        if skip_indexer:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                skip_indexer_for_short_seqs=True)
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
@@ -2464,23 +2802,21 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS"),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS"),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
+            (8, 1, 8, 0, True, True, True, True, 32, "CUTLASS"),
             (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
         ],
-        ids=["baseline", "baseline_mtp1", "baseline_fp8kv", "latency"])
-    def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
-                              attention_dp, cuda_graph, overlap_scheduler,
-                              max_batch_size, moe_backend):
+        ids=["baseline_fp8kv", "latency"])
+    def test_nvfp4_multi_gpus_chunked_prefill(self, tp_size, pp_size, ep_size,
+                                              mtp_nextn, fp8kv, attention_dp,
+                                              cuda_graph, overlap_scheduler,
+                                              max_batch_size, moe_backend):
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
                 "MOE TRTLLM backend does not support SM version 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        free_gpu_memory_fraction=0.7,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         tokens_per_block=64)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
@@ -2504,7 +2840,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
@@ -2558,11 +2896,14 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,mtp_nextn,fp8kv,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
-        [pytest.param(4, 1, 2, True, True, True, True, 16, "CUTLASS")],
-        ids=["throughput"])
-    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, fp8kv,
-                              cuda_graph, overlap_scheduler, chunked_prefill,
+        "tp_size,pp_size,mtp_nextn,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
+        [
+            pytest.param(4, 1, 2, True, True, True, 16, "CUTLASS"),
+            pytest.param(4, 1, 2, True, True, True, 16, "TRTLLM")
+        ],
+        ids=["throughput", "throughput_trtllm"])
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, cuda_graph,
+                              overlap_scheduler, chunked_prefill,
                               max_batch_size, moe_backend):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
@@ -2571,16 +2912,46 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend))
 
-        if fp8kv:
-            kv_cache_config.dtype = "fp8"
-
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        with LLM(f"{llm_models_root()}/GLM-4.6/GLM-4.6-FP4",
+        with LLM(f"{llm_models_root()}/glm-4.6-fp4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=chunked_prefill) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
+        [
+            pytest.param(4, True, True, True, 16, "CUTLASS"),
+            pytest.param(4, True, True, True, 16, "TRTLLM"),
+        ],
+        ids=["2model", "2model_trtllm"])
+    def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
+                               chunked_prefill, max_batch_size, moe_backend):
+        model_path = f"{llm_models_root()}/glm-4.6-fp4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       mtp_eagle_one_model=False,
+                                       speculative_model_dir=model_path)
+
+        with LLM(model_path,
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  speculative_config=mtp_config,
@@ -2986,7 +3357,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       True,
                       True,
                       True,
-                      marks=pytest.mark.skip_less_mpi_world_size(8))],
+                      marks=(pytest.mark.skip_less_mpi_world_size(8),
+                             pytest.mark.timeout(7200)))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                   overlap_scheduler, is_cached):
@@ -3031,8 +3403,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   enable_chunked_prefill=enable_chunked_prefill,
                   max_num_tokens=256 if enable_chunked_prefill else 8192,
-                  speculative_config=spec_config,
-                  build_config=None)
+                  speculative_config=spec_config)
 
         with llm:
             task = GSM8K(self.MODEL_NAME)
@@ -3104,7 +3475,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
@@ -3112,6 +3483,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler, torch_compile):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
+        "Need to check Ada support"
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
@@ -3196,31 +3569,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_eagle3(self):
-        pytorch_config = dict(
-            disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3, 4, 8]),
-        )
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-
-        eagle_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3"
-        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B"
-
-        draft_len = 1
-        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=True)
-
-        llm = LLM(model=target_model_dir,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  speculative_config=spec_config,
-                  max_seq_len=8192)
-
-        with llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON", "TRTLLM"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
@@ -3231,9 +3579,27 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency", "ep2", "ep4"])
     @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
                              ids=["fp8", "mxfp8"])
+    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                             ids=lambda x: ""
+                             if x == 0 else "enable_configurable_moe")
     def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
                         attention_dp, cuda_graph, overlap_scheduler,
-                        activation_dtype):
+                        activation_dtype, enable_configurable_moe, mocker):
+        # Handle ENABLE_CONFIGURABLE_MOE environment variable
+        if enable_configurable_moe == 1 and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
+            pytest.skip(
+                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
+                f"current backend is {moe_backend}")
+
+        # Patch MpiPoolSession to propagate env vars to MPI worker processes
+        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
+            "TRTLLM", "CUTLASS"
+        ] else "0"
+        patch_mpi_pool_session_for_env(mocker,
+                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
+
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("TRITON moe backend is not available.")
@@ -3685,9 +4051,27 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (4, 1, 4, True, True, True),
         ],
         ids=["tp4", "ep4", "dp4"])
+    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                             ids=lambda x: ""
+                             if x == 0 else "enable_configurable_moe")
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      mocker):
+                      enable_configurable_moe, mocker):
+        # Handle ENABLE_CONFIGURABLE_MOE environment variable
+        if enable_configurable_moe == 1 and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
+            pytest.skip(
+                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
+                f"current backend is {moe_backend}")
+
+        # Patch MpiPoolSession to propagate env vars to MPI worker processes
+        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
+            "TRTLLM", "CUTLASS"
+        ] else "0"
+        patch_mpi_pool_session_for_env(mocker,
+                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
+
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -3704,7 +4088,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
@@ -3718,8 +4103,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   max_seq_len=max_seq_len,
                   max_batch_size=720,
                   **pytorch_config,
-                  enable_attention_dp=attention_dp,
-                  moe_config=MoeConfig(backend=moe_backend))
+                  enable_attention_dp=attention_dp)
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
@@ -3947,12 +4331,101 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("overlap_scheduler", [True, False],
+                             ids=["overlap_scheduler", "no_overlap_scheduler"])
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
          pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
         ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3(self, moe_backend, mocker):
+    def test_eagle3_4gpus(self, moe_backend, one_model, overlap_scheduler,
+                          mocker):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+
+        if get_sm_version() == 90:
+            pytest.skip(
+                "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
+            )
+
+        MAX_OUTPUT_LEN = 128179
+        MAX_INPUT_LEN = 32768
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
+        mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+
+        # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig())
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        dtype="auto")
+
+        eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
+        draft_len = 3
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=one_model,
+                                          allow_advanced_sampling=True)
+
+        max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_seq_len=max_seq_len,
+                  speculative_config=spec_config,
+                  **pytorch_config,
+                  enable_attention_dp=False,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+
+            # GSM8K
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+            # GPQA Medium Reasoning
+            task = GPQADiamond(model_name)
+
+            chat_template_kwargs = dict(reasoning_effort="medium")
+            extra_evaluator_kwargs = {
+                **self.extra_evaluator_kwargs, "chat_template_kwargs":
+                chat_template_kwargs
+            }
+
+            sampling_params = SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=MAX_INPUT_LEN)
+
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.timeout(14400)
+    @pytest.mark.parametrize("overlap_scheduler", [True, False],
+                             ids=["overlap_scheduler", "no_overlap_scheduler"])
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    def test_eagle3_2gpus(self, moe_backend, one_model, overlap_scheduler,
+                          mocker):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -3968,20 +4441,22 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
-        pytorch_config = dict(disable_overlap_scheduler=True,
-                              cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8))
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
                                           speculative_model_dir=eagle_model_dir,
-                                          eagle3_one_model=False)
+                                          eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
-                  tensor_parallel_size=4,
+                  tensor_parallel_size=2,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
@@ -4023,8 +4498,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
-    def test_w4_4gpus_online_eplb(self, kv_cache_dtype, mocker):
+    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                             ids=lambda x: ""
+                             if x == 0 else "enable_configurable_moe")
+    def test_w4_4gpus_online_eplb(self, kv_cache_dtype, enable_configurable_moe,
+                                  mocker):
         """Test GPTOSS with online expert parallel load balancer using TRTLLM backend and attention DP."""
+        # Patch MpiPoolSession to propagate env vars to MPI worker processes
+        env_value = "1" if enable_configurable_moe == 1 else "0"
+        patch_mpi_pool_session_for_env(mocker,
+                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
+
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4121,6 +4605,88 @@ class TestQwen3NextThinking(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/Qwen3-Next"
+    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
+
+    # Default setting of `256` is too small
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        [
+            (4, 1, 4, True, True),
+        ],
+        ids=[
+            "tp4ep4_cudagraph_overlap",
+        ],
+    )
+    def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
+                       overlap_scheduler, mocker):
+        model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
+
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                max_num_tokens=16384,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
+                             ids=["cutlass", "trtllm"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, True, True), (4, 1, 1, True, True), (4, 1, 4, True, True),
+         (4, 1, 4, False, False)],
+        ids=["tp1", "tp4ep1", "tp4ep4", "no_cuda_graph_overlap"])
+    def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
+                   overlap_scheduler, mocker):
+        model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=512, enable_padding=True)
+                              if cuda_graph else None)
+        moe_config = MoeConfig(backend=moe_backend)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_num_tokens=16384,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 moe_config=moe_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
@@ -4152,100 +4718,282 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_fp8_8gpus(self):
-        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
-        if not os.path.exists(original_model_dir):
-            pytest.skip(f"Model directory {original_model_dir} does not exist")
+        model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
 
-        temp_dir = None
-        try:
-            # Create modified model directory using LongBenchV2 static method
-            # This is a WAR for the fact that the model config is not modified to support long context.
-            # TODO: remove this once the model config is modified to support long context.
-            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+        # Configure model settings
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=True,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
 
-            # Configure model settings
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                            enable_block_reuse=True,
-                                            enable_partial_reuse=False,
-                                            dtype="fp8")
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
 
-            cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                                max_batch_size=32)
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
 
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+        moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
 
-            moe_config = MoeConfig(backend='DEEPGEMM', max_num_tokens=32000)
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              speculative_config=mtp_config,
+                              moe_config=moe_config,
+                              enable_chunked_prefill=True,
+                              enable_autotuner=True)
 
-            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
-                                  kv_cache_config=kv_cache_config,
-                                  speculative_config=mtp_config,
-                                  moe_config=moe_config,
-                                  enable_chunked_prefill=True,
-                                  enable_autotuner=True)
+        # Create LLM instance and evaluate
+        with LLM(model_dir,
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 max_num_tokens=32000,
+                 max_batch_size=32,
+                 **pytorch_config) as llm:
 
-            # Create LLM instance and evaluate
-            with LLM(temp_dir,
-                     tensor_parallel_size=8,
-                     moe_expert_parallel_size=8,
-                     max_num_tokens=32000,
-                     max_batch_size=32,
-                     **pytorch_config) as llm:
+            task = LongBenchV2(self.MODEL_NAME)
 
-                task = LongBenchV2(self.MODEL_NAME)
+            sampling_params = SamplingParams(
+                max_tokens=32000,
+                truncate_prompt_tokens=128000,
+            )
 
-                sampling_params = SamplingParams(max_tokens=32000)
-
-                task.evaluate(llm, sampling_params=sampling_params)
-
-        finally:
-            # Cleanup temporary files
-            if temp_dir and os.path.exists(temp_dir):
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_nvfp4_4gpus(self):
-        original_model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
-        temp_dir = None
-        try:
-            # Create modified model directory using LongBenchV2 static method
-            temp_dir = LongBenchV2.create_modified_model_dir(original_model_dir)
+        model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
 
-            # Configure model settings (no MOE config for FP4 version)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                            enable_block_reuse=True,
-                                            enable_partial_reuse=False,
-                                            dtype="fp8")
+        # Configure model settings (no MOE config for FP4 version)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=True,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
 
-            cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                                max_batch_size=32)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
 
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3)
 
-            pytorch_config = dict(cuda_graph_config=cuda_graph_config,
-                                  kv_cache_config=kv_cache_config,
-                                  speculative_config=mtp_config,
-                                  enable_chunked_prefill=True,
-                                  enable_autotuner=True)
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              speculative_config=mtp_config,
+                              enable_chunked_prefill=True,
+                              enable_autotuner=True)
 
-            # Create LLM instance and evaluate
-            with LLM(temp_dir,
-                     tensor_parallel_size=4,
-                     moe_expert_parallel_size=4,
-                     max_num_tokens=32000,
-                     max_batch_size=32,
-                     **pytorch_config) as llm:
+        # Create LLM instance and evaluate
+        with LLM(model_dir,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 max_num_tokens=32000,
+                 max_batch_size=32,
+                 **pytorch_config) as llm:
 
-                assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-                task = LongBenchV2(self.MODEL_NAME)
+            task = LongBenchV2(self.MODEL_NAME)
 
-                sampling_params = SamplingParams(max_tokens=32000)
+            sampling_params = SamplingParams(
+                max_tokens=32000,
+                truncate_prompt_tokens=128000,
+            )
 
-                task.evaluate(llm, sampling_params=sampling_params)
+            task.evaluate(llm, sampling_params=sampling_params)
 
-        finally:
-            # Cleanup temporary files
-            if temp_dir and os.path.exists(temp_dir):
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
+
+class TestStarcoder2_3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-3b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-3b/"
+
+    @skip_pre_hopper
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestStarcoder2_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-7b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b/"
+
+    @skip_pre_hopper
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-15b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-15b/"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestLlama3_1_8B_Instruct_RocketKV(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+
+    def test_auto_dtype(self):
+        model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct/"
+        if not os.path.exists(model_dir):
+            pytest.skip(f"Model directory {model_dir} does not exist")
+
+        # Configure model settings
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=64)
+
+        sparse_attention_config = RocketSparseAttentionConfig(
+            kt_cache_dtype="float8_e5m2", )
+
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              kv_cache_config=kv_cache_config,
+                              sparse_attention_config=sparse_attention_config,
+                              enable_chunked_prefill=False)
+
+        MAX_LEN = 128000
+        MAX_NEW_TOKENS = 1024
+
+        with LLM(model_dir,
+                 max_seq_len=MAX_LEN,
+                 max_num_tokens=128000,
+                 max_batch_size=64,
+                 **pytorch_config) as llm:
+            task = LongBenchV2(self.MODEL_NAME)
+
+            sampling_params = SamplingParams(
+                max_tokens=MAX_NEW_TOKENS,
+                temperature=0.8,
+                top_p=0.95,
+            )
+
+            extra_evaluator_kwargs = dict(max_len=MAX_LEN,
+                                          max_output_length=MAX_NEW_TOKENS)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+
+class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistral/Mistral-Large-3-675B"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
+        [
+            (4, 1, 4, False, True, True, "TRTLLM", False),
+        ],
+        ids=[
+            "latency_moe_trtllm",
+        ],
+    )
+    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler, moe_backend, eagle3):
+
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not eagle3)
+        spec_config = None
+        if eagle3:
+            spec_config = EagleDecodingConfig(
+                max_draft_len=2,
+                speculative_model_dir=
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
+                eagle3_one_model=True)
+        with LLM(
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
+                checkpoint_format="mistral",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config,
+                speculative_config=spec_config) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
+        [
+            (8, 1, 8, False, True, True, "DEEPGEMM", False),
+        ],
+        ids=[
+            "latency_moe_deepgemm",
+        ],
+    )
+    def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                 overlap_scheduler, moe_backend, eagle3):
+
+        if moe_backend == "DEEPGEMM" and (get_sm_version() == 120
+                                          or get_sm_version() == 121):
+            pytest.skip(
+                "MOE DEEPGEMM backend does not support SM version 120 or 121")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not eagle3)
+        spec_config = None
+        if eagle3:
+            spec_config = EagleDecodingConfig(
+                max_draft_len=2,
+                speculative_model_dir=
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
+                eagle3_one_model=True)
+        with LLM(
+                f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
+                checkpoint_format="mistral",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config,
+                speculative_config=spec_config) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

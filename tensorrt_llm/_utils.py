@@ -524,13 +524,6 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
-def ray_use_rpc() -> bool:
-    """True if TLLM_RAY_USE_RPC is set to "1", False otherwise.
-    # TODO: deprecate this once Ray is fully moved to use RPC client/server.
-    """
-    return os.environ.get("TLLM_RAY_USE_RPC") == "1"
-
-
 def mpi_rank():
     if mpi_disabled():
         try:
@@ -1124,7 +1117,9 @@ class KVCacheEventSerializer:
             "cache_level":
             data.cache_level,
             "priority":
-            data.priority
+            data.priority,
+            "mm_keys":
+            KVCacheEventSerializer._mm_keys_to_json(data)
         }
 
     @staticmethod
@@ -1160,6 +1155,30 @@ class KVCacheEventSerializer:
             "token_extra_id": data.token_extra_id
         }
 
+    @staticmethod
+    def _mm_key_to_json(data):
+        # MmKey is a pair of (array<uint8_t, 32>, SizeType32)
+        hash_array, start_offset = data
+
+        # Convert array to hex string
+        hash_hex = ''.join(f'{b:02x}' for b in hash_array)
+        return {
+            "type": "mm_key",
+            "hash": hash_hex,
+            "start_offset": start_offset
+        }
+
+    @staticmethod
+    def _mm_keys_to_json(data):
+        # MmKeys is a list of MmKey
+        if hasattr(data, 'mm_keys') and data.mm_keys:
+            return [
+                KVCacheEventSerializer._mm_key_to_json(mm_key)
+                for mm_key in data.mm_keys
+            ]
+        else:
+            return []
+
 
 def set_prometheus_multiproc_dir() -> object:
     # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
@@ -1173,6 +1192,50 @@ def set_prometheus_multiproc_dir() -> object:
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.info(
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+def confidential_compute_enabled() -> bool:
+    """
+    Query NVML for the confidential compute state
+    """
+
+    cc_enabled = False
+
+    try:
+        # Init
+        import pynvml
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
+                pynvml.NVML_SUCCESS):
+            cc_enabled = (cc_settings.ccFeature
+                          == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+                          or cc_settings.multiGpuMode
+                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+                          or cc_settings.multiGpuMode
+                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = (
+                cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED)
+        except Exception as e:
+            logger.error(f"Error querying confidential compute state: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error querying confidential compute state: {str(e)}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 P = ParamSpec("P")

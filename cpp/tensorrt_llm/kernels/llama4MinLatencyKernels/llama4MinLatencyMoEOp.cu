@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4MinLatencyMoEOp.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 #include <cmath>
@@ -33,7 +34,9 @@
 #define ENABLE_PREFETCH 1
 #define ENABLE_PREEXIT 1
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency::llama4_moe
 {
 
 #define TOPK_VEC_SIZE 4
@@ -351,4 +354,6 @@ void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
         exp_idx, output_void, dequant_fc2, stream);
 }
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe
+} // namespace kernels::llama4_min_latency::llama4_moe
+
+TRTLLM_NAMESPACE_END

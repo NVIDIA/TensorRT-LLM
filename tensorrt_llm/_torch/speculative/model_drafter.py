@@ -187,6 +187,9 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
         new_request.py_is_first_draft = True
+        # For tree decoding, we need to store the accepted tokens indices for these requests,
+        # which will be used to update the hidden_states_read_indices.
+        new_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
         return new_request
 
     def _create_draft_request_for_request(
@@ -441,7 +444,18 @@ class ModelDrafter(Drafter):
                     req.py_request_id] = [0] * self.max_total_draft_tokens
             self.draft_tokens_accumulator[req.py_request_id][
                 draft_position - 1] = req.get_last_tokens(0)
-            target_model_req.py_draft_logits = req.py_result.generation_logits  # forwards Nones
+
+            generation_logits = req.py_result.generation_logits  # forwards Nones
+            if generation_logits is not None:
+                # generation_logits returns [beam_width, seq_length, vocab_size]
+                beam_width = generation_logits.size(0)
+                assert beam_width == 1, f"expected beam_width=1, got {beam_width}"
+                generation_logits.squeeze_(0)
+                # Transfer to CUDA if needed (chunked LogitsStorage stores on CPU)
+                if generation_logits.device.type == 'cpu':
+                    generation_logits = generation_logits.to('cuda',
+                                                             non_blocking=True)
+            target_model_req.py_draft_logits = generation_logits
 
             if req.state != LlmRequestState.GENERATION_COMPLETE and draft_position < target_model_req.py_draft_pages_allocated:
                 new_requests.append(req)
@@ -610,11 +624,14 @@ class ModelDrafter(Drafter):
                 continue
             target_model_req.py_draft_tokens = []
             py_draft_logits = []
-            for token_idx in range(self.max_draft_len):
+            for token_idx in range(self.max_total_draft_tokens):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])
-            target_model_req.py_draft_logits = torch.stack(py_draft_logits)
+
+            # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
+            if self.disable_overlap_scheduler:
+                target_model_req.py_draft_logits = torch.stack(py_draft_logits)
 
     def process_dynamic_draft_outputs(
             self,

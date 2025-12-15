@@ -16,6 +16,7 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from transformers.configuration_utils import PretrainedConfig
 from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest,
                         skip_non_hopper_unittest, skip_pre_blackwell,
@@ -139,14 +140,20 @@ def test_fused_moe(moe_backend,
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         fused_moe = create_moe(
-            num_experts=NUM_EXPERTS,
             routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
             reduce_results=True,
-            model_config=ModelConfig(mapping=mapping, moe_backend=moe_backend),
+            model_config=ModelConfig(pretrained_config=pretrained_config,
+                                     mapping=mapping,
+                                     moe_backend=moe_backend),
             bias=bias,
         )
         fused_moe.load_weights([weights])
@@ -210,7 +217,7 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.MNNVL, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
     AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
@@ -302,7 +309,7 @@ def test_fused_moe_alltoall(alltoall_method_type):
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False)
 
-            if alltoall_method_type == AlltoallMethodType.MNNVL and output.ndim == 3:
+            if output.ndim == 3:
                 output = output.sum(dim=1)
             print(f"output: {output.shape}")
             print(f"ref_output: {ref_output.shape}")
@@ -323,18 +330,14 @@ def test_fused_moe_alltoall(alltoall_method_type):
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.MNNVL, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
     AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
-
-    if alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-        pytest.skip("Skipped due to https://nvbugs/5467531")
-
     world_size = 4
     dtype = torch.bfloat16
-    HIDDEN_SIZE = 2560
+    HIDDEN_SIZE = 4096
     INTERMEDIATE_SIZE = 1536
     NUM_EXPERTS = 72
     TOP_K = 6
@@ -350,8 +353,8 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
         x_list = []
         m = MAX_NUM_TOKENS
         while m >= 1:
-            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype, device="cuda")
-            x_list.append(x.cuda(i))
+            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype)
+            x_list.append(x)
             m //= 2
 
         x_abs_max = torch.cat([x.flatten() for x in x_list]).abs().max().float()
@@ -396,40 +399,28 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
                 w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
 
-            w1_input_scale = x_sf_global.cuda(i)
-            w2_input_scale = x_sf_global.cuda(i)
-            w3_input_scale = x_sf_global.cuda(i)
+            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4.cpu()
+            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4.cpu()
+            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4.cpu()
+            weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled
+            weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled
+            weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled
 
-            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4.cuda(i)
-            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4.cuda(i)
-            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4.cuda(i)
-            weights[
-                f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.cuda(i)
-            weights[
-                f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.cuda(i)
-            weights[
-                f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.cuda(i)
-
-            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale.cuda(
-                i)
-            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale.cuda(
-                i)
-            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale.cuda(
-                i)
-            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global.cuda(
-                i)
-            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global.cuda(
-                i)
-            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global.cuda(
-                i)
+            weights[f"{expert_id}.w1.input_scale"] = 1.0 / x_sf_global
+            weights[f"{expert_id}.w2.input_scale"] = 1.0 / x_sf_global
+            weights[f"{expert_id}.w3.input_scale"] = 1.0 / x_sf_global
+            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global.cpu()
+            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global.cpu()
+            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global.cpu()
 
         x_list_world.append(x_list)
         weights_world.append(weights)
+        torch.cuda.synchronize()
 
-    def per_rank_test_fused_moe_alltoall(job_id):
+    def per_rank_test_fused_moe_alltoall(job_id, weights, x_list):
         routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
         mapping = Mapping(world_size=world_size,
-                          rank=mpi_rank(),
+                          rank=job_id,
                           tp_size=world_size,
                           moe_ep_size=world_size,
                           moe_tp_size=1,
@@ -437,8 +428,8 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
         torch.cuda.set_device(mapping.rank)
         torch.manual_seed(mapping.rank)
 
-        x_list = x_list_world[mapping.rank]
-        weights = weights_world[mapping.rank]
+        weights = {k: v.cuda() for k, v in weights.items()}
+        x_list = [x.cuda() for x in x_list]
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
         with mock.patch.object(WideEPMoE,
@@ -489,6 +480,16 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False)
+                # Verify the fake impl is correct.
+                output_fake = alltoall_model.forward_fake(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False)
+                assert output_fake.shape == output.shape
+                assert output_fake.dtype == output.dtype
+                if len(output.shape) == 3:
+                    output = torch.sum(output, dim=1, keepdim=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
@@ -500,8 +501,10 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             m //= 2
 
     with MPIPoolExecutor(max_workers=world_size) as executor:
-        results = executor.map(per_rank_test_fused_moe_alltoall,
-                               range(world_size))
+        results = executor.map(
+            per_rank_test_fused_moe_alltoall,
+            *zip(*[(i, weights_world[i], x_list_world[i])
+                   for i in range(world_size)]))
         for r in results:
             assert r is None
 
@@ -589,14 +592,18 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             weights[f"{expert_id}.w2.input_scale"] = w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
 
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-        fused_moe = create_moe(num_experts=NUM_EXPERTS,
-                               routing_method=routing_method,
-                               hidden_size=HIDDEN_SIZE,
-                               intermediate_size=INTERMEDIATE_SIZE,
-                               dtype=dtype,
+        fused_moe = create_moe(routing_method=routing_method,
                                reduce_results=False,
                                model_config=ModelConfig(
+                                   pretrained_config=pretrained_config,
                                    quant_config=quant_config,
                                    moe_backend=moe_backend),
                                bias=bias)
@@ -684,7 +691,7 @@ def set_tensor_value_4(x, num_row, num_cols):
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize(
     "alltoall_method_type",
-    [AlltoallMethodType.MNNVL, AlltoallMethodType.NotEnabled],
+    [AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.NotEnabled],
     ids=lambda s: s.name)
 def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
     """Test WideEPMoE with FP8 block-wise quantization using DeepGemmFusedMoE as reference."""
@@ -845,12 +852,23 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         [DefaultMoeRoutingMethod],
     ),
 )
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
 def test_fused_moe_fp8_blockwise_deepgemm(dtype,
                                           num_experts,
                                           seq_len,
                                           hidden_size,
                                           RoutingMethodCls,
+                                          enable_configurable_moe,
+                                          mocker,
                                           mapping=None):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
+
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
     INTERMEDIATE_SIZE = 256
@@ -914,14 +932,20 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
-    fused_moe = DeepGemmFusedMoE(
-        num_experts=NUM_EXPERTS,
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+    pretrained_config.torch_dtype = dtype
+
+    fused_moe = create_moe(
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
+                                 mapping=mapping,
+                                 moe_backend="DEEPGEMM"),
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
@@ -1346,13 +1370,38 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "moe_backend",
-    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-def test_fused_moe_nvfp4(dtype, moe_backend):
+@pytest.mark.parametrize("moe_backend", [
+    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
+])
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_nvfp4(dtype, moe_backend, enable_configurable_moe, mocker):
+
+    if enable_configurable_moe == 1 and moe_backend not in [
+            "TRTLLM", "CUTLASS"
+    ]:
+        pytest.skip(
+            "ENABLE_CONFIGURABLE_MOE=1, only TRTLLM and CUTLASS backend are enabled"
+        )
+
+    mocker.patch.dict(
+        os.environ, {
+            "ENABLE_CONFIGURABLE_MOE":
+            "1" if enable_configurable_moe == 1
+            and moe_backend in ["TRTLLM", "CUTLASS"] else "0"
+        })
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+    if moe_backend == "CUTEDSL":
+        if dtype == torch.float16:
+            pytest.skip(
+                "CUTEDSL NVFP4 MoE backend does not support float16 yet")
+        if get_sm_version() not in (100, 103):
+            pytest.skip(
+                "CUTEDSL NVFP4 MoE backend supports SM 100 (B200) and SM 103 (B300) only"
+            )
 
     test_all_kernels = True
     if get_sm_version() == 120:
@@ -1368,7 +1417,7 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
         SEQ_LEN = 4
         HIDDEN_SIZE = 512
         INTERMEDIATE_SIZE = 512
-        NUM_EXPERTS = 4
+        NUM_EXPERTS = 8
         TOP_K = 2
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
@@ -1439,17 +1488,23 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         fused_moe = create_moe(
-            num_experts=NUM_EXPERTS,
             routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
             reduce_results=True,
-            model_config=ModelConfig(quant_config=quant_config,
+            model_config=ModelConfig(pretrained_config=pretrained_config,
+                                     quant_config=quant_config,
                                      moe_backend=moe_backend),
         )
         fused_moe.load_weights([weights])
+        fused_moe.post_load_weights()
         fused_moe.cuda()
 
         # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
@@ -1494,7 +1549,15 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
-def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend, enable_configurable_moe, mocker):
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
+
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1909,7 +1972,16 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 @pytest.mark.parametrize("hidden_unpadded", [64, 192, 256])
 @pytest.mark.parametrize("seq_len", [8, 128])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
+                               enable_configurable_moe, mocker):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     if moe_backend == "CUTLASS" and hidden_unpadded % 128 != 0:
         pytest.skip()
@@ -1927,14 +1999,19 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE_UNPADDED
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE_UNPADDED
+    pretrained_config.torch_dtype = dtype
+
     fused_moe = create_moe(
-        num_experts=NUM_EXPERTS,
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE_UNPADDED,
-        intermediate_size=INTERMEDIATE_SIZE_UNPADDED,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config,
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
                                  moe_backend=moe_backend),
         bias=bias,
     )
@@ -2165,7 +2242,16 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
             marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
     ],
 )
-def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
+@pytest.mark.parametrize("enable_configurable_moe", [0, 1],
+                         ids=lambda x: ""
+                         if x == 0 else "enable_configurable_moe")
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend,
+                           enable_configurable_moe, mocker):
+
+    mocker.patch.dict(os.environ, {
+        "ENABLE_CONFIGURABLE_MOE":
+        "1" if enable_configurable_moe == 1 else "0"
+    })
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -2230,13 +2316,18 @@ def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
             weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
-        fused_moe = create_moe(num_experts=NUM_EXPERTS,
-                               routing_method=routing_method,
-                               hidden_size=HIDDEN_SIZE,
-                               intermediate_size=INTERMEDIATE_SIZE,
-                               dtype=dtype,
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
+        fused_moe = create_moe(routing_method=routing_method,
                                reduce_results=False,
                                model_config=ModelConfig(
+                                   pretrained_config=pretrained_config,
                                    quant_config=quant_config,
                                    moe_backend=moe_backend))
         fused_moe.load_weights([weights])

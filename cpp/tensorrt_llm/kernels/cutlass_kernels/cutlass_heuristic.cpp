@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
@@ -36,8 +37,8 @@
 
 using namespace tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -177,13 +178,13 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
         {
             if (sm == 89 || sm >= 120)
             {
-                return {CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128,
-                    CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                     CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
                     CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                     CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
                     CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
+                    CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
             }
             else
             {
@@ -693,4 +694,5 @@ CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmC
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

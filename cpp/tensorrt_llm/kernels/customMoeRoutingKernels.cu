@@ -15,6 +15,7 @@
  */
 
 #include "moeTopKFuncs.cuh"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
@@ -29,7 +30,9 @@
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 static constexpr int BLOCK_SIZE = 1024;
@@ -120,6 +123,11 @@ __global__ void customMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues
     auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
     BaseType minScore = BaseType{-INFINITY};
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
     for (uint32_t tokenId = warpIdx; tokenId < numTokens; tokenId += warpNum)
     {
         auto scoreOffset = tokenId * numExperts;
@@ -168,6 +176,10 @@ __global__ void customMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues
             }
         }
     } // end for tokenId
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 int nextPowerOfTwo(int num)
@@ -275,4 +287,6 @@ INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

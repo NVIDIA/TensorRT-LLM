@@ -16,14 +16,18 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <array>
 #include <cstdint>
 #include <utility>
 #include <vector>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
-namespace mnnvl_throughput
+namespace moe_comm
 {
 
 // Enum for indexing into moe_a2a_metainfo tensor
@@ -61,5 +65,7 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
     };
 }
 
-} // namespace mnnvl_throughput
+} // namespace moe_comm
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

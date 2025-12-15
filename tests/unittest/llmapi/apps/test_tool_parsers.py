@@ -23,6 +23,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
+from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
@@ -469,6 +470,149 @@ class BaseToolParserTestClass:
         assert len(result.calls) == 0
 
 
+class TestKimiK2ToolParser(BaseToolParserTestClass):
+    """Test suite for KimiK2ToolParser class."""
+
+    def make_parser(self):
+        return KimiK2ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            'Some text <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|><|tool_calls_section_end|>',
+            detect_and_parse_single_tool=(
+                # Input text.
+                ('Normal text'
+                 '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected `normal_text`.
+                "Normal text",
+                # Expected `name`.
+                "get_weather",
+                # Expected `parameters`.
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                # Input text.
+                ('<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"LA"}<|tool_call_end|>\n'
+                 '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"query":"AI"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected names.
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=
+            ('<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>MALFORMED<|tool_call_end|><|tool_calls_section_end|>'
+             ),
+            detect_and_parse_with_parameters_key=(
+                # Input text.
+                ('<|tool_calls_section_begin|><|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"query":"test"}<|tool_call_end|><|tool_calls_section_end|>'
+                 ),
+                # Expected `name`.
+                "search_web",
+                # Expected `parameters`.
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token=
+            "<|tool_calls_section_begin|><|tool_call_be",
+            undefined_tool=
+            '<|tool_calls_section_begin|><|tool_call_begin|>functions.undefined_func:0<|tool_call_argument_begin|>{"arg":"any value"}<|tool_call_end|><|tool_calls_section_end|>',
+        )
+
+    def test_initialization(self, parser):
+        """Test that Qwen3ToolParser initializes correctly."""
+        assert parser.bot_token == "<|tool_calls_section_begin|>"
+        assert parser.eot_token == "<|tool_calls_section_end|>"
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+
+        # Send bot token
+        parser.parse_streaming_increment("<|tool_calls_section_begin|>",
+                                         sample_tools)
+
+        # Send partial tool call with name
+        result = parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{',
+            sample_tools)
+
+        # Should send tool name
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        # Send arguments
+        result = parser.parse_streaming_increment(
+            '"location":"SF"}<|tool_call_end|>', sample_tools)
+
+        # Should stream arguments
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles multiple tool calls."""
+
+        # First tool
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>',
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"NYC"}<|tool_call_end|>',
+            sample_tools)
+
+        # Second tool
+        parser.parse_streaming_increment(
+            '<|tool_call_begin|>functions.search_web:0<|tool_call_argument_begin|>{"arg": "any value"}<|tool_call_end|>',
+            sample_tools)
+
+        result = parser.parse_streaming_increment('<|tool_calls_section_end|>',
+                                                  sample_tools)
+        # Should have started second tool
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[0].tool_index == 1
+
+    def test_structure_info_function(self):
+        """Test structure_info returns correct lambda function."""
+        parser = KimiK2ToolParser()
+        func = parser.structure_info()
+
+        info = func("test_function")
+
+        assert isinstance(info, StructureInfo)
+        assert info.begin == '<|tool_calls_section_begin|><|tool_call_begin|>functions.test_function:0<|tool_call_argument_begin|>'
+        assert info.end == "<|tool_call_end|><|tool_calls_section_end|>"
+        assert info.trigger == "<|tool_calls_section_begin|>"
+
+    def test_structure_info_different_names(self):
+        """Test structure_info works with different function names."""
+        parser = KimiK2ToolParser()
+        func = parser.structure_info()
+
+        info1 = func("get_weather")
+        info2 = func("search_web")
+
+        assert "get_weather" in info1.begin
+        assert "search_web" in info2.begin
+        assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
+
+    def test_kimi_k2_format_compliance(self, sample_tools, parser):
+        """Test that KimiK2ToolParser follows the documented format structure."""
+
+        # Test the exact format from the docstring
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location":"Tokyo"}<|tool_call_end|><|tool_calls_section_end|>'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
 
@@ -780,26 +924,50 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 name="multi_param_func",
                 description="Function with multiple parameters",
                 parameters={
-                    "type": "object",
+                    "type":
+                    "object",
                     "properties": {
                         "param1": {
                             "type": "string"
                         },
                         "param2": {
-                            "type": "string"
+                            "type": "float"
                         },
                         "param3": {
                             "type": "integer"
+                        },
+                        "param4": {
+                            "type": "boolean"
+                        },
+                        "param5": {
+                            "type": "object"
+                        },
+                        "param6": {
+                            "type": "array"
+                        },
+                        "param7": {
+                            "type": "null"
+                        },
+                        "param8": {
+                            "type": "other_type"
                         }
                     },
-                    "required": ["param1", "param2", "param3"]
+                    "required": [
+                        "param1", "param2", "param3", "param4", "param5",
+                        "param6", "param7", "param8"
+                    ]
                 }))
 
         text = ("<tool_call>\n"
                 "<function=multi_param_func>\n"
-                "<parameter=param1>value1</parameter>\n"
-                "<parameter=param2>value2</parameter>\n"
+                "<parameter=param1>42</parameter>\n"
+                "<parameter=param2>41.9</parameter>\n"
                 "<parameter=param3>42</parameter>\n"
+                "<parameter=param4>true</parameter>\n"
+                "<parameter=param5>{\"key\": \"value\"}</parameter>\n"
+                "<parameter=param6>[1, 2, 3]</parameter>\n"
+                "<parameter=param7>null</parameter>\n"
+                "<parameter=param8>{'arg1': 3, 'arg2': [1, 2]}</parameter>\n"
                 "</function>\n"
                 "</tool_call>")
 
@@ -808,9 +976,19 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "multi_param_func"
         assert json.loads(result.calls[0].parameters) == {
-            "param1": "value1",
-            "param2": "value2",
-            "param3": 42
+            "param1": "42",
+            "param2": 41.9,
+            "param3": 42,
+            "param4": True,
+            "param5": {
+                "key": "value"
+            },
+            "param6": [1, 2, 3],
+            "param7": None,
+            "param8": {
+                "arg1": 3,
+                "arg2": [1, 2]
+            }
         }
 
     def test_qwen3_coder_format_compliance(

@@ -44,6 +44,7 @@ def parse_arguments():
         type=str,
         default="tests/unittest/_torch/multi_gpu/test_star_attention_input.jsonl"
     )
+
     # Build config
     parser.add_argument('--algo',
                         type=str,
@@ -53,6 +54,8 @@ def parse_arguments():
                         type=str,
                         default='TRTLLM',
                         choices=['VANILLA', 'TRTLLM'])
+
+    # RocketKV config
     parser.add_argument('--window_size',
                         type=int,
                         default=32,
@@ -65,6 +68,14 @@ def parse_arguments():
                         type=int,
                         default=2048,
                         help="The prompt budget for RocketKV.")
+    parser.add_argument('--topk',
+                        type=int,
+                        default=64,
+                        help='Top-k for RocketKV')
+    parser.add_argument('--kt_cache_dtype',
+                        type=str,
+                        default='float8_e5m2',
+                        choices=['bfloat16', 'float8_e5m2'])
     parser.add_argument('--index_max_chunk_size',
                         type=int,
                         default=32768,
@@ -106,6 +117,7 @@ def parse_arguments():
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
     parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
+    parser.add_argument('--tokens_per_block', type=int, default=32)
     parser.add_argument('--num_samples', type=int, default=10)
 
     # Runtime
@@ -121,6 +133,10 @@ def parse_arguments():
                         nargs='+',
                         type=int,
                         default=None)
+    parser.add_argument('--enable_chunked_prefill',
+                        default=False,
+                        action='store_true',
+                        help='Enable chunked prefill')
     args = parser.parse_args()
     return args
 
@@ -135,6 +151,7 @@ def run_llm(args, sparse_attention_config):
         enable_block_reuse=
         False,  # sparse attention does not support kv cache reuse now
         free_gpu_memory_fraction=args.kv_cache_fraction,
+        tokens_per_block=args.tokens_per_block,
         dtype=args.kv_cache_dtype,
     )
 
@@ -159,6 +176,7 @@ def run_llm(args, sparse_attention_config):
         print_iter_log=args.print_iter_log,
         enable_iter_perf_stats=args.print_iter_log,
         moe_config=MoeConfig(backend=args.moe_backend),
+        enable_chunked_prefill=args.enable_chunked_prefill,
     )
 
     prompts = []
@@ -185,6 +203,8 @@ def run_RocketKV(args):
         window_size=args.window_size,
         kernel_size=args.kernel_size,
         prompt_budget=args.prompt_budget,
+        topk=args.topk,
+        kt_cache_dtype=args.kt_cache_dtype,
     )
     run_llm(args, sparse_attention_config)
 

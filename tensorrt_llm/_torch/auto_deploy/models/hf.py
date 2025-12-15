@@ -110,6 +110,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         "use_cache": False,
     }
 
+    # The below maps from a model's config class definition's name (str) to the alternative `AutoModelForCausalLM`
+    # implementation we would like to use.
+    _custom_model_mapping: Dict[str, Type[AutoModelForCausalLM]] = {}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._quant_config_reader: QuantConfigReader | None = None
@@ -136,13 +140,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def vocab_size_padded(self) -> Optional[int]:
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
-
-    @property
-    def chunk_size(self) -> Optional[int]:
-        """Returns the chunk size for this model."""
-        model_config, _ = self._get_model_config()
-        # chunk_size is an input to a custom op, so it can not be none. We set it to a default value of 128.
-        return getattr(model_config, "chunk_size", 128)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -212,14 +209,28 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Build the model on the desired device."""
         model_config, unused_kwargs = self._get_model_config()
 
+        config_cls_name = type(model_config).__name__
+        custom_model_cls = self._custom_model_mapping.get(config_cls_name, None)
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = self.automodel_cls.from_config(
-                model_config,
-                **{
-                    "trust_remote_code": True,
-                    **unused_kwargs,
-                },
-            )
+            if custom_model_cls is not None:
+                # `_from_config` has some behavior we would like to use where possible. It is
+                # defined in the `PreTrainedModel` mixin.
+                ad_logger.info(f"Using custom model implementation {custom_model_cls}")
+                if not hasattr(custom_model_cls, "_from_config"):
+                    raise ValueError(
+                        f"`{custom_model_cls.__name__}` must have a `_from_config` class method. "
+                        "Consider inheriting from `PreTrainedModel`."
+                    )
+                model = custom_model_cls._from_config(model_config, **unused_kwargs)
+            else:
+                model = self.automodel_cls.from_config(
+                    model_config,
+                    **{
+                        "trust_remote_code": True,
+                        **unused_kwargs,
+                    },
+                )
+
         if device == "meta":
             # post-init --> this must be called explicitly for HF models the way we initialize them
             # since this "gets lost" with the init_empty_weights context manager.
@@ -481,6 +492,27 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
+
+    @classmethod
+    def register_custom_model_cls(
+        cls, config_cls_name: str, custom_model_cls: Type[AutoModelForCausalLM]
+    ) -> None:
+        """Register a custom model implementation.
+
+        This is useful when the default `AutoModelForCausalLM` is not the one we want to use. For
+        example, when the model's code is in a HuggingFace repo that is out of date, or has
+        dependencies that TensorRT-LLM does not have, etc.
+
+        Args:
+            config_cls_name: This should be the model's config class definition's `__name__` attribute.
+            custom_model_cls: The `AutoModelForCausalLM` implementation that should be used for
+                `model_type`.
+        """
+        cls._custom_model_mapping[config_cls_name] = custom_model_cls
+
+    def __init_subclass__(cls, **kwargs):
+        """Hook when child classes are defined."""
+        cls._custom_model_mapping = {}
 
 
 class _StateDictParamNameConverter:

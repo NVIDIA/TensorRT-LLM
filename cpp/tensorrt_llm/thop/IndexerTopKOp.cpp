@@ -31,10 +31,12 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
-void indexer_topk_decode_op(
+void indexer_topk_decode(
     th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices, int64_t next_n, int64_t index_topk)
 {
 
@@ -57,7 +59,6 @@ void indexer_topk_decode_op(
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
 
     TORCH_CHECK(next_n > 0, "next_n must be greater than 0");
-    TORCH_CHECK(index_topk == 2048, "index_topk must be 2048 for now");
 
     int32_t num_rows = static_cast<int32_t>(numRows64);
     int32_t num_columns = static_cast<int32_t>(numColumns64);
@@ -70,12 +71,13 @@ void indexer_topk_decode_op(
     int32_t splitWorkThreshold = 200 * 1000;
     th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
     th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+    constexpr auto multipleBlocksPerRowConfig = 10;
     if (num_columns >= splitWorkThreshold)
     {
-        aux_indices
-            = th::empty({num_rows, 10 * index_topk}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-        aux_logits
-            = th::empty({num_rows, 10 * index_topk}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+        aux_indices = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
+            th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+        aux_logits = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
+            th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
     }
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
     tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
@@ -83,7 +85,7 @@ void indexer_topk_decode_op(
         logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), stream);
 }
 
-void indexer_topk_prefill_op(th::Tensor const& logits, th::Tensor const& row_starts, th::Tensor const& row_ends,
+void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts, th::Tensor const& row_ends,
     th::Tensor const& indices, int64_t index_topk)
 {
     TORCH_CHECK(logits.is_cuda() && row_starts.is_cuda() && row_ends.is_cuda() && indices.is_cuda(),
@@ -94,7 +96,6 @@ void indexer_topk_prefill_op(th::Tensor const& logits, th::Tensor const& row_sta
 
     TORCH_CHECK(indices.dim() == 2, "indices must be a 2D Tensor");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D Tensor");
-    TORCH_CHECK(index_topk == 2048, "index_topk must be 2048 for now");
 
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];
@@ -119,28 +120,31 @@ void indexer_topk_prefill_op(th::Tensor const& logits, th::Tensor const& row_sta
         indices.data_ptr<int32_t>(), num_rows, num_columns, static_cast<int32_t>(logits_stride_0),
         static_cast<int32_t>(logits_stride_1), static_cast<int32_t>(index_topk), stream);
 }
+
 } // end namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "indexer_topk_decode_op(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048) -> "
+        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048) -> "
         "()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("indexer_topk_decode_op", &torch_ext::indexer_topk_decode_op);
+    m.impl("indexer_topk_decode", &tensorrt_llm::torch_ext::indexer_topk_decode);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "indexer_topk_prefill_op(Tensor logits, Tensor row_starts, Tensor row_ends, Tensor indices, int "
+        "indexer_topk_prefill(Tensor logits, Tensor row_starts, Tensor row_ends, Tensor indices, int "
         "index_topk=2048) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("indexer_topk_prefill_op", &torch_ext::indexer_topk_prefill_op);
+    m.impl("indexer_topk_prefill", &tensorrt_llm::torch_ext::indexer_topk_prefill);
 }

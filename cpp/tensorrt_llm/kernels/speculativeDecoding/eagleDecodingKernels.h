@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -23,7 +24,9 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding
 {
 
 //! \brief Sets pointers to logits in logitsPtrs according to the draftDecodingTokens.
@@ -782,4 +785,6 @@ void invokeCopyFinalDraftTokens(runtime::SizeType32 batchSize, runtime::SizeType
     runtime::TokenIdType const* const* thirdTopKOutputIdsPtrs, runtime::TokenIdType* pluginOutputAllLayersDraftTokenIds,
     runtime::TokenIdType* pluginOutputDraftTokenIds, runtime::SizeType32* pluginOutputDraftLens, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+
+TRTLLM_NAMESPACE_END

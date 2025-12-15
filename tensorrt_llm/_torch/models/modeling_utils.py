@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import math
 import os
 import time
@@ -17,7 +18,7 @@ from tensorrt_llm.models.convert_utils import split_matrix_tp
 from ...logger import logger
 from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
-from ..distributed.communicator import pp_recv, pp_send
+from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
@@ -70,6 +71,7 @@ class MetaInitMode(TorchDispatchMode):
     random_init_ops = {
         aten.normal_.default,
         aten.uniform_.default,
+        aten.log.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
 
@@ -171,11 +173,12 @@ def forward_after_recv(forward_fn):
         residual=...,
         **kwargs,
     ):
-        pp_recv(hidden_states)
         if residual is not ...:
             if residual is None:
                 residual = torch.empty_like(hidden_states)
-            pp_recv(residual)
+            pp_recv_tensors([hidden_states, residual])
+        else:
+            pp_recv_tensors([hidden_states])
         return forward_fn(
             position_ids,
             hidden_states,
@@ -208,11 +211,10 @@ def forward_before_send(forward_fn):
         )
         if residual is not ...:
             hidden_states, residual = output
-            pp_send(hidden_states)
-            pp_send(residual)
+            pp_send_tensors([hidden_states, residual])
         else:
             hidden_states = output
-            pp_send(hidden_states)
+            pp_send_tensors([hidden_states])
         return output
 
     forward_before_send_fn.__wrapped_by_forward_before_send__ = True
@@ -380,6 +382,7 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
             )
@@ -557,7 +560,8 @@ class DecoderModelForCausalLM(nn.Module,
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: List[str] = []):
+                     skip_modules: List[str] = [],
+                     allow_partial_loading: bool = False):
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
         # this method will be removed.
@@ -566,13 +570,15 @@ class DecoderModelForCausalLM(nn.Module,
             _load_weights_impl(self,
                                weights,
                                skip_modules,
-                               preload_weight_modules=preload_weight_modules)
+                               preload_weight_modules=preload_weight_modules,
+                               allow_partial_loading=allow_partial_loading)
         else:
             _load_weights_impl_v2(self,
                                   weights,
                                   weight_mapper,
                                   skip_modules,
-                                  preload_weight_modules=preload_weight_modules)
+                                  preload_weight_modules=preload_weight_modules,
+                                  allow_partial_loading=allow_partial_loading)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -817,7 +823,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None,
-                       preload_weight_modules: Optional[List[str]] = None):
+                       preload_weight_modules: Optional[List[str]] = None,
+                       allow_partial_loading: bool = False):
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     # TODO smor- this method is here as a temporary solution to load weights.
@@ -863,6 +870,17 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             names = name.split('.')
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            if names[-1] == "backend" and isinstance(module, MoE):
+                name = '.'.join(names[:-1])
+                names = name.split('.')
+
             # WAR: better solution is that llama has its own load_weights function.
             if names[-1] == 'next_layer_layernorm':
                 return
@@ -871,8 +889,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 for new_name in params_map[names[-1]]:
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
-                    if not fw:
-                        continue
                     if new_name in ['k_proj', 'v_proj']:
                         num_kv_heads_list = [num_kv_heads
                                              ] * len(fw) if isinstance(
@@ -887,21 +903,29 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             if k in ["weight", "bias"] else v
                             for i, (k, v) in enumerate(fw.items())
                         }
-
                     module_weights.append(fw)
-                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
-                if module_weights:
-                    module.load_weights(weights=module_weights)
+                module.load_weights(weights=module_weights,
+                                    allow_partial_loading=allow_partial_loading)
 
             else:
                 module_weights = filter_weights(name, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
+                        args = inspect.getfullargspec(module.load_weights).args
+                        if "allow_partial_loading" not in args:
+                            assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
+                            module.load_weights(weights=[module_weights])
+                        else:
+                            module.load_weights(
+                                weights=[module_weights],
+                                allow_partial_loading=allow_partial_loading)
                     else:
                         for n, p in module.named_parameters(recurse=False):
-                            p.data.copy_(module_weights[n][:])
+                            if not allow_partial_loading:
+                                assert n in module_weights
+                            if n in module_weights:
+                                p.data.copy_(module_weights[n][:])
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
@@ -942,7 +966,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                           weight_mapper: "BaseWeightMapper",
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
-                          preload_weight_modules: Optional[List[str]] = None):
+                          preload_weight_modules: Optional[List[str]] = None,
+                          allow_partial_loading: bool = False):
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)
@@ -956,31 +981,54 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             names = name.split('.')
+
+            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+            # Currently saved MoE weights don't include 'backend' in their names.
+            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+            # and weights loading is done in the backend, so module name includes '.backend'.
+            # We need to use parent module name (without .backend) to match saved weight names.
+            # After MoE refactoring is fully complete, all paths will follow this branch.
+            if names[-1] == "backend" and isinstance(module, MoE):
+                name = '.'.join(names[:-1])
+                names = name.split('.')
+
             module_names_breakdown, module_name = names[:-1], names[-1]
 
             if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
-                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
-                if module_weights:
-                    module.load_weights(weights=module_weights)
+                module.load_weights(weights=module_weights,
+                                    allow_partial_loading=allow_partial_loading)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     if weight_mapper.is_special_instance_module(module):
                         weight_mapper.handle_special_instance_module(
-                            module, module_name, module_weights)
+                            module,
+                            module_name,
+                            module_weights,
+                            allow_partial_loading=allow_partial_loading)
                     elif hasattr(module, 'load_weights'):
-                        if module_weights:
-                            if "linear_attn.conv1d" in name:
-                                module_weights['weight'] = module_weights[
-                                    'weight'].squeeze(dim=1)
+                        if "linear_attn.conv1d" in name:
+                            module_weights['weight'] = module_weights[
+                                'weight'].squeeze(dim=1)
+                        args = inspect.getfullargspec(module.load_weights).args
+                        if "allow_partial_loading" not in args:
+                            assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
                             module.load_weights(weights=[module_weights])
+                        else:
+                            module.load_weights(
+                                weights=[module_weights],
+                                allow_partial_loading=allow_partial_loading)
                     else:
                         for n, p in module.named_parameters(recurse=False):
                             weight_mapper.handle_manual_copy(
-                                module_name, module_weights, n, p)
+                                module_name,
+                                module_weights,
+                                n,
+                                p,
+                                allow_partial_loading=allow_partial_loading)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:

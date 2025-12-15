@@ -16,6 +16,7 @@ from enum import IntEnum
 from typing import List
 
 import torch
+from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import mpi_disabled
@@ -62,8 +63,19 @@ class MappingBase:
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
-        cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
-            "cp_type", CpType.ULYSSES)
+        # Set default cp_type to ULYSSES.
+        cp_type = CpType.ULYSSES
+
+        # Convert cp_type to CpType enum if it is a string.
+        if cp_config is not None:
+            if "cp_type" in cp_config and isinstance(cp_config["cp_type"], str):
+                try:
+                    cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+                except KeyError:
+                    raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                                    f"Must be one of: {', '.join([t.name for t in CpType])}")
+            cp_type = cp_config.get("cp_type", CpType.ULYSSES)
+
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
         if moe_tp_size == -1 and moe_ep_size == -1:
@@ -485,25 +497,45 @@ class Mapping(MappingBase):
                          enable_attention_dp=enable_attention_dp,
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp)
 
+    def repurpose_helix_cp_to_tp(self):
+        # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
+        # for FFN layers.
+        assert self.has_cp_helix()
+        return Mapping(
+            world_size=self.world_size,
+            rank=self.rank,
+            gpus_per_node=self.gpus_per_node,
+            cp_size=1,
+            cp_config={},
+            tp_size=self.tp_size * self.cp_size,
+            pp_size=self.pp_size,
+            pp_partition=self.pp_partition,
+            moe_cluster_size=self.moe_cluster_size,
+            moe_tp_size=self.moe_tp_size,
+            moe_ep_size=self.moe_ep_size,
+            # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
+            enable_attention_dp=self.enable_attention_dp,
+            enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
+
     # DeviceMesh specific methods
     @property
-    def tp_group_pg(self):
+    def tp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("tp_group_pg is not implemented.")
 
     @property
-    def pp_group_pg(self):
+    def pp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("pp_group_pg is not implemented.")
 
     @property
-    def cp_group_pg(self):
+    def cp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("cp_group_pg is not implemented.")
 
     @property
-    def moe_tp_group_pg(self):
+    def moe_tp_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_tp_group_pg is not implemented.")
 
     @property
-    def moe_ep_group_pg(self):
+    def moe_ep_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_ep_group_pg is not implemented.")
 
     def build_mesh(self):

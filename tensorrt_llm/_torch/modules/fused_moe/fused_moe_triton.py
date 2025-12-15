@@ -1389,7 +1389,10 @@ class TritonFusedMoE(MoE):
 
         return final_hidden_states
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        assert not allow_partial_loading, "Partial loading is not supported for TritonFusedMoE now"
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]

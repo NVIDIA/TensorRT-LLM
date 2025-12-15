@@ -7,6 +7,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+from ...flashinfer_utils import get_env_enable_pdl
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args
@@ -156,13 +157,9 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Prepare metadata for flashinfer attention.
 
@@ -173,58 +170,36 @@ def prepare_flashinfer_metadata(
     # reset the planner
     _GlobalFlashInferPlanner.reset()
 
-    # retrieve sanitzed metadata
-    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len)
+    # retrieve host-side metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+    num_tokens = num_prefill_tokens + num_decode
 
-    # prepare flashinfer-style metadata
-    offsets = input_pos[:num_seq].clone()
+    qo_indptr = cu_seqlen[: num_seq + 1]
 
-    qo_indptr = torch.zeros(num_seq + 1, dtype=torch.int, device=seq_len.device)
-    qo_indptr[1:] = torch.cumsum(seq_len, 0)
-
-    paged_kv_indptr = torch.zeros_like(qo_indptr)
-    paged_kv_indptr[1:] = torch.cumsum(pages_per_seq[:num_seq], 0)
-
-    # NOTE: it is okay to clone cache_loc here without truncation. paged_kv_indptr is already
-    # truncated and will point to the correct sub range of cache_loc.
-    paged_kv_indices = cache_loc.clone()
-
-    paged_kv_last_page_len = ((offsets + seq_len - 1) % page_size) + 1
-
+    # NOTE: in theory we could easily precompute batch_indices. And positions is just position_ids
+    # so we could skip that as well. However, we still need a place for resetting the planner and
+    # for now we keep it here since the kernel is fast
     # Compute batch_indices and positions so that they can be reused for kv cache appends
     # for all the layers
     batch_indices, positions = flashinfer.get_batch_indices_positions(
-        qo_indptr,
-        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
-        position_ids.numel(),
+        qo_indptr, seq_len_with_cache[:num_seq], num_tokens
     )
-    # return metadata
-    return (
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
-        batch_indices,
-        positions,
-    )
+    # return extra metadata
+    return batch_indices, positions
 
 
-# TODO: Move the truncation of seq_len out of this custom op
-# As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
+    position_ids: torch.Tensor,
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    seq_len_with_cache: torch.Tensor,
 ):
-    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
+    num_tokens = position_ids.shape[0] * position_ids.shape[1]
     return (
-        qo_indptr,  # qo_indptr
-        torch.empty_like(qo_indptr),  # paged_kv_indptr
-        torch.empty_like(cache_loc),  # paged_kv_indices
-        torch.empty_like(seq_len),  # paged_kv_last_page_len
-        torch.empty_like(seq_len),  # batch_indices
-        torch.empty_like(seq_len),  # positions
+        torch.empty(num_tokens, dtype=torch.int32, device=position_ids.device),  # batch_indices
+        torch.empty(num_tokens, dtype=torch.int32, device=position_ids.device),  # positions
     )
 
 
@@ -234,13 +209,15 @@ def flashinfer_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    # METADATA
-    qo_indptr: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-    batch_indices: torch.Tensor,
-    positions: torch.Tensor,
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
+    # EXTRA METADATA
+    flashinfer_batch_indices: torch.Tensor,
+    flashinfer_positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -256,9 +233,21 @@ def flashinfer_mha_with_cache(
     q_shape_og = q.shape
     b, s = q_shape_og[:2]
 
-    q = q.contiguous().view(b * s, -1, head_dim)
-    k = k.contiguous().view(b * s, -1, head_dim)
-    v = v.contiguous().view(b * s, -1, head_dim)
+    q = q.reshape(b * s, -1, head_dim)
+    k = k.reshape(b * s, -1, head_dim)
+    v = v.reshape(b * s, -1, head_dim)
+
+    # convert to flashinfer-style metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+
+    qo_indptr = cu_seqlen[: num_seq + 1]
+    paged_kv_indptr = cu_num_pages[: num_seq + 1]
+
+    # NOTE: it is okay to have cache_loc here without truncation. paged_kv_indptr will be
+    # truncated and will point to the correct sub range of cache_loc.
+    paged_kv_indices = cache_loc
+    paged_kv_last_page_len = last_page_len[:num_seq]
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -275,17 +264,18 @@ def flashinfer_mha_with_cache(
         sm_scale=scale,
     )
 
-    # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
+    # Assuming k_scale = v_scale = 1.0
     k_scale, v_scale = 1.0, 1.0
+    # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
     if k_cache.dtype == torch.float8_e4m3fn:
-        k = (k / k_scale).to(torch.float8_e4m3fn)
-        v = (v / v_scale).to(torch.float8_e4m3fn)
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
 
     flashinfer.page.append_paged_kv_cache(
         k,
         v,
-        batch_indices,
-        positions,
+        flashinfer_batch_indices,
+        flashinfer_positions,
         (k_cache, v_cache),
         paged_kv_indices,
         paged_kv_indptr,
@@ -300,7 +290,10 @@ def flashinfer_mha_with_cache(
         paged_kv_last_page_len,
         pp,
     )
-    y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+
+    y = wrapper.run(
+        q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale, enable_pdl=get_env_enable_pdl()
+    )
 
     return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
@@ -311,13 +304,15 @@ def flashinfer_mha_with_cache_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    # METADATA
-    qo_indptr: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-    batch_indices: torch.Tensor,
-    positions: torch.Tensor,
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
+    # EXTRA METADATA
+    flashinfer_batch_indices: torch.Tensor,
+    flashinfer_positions: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -359,11 +354,17 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache
+        return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.flashinfer_attention_prepare_metadata, 6
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "cu_seqlen", "cu_num_pages", "cache_loc", "last_page_len"]
+
+    @classmethod
+    def get_prepare_extra_metadata_info(
+        cls, any_source_attn_node: Node
+    ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
+        return (torch.ops.auto_deploy.flashinfer_attention_prepare_metadata.default, 2, [])
 
     @classmethod
     def get_cache_initializers(

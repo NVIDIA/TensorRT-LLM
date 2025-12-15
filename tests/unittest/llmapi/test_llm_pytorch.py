@@ -54,36 +54,42 @@ def test_tinyllama_logits_processor(enable_chunked_prefill):
 
 @skip_ray
 @pytest.mark.parametrize(
-    "return_context_logits, use_overlap, enable_iter_req_stats", [
-        (False, False, False),
-        (False, False, True),
-        (False, True, False),
-        (False, True, True),
+    "return_context_logits, use_overlap, enable_chunked_prefill, enable_iter_req_stats",
+    [
+        (False, False, False, True),
+        (False, False, True, True),
+        (False, True, False, True),
+        (False, True, True, True),
     ])
 def test_llm_get_stats(return_context_logits, use_overlap,
-                       enable_iter_req_stats):
+                       enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_test_harness(tp_size=1,
+                               pp_size=1,
                                return_context_logits=return_context_logits,
                                pytorch_backend=True,
                                use_overlap=use_overlap,
+                               enable_chunked_prefill=enable_chunked_prefill,
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
 @skip_ray
 @pytest.mark.parametrize(
-    "return_context_logits, use_overlap, enable_iter_req_stats", [
-        (False, False, False),
-        (False, False, True),
-        (False, True, False),
-        (False, True, True),
+    "return_context_logits, use_overlap, enable_chunked_prefill, enable_iter_req_stats",
+    [
+        (False, False, False, True),
+        (False, False, True, True),
+        (False, True, False, True),
+        (False, True, True, True),
     ])
 def test_llm_get_stats_async(return_context_logits, use_overlap,
-                             enable_iter_req_stats):
+                             enable_chunked_prefill, enable_iter_req_stats):
     llm_get_stats_async_test_harness(
         tp_size=1,
+        pp_size=1,
         return_context_logits=return_context_logits,
         pytorch_backend=True,
         use_overlap=use_overlap,
+        enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats)
 
 
@@ -360,6 +366,7 @@ def _check_llama_7b_multi_lora_evict_load_new_adapters(
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
     """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
     llm.generate call, that's repeated twice.
@@ -454,6 +461,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             cuda_graph_config=None)
 
 
+@skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_config_overrides_peft_cache_config():
     """Tests that cache size args in lora_config LLM arg override the cache size
@@ -932,7 +940,8 @@ class TestLlmError:
 
 
 @skip_ray
-def test_llm_rpc():
+@pytest.mark.parametrize("num_requests", [1, 5, 10])
+def test_llm_rpc(num_requests: int):
     # TODO: remove the with-statement when shutdown hang issue is fixed
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config,
@@ -986,7 +995,7 @@ def test_llm_context_only_timed_out():
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
-                  backend="DEFAULT", kv_transfer_timeout_ms=1000),
+                  backend="UCX", kv_transfer_timeout_ms=1000),
               **llm_args_extra)
 
     max_tokens = 1
@@ -1043,8 +1052,9 @@ def test_llm_context_only_timed_out():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-def test_llm_context_only_timed_out_kv_cache_exhausted(
-        sender_future_timeout_ms):
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
+                                                       backend):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1064,7 +1074,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=tp_size,
         cache_transceiver_config=CacheTransceiverConfig(
-            backend="DEFAULT",
+            backend=backend,
             kv_transfer_timeout_ms=1000,
             kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
         **llm_args_extra)

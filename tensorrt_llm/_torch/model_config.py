@@ -102,6 +102,11 @@ class ModelConfig(Generic[TConfig]):
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
 
+    # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
+    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
+    nvfp4_gemm_allowed_backends: List[str] = field(
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
+
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.
@@ -164,6 +169,11 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(self.allreduce_strategy, str):
             self.allreduce_strategy = get_all_reduce_strategy(
                 self.allreduce_strategy)
+
+        # Set default moe_max_num_tokens if not specified
+        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        if self.moe_max_num_tokens is None:
+            self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -411,17 +421,21 @@ class ModelConfig(Generic[TConfig]):
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                        skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
+                        skip_indexer_for_short_seqs = False
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
                             index_head_dim=index_head_dim,
                             index_topk=index_topk,
-                            indexer_max_chunk_size=indexer_max_chunk_size)
+                            indexer_max_chunk_size=indexer_max_chunk_size,
+                            skip_indexer_for_short_seqs=
+                            skip_indexer_for_short_seqs)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

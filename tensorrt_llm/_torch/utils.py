@@ -1,10 +1,12 @@
 import contextlib
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
+from torch.nn import functional as F
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.mapping import Mapping
@@ -34,15 +36,23 @@ EventType = Enum(
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
 # cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    SwigluBias = 5
-    Identity = 6
-    Relu2 = 7
-    InvalidType = 8
+    InvalidType = 0
+    Identity = 1
+    Gelu = 2
+    Relu = 3
+    Silu = 4
+    Swiglu = 5
+    Geglu = 6
+    SwigluBias = 7
+    Relu2 = 8
+
+
+# IMPORTANT: when adding a new activation type, please update this function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    return activation_type in [
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+    ]
 
 
 def set_torch_compiling(enable: bool):
@@ -281,6 +291,15 @@ def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16,
+                                                     is_swizzled_layout=False)
+    return scale_shape * 2
+
+
 _enable_piecewise_cuda_graph = True
 
 
@@ -316,10 +335,16 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # We use heuristic to determine the lm_head_tp_size
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
     lm_head_tp_size_raw = 256 // token_count
-    lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
-                                         [1, mapping.gpus_per_node])
-    assert mapping.tp_size % lm_head_tp_size == 0
+    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw,
+                               [1, lm_head_tp_size_upper_bound])))
+    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
     return Mapping(
@@ -363,3 +388,18 @@ def maybe_compile(func=None, **compile_kwargs):
         return wrapper
 
     return decorator(func) if func else decorator
+
+
+def split(x: torch.Tensor,
+          tp_size: int,
+          idx: int,
+          dim: int = 0) -> torch.Tensor:
+    assert x.shape[dim] % tp_size == 0
+    split_size = x.shape[dim] // tp_size
+    if tp_size == 1:
+        return x
+    return torch.split(x, split_size, dim=dim)[idx]
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    return torch.square(F.relu(x))

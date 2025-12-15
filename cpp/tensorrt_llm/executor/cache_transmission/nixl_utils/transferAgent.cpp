@@ -348,11 +348,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     std::string nixlBackend = common::getEnvNixlBackend();
     // List of supported backends - extend this list as new backends are added
-    static const std::set<std::string> kSUPPORTED_BACKENDS = {"UCX"};
+    static const std::set<std::string> kSUPPORTED_BACKENDS = {"UCX", "LIBFABRIC"};
 
     if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
     {
-        TLLM_LOG_ERROR("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
+        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
         nixlBackend = "UCX";
     }
 
@@ -454,21 +454,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
 {
-    if (name == mName)
-    {
-        // FIXME: nixl does not support gen notif to itself ,but support local transfer. we use local transfer to notify
-        // itself
-        MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
-        TransferRequest request{TransferOp::kWRITE, descs, descs, name, syncMessage};
-        auto request_status = submitTransferRequests(request);
-        request_status->wait();
-    }
-    else
-    {
-        auto status = mRawAgent->genNotif(name, syncMessage);
-        TLLM_CHECK_WITH_INFO(
-            status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-    }
+
+    auto status = mRawAgent->genNotif(name, syncMessage);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()

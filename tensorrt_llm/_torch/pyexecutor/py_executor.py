@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -52,8 +52,10 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
-from .sampler import Sampler, SampleState, SampleStateTensors
-from .scheduler import RequestScheduler, ScheduledRequests
+from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
+                      SampleStateTensors)
+from .scheduler import (RequestScheduler, ScheduledRequests,
+                        SerializableSchedulerOutput)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -65,6 +67,8 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
 # Unique tag base to avoid collisions with token/logits comms
 TERMINATION_COMM_TAG_BASE = 20000
+PP_COMM_TAG_SCHEDULE_RESULT = 21000
+PP_COMM_TAG_SAMPLE_STATE_BASE = 21001
 
 
 @functools.cache
@@ -106,6 +110,7 @@ class BatchState:
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
     scheduled_ctx_reqs: list[LlmRequest] = None
+    finished_ctx_reqs: list[LlmRequest] = None
 
 
 class PyExecutor:
@@ -231,7 +236,13 @@ class PyExecutor:
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
+        # schedule handle for PP to propagate the first PP rank's schedule result
+        self.send_schedule_handler = None
+        self.pp_scheduler_max_retry_count = int(
+            os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
 
+        # Set of request IDs that are currently in flight across all micro batches.
+        # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
 
         # During warmup, we don't enable the profiler
@@ -273,7 +284,7 @@ class PyExecutor:
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.num_micro_batches, self.dist)
+                self.dist, self._do_terminate_request)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -359,6 +370,10 @@ class PyExecutor:
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
+            # Start the sampler's async worker, if it is enabled
+            if (isinstance(self.sampler, AsyncWorkerMixin)
+                    and self.sampler.async_worker_enabled()):
+                self.sampler.async_worker_start()
 
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
@@ -451,6 +466,10 @@ class PyExecutor:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
                 del self.virtual_memory_pools[key]
+        # Stop the sampler's async worker, if it was used
+        if (isinstance(self.sampler, AsyncWorkerMixin)
+                and self.sampler.async_worker_enabled()):
+            self.sampler.async_worker_stop()
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -694,7 +713,7 @@ class PyExecutor:
         return req_stats
 
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
-                           scheduled_batch) -> IterationStats:
+                           scheduled_batch, micro_batch_id) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
 
         stats.num_queued_requests = self.executor_request_queue.get_request_queue_size(
@@ -735,7 +754,7 @@ class PyExecutor:
         stats.inflight_batching_stats.num_paused_requests = len(
             scheduled_batch.paused_requests)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
-        stats.inflight_batching_stats.micro_batch_id = 0
+        stats.inflight_batching_stats.micro_batch_id = micro_batch_id
         if stats.specdec_stats is not None:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
@@ -748,9 +767,13 @@ class PyExecutor:
         with self.stats_lock:
             self.stats.append((stats, req_stats))
 
-    def _process_iter_stats(self, finished_requests: list[LlmRequest],
-                            active_requests: List[LlmRequest],
-                            batch_state: BatchState):
+    def _process_iter_stats(
+        self,
+        finished_requests: list[LlmRequest],
+        active_requests: List[LlmRequest],
+        batch_state: BatchState,
+        micro_batch_id: int = 0,
+    ):
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -763,9 +786,10 @@ class PyExecutor:
                 and self.enable_iter_perf_stats) else None
 
         self._append_iter_stats(
-            self._update_iter_stats(
-                batch_state.iter_stats, iter_latency_ms, len(finished_requests),
-                batch_state.sample_state.scheduled_requests), req_stats)
+            self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
+                                    len(finished_requests),
+                                    batch_state.sample_state.scheduled_requests,
+                                    micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
 
@@ -773,13 +797,81 @@ class PyExecutor:
             if h is not None:
                 h.wait()
 
-        if self._disagg_pp_termination_handler is not None:
-            self._disagg_pp_termination_handler.cleanup()
-
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+    def _pp_schedule_and_propagate(self):
+        """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
+
+        # The first PP rank schedules the requests, other ranks receive the schedule result from the previous PP rank.
+        if self.dist.is_first_pp_rank:
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+            )
+            serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
+                scheduled_batch, fitting_disagg_gen_init_requests,
+                num_fitting_reqs)
+        else:
+            with nvtx_range("recv_schedule_from_prev_pp"):
+                serializable_schedule = self.dist.recv_object(
+                    self.dist.prev_pp_rank, PP_COMM_TAG_SCHEDULE_RESULT)
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
+                self.active_requests)
+
+        # Propagate the schedule result to the next PP rank except the last PP rank.
+        if not self.dist.is_last_pp_rank:
+            if self.send_schedule_handler is not None:
+                with nvtx_range("wait_send_schedule_handler"):
+                    self.send_schedule_handler.wait()
+            with nvtx_range("send_schedule_to_next_pp"):
+                self.send_schedule_handler = self.dist.isend_object(
+                    serializable_schedule, self.dist.next_pp_rank,
+                    PP_COMM_TAG_SCHEDULE_RESULT)
+        return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
+
+    def _pp_retry_until_can_schedule(self, scheduled_batch):
+        """
+        If current rank cannot run the scheduled batch, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
+        1. Wait for cache transceiver to finish at least one cache transmission.
+        2. Terminate requests that have finished context cache transmission.
+        3. Check if current rank has enough KV cache resources to run the scheduled batch.
+        """
+        scheduled_batch_requests = scheduled_batch.all_requests()
+        if self.scheduler.can_schedule(scheduled_batch_requests):
+            return
+
+        logger.warning(
+            "Cannot run first PP's schedule result due to limited KV cache resources. This may cause bubbles in the PP pipeline. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value."
+        )
+        if self.kv_cache_transceiver is None:
+            raise RuntimeError(
+                "KV cache transceiver is not enabled, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
+            )
+        if not self.ctx_in_transmission_requests:
+            raise RuntimeError(
+                "No context cache transmission is in progress, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
+            )
+        if self.block_reuse_enabled and self._disagg_pp_termination_handler is not None:
+            raise RuntimeError(
+                "Cannot terminate requests in cache transmission and release their KV cache resources when block reuse is enabled. Please consider increasing the KV cache size."
+            )
+
+        for retry_count in range(self.pp_scheduler_max_retry_count):
+            if self.scheduler.can_schedule(scheduled_batch_requests):
+                break
+            logger.debug(
+                f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.pp_scheduler_max_retry_count})"
+            )
+
+            # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
+            self._check_disagg_ctx_cache_transfer_status(1)
+            self._check_kv_transfer_timeout()
+            self._terminate_disagg_ctx_finished_requests()
+        else:
+            raise RuntimeError(
+                f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
+            )
 
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
@@ -794,6 +886,8 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
@@ -811,11 +905,18 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                 )
+                if not self.dist.is_first_pp_rank:
+                    # Retry until current rank can run first PP's schedule result.
+                    self._pp_retry_until_can_schedule(scheduled_batch)
+                    # Run scheduler locally because scheduler may change llm requests' state.
+                    self.scheduler.schedule_request(self.active_requests,
+                                                    self.inflight_req_ids)
 
+                # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
-                    # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
@@ -828,17 +929,21 @@ class PyExecutor:
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
+                    f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
                     f'{len(scheduled_batch.generation_requests)} generation requests'
                 )
 
                 can_queue = self._can_queue(scheduled_batch)
-
                 if not can_queue:
+                    logger.debug(
+                        f"microbatch {microbatch_id} cannot be queued, skipping"
+                    )
                     self.micro_batches[microbatch_id] = None
                 else:
-                    self._add_inflight_ids(scheduled_batch)
+                    logger.debug(f"microbatch {microbatch_id} can be queued")
+                    finished_ctx_reqs = self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -879,14 +984,22 @@ class PyExecutor:
 
                             batch_outputs = self._forward_step(scheduled_batch)
 
+                            guided_decoder_failed_requests = None
                             if self.guided_decoder is not None:
                                 self.guided_decoder.add_batch(scheduled_batch)
-                                self.guided_decoder.execute(
+                                guided_decoder_failed_requests = self.guided_decoder.execute(
                                     batch_outputs['logits'])
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
                             assert sample_state is not None, "Sampling failed"
+
+                            # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                            # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                            # causing _sample_async to fail when accessing context_chunk_size property.
+                            self._handle_guided_decoder_errors(
+                                scheduled_batch, guided_decoder_failed_requests)
+
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -898,6 +1011,7 @@ class PyExecutor:
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
                         scheduled_ctx_reqs=scheduled_batch.context_requests,
+                        finished_ctx_reqs=finished_ctx_reqs,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -917,20 +1031,18 @@ class PyExecutor:
                 prev_microbatch_id = (microbatch_id +
                                       offset) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
+                tag = PP_COMM_TAG_SAMPLE_STATE_BASE + prev_microbatch_id
                 if previous_batch is not None:
                     sample_state = previous_batch.sample_state
                     if not self.dist.is_last_pp_rank:
                         recv_object_funct = self.dist.recv_object_from_isend if self._disable_mpi \
                             else self.dist.recv_object
-                        torch.cuda.nvtx.range_push(
-                            "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        sample_state.host = recv_object_funct(
-                            src=self.dist.prev_pp_rank,
-                            tag=prev_microbatch_id,
-                        )
-                    else:
-                        torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
+                        with nvtx_range("recv_sample_state"):
+                            sample_state.host = recv_object_funct(
+                                src=self.dist.prev_pp_rank,
+                                tag=tag,
+                            )
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
@@ -941,8 +1053,7 @@ class PyExecutor:
                                 prev_microbatch_id] = self.dist.isend_object(
                                     sample_state.host,
                                     dest=self.dist.next_pp_rank,
-                                    tag=prev_microbatch_id)
-                    torch.cuda.nvtx.range_pop()
+                                    tag=tag)
 
                 # Stage 3: Finalize previous batch that finished sample state communication
                 # In last pp rank, stage 2 and 3 process different previous batches
@@ -952,6 +1063,8 @@ class PyExecutor:
                 finished_requests = []
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
+                        sample_state = previous_batch.sample_state
+                        sample_state.scheduled_requests.context_requests = previous_batch.finished_ctx_reqs
                         self._update_requests(previous_batch.sample_state)
 
                         if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
@@ -983,7 +1096,8 @@ class PyExecutor:
                         self.resource_manager.update_resources(
                             previous_scheduled_batch, attn_metadata,
                             kv_cache_dtype_byte_size)
-                        self._remove_inflight_ids(previous_scheduled_batch)
+
+                        self._remove_inflight_ids(previous_batch)
 
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
@@ -993,21 +1107,22 @@ class PyExecutor:
                     self._terminate_disagg_ctx_finished_requests()
 
                 if self._disagg_pp_termination_handler is not None:
-                    requests_to_terminate = self._disagg_pp_termination_handler.sync(
-                        prev_microbatch_id)
-                    for req in requests_to_terminate:
-                        self._do_terminate_request(req)
+                    self._disagg_pp_termination_handler.terminate_pending_requests(
+                    )
 
                 # march forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
 
                 if self.enable_iter_perf_stats and previous_batch is not None:
+                    sample_state = previous_batch.sample_state
+                    sample_state.scheduled_requests.context_requests = previous_batch.scheduled_ctx_reqs
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
-                                             previous_batch)
+                                             previous_batch, microbatch_id)
 
                 self.iter_counter += 1
 
+    @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, microbatch_id):
         if self.send_handles[microbatch_id] is not None:
             self.send_handles[microbatch_id].wait()
@@ -1062,7 +1177,7 @@ class PyExecutor:
             else:
                 self.use_spec_decode = self.drafter.should_use_spec_decode(
                     self.active_requests, self.max_batch_size,
-                    self.model_engine.max_num_tokens,
+                    self.model_engine.llm_args.max_num_tokens,
                     self.max_total_draft_tokens)
             logger.debug(f"Use spec decode: {self.use_spec_decode}")
             self.model_engine.enable_spec_decode = self.use_spec_decode
@@ -1199,11 +1314,21 @@ class PyExecutor:
                                 self.guided_decoder.rollback_draft_tokens()
 
                     batch_outputs = self._forward_step(scheduled_batch)
+
+                    guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
-                        self.guided_decoder.execute(batch_outputs['logits'])
+                        guided_decoder_failed_requests = self.guided_decoder.execute(
+                            batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
+
+                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                    # causing _sample_async to fail when accessing context_chunk_size property.
+                    self._handle_guided_decoder_errors(
+                        scheduled_batch, guided_decoder_failed_requests)
+
                     if self.drafter is not None:
                         self.drafter.run_drafter_post(scheduled_batch,
                                                       self.resource_manager,
@@ -1455,14 +1580,22 @@ class PyExecutor:
                     self.drafter.cleanup_previous_draft_resources()
 
                 if can_queue:
+                    guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
                         # add_batch must be called again to have updated new tokens.
                         self.guided_decoder.add_batch(scheduled_batch)
-                        self.guided_decoder.execute(batch_outputs['logits'])
+                        guided_decoder_failed_requests = self.guided_decoder.execute(
+                            batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
                     assert sample_state is not None, "Sampling failed"
+
+                    # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                    # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                    # causing _sample_async to fail when accessing context_chunk_size property.
+                    self._handle_guided_decoder_errors(
+                        scheduled_batch, guided_decoder_failed_requests)
 
                     self._update_request_states(scheduled_batch)
 
@@ -1608,10 +1741,20 @@ class PyExecutor:
         self._update_request_states(scheduled_batch)
         return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
-            sampler_event=sampler_event,
+            sampler_event=SamplerEvent(cuda_event=sampler_event),
         )
 
     def _validate_request(self, request: LlmRequest):
+        # Validate beam width
+        sampling_config = request.sampling_config
+        if sampling_config is not None:
+            if sampling_config.beam_width != self.max_beam_width:
+                raise ValueError(
+                    f"Request beam width {sampling_config.beam_width} "
+                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
+                )
+
+        # Check token ID ranges
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
             # Only skip token‐range checks for Llama4 when the request has multimodal data
             from ..models.modeling_llama import Llama4ForConditionalGeneration
@@ -1635,7 +1778,6 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
-    @nvtx_range("_fetch_and_activate_new_requests")
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -1726,24 +1868,26 @@ class PyExecutor:
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
-        if not self.enable_batch_waiting:
-            return context_requests
+        """
+        Return an empty list if scheduled requests fulfill the waiting conditions, otherwise return the original context requests.
+        Waiting conditions:
+        - The number of scheduled tokens (both context and generation) is smaller than `self.batch_wait_max_tokens_ratio * self.max_num_tokens`
+        - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
+        """
 
-        waited_context_requests = []
-        stop_waiting = False
         num_scheduled_ctx_tokens = sum(
             len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)
         num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
-        stop_waiting = self.batch_wait_iters_count >= self.batch_wait_timeout_iters or num_scheduled_tokens >= self.batch_wait_max_tokens_ratio * self.max_num_tokens
-        if stop_waiting:
-            waited_context_requests = context_requests
-            self.batch_wait_iters_count = 0
-        else:
+        should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        if should_waiting:
             self.batch_wait_iters_count += 1
-        return waited_context_requests
+            return []
+
+        self.batch_wait_iters_count = 0
+        return context_requests
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -1755,10 +1899,11 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
-        # if no generation requests, no need to wait, to avoid dead waiting
-        if not self.enable_attention_dp and self.enable_batch_waiting and len(
-                scheduler_output.context_requests) > 0 and len(
-                    scheduler_output.generation_requests) > 0:
+        # If no generation requests, no need to wait, to avoid dead waiting
+        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
+            scheduler_output.context_requests) > 0 and len(
+                scheduler_output.generation_requests) > 0
+        if should_check_waiting:
             scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
@@ -2216,9 +2361,14 @@ class PyExecutor:
         # Remove cancel request in the waiting queue
         self.executor_request_queue.update_waiting_queue()
 
+        # Create set from list of canceled request ids to speed up canceled test
+        canceled_req_ids = set(
+            self.executor_request_queue.get_canceled_req_ids())
+
+        still_pending_canceled_ids = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
-            if req_id not in self.executor_request_queue.get_canceled_req_ids():
+            if req_id not in canceled_req_ids:
                 continue
 
             is_cancelled = self._try_cancel_request(request)
@@ -2227,13 +2377,13 @@ class PyExecutor:
                 # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-                self.executor_request_queue.canceled_req_ids.remove(req_id)
+            else:
+                still_pending_canceled_ids.append(req_id)
 
-        if self.enable_attention_dp:
-            # TODO: revisit the cancel logic of attention dp
-            # When enable attention dp, each rank does not have full copy of requests
-            # so we need to remove the cancel requests not in the local rank
-            self.executor_request_queue.clear_canceled_req_ids()
+        # Clear list of requests marked for cancellation and add back those that failed to cancel.
+        self.executor_request_queue.canceled_req_ids.clear()
+        self.executor_request_queue.canceled_req_ids.extend(
+            still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
@@ -2383,7 +2533,10 @@ class PyExecutor:
 
     @nvtx_range("_terminate_disagg_ctx_finished_requests")
     def _terminate_disagg_ctx_finished_requests(self):
-        for request_id in list(self.ctx_in_transmission_requests.keys()):
+        # make a copy of the keys, since we are modifying the dictionary in the loop
+        in_transmission_requests_id = list(
+            self.ctx_in_transmission_requests.keys())
+        for request_id in in_transmission_requests_id:
             request, block_id, counter = self.ctx_in_transmission_requests[
                 request_id]
 
@@ -2423,7 +2576,8 @@ class PyExecutor:
             r for r in
             previous_batch.sample_state.scheduled_requests.all_requests()
             if r.state == LlmRequestState.GENERATION_COMPLETE and (
-                r.py_return_context_logits or r.py_return_generation_logits)
+                r.py_return_context_logits or r.py_return_generation_logits
+                or r.py_additional_outputs is not None)
         ]
         if self.dist.is_first_pp_rank and len(finished_reqs):
             finished_reqs_py_results = [r.py_result for r in finished_reqs]
@@ -2480,13 +2634,43 @@ class PyExecutor:
             self._terminate_request(req)
 
     def _add_inflight_ids(self, scheduled_requests):
-        """Add reqids of current requests to self.inflight_req_ids."""
-        for req in scheduled_requests.all_requests():
-            self.inflight_req_ids.insert(req.request_id)
+        """Add request IDs of current requests to self.inflight_req_ids.
 
-    def _remove_inflight_ids(self, scheduled_requests):
-        """Remove reqids of current requests from self.inflight_req_ids."""
-        for req in scheduled_requests.all_requests():
+        Non‑final context chunks are not added to the inflight set, so the scheduler can keep scheduling further
+        context chunks while earlier ones are in the PP pipeline. Only context requests that finish context phase
+        are inserted into the inflight set and collected into finished_ctx_reqs.
+        All generation requests are still inserted into the inflight set.
+        """
+        finished_ctx_reqs = []
+        for req in scheduled_requests.context_requests:
+            if req.is_last_context_chunk:
+                logger.debug(
+                    f"Context request with ID {req.request_id} added to DECODER model inflight set"
+                )
+                self.inflight_req_ids.insert(req.request_id)
+                finished_ctx_reqs.append(req)
+        for req in scheduled_requests.generation_requests:
+            logger.debug(
+                f"Generation request with ID {req.request_id} added to DECODER model inflight set"
+            )
+            self.inflight_req_ids.insert(req.request_id)
+        return finished_ctx_reqs
+
+    def _remove_inflight_ids(self, batch_state: BatchStatePP):
+        """Remove request IDs of current requests from self.inflight_req_ids.
+
+        Context IDs are erased from the inflight set using batch_state.finished_ctx_reqs.
+        Generation IDs are erased using batch_state.sample_state.scheduled_requests.generation_requests.
+        """
+        for req in batch_state.finished_ctx_reqs:
+            logger.debug(
+                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
+            )
+            self.inflight_req_ids.erase(req.request_id)
+        for req in batch_state.sample_state.scheduled_requests.generation_requests:
+            logger.debug(
+                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
+            )
             self.inflight_req_ids.erase(req.request_id)
 
     def _handle_speculative_decoding(self, scheduled_batch, previous_tensors,
@@ -2536,6 +2720,27 @@ class PyExecutor:
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
 
+    def _handle_guided_decoder_errors(
+            self, scheduled_batch: ScheduledRequests,
+            failed_requests: Optional[List[Tuple[int, str]]]):
+        """Handle errors that occurred during guided decoding.
+
+        Args:
+            scheduled_batch: The current batch of scheduled requests
+            failed_requests: List of (request_id, error_message) tuples for failed requests,
+                           or None if no failures occurred
+        """
+        if not failed_requests:
+            return
+
+        failed_req_id_to_err = {req_id: err for req_id, err in failed_requests}
+
+        for request in scheduled_batch.all_requests():
+            if request.py_request_id not in failed_req_id_to_err:
+                continue
+            error_msg = failed_req_id_to_err[request.py_request_id]
+            self._handle_errors(error_msg, requests=[request])
+
 
 class DisaggPPTerminationHandler:
     """Handles termination synchronization across pipeline parallel ranks under disaggregated serving.
@@ -2545,94 +2750,73 @@ class DisaggPPTerminationHandler:
     resources to avoid a NCCL hang.
     """
 
-    def __init__(self, num_micro_batches: int, dist):
-        self.dist = dist
-        # Request termination synchronization across PP ranks
-        # {request_id: {'ready_to_terminate': set{ranks}, 'terminated': {ranks}}}
-        self.pending_termination = {}
-        self.termination_handles = [None] * num_micro_batches
-        # Local map from request_id -> local LlmRequest awaiting consensus termination
-        self.local_termination = {}
+    def __init__(self, dist, terminator_func: Callable[[LlmRequest], None]):
+        self._dist = dist
+        self._terminator_func = terminator_func
+        self._pending_termination = {}
+        self._terminating_iteration = 0
+        self._send_handle = None
+        self._comm_tag = TERMINATION_COMM_TAG_BASE
 
-    def terminate(self, request: LlmRequest) -> bool:
-        req_key = request.py_request_id
-        self.local_termination[req_key] = request
-        state = self.pending_termination.get(req_key, None)
-        if state is None:
-            state = {'ready_to_terminate': set(), 'terminated': set()}
-            self.pending_termination[req_key] = state
-        if self.dist.rank not in state['ready_to_terminate']:
-            state['ready_to_terminate'].add(self.dist.rank)
-        return False
+    def terminate(self, request: LlmRequest):
+        self._pending_termination[request.py_request_id] = request
 
-    def sync(self, microbatch_id: int) -> List[LlmRequest]:
-        """Ring-communicate pending termination state and apply local terminations upon consensus.
-
-        Each rank sends its current pending_termination snapshot to the next PP rank
-        and receives the previous rank's snapshot. After merging, apply any terminations
-        that have reached consensus (i.e., all PP ranks are ready).
+    @nvtx_range("_disagg_pp_termination_handler_sync")
+    def terminate_pending_requests(self):
         """
-        snapshot = {
-            req_id: {
-                'ready_to_terminate': state.get('ready_to_terminate', set()),
-                'terminated': state.get('terminated', set()),
-            }
-            for req_id, state in self.pending_termination.items()
+        Ring-style communicating to decide which requests to be terminated and avoid bubbles.
+        This ensures that one request is terminated from rank_0 to rank_(pp_size-1) in order.
+        """
+        terminate_req_ids = []
+        term_state = None
+        if self._send_handle:
+            self._send_handle.wait()
+
+        if not (self._dist.is_first_pp_rank
+                and self._terminating_iteration == 0):
+            term_state = self._dist.recv_object(src=self._dist.prev_pp_rank,
+                                                tag=self._comm_tag)
+
+        ready_req_map = term_state["ready"] if term_state else {
+        }  # {req_id: num_ranks} ranks vote in the ready dict
+        terminate_req_ids = term_state["term"] if term_state else [
+        ]  # request ids to be terminated in the current iteration
+
+        reqs_to_terminate = {
+            req_id: self._pending_termination.pop(req_id, None)
+            for req_id in terminate_req_ids
+            if req_id in self._pending_termination
         }
 
-        if self.termination_handles[microbatch_id] is not None:
-            self.termination_handles[microbatch_id].wait()
+        if self._dist.is_first_pp_rank:
+            # rank0 proposes the requests to be terminated
+            ready_req_map = {req_id: 1 for req_id in self._pending_termination}
+        else:
+            # if a rank agrees to terminate a request, increase the vote count for the request id
+            for req_id in ready_req_map.keys():
+                if req_id in self._pending_termination:
+                    ready_req_map[req_id] += 1
 
-        term_tag = TERMINATION_COMM_TAG_BASE + microbatch_id
-        self.termination_handles[microbatch_id] = self.dist.isend_object(
-            snapshot,
-            dest=self.dist.next_pp_rank,
-            tag=term_tag,
-        )
-        remote_state = self.dist.recv_object(
-            src=self.dist.prev_pp_rank,
-            tag=term_tag,
-        )
-        logger.debug(
-            f"received remote state for microbatch {microbatch_id}, prev pp rank: {self.dist.prev_pp_rank} state {remote_state}"
-        )
+        if self._dist.is_last_pp_rank:
+            new_terminate_req_ids = [
+                req_id for req_id, num_ranks in ready_req_map.items()
+                if num_ranks == self._dist.pp_size
+            ]
+            # by determining the terminate ids in the last rank, we can save the overhead of sending the ready dict back to rank0
+            new_term_state = {"ready": {}, "term": new_terminate_req_ids}
+        else:
+            # other pp ranks pass the updated ready dict and terminate request ids to the next rank, and the
+            # terminate_req_ids will not change in a given iteration, so we can terminate the requests synchronously
+            new_term_state = {"ready": ready_req_map, "term": terminate_req_ids}
 
-        if remote_state:
-            for req_id, state in remote_state.items():
-                local = self.pending_termination.get(req_id)
-                if local is None:
-                    self.pending_termination[req_id] = {
-                        'ready_to_terminate': state.get('ready_to_terminate',
-                                                        set()),
-                        'terminated': state.get('terminated', set()),
-                    }
-                else:
-                    for key in ('ready_to_terminate', 'terminated'):
-                        for r in state.get(key, []):
-                            if r not in local[key]:
-                                local[key].add(r)
+        self._send_handle = self._dist.isend_object(
+            new_term_state, dest=self._dist.next_pp_rank, tag=self._comm_tag)
 
-        requests_to_terminate = []
-        to_delete = []
-        for req_id, state in self.pending_termination.items():
-            ready = state.get('ready_to_terminate', set())
-            done = state.get('terminated', set())
-            # If all PP ranks are ready to terminate the request, we can free the resources
-            if len(ready) >= self.dist.pp_size and self.dist.rank not in done:
-                local_req = self.local_termination.get(req_id)
-                if local_req is not None:
-                    requests_to_terminate.append(local_req)
-                done.add(self.dist.rank)
-            if len(done) >= self.dist.pp_size:
-                to_delete.append(req_id)
-                if req_id in self.local_termination:
-                    self.local_termination.pop(req_id, None)
-        for req_id in to_delete:
-            self.pending_termination.pop(req_id, None)
-
-        return requests_to_terminate
-
-    def cleanup(self):
-        for h in self.termination_handles:
-            if h is not None:
-                h.wait()
+        if reqs_to_terminate:
+            logger.debug(
+                f'rank {self._dist.pp_rank} terminates {list(reqs_to_terminate.keys())} in iter {self._terminating_iteration}'
+            )
+        for req_id, req in reqs_to_terminate.items():
+            if req:
+                self._terminator_func(req)
+        self._terminating_iteration += 1

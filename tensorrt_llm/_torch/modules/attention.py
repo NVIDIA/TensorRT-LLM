@@ -138,6 +138,7 @@ class Attention(nn.Module):
         disable_deep_gemm: bool = False,
         attn_output_gate: Optional[bool] = None,
         use_custom_cublas_mm: bool = False,
+        reduce_output: bool = True,
     ):
         """
         Initialize the Attention module.
@@ -234,6 +235,15 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
+        qkv_shard_indices_mapping = {
+            "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
+            "k":
+            (self.q_size * (2 if self.attn_output_gate else 1), self.kv_size),
+            "v":
+            (self.q_size * (2 if self.attn_output_gate else 1) + self.kv_size,
+             self.kv_size),
+        }
+
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size * (2 if self.attn_output_gate else 1) +
@@ -249,7 +259,8 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-            use_custom_cublas_mm=use_custom_cublas_mm)
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            fused_weight_shard_indices_mapping=qkv_shard_indices_mapping)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -264,6 +275,7 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
+            reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
@@ -370,8 +382,11 @@ class Attention(nn.Module):
         out_dtype = q.dtype
 
         if self.attn_backend == "TRTLLM":
-            if self.has_quant_scale and (self.attn.has_fp8_kv_cache
-                                         or self.attn.has_fp4_kv_cache):
+            # Don't use FP8 output if o_proj has pre_quant_scale - keep BF16 for better precision
+            has_pre_quant_scale = getattr(self.o_proj, 'pre_quant_scale',
+                                          None) is not None
+            if self.has_quant_scale and not has_pre_quant_scale and (
+                    self.attn.has_fp8_kv_cache or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
         return output
@@ -402,8 +417,18 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        if self.has_quant_scale and not self.attn_output_gate:
+        has_awq_pre_quant_scale = hasattr(
+            self.o_proj,
+            'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
+        # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
+        # and keeps attention output in BF16 for better precision when applying pre_quant_scale
+        if self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale:
             out_scale = self.o_proj.inv_input_scale
+        if has_awq_pre_quant_scale and enable_attn_nvfp4_output:
+            logger.warning_once(
+                "Disable attn nvfp4 output because o_proj has pre_quant_scale for AWQ.",
+                key="disable_attn_nvfp4_output_for_awq")
+            enable_attn_nvfp4_output = False
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output and not self.attn_output_gate:
             out_scale_sf = self.o_proj.input_scale
 
@@ -676,6 +701,8 @@ class MLA(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         enable_unit_test: bool = False,
+        mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
     ):
         """
         Initialize the MLA module.
@@ -747,7 +774,12 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        self.mapping = config.mapping
+        if mapping_with_cp is not None:
+            logger.warning(
+                "[MLA::__init__] Overriding mapping with CP detected.")
+            self.mapping = mapping_with_cp
+        else:
+            self.mapping = config.mapping
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
@@ -755,6 +787,9 @@ class MLA(nn.Module):
             tp_size = 1
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
+        if self.mapping.cp_size > 1:
+            assert self.mapping.has_cp_helix(
+            ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
         mapping = Mapping(
             world_size=tp_size * pp_size * cp_size,
@@ -875,6 +910,7 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization)
 
@@ -948,6 +984,14 @@ class MLA(nn.Module):
                 head_dim=self.qk_rope_head_dim,
                 is_neox=pos_embd_params.is_neox,
             )
+
+        self.llama_4_scaling = False
+        if hasattr(config.pretrained_config, 'llama_4_scaling'):
+            self.llama_4_scaling = True
+            self.floor_scale = getattr(config.pretrained_config.llama_4_scaling,
+                                       'original_max_position_embeddings', 8192)
+            self.attn_scale = getattr(config.pretrained_config.llama_4_scaling,
+                                      'beta', 0.1)
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -1044,7 +1088,7 @@ class MLA(nn.Module):
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
-        if self.mapping.cp_size > 1:
+        if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
@@ -1062,24 +1106,20 @@ class MLA(nn.Module):
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            chunks_o = [
-                t.contiguous() for t in torch.split(partial_o,
-                                                    partial_o.shape[-1] //
-                                                    self.mapping.cp_size,
-                                                    dim=-1)
-            ]
-            chunks_stats = [
-                t.contiguous() for t in torch.split(softmax_stats,
-                                                    softmax_stats.shape[1] //
-                                                    self.mapping.cp_size,
-                                                    dim=1)
-            ]
-            gathered_o, gathered_stats = alltoall_helix(
-                chunks_o + chunks_stats,
-                self.mapping.cp_group,
-            )
-            return torch.ops.trtllm.helix_post_process(gathered_o,
-                                                       gathered_stats, 1.0)
+            # transpose the tensors to make the split across cp_size contiguous
+            # for both tensors, we need to split across the second dimension
+            chunks = []
+            for t in [partial_o, softmax_stats]:
+                t = t.transpose(1, 0).contiguous()
+                chunks.extend(torch.split(t,
+                                          t.shape[0] // self.mapping.cp_size))
+            gathered = alltoall_helix(chunks, self.mapping.cp_group)
+            # transpose the tensors back to ensure dimensions are ordered correctly
+            # note: an additional dimension was added at the first index for all-to-all,
+            # so the transpose dimensions are shifted by 1
+            gathered = [t.transpose(1, 2).contiguous() for t in gathered]
+            return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
+                                                       1.0)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output
@@ -1094,6 +1134,18 @@ class MLA(nn.Module):
             hidden_size *= self.mapping.cp_size
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
+
+    def _attention_scaling(self, q, position_ids):
+
+        def _get_attn_scale(position_ids: torch.Tensor) -> torch.Tensor:
+            positions = position_ids.view(-1)
+            floor = torch.floor((positions + 1.0) / self.floor_scale)
+            attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+            return attn_scale.unsqueeze(-1)
+
+        attn_scale = _get_attn_scale(position_ids)
+        q = (q * attn_scale).to(q.dtype)
+        return q
 
     def forward_impl(self,
                      position_ids: Optional[torch.Tensor],
@@ -1165,6 +1217,10 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
+            if self.llama_4_scaling:
+                q_ctx = self._attention_scaling(
+                    q_ctx, position_ids[..., :num_ctx_tokens])
+
             self.forward_context(
                 q_ctx,
                 compressed_kv_ctx,
@@ -1184,6 +1240,10 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
+
+            if self.llama_4_scaling:
+                q_gen = self._attention_scaling(
+                    q_gen, position_ids[..., num_ctx_tokens:])
 
             self.forward_absorption_generation(
                 q_gen,
@@ -1221,19 +1281,11 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        if self.fuse_a_indexer_k_weight:
-            q, compressed_kv, k_pe, indexer_k, indexer_weights = self.kv_a_proj_with_mqa(
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
-                    self.indexer.head_dim, self.indexer.n_heads
-                ], -1)
-        else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
-                ], -1)
-            indexer_k = None
-            indexer_weights = None
+        q, compressed_kv, k_pe, indexer_k = self.kv_a_proj_with_mqa(
+            hidden_states).split([
+                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim,
+                self.indexer.head_dim
+            ], -1)
 
         # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
@@ -1255,7 +1307,6 @@ class MLA(nn.Module):
             attn_metadata,
             position_ids,
             indexer_k=indexer_k,  # indexer K proj
-            indexer_weights=indexer_weights,  # indexer weights proj
         )
 
         assert q.shape[
@@ -1329,7 +1380,8 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
-        helix_position_offsets = position_ids if self.mapping.cp_size > 1 else None
+        helix_position_offsets = position_ids if self.mapping.has_cp_helix(
+        ) else None
 
         attn_output = self.mha.forward(
             q,
@@ -1709,6 +1761,12 @@ class MLA(nn.Module):
             device=q.device,
         )
 
+        helix_position_offsets, helix_is_inactive_rank = None, None
+        if self.mapping.has_cp_helix():
+            helix_position_offsets = position_ids
+            helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank
+            assert helix_position_offsets is not None and helix_is_inactive_rank is not None, "helix_position_offsets and helix_is_inactive_rank must be provided for helix parallelism."
+
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -1723,9 +1781,18 @@ class MLA(nn.Module):
                 lambda: torch.ops.trtllm.bmm_out(
                     q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
                 lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    helix_position_offsets=helix_position_offsets,
+                    helix_is_inactive_rank=helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -1744,9 +1811,18 @@ class MLA(nn.Module):
                     self.k_b_proj_trans_dequant,
                 ),
                 lambda: self.mqa.mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer),
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    helix_position_offsets=helix_position_offsets,
+                    helix_is_inactive_rank=helix_is_inactive_rank),
                 self.ln_events[0],
                 self.ln_events[1],
                 rope_stream,
@@ -2040,9 +2116,10 @@ class MLA(nn.Module):
 
         # [seq, num_heads, kv_lora_rank], account for padding
         attn_out_latent = attn_out_latent[:, :self.num_heads_tp, :]
-        # TODO: seems we need .contiguous() here when padding enabled before pass to bmm?
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp, self.kv_lora_rank])
+        if self.num_heads_tp != padding:
+            attn_out_latent = attn_out_latent.contiguous()
 
         assert (attn_out_latent.shape[0] == q.shape[0]
                 and attn_out_latent.shape[1] == self.num_heads_tp)
@@ -2067,7 +2144,6 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-
         return output
 
     def forward(
@@ -2098,7 +2174,7 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        if self.enable_unit_test and self.mapping.cp_size > 1:
+        if self.enable_unit_test and self.mapping.has_cp_helix():
             # note: for allowing testing Helix parallelism, we ensure that
             # the output is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim

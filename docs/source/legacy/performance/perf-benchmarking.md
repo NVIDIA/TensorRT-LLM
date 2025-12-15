@@ -110,7 +110,7 @@ of 128:128.
 To run the benchmark from start to finish, run the following commands:
 
 ```shell
-python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000 > /tmp/synthetic_128_128.txt
+trtllm-bench --tokenizer meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000
 trtllm-bench --model meta-llama/Llama-3.1-8B build --dataset /tmp/synthetic_128_128.txt --quantization FP8
 trtllm-bench --model meta-llama/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 ```
@@ -207,7 +207,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
 ```shell
-benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
+trtllm-bench --tokenizer meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000
 ```
 
 ### Building a Benchmark Engine
@@ -662,7 +662,7 @@ checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkp
 - [`nvidia/Llama-3.1-405B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8)
 
 `trtllm-bench` utilizes the `hf_quant_config.json` file present in the pre-quantized checkpoints above. The configuration
-file is present in checkpoints quantized with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+file is present in checkpoints quantized with [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
 above:
 

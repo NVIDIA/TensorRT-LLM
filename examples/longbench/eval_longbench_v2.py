@@ -121,10 +121,15 @@ def parse_arguments() -> argparse.Namespace:
                         type=int,
                         default=63,
                         help='Kernel size for RocketKV')
-    parser.add_argument('--topr',
+    parser.add_argument('--topk',
                         type=int,
-                        default=90,
-                        help='Top-r for RocketKV')
+                        default=64,
+                        help='Top-k for RocketKV')
+    parser.add_argument('--kt_cache_dtype',
+                        type=str,
+                        default='float8_e5m2',
+                        choices=['bfloat16', 'float8_e5m2'],
+                        help='KT cache data type')
 
     # KV cache configuration
     parser.add_argument('--kv_cache_dtype',
@@ -356,7 +361,8 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
                 window_size=args.window_size,
                 kernel_size=args.kernel_size,
                 prompt_budget=args.token_budget,
-                topr=args.topr,
+                topk=args.topk,
+                kt_cache_dtype=args.kt_cache_dtype,
             )
             logger.info(f"Using RocketKV sparse attention")
         else:

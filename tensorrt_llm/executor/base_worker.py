@@ -125,12 +125,13 @@ class BaseWorker(GenerationExecutor):
         Note:
             If the process already has constrained affinity, a warning is logged.
             Configuration is handled as follows:
-                TLLM_NUMA_WORKER_AFFINITY = <unset>
-                    -> affinity is auto-configured only if it is unconstrained
-                TLLM_NUMA_WORKER_AFFINITY = 1
-                    -> affinity is unconditionally auto-configured
-                TLLM_NUMA_WORKER_AFFINITY = 0 or any other value
-                    -> affinity is unconditionally _not_ auto-configured
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
+                    -> Affinity is automatically configured if it is unconstrained,
+                       and deleted if it is constrained externally by the user.
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
+                    -> Affinity is unconditionally auto-configured.
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
+                    -> Affinity is unconditionally _not_ auto-configured.
         '''
 
         # Get the current affinity setting
@@ -141,22 +142,31 @@ class BaseWorker(GenerationExecutor):
         all_cpus = list(range(psutil.cpu_count()))
 
         constrained_affinity = (cpu_affinity != all_cpus)
+        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
 
-        # If the process is affined to a constrained set of CPUs, warn the user
-        # so as to ensure that this is what is intended
+        # If affinity is constrained but the user hasn't explicitly
+        # requested NUMA-aware affinity, remove the constraints.
         if constrained_affinity:
             logger.warning(
                 f"Worker process {pid} is affined to run on the following CPUs: "
                 f"{cpu_affinity} (subset of all logical CPUs). This may harm "
                 f"performance if set incorrectly.")
+            if numa_aware_affinity is None:
+                logger.warning(
+                    f"Worker process {pid} has constrained CPU affinity "
+                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
+                    f"Removing CPU affinity constraints.")
+                process.cpu_affinity(all_cpus)
 
         # If affinity is unconstrained and the user hasn't explicitly
         # prohibited it or the user has explicitly requested it, choose the
         # optimal affinity based upon the NUMA topology
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
         if ((numa_aware_affinity is None and not constrained_affinity)
                 or (numa_aware_affinity == "1")):
             process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+            logger.info(
+                f"Worker process {pid} CPU affinity set to "
+                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
 
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
@@ -486,25 +496,27 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
-                logger.warning(
-                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                raise ValueError(
+                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
                     f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
                 )
-                if max_tokens is None:
-                    raise ValueError(
-                        "`max_tokens` must be set when `default_max_tokens` is illegal"
-                    )
+
             # default_max_tokens is the biggest available value
             if max_tokens is None:
                 return default_max_tokens
-            elif max_tokens > default_max_tokens:
+            elif max_tokens > default_max_tokens and default_max_tokens > 0:
                 logger.warning(
                     f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
                     f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
                 )
                 return default_max_tokens
-            return max_tokens
+            elif max_tokens <= 0:
+                raise ValueError(
+                    f"`max_tokens` ({max_tokens}) must be greater than 0")
+            else:
+                return max_tokens
 
         try:
             executor_request = tllm.Request(

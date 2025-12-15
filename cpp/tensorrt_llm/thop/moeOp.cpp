@@ -23,6 +23,7 @@
 // Always include the public header for moe_gemm_kernels.h
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
@@ -41,6 +42,8 @@
         oss << __VA_ARGS__;                                                                                            \
         C10_THROW_ERROR(ErrorType, oss.str());                                                                         \
     } while (0)
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -234,6 +237,7 @@ public:
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+        cuInit(0);
     }
 
     ~FusedMoeRunner()
@@ -435,7 +439,8 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+        auto const quant_params
+            = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
         kernels::MoeMinLatencyParams min_latency_params{};
 
         // TODO: support lora in the future
@@ -613,7 +618,8 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+        auto const quant_params
+            = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
 
         // TODO: support lora in the future
         ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -859,8 +865,10 @@ private:
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
-        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales) const
+        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
+        ActivationType base_activation_type) const
     {
+        int expand_ratio = isGatedActivation(base_activation_type) ? 2 : 1;
         if (isFp8Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for fp8 quantization");
@@ -925,12 +933,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
@@ -978,12 +986,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank
@@ -1044,12 +1052,12 @@ private:
                     && fc1_weight_block.sizes()[1]
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4)
-                            * 2
+                            * expand_ratio
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
                         == TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                             hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4),
-                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * expand_ratio, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_act_global.dim() == 0 || fc2_act_global.sizes()[0] == num_experts_on_rank,
@@ -1189,12 +1197,14 @@ private:
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY(trtllm, m)
 {
-    m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
+    m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
-        .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
-        .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
-        .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
-        .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
+        .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
+        .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
+        .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
+        .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency);
 }

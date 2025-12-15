@@ -30,6 +30,8 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 #if ENABLE_MULTI_DEVICE
@@ -64,6 +66,10 @@ public:
         // note: ensures that input_list size > 0
         TLLM_CHECK_WITH_INFO(static_cast<int>(input_list.size()) == num_ranks * num_lists_,
             "input_list size should be equal to group size * num_lists");
+        for (auto const& input : input_list)
+        {
+            TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+        }
         std::vector<torch::Tensor> output_list(static_cast<size_t>(num_lists_));
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
         ncclGroupStart();
@@ -115,6 +121,8 @@ std::vector<torch::Tensor> alltoall_helix(
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
@@ -122,5 +130,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("alltoall_helix", &torch_ext::alltoall_helix);
+    m.impl("alltoall_helix", &tensorrt_llm::torch_ext::alltoall_helix);
 }

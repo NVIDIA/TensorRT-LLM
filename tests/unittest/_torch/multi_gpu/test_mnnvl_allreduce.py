@@ -108,7 +108,7 @@ def row_linear_residual_norm_fusion_forward(
         ub.initialize_userbuffers_manager(
             tensor_parallel_size, 1, 1, tensor_parallel_rank,
             torch.cuda.device_count(),
-            x_list[0].nelement() * x_list[0].element_size(), True)
+            x_list[0].nelement() * x_list[0].element_size())
     elif strategy == AllReduceStrategy.MNNVL:
         os.environ["TLLM_TEST_MNNVL"] = "1"
 
@@ -164,7 +164,6 @@ def row_linear_residual_norm_fusion_forward(
             )
 
 
-@pytest.mark.skip(reason="https://nvbugs/5597647")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize(
@@ -194,7 +193,6 @@ def row_linear_residual_norm_fusion_forward(
 )
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
                                          fusion):
-
     if strategy == AllReduceStrategy.NCCL_SYMMETRIC and 2048 in seq_len:
         pytest.skip("https://nvbugspro.nvidia.com/bug/5573856")
 

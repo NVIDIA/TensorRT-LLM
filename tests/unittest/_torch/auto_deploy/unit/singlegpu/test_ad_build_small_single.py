@@ -47,7 +47,9 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "resize_kv_cache": {"free_mem_ratio": 0.0001},
                     "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {"backend": "torch-opt"},
+                    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
+                    # "compile_model": {"backend": "torch-opt"},
+                    "compile_model": {"backend": "torch-cudagraph"},
                 },
             },
         ),
@@ -183,6 +185,16 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "compile_model": {"backend": "torch-simple"},
+                },
+            },
+        ),
+        (
+            "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024",
+            {
+                "transforms": {
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
+                    "compile_model": {"backend": "torch-cudagraph"},
                 },
             },
         ),

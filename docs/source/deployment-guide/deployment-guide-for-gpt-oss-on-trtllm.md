@@ -64,7 +64,7 @@ For low-latency use cases:
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-latency.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -72,7 +72,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/gpt-oss-120b-latency.yaml
+```{literalinclude} ../../../examples/configs/curated/gpt-oss-120b-latency.yaml
 ---
 language: shell
 prepend: |
@@ -88,7 +88,7 @@ For max-throughput use cases:
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/gpt-oss-120b-throughput.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -96,7 +96,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/gpt-oss-120b-throughput.yaml
+```{literalinclude} ../../../examples/configs/curated/gpt-oss-120b-throughput.yaml
 ---
 language: shell
 prepend: |
@@ -211,8 +211,6 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 Here is an example response, showing that the TensorRT LLM server reasons and answers the questions.
-
-TODO: Use Chat Compeletions API / Responses API as the example after the PR is merged.
 
 ```json
 {"id":"chatcmpl-c5bf51b5cab94e10ba5da5266d12ee59","object":"chat.completion","created":1755815898,"model":"openai/gpt-oss-120b","choices":[{"index":0,"message":{"role":"assistant","content":"analysisThe user asks: \"Where is New York?\" Likely they want location info. Provide answer: New York State in northeastern US, New York City on the east coast, coordinates, etc. Provide context.assistantfinal**New York** can refer to two related places in the United States:\n\n| What it is | Where it is | Approx. coordinates | How to picture it |\n|------------|------------|--------------------|-------------------|\n| **New York State** | The northeastern corner of the United States, bordered by **Vermont, Massachusetts, Connecticut, New Jersey, Pennsylvania, and the Canadian provinces of Ontario and Quebec**. | 42.7° N, 75.5° W (roughly the state’s geographic centre) | A roughly rectangular state that stretches from the Atlantic Ocean in the southeast to the Adirondack Mountains and the Great Lakes region in the north. |\n| **New York City (NYC)** | The largest city in the state, located on the **southern tip of the state** where the **Hudson River meets the Atlantic Ocean**. It occupies five boroughs: Manhattan, Brooklyn, Queens, The Bronx, and Staten Island. | 40.7128° N, 74.0060° W | A dense, world‑famous metropolis that sits on a series of islands (Manhattan, Staten Island, parts of the Bronx) and the mainland (Brooklyn and Queens). |\n\n### Quick geographic context\n- **On a map of the United States:** New York State is in the **Northeast** region, just east of the Great Lakes and north of Pennsylvania.  \n- **From Washington, D.C.:** Travel roughly **225 mi (360 km) northeast**.  \n- **From Boston, MA:** Travel about **215 mi (350 km) southwest**.  \n- **From Toronto, Canada:** Travel about **500 mi (800 km) southeast**.\n\n### Travel tips\n- **By air:** Major airports include **John F. Kennedy International (JFK)**, **LaGuardia (LGA)**, and **Newark Liberty International (EWR)** (the latter is actually in New Jersey but serves the NYC metro area).  \n- **By train:** Amtrak’s **Northeast Corridor** runs from **Boston → New York City → Washington, D.C.**  \n- **By car:** Interstates **I‑87** (north‑south) and **I‑90** (east‑west) are the primary highways crossing the state.\n\n### Fun fact\n- The name “**New York**” was given by the English in 1664, honoring the Duke of York (later King James II). The city’s original Dutch name was **“New Amsterdam.”**\n\nIf you need more specific directions (e.g., how to get to a particular neighborhood, landmark, or the state capital **Albany**), just let me know!","reasoning_content":null,"tool_calls":[]},"logprobs":null,"finish_reason":"stop","stop_reason":null,"mm_embedding_handle":null,"disaggregated_params":null,"avg_decoded_tokens_per_iter":1.0}],"usage":{"prompt_tokens":72,"total_tokens":705,"completion_tokens":633},"prompt_token_ids":null}
@@ -349,31 +347,47 @@ P99 E2EL (ms):                            [result]
 
 For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
 
-```math
-\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
-```
+$$
+\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
+$$
 
 Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
 
-```math
+$$
 \text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
-```
+$$
 
-```math
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
-```
+$$
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
+$$
 
 #### End-to-End (E2E) Latency
   * The typical total time from when a request is submitted until the final token of the response is received.
 
 #### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
-```math
-\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
-```
+
+$$
+\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
 
 #### Tokens Per Second (TPS) or Output Token Throughput
   * how many output tokens the system generates each second.
-```math
-\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+
+$$
+\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
+
+## Preconfigured Recipes
+
+The following table lists recommended configurations from the comprehensive database for different performance profiles.
+
+```{eval-rst}
+.. include:: note_sections.rst
+   :start-after: .. start-note-traffic-patterns
+   :end-before: .. end-note-traffic-patterns
+
+.. include:: config_table.rst
+   :start-after: .. start-openai/gpt-oss-120b
+   :end-before: .. end-openai/gpt-oss-120b
 ```

@@ -92,10 +92,18 @@ from ..logger import logger, severity_map
               is_flag=True,
               default=False,
               help="Flag for HF transformers.")
-@click.option("--extra_llm_api_options",
+@click.option("--revision",
               type=str,
               default=None,
-              help="Path to a YAML file that overwrites the parameters")
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--config",
+              "--extra_llm_api_options",
+              "extra_llm_api_options",
+              type=str,
+              default=None,
+              help="Path to a YAML file that overwrites the parameters. "
+              "Can be specified as either --config or --extra_llm_api_options.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
               default=False,
@@ -106,12 +114,9 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
-         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
+         revision: Optional[str], extra_llm_api_options: Optional[str],
+         disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
@@ -125,7 +130,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "moe_expert_parallel_size": ep_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
+        "revision": revision,
         "kv_cache_config": kv_cache_config,
     }
 
@@ -135,9 +140,17 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     profiler.start("trtllm init")
     if backend == 'pytorch':
-        llm = PyTorchLLM(**llm_args)
+        llm = PyTorchLLM(**llm_args,
+                         max_batch_size=max_batch_size,
+                         max_num_tokens=max_num_tokens,
+                         max_beam_width=max_beam_width,
+                         max_seq_len=max_seq_len)
     elif backend == 'tensorrt':
-        llm = LLM(**llm_args)
+        build_config = BuildConfig(max_batch_size=max_batch_size,
+                                   max_num_tokens=max_num_tokens,
+                                   max_beam_width=max_beam_width,
+                                   max_seq_len=max_seq_len)
+        llm = LLM(**llm_args, build_config=build_config)
     else:
         raise click.BadParameter(
             f"{backend} is not a known backend, check help for available options.",
