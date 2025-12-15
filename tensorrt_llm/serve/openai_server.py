@@ -265,7 +265,6 @@ class OpenAIServer:
         self.app.add_api_route("/steady_clock_offset", self.set_steady_clock_offset, methods=["POST"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
-        self.app.add_api_route("/v1/kv_cache_hints_legacy", self.set_kv_cache_hints_legacy, methods=["POST"])
         self.app.add_api_route("/v1/kv_cache_hints", self.set_kv_cache_hints if not self.use_harmony else self.set_kv_cache_hints_harmony, methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
@@ -465,27 +464,6 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
-    async def set_kv_cache_hints_legacy(self, hints: Annotated[dict, Body(embed=False)]) -> Response:
-        if 'action' not in hints.keys():
-            return self.create_error_response(
-                message="Missing 'action' in hints",
-                err_type="InvalidRequestError",
-                status_code=HTTPStatus.BAD_REQUEST)
-
-        if hints['action'] == "truncate":
-            self.llm.set_kv_cache_hints(
-                action="truncate",
-                messages_to_retain=hints['messages_to_retain'],
-                messages=hints['messages'],
-            )
-            return Response(status_code=200)
-        else:
-            return self.create_error_response(
-                message=f"Invalid action: {hints['action']}",
-                err_type="InvalidRequestError",
-                status_code=HTTPStatus.BAD_REQUEST
-            )
-
     async def set_kv_cache_hints(self, request: KVCacheHintRequest) -> Response:
         # Currently only support truncate action
         if request.action != "truncate":
@@ -531,8 +509,8 @@ class OpenAIServer:
                 logger.error(traceback.format_exc())
                 return self.create_error_response(str(e))
 
-        messages_to_retain = convert_messages(request.messages_to_retain)
-        messages = convert_messages(request.messages)
+        messages_to_retain = convert_messages(request.messages_to_retain) if request.messages_to_retain else []
+        messages = convert_messages(request.messages) if request.messages else []
 
         self.llm.set_kv_cache_hints(
             action="truncate",
