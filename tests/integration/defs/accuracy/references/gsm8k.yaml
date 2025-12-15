@@ -285,3 +285,8 @@ bigcode/starcoder2-15b:
   - accuracy: 54.5
 mistral/Mistral-Large-3-675B:
   - accuracy: 90.83
+nvidia/Nemotron-3-Nano:
+  - accuracy: 69.37
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 68.73
