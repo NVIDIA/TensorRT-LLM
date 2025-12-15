@@ -23,6 +23,7 @@ Algorithm:
 2. Forward propagation of "constantness" - a node is constant if all its inputs are constant
 3. Identify fold boundaries where constant nodes have dynamic users
 4. Evaluate constant subgraphs and replace with materialized constants
+5. Remove unused parameters and buffers
 """
 
 import operator
@@ -316,14 +317,7 @@ def _del_attr_by_name(obj: Any, name: str) -> None:
 
 
 def _remove_unused_params_and_buffers(gm: GraphModule) -> int:
-    """Remove parameters and buffers that are no longer referenced in the graph.
-
-    After constant folding, original parameters (like A_log) may become unused.
-    This function cleans them up to save memory.
-
-    Returns:
-        Number of removed parameters/buffers.
-    """
+    """Remove parameters and buffers that are no longer referenced in the graph."""
     # Collect all get_attr targets still in use
     used_attrs = {str(node.target) for node in gm.graph.nodes if node.op == "get_attr"}
 
@@ -383,7 +377,6 @@ class ConstantFolding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Apply constant folding to the graph."""
-        # Classify and evaluate all constant nodes in a single forward pass
         is_constant, constant_values = _classify_and_evaluate_constants(gm)
 
         num_constant_nodes = sum(1 for v in is_constant.values() if v)
