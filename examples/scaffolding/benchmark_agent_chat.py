@@ -2,15 +2,20 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import sys
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import List
 
 from openai import AsyncOpenAI
+from transformers import AutoTokenizer
 
 from tensorrt_llm.scaffolding import (
+    Worker,
     MCPWorker,
+    Controller,
     NativeChatController,
     QueryCollector,
     ScaffoldingLlm,
@@ -20,6 +25,7 @@ from tensorrt_llm.scaffolding import (
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.contrib.DeepResearch import create_open_deep_research_scaffolding_llm
 from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
+from tensorrt_llm.scaffolding.task import GenerationTask, TaskStatus
 
 # Global lock for thread-safe printing
 print_lock = threading.Lock()
@@ -136,6 +142,11 @@ def parse_arguments():
     parser.add_argument("--openai_api_key", type=str, default="tensorrt_llm")
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1")
     parser.add_argument("--model", type=str, default="gpt-oss-20b")
+    parser.add_argument(
+        '--model_dir',
+        type=str,
+        required=True,
+        help="Path to the directory containing the generation model")
 
     # Benchmark enable flags
     parser.add_argument(
@@ -147,6 +158,11 @@ def parse_arguments():
         "--enable_chatbot",
         action="store_true",
         help="Enable chatbot benchmark",
+    )
+    parser.add_argument(
+        "--enable_multiround_chatbot",
+        action="store_true",
+        help="Enable multiround chatbot benchmark",
     )
 
     # Benchmark parameters
@@ -161,6 +177,12 @@ def parse_arguments():
         type=int,
         default=20,
         help="Number of prompts to send for chat benchmark (default: 20)",
+    )
+    parser.add_argument(
+        "--chat_multiround_rounds",
+        type=int,
+        default=3,
+        help="Number of rounds for multiround chat benchmark (default: 3)",
     )
     parser.add_argument(
         "--times", type=int, default=1, help="Number of times to run the benchmark (default: 1)"
@@ -222,6 +244,14 @@ def parse_arguments():
         type=int,
         default=32,
         help="Concurrency for burst agent benchmark (default: 32)",
+    )
+
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        #TODO: fit the model real vocab size
+        default=1000,
+        help="Vocabulary size for multiround chat benchmark (default: 10000)",
     )
 
     return parser.parse_args()
@@ -391,6 +421,125 @@ async def async_chat_benchmark(args):
     return
 
 
+class FakeMultiroundWorker(Worker):
+    """Worker that simulates a user in multi-round conversations.
+    
+    Processes GenerationTask by combining previous input/output as history
+    and adding random tokens for the next round's input.
+    """
+    
+    rounds: int = 4
+    input_tokens: List[int] = [1000, 100, 100, 100]
+    output_tokens: List[int] = [500, 500, 500, 500]
+    user_response_times: List[float] = [1.0, 1.0, 1.0, 1.0]
+    
+    def __init__(self, model_dir: str, vocab_size: int):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=False,
+            use_fast=True,
+        )
+        self.vocab_size = vocab_size
+    
+    def _generate_random_token_ids(self, num_tokens: int) -> List[int]:
+        if num_tokens <= 0:
+            return []
+        return [random.randint(0, self.vocab_size - 1) for _ in range(num_tokens)]
+    
+    async def multiround_generation_handler(self, task:GenerationTask) -> TaskStatus:
+        """Process tasks to generate the next round's input."""
+        if task.customized_result_fields is None:
+            task.customized_result_fields = {}
+        
+        current_round = task.customized_result_fields.get('round_index', 0)
+        if current_round >= self.rounds:
+            task.customized_result_fields['is_conversation_end'] = True
+            return TaskStatus.SUCCESS
+        
+        await asyncio.sleep(self.user_response_times[current_round])
+        
+        # Build new input: previous input + output + random tokens
+        new_input_tokens = []
+        if task.input_str:
+            new_input_tokens.extend(self.tokenizer.encode(task.input_str))
+        if task.output_str:
+            new_input_tokens.extend(self.tokenizer.encode(task.output_str))
+        new_input_tokens.extend(self._generate_random_token_ids(self.input_tokens[current_round]))
+        
+        # Update task for next round
+        task.input_str = self.tokenizer.decode(new_input_tokens)
+        task.ignore_eos = True
+        task.output_tokens = None
+        task.max_tokens = len(new_input_tokens) + self.output_tokens[current_round]
+        task.output_str = None
+        task.customized_result_fields['round_index'] = current_round + 1
+        task.customized_result_fields['is_conversation_end'] = False
+        
+        return TaskStatus.SUCCESS
+    
+    task_handlers = {GenerationTask: multiround_generation_handler}
+
+
+class FakeMultiroundChatController(Controller):
+
+    class WorkerTag(Enum):
+        GENERATION = "generation"
+        FAKE_MULTIROUND = "fake_multiround"
+
+    def __init__(self, rounds: int):
+        super().__init__()
+        self.rounds = rounds
+
+    def generate(self, prompt: str):
+        task = GenerationTask()
+        yield from self.process([task])
+        return task.create_scaffolding_output()
+
+    def process(self, tasks) -> TaskStatus:
+        task = tasks[0]
+        for _ in range(self.rounds):
+            task.worker_tag = self.WorkerTag.FAKE_MULTIROUND
+            yield [task]
+            task.worker_tag = self.WorkerTag.GENERATION
+            yield [task]
+    
+        return TaskStatus.SUCCESS
+
+async def async_multiround_chat_benchmark(args):
+    """Multiround chat benchmark."""
+    client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
+    generation_worker = TRTOpenaiWorker(client, args.model)
+    multiround_worker = FakeMultiroundWorker(model_dir=args.model_dir, vocab_size=args.vocab_size)
+    
+    chat_controller = FakeMultiroundChatController(rounds=args.chat_multiround_rounds)
+    chat_llm = ScaffoldingLlm(
+        chat_controller,
+        {FakeMultiroundChatController.WorkerTag.GENERATION: generation_worker, FakeMultiroundChatController.WorkerTag.FAKE_MULTIROUND: multiround_worker},
+    )
+
+    task_collection_types = {}
+    requests = [ScaffoldingBenchRequest(prompt="Just a placeholder prompt") for _ in range(args.chat_prompt_num)]
+    strategy = ConcurrentStrategy(concurrency=args.chat_concurrency)
+
+    (
+        results,
+        requests_start_time,
+        requests_execution_time,
+        total_time,
+    ) = await async_scaffolding_benchmark(
+        chat_llm, task_collection_types, requests, strategy=strategy
+    )
+
+    print("chat finished")
+
+    # Graceful shutdown
+    chat_llm.shutdown(shutdown_workers=True)
+
+    return
+
 def run_async_in_thread(coro):
     """Run async coroutine in a separate thread with proper cleanup."""
     loop = asyncio.new_event_loop()
@@ -432,6 +581,8 @@ if __name__ == "__main__":
         benchmarks.append((async_burst_agent_benchmark, "Burst-Agent-Benchmark"))
     if args.enable_chatbot:
         benchmarks.append((async_chat_benchmark, "Chat-Benchmark"))
+    if args.enable_multiround_chatbot:
+        benchmarks.append((async_multiround_chat_benchmark, "Multiround-Chat-Benchmark"))
 
     if not benchmarks:
         print(
