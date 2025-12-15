@@ -182,10 +182,11 @@ class ExportToGM(BaseTransform):
                     patch_list=self.config.patch_list,
                 )
 
-            # We intentionally do not export `attention_mask` as a GraphModule input.
-            # Some HF call sites will still pass `attention_mask` at runtime; we will
-            # handle that separately during inference.
-            captured_kwargs.pop("attention_mask", None)
+            # We intentionally do not export certain HF-only kwargs as GraphModule inputs.
+            # Some HF call sites will still pass these at runtime; we will drop them before
+            # calling the exported GraphModule to avoid torch.export strict in_spec matching.
+            for k in _DROP_GM_KWARGS:
+                captured_kwargs.pop(k, None)
 
             # construct dynamic shapes based on the captured kwargs and the dynamic shape lookup
             dynamic_shapes = {

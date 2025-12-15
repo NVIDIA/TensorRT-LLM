@@ -123,16 +123,21 @@ class InsertCachedAttention(BaseTransform):
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
+            cached_attn_op = self.attn_descriptor.get_cached_attention_op()
+            args = (*qkv_nodes, *meta_nodes_std, *meta_nodes_extra, *cache_nodes, *buffer_nodes, *constants)
+            # FlashInfer cached attention op optionally accepts two extra args for VLM custom masks:
+            #   custom_mask_full, custom_mask_sliding
+            # In graph-mode we may not have these tensors available; still pass explicit None
+            # placeholders to satisfy the operator schema (important for torch.compile / Dynamo).
+            try:
+                if cached_attn_op == torch.ops.auto_deploy.flashinfer_attention_mha_with_cache:
+                    args = (*args, None, None)
+            except Exception:
+                # Be conservative: if op resolution fails in some environments, don't special-case.
+                pass
             cached_attn_node = gm.graph.call_function(
-                self.attn_descriptor.get_cached_attention_op(),
-                args=(
-                    *qkv_nodes,
-                    *meta_nodes_std,
-                    *meta_nodes_extra,
-                    *cache_nodes,
-                    *buffer_nodes,
-                    *constants,
-                ),
+                cached_attn_op,
+                args=args,
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
