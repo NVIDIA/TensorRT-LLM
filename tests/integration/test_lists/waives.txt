@@ -441,6 +441,5 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2
 unittest/_torch/modeling/test_modeling_out_of_tree.py::TestOutOfTree::test_llm_api[False] SKIP (https://nvbugs/5739981)
 unittest/_torch/modeling/test_modeling_out_of_tree.py::TestOutOfTree::test_llm_api[True] SKIP (https://nvbugs/5739981)
 unittest/_torch/modeling/test_modeling_out_of_tree.py::TestOutOfTree::test_serve[True] SKIP (https://nvbugs/5739981)
-unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py SKIP (https://nvbugs/5741060)
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2] SKIP (https://nvbugs/5596337)
 full:sm89/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2] SKIP (https://nvbugs/5596337)
