@@ -1569,7 +1569,7 @@ class TestBatchedSampling:
                 # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
                 # will be empty when all requests are greedy
                 all_greedy = all(
-                    _request_strategy(req, vocab_size=2**31) is GREEDY
+                    _request_strategy(req, vocab_size=2**31) == GREEDY
                     for req in scheduled_requests.all_requests()
                 )
                 assert flashinfer_keys_seen or all_greedy

@@ -1908,7 +1908,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         max_beam_width: int,
         d2t: torch.Tensor | None,
     ) -> None:
-        """Compiled kernel for fast greedy sampling.
+        """Applies fast greedy sampling to the logits.
 
         Performs argmax, applies d2t translation if present, and scatters
         tokens into the output buffer. All operations are in-place.
