@@ -1,11 +1,16 @@
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
 
+from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
+from tensorrt_llm.serve.responses_utils import \
+    create_response_non_store as responses_api_create_response_non_store
+
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
+from ..llmapi import SamplingParams
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
@@ -26,7 +31,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
-                              PromptTokensDetails, StreamOptions, ToolCall,
+                              PromptTokensDetails, ResponsesRequest,
+                              ResponsesResponse, StreamOptions, ToolCall,
                               UsageInfo, to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
 from .tool_parser.core_types import ToolCallItem
@@ -543,3 +549,42 @@ def chat_harmony_streaming_post_processor(
         num_prompt_tokens=args.num_prompt_tokens,
     )
     return response
+
+
+@dataclass(kw_only=True)
+class ResponsesAPIPostprocArgs(PostprocArgs):
+    model: str
+    request: ResponsesRequest
+    sampling_params: SamplingParams
+    use_harmony: bool
+    reasoning_parser: Optional[str] = None
+    tool_parser: Optional[str] = None
+    streaming_processor: Optional[ResponsesStreamingProcessor] = None
+
+
+@nvtx_range_debug("responses_api_post_processor")
+def responses_api_post_processor(
+        rsp: GenerationResult,
+        args: ResponsesAPIPostprocArgs) -> ResponsesResponse:
+    return responses_api_create_response_non_store(
+        generation_result=rsp,
+        request=args.request,
+        sampling_params=args.sampling_params,
+        model_name=args.model,
+        use_harmony=args.use_harmony,
+        reasoning_parser=args.reasoning_parser,
+        tool_parser=args.tool_parser,
+    )
+
+
+@nvtx_range_debug("responses_api_streaming_post_processor")
+def responses_api_streaming_post_processor(
+        rsp: GenerationResult, args: ResponsesAPIPostprocArgs) -> List[str]:
+    if args.streaming_processor is None:
+        raise ValueError(
+            "streaming_processor is required for streaming post-processing")
+    outputs = args.streaming_processor.process_single_output(rsp)
+    if rsp._done:
+        outputs.append(
+            args.streaming_processor.get_final_response_non_store(rsp))
+    return outputs
