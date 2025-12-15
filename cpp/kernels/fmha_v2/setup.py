@@ -3683,6 +3683,24 @@ extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_
     return '\n'.join(lines)
 
 
+# Specialized cubins for TRT-LLM.
+def trtllm_cubins(kname, kspec):
+    # Still use cubins due to failing tests in CI.
+    kname_lists = [
+        "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_kernel",
+    ]
+    if kname.replace("__placeholder__", "") in kname_lists:
+        return True
+
+    if kspec.enable_skip_softmax:
+        return False
+
+    # Always use cubins for head_size == 128 hopper or e4m3 ada kernels.
+    # TODO: Should we call use_cubin_header instead?
+    return (kspec.sm == 90 and kspec.head_size == 128) \
+        or (kspec.sm == 89 and 'e4m3' in kspec.dtype)
+
+
 def generate_files(specs_names):
 
     kfiles = []
@@ -3691,7 +3709,8 @@ def generate_files(specs_names):
     for kspec, fname, lname, kname in specs_names:
         code = get_kernel_code(kspec, kname, lname)
         # some kernels are skipped when generating cubins for trt-llm.
-        if code is None:
+        if code is None or ("GENERATE_CUBIN" in os.environ
+                            and not trtllm_cubins(kname, kspec)):
             continue
         # add valid specs names
         valid_specs_names.append((kspec, fname, lname, kname))
