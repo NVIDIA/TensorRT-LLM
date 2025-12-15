@@ -27,9 +27,9 @@ def parse_args():
                        type=str,
                        help='Directory containing YAML configuration files')
     parser.add_argument('--log-dir',
-                       type=str,
-                       default=None,
-                       help='Log directory')
+                        type=str,
+                        default=None,
+                        help='Log directory')
     return parser.parse_args()
 
 
@@ -156,13 +156,15 @@ def submit_job(config, log_dir):
     # Calculate nodes based on world sizes
     ctx_tp_size = config['worker_config']['ctx'].get('tensor_parallel_size', 1)
     ctx_cp_size = config['worker_config']['ctx'].get('context_parallel_size', 1)
-    ctx_pp_size = config['worker_config']['ctx'].get('pipeline_parallel_size', 1)
+    ctx_pp_size = config['worker_config']['ctx'].get('pipeline_parallel_size',
+                                                     1)
     ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
 
     gen_tp_size = config['worker_config']['gen'].get('tensor_parallel_size', 1)
     gen_cp_size = config['worker_config']['gen'].get('context_parallel_size', 1)
-    gen_pp_size = config['worker_config']['gen'].get('pipeline_parallel_size', 1)
+    gen_pp_size = config['worker_config']['gen'].get('pipeline_parallel_size',
+                                                     1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
 
