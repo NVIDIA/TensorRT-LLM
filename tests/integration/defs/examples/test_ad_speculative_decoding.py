@@ -29,7 +29,7 @@ prompts = [
     "What is the highest mountain in the world?",
 ]
 
-EAGLE_MODEL_SUBPATH = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
 LLAMA_BASE_SUBPATH = "llama-3.1-model/Llama-3.1-8B-Instruct"
 DRAFT_TARGET_MAX_DRAFT_LEN = 3
 EAGLE_MAX_DRAFT_LEN = 3
