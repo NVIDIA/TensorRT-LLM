@@ -740,6 +740,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
         "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
         "tests/integration/defs/examples/test_ray.py",
+        "tests/unittest/llmapi/test_async_llm.py",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
