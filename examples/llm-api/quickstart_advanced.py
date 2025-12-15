@@ -1,4 +1,6 @@
 import argparse
+import json
+import time
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
@@ -90,6 +92,9 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument("--tokens_per_block", type=int, default=32)
+    parser.add_argument('--log_kv_cache_events',
+                        default=False,
+                        action='store_true')
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -190,7 +195,7 @@ def setup_llm(args, **kwargs):
         free_gpu_memory_fraction=args.kv_cache_fraction,
         dtype=args.kv_cache_dtype,
         tokens_per_block=args.tokens_per_block,
-    )
+        event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 
     spec_decode_algo = args.spec_decode_algo.upper(
     ) if args.spec_decode_algo is not None else None
@@ -354,6 +359,13 @@ def main():
                     print(
                         f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
                     )
+
+    if args.log_kv_cache_events:
+        time.sleep(1)  # Wait for events to be dispatched
+        events = llm.get_kv_cache_events(5)
+        print("=== KV_CACHE_EVENTS_START ===")
+        print(json.dumps(events, indent=2))
+        print("=== KV_CACHE_EVENTS_END ===")
 
 
 if __name__ == '__main__':

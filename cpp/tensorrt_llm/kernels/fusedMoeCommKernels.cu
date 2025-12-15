@@ -20,7 +20,9 @@
 #include <type_traits>
 
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
 #include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
+#include "tensorrt_llm/kernels/ll128Proto.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -337,154 +339,6 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
 #endif
 }
 
-static __device__ __forceinline__ uint32_t __as_ptr_smem(void const* __ptr)
-{
-    // Consider adding debug asserts here.
-    return static_cast<uint32_t>(__cvta_generic_to_shared(__ptr));
-}
-
-static __device__ __forceinline__ uint64_t __as_ptr_gmem(void const* __ptr)
-{
-    // Consider adding debug asserts here.
-    return static_cast<uint64_t>(__cvta_generic_to_global(__ptr));
-}
-
-__device__ __forceinline__ void fence_release_sys()
-{
-    asm volatile("fence.release.sys;" : : : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_init(uint64_t* addr, uint32_t const& count)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm("mbarrier.init.shared.b64 [%0], %1;" : : "r"(__as_ptr_smem(addr)), "r"(count) : "memory");
-#endif
-}
-
-__device__ __forceinline__ void mbarrier_expect_tx(uint64_t* addr, const uint32_t txCount)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
-        :
-        : "r"(__as_ptr_smem(addr)), "r"(txCount)
-        : "memory");
-#endif
-}
-
-__device__ __forceinline__ uint64_t mbarrier_arrive(uint64_t* addr)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    uint64_t state;
-    asm("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(__as_ptr_smem(addr)) : "memory");
-    return state;
-#else
-    return 0;
-#endif
-}
-
-__device__ __forceinline__ uint64_t mbarrier_arrive_expect_tx(uint64_t* addr, const uint32_t txCount)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    uint64_t state;
-    asm("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
-        : "=l"(state)
-        : "r"(__as_ptr_smem(addr)), "r"(txCount)
-        : "memory");
-    return state;
-#else
-    return 0;
-#endif
-}
-
-__device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_t const& phaseParity)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    uint32_t waitComplete;
-    asm("{\n\t .reg .pred P_OUT; \n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64  P_OUT, [%1], %2;\n\t"
-        "selp.b32 %0, 1, 0, P_OUT; \n"
-        "}"
-        : "=r"(waitComplete)
-        : "r"(__as_ptr_smem(addr)), "r"(phaseParity)
-        : "memory");
-    return static_cast<bool>(waitComplete);
-#else
-    return false;
-#endif
-}
-
-template <int COPY_SIZE = 4>
-__device__ __forceinline__ void ldgsts(int* dstShm, int const* srcMem, bool predGuard)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %0, 0;\n"
-        "  @p cp.async.ca.shared.global [%1], [%2], %3;\n"
-        "}\n" ::"r"((int) predGuard),
-        "r"(__as_ptr_smem(dstShm)), "l"(__as_ptr_gmem(srcMem)), "n"(COPY_SIZE));
-#endif
-}
-
-__device__ __forceinline__ void cp_async_commit_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.commit_group;" : : :);
-#endif
-}
-
-template <int N = 0>
-__device__ __forceinline__ void cp_async_wait_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_group %0;" : : "n"(N) : "memory");
-#endif
-}
-
-__device__ __forceinline__ void cp_async_bulk_g2s(void* dstMem, void const* srcMem, int copySize, uint64_t* smemBar)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-        :
-        : "r"(__as_ptr_smem(dstMem)), "l"(__as_ptr_gmem(srcMem)), "r"(copySize), "r"(__as_ptr_smem(smemBar))
-        : "memory");
-#endif
-}
-
-__device__ __forceinline__ void cp_async_bulk_s2g(void* dstMem, void const* srcMem, int copySize)
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-        :
-        : "l"(__as_ptr_gmem(dstMem)), "r"(__as_ptr_smem(srcMem)), "r"(copySize)
-        : "memory");
-#endif
-}
-
-__device__ __forceinline__ void cp_async_bulk_commit_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.commit_group;" : : :);
-#endif
-}
-
-template <int N = 0>
-__device__ __forceinline__ void cp_async_bulk_wait_group()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.wait_group %0;" : : "n"(N) : "memory");
-#endif
-}
-
-template <int N = 0>
-__device__ __forceinline__ void cp_async_bulk_wait_group_read()
-{
-#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
-    asm volatile("cp.async.bulk.wait_group.read %0;" : : "n"(N) : "memory");
-#endif
-}
-
 __host__ void MoeCommFieldInfo::fillFieldInfo(
     uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride, cudaDataType_t dataType)
 {
@@ -527,143 +381,47 @@ __host__ void MoeCommFieldInfo::fillFieldInfo(
     originalDataType = dataType;
 }
 
-class Ll128Proto
+// Wrapper class that delegates to LL128Proto but accepts extra warpId parameter for backward compatibility
+class Ll128ProtoWrapper
 {
 public:
-    static constexpr uint32_t INITIALIZED_VALUE = 0xFFFFFFFFU;
+    static constexpr uint32_t INITIALIZED_VALUE = LL128Proto::INITIALIZED_VALUE;
 
     template <bool USE_FINISH>
     static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, uint64_t step,
-        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
+        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int /*warpId*/, int laneId)
     {
-        // return value should be how many package already been received.
-        // 0 means no data received, -1 means has received finish package(should be the very first 128 Byte).
-        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
-        int totalValidCount = 0;
-        for (int idxBase = loaded128ByteCount; idxBase < countIn128Bytes; idxBase += WARP_SIZE)
-        {
-            int idx = idxBase + laneId;
-            bool valid = false;
-            bool finish = false;
-            if (idx < countIn128Bytes)
-            {
-                int indexInFifoEntry = fifoEntry128ByteIndexBase + idx;
-                uint64_t value = aligned128BytesShm[idx * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
-                    + indexInFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK];
-                if (USE_FINISH)
-                {
-                    finish = (value == (step & (1ULL << 63ULL)));
-                    valid = (value == step) || finish;
-                }
-                else
-                {
-                    valid = (value == step);
-                }
-            }
-            __syncwarp();
-            unsigned validMask = __ballot_sync(WARP_MASK, valid);
-            // here we check valid in order, if previous valid is not true, we ignore the current valid.
-            int validCount = (validMask == WARP_MASK) ? WARP_SIZE : (__ffs(~validMask) - 1);
-            if (USE_FINISH)
-            {
-                unsigned finishedMask = __ballot_sync(WARP_MASK, finish);
-                // finish should be the very first 128 Byte.
-                if (finishedMask & 0x1)
-                {
-                    return -1;
-                }
-            }
-            totalValidCount += validCount;
-
-            if (validCount != WARP_SIZE)
-            {
-                break;
-            }
-        }
-        return totalValidCount;
+        return LL128Proto::checkDataReceivedInShm<USE_FINISH>(
+            sharedMemoryBase, step, countIn128Bytes, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
     }
 
     static __device__ __forceinline__ void protoPack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int warpId, int laneId)
+        int fifoEntry128ByteIndexBase, int /*warpId*/, int laneId)
     {
-        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
-        int halfLaneId = laneId % 16;
-        int halfIndex = laneId / 16;
-        int tailOffsetIn128Bytes = countIn128Bytes + halfIndex;
-        // for LL128 15 * 128 Bytes will be packed to 16 * 128 Bytes, each 16 threads is used for one 15 * 128 bytes.
-        for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
-        {
-            int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
-            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
-            int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
-            int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
-            uint64_t tailValue = step;
-            uint64_t tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
-            if (halfLaneId == 15)
-            {
-                tailInnerIndex = tailFlagInnerIndex;
-            }
-            int targetTailIndex = tailOffsetIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK + tailInnerIndex;
-            if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
-            {
-                int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
-                    + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
-                tailValue = aligned128BytesShm[flagIndex];
-                aligned128BytesShm[flagIndex] = step;
-            }
-            aligned128BytesShm[targetTailIndex] = tailValue;
-            tailOffsetIn128Bytes += 2;
-        }
-        __syncwarp();
+        LL128Proto::protoPack(sharedMemoryBase, step, countIn128Bytes, fifoEntry128ByteIndexBase, laneId);
     }
 
     static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
+        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int /*warpId*/, int laneId)
     {
-        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
-        int halfLaneId = laneId % 16;
-        int halfIndex = laneId / 16;
-        int tailOffsetIn128Bytes = countIn128Bytes + halfIndex;
-        for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
-        {
-            int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
-            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
-            int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
-            int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
-            uint64_t tailValue = 0;
-            int tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
-            int targetTailIndex = tailOffsetIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK + tailInnerIndex;
-            if (halfLaneId < 15)
-            {
-                tailValue = aligned128BytesShm[targetTailIndex];
-            }
-            if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
-            {
-                int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
-                    + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
-                aligned128BytesShm[flagIndex] = tailValue;
-            }
-            tailOffsetIn128Bytes += 2;
-        }
-        __syncwarp();
+        LL128Proto::protoUnpack(
+            sharedMemoryBase, step, countIn128Bytes, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
     }
 
-    static __device__ __forceinline__ void rearm(
-        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int warpId, int laneId)
+    static __device__ __forceinline__ void rearm(uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes,
+        int fifoEntry128ByteIndexBase, int /*warpId*/, int laneId)
     {
-        // LL128 don't need rearm
+        LL128Proto::rearm(u32FifoPtr, step, countIn128Bytes, fifoEntry128ByteIndexBase, laneId);
     }
 
     static __device__ __host__ __forceinline__ int computeProtoTransfer128ByteAlignedSize(
         int compact128ByteSizeBeforeProto)
     {
-        // each 15 * 128 byte need one tail 128 byte
-        int tail128ByteSize = (compact128ByteSizeBeforeProto + 15 * 128 - 1) / (15 * 128) * 128;
-        return compact128ByteSizeBeforeProto + tail128ByteSize;
+        return LL128Proto::computeProtoTransfer128ByteAlignedSize(compact128ByteSizeBeforeProto);
     }
 };
 
-using FusedMoeProto = Ll128Proto;
+using FusedMoeProto = Ll128ProtoWrapper;
 
 // using FusedMoeProto = LamportProto;
 
@@ -797,23 +555,6 @@ __device__ __forceinline__ void unpackAllFields(
     __syncwarp();
 }
 
-__device__ __forceinline__ void initSmemBar(uint64_t* smemBar, int laneId)
-{
-    if (laneId == 0)
-    {
-        mbarrier_init(smemBar, WARP_SIZE);
-    }
-    __syncwarp();
-}
-
-__device__ __forceinline__ void smemBarWait(uint64_t* smemBar, uint32_t* phaseParity)
-{
-    while (!mbarrier_try_wait_parity(smemBar, *phaseParity))
-    {
-    }
-    *phaseParity = 1 - *phaseParity;
-}
-
 __device__ __forceinline__ void startWorkspaceS2G(
     uint64_t* fifoEntry, uint8_t* sharedMemoryBase, int send128ByteCount, int fifo128ByteOffset, int warpId, int laneId)
 {
@@ -901,7 +642,7 @@ __device__ __forceinline__ void waitG2SBasicFields()
 
 __device__ __forceinline__ void waitG2SOtherFields(uint64_t* memBar, uint32_t* phaseParity)
 {
-    tensorrt_llm::kernels::fused_moe_impl::smemBarWait(memBar, phaseParity);
+    smemBarWait(memBar, phaseParity);
 }
 
 template <bool HAS_BASIC_FIELDS = true>
@@ -988,7 +729,7 @@ public:
         mFifoEntry128ByteIndexBase = kFifoEntry128ByteCount;
         mFifoEntryIndex = -1;
 
-        tensorrt_llm::kernels::fused_moe_impl::initSmemBar(mSmemBar, mLaneId);
+        initSmemBar(mSmemBar, mLaneId);
     }
 
     __device__ __forceinline__ uint64_t* getFifoEntryPtr() const
@@ -1175,7 +916,7 @@ public:
                     updateReadEntry();
                     needRelease = false;
                 }
-                tensorrt_llm::kernels::fused_moe_impl::smemBarWait(mSmemBar, &phaseParity);
+                smemBarWait(mSmemBar, &phaseParity);
                 loaded128ByteCount += FusedMoeProto::template checkDataReceivedInShm<false>(mShmemBase, mTail,
                     mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mWarpId, mLaneId);
             }
@@ -1521,7 +1262,7 @@ __global__ void g2sKernel(FusedMoeFieldInfo allFieldInfo, MoeExpertParallelInfo 
 
     int singleShmSize = singleCommMeta.singleUncompactAlignedSize;
 
-    tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
+    initSmemBar(&allWarpSmemBar[warpId], laneId);
     uint32_t phaseParity = 0;
 
     uint8_t* sharedMemoryBase = reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * warpId;
@@ -1632,7 +1373,7 @@ __global__ void loopbackKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInf
 
     int recvTokenIndex = recvIndexMapping[tokenIndex];
 
-    tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
+    initSmemBar(&allWarpSmemBar[warpId], laneId);
     uint32_t phaseParity = 0;
 
     int singleShmSize = sendCommMeta.getSingleShmSize();
