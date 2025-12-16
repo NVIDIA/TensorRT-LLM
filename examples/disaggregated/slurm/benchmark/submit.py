@@ -236,9 +236,9 @@ def submit_job(config, log_dir, dry_run):
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)
 
-    # Generate start worker commands with placeholder hostnames
     container_name = "disaggr-test"
-    start_worker_cmds = []
+    start_server_cmds = []
+    # Generate start worker commands with placeholder hostnames
     for allocation in allocations:
         server_type = allocation["server_type"]
         cuda_devices = ",".join(
@@ -270,9 +270,7 @@ def submit_job(config, log_dir, dry_run):
             f'"{cur_worker_env_var}"',
             f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
         ]
-        start_worker_cmds.append(" ".join(cmd))
-    with open(os.path.join(log_dir, "start_worker_cmds.sh"), "w") as f:
-        f.write("\n".join(start_worker_cmds) + "\n")
+        start_server_cmds.append(" ".join(cmd))
 
     # Generate start server commands
     cmd = [
@@ -283,9 +281,9 @@ def submit_job(config, log_dir, dry_run):
         f"bash {env_config['work_dir']}/start_server.sh {ctx_num} {gen_num} {log_dir} {env_config['work_dir']} \"{server_env_var}\"",
         f"&> {log_dir}/4_output_server.log &",
     ]
-    start_server_cmd=" ".join(cmd)
-    with open(os.path.join(log_dir, "start_server_cmd.sh"), "w") as f:
-        f.write(start_server_cmd + "\n")
+    start_server_cmds.append(" ".join(cmd))
+    with open(os.path.join(log_dir, "start_server_cmds.sh"), "w") as f:
+        f.write("\n".join(start_server_cmds) + "\n")
 
     # Generate client commands
     client_cmds = []
@@ -335,22 +333,10 @@ def submit_job(config, log_dir, dry_run):
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
 
-        # Worker configuration
-        '--num-gen-servers', str(gen_num),
-        '--concurrency-list', benchmark_config['concurrency_list'],
-
         # Sequence and benchmark parameters
-        '--isl', str(benchmark_config['input_length']),
-        '--osl', str(benchmark_config['output_length']),
-        '--multi-round', str(benchmark_config['multi_round']),
-        '--benchmark-ratio', str(benchmark_config['benchmark_ratio']),
-        '--streaming', str(benchmark_config['streaming']).lower(),
-        '--use-nv-sa-benchmark', str(benchmark_config['use_nv_sa_benchmark']).lower(),
         '--benchmark-mode', benchmark_config['mode'],
 
         # Environment and paths
-        '--dataset-file', benchmark_config['dataset_file'],
-        '--model-path', env_config['model_path'],
         '--trtllm-repo', env_config['trtllm_repo'],
         '--work-dir', env_config['work_dir'],
         '--full-logdir', log_dir,
@@ -359,12 +345,6 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
-
-        # Accuracy evaluation
-        '--enable-accuracy-test', str(config['accuracy']['enable_accuracy_test']).lower(),
-        '--accuracy-model', config['accuracy']['model'],
-        '--accuracy-tasks', config['accuracy']['tasks'],
-        '--model-args-extra', config['accuracy']['model_args_extra'],
     ]
     # yapf: enable
 

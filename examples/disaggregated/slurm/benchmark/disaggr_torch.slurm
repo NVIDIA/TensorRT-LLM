@@ -123,37 +123,32 @@ all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
-start_worker_cmds_file=${full_logdir}/start_worker_cmds.sh
+start_server_cmds_file=${full_logdir}/start_server_cmds.sh
 IFS=',' read -r -a node_array <<< "$all_nodes_str"
 for i in "${!node_array[@]}"; do
     current_val="${node_array[$i]}"
     placeholder="<node${i}_placeholder>"
 
     # Use sed to replace the placeholder with the value in-place
-    sed -i "s|$placeholder|$current_val|g" "${start_worker_cmds_file}"
+    sed -i "s|$placeholder|$current_val|g" "${start_server_cmds_file}"
     echo "Replaced $placeholder with $current_val"
 done
 
-# start the workers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
-echo "Starting worker commands from ${start_worker_cmds_file}..."
-cat ${start_worker_cmds_file} | while read cmd; do
+# start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
+echo "Starting worker commands from ${start_server_cmds_file}..."
+cat ${start_server_cmds_file} | while read cmd; do
     # Skip ctx worker commands if in gen-only mode
     # CTX appears as argument to start_worker.sh and in log filename
     if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" = "1" ] && [[ "$cmd" == *"start_worker.sh CTX"* ]]; then
         echo "Skipping ctx worker command (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set): ${cmd}"
         continue
     fi
-    echo "Starting worker command: ${cmd}"
+    echo "Executing command: ${cmd}"
     eval "${cmd}"
 done
 
-# start the server (in background)
-start_server_cmd_file=${full_logdir}/start_server_cmd.sh
-echo "Starting server command from ${start_server_cmd_file}..."
-eval $(cat ${start_server_cmd_file})
-
-# Wait for server to be ready (runs synchronously)
-echo "Waiting for server to be ready..."
+# Wait for servers to be ready (runs synchronously)
+echo "Waiting for servers to be ready..."
 if ! srun -l --container-name=${container_name} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
