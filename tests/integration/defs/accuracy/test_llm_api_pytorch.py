@@ -2999,6 +2999,35 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.timeout(7200)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.parametrize("tp_size", [
+        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
+        pytest.param(8, marks=pytest.mark.skip_less_device(8)),
+    ],
+                             ids=["4gpus", "8gpus"])
+    def test_nvfp4(self, tp_size):
+        model_name = "moonshotai/Kimi-K2-Thinking"
+        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 max_batch_size=16,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=True,
+                 trust_remote_code=True,
+                 speculative_config=None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
 
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
