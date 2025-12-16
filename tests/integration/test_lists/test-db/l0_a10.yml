@@ -80,6 +80,7 @@ l0_a10:
   # executor
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
+  - unittest/executor/_torch/test_async_transfer_manager.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py

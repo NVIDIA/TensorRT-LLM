@@ -129,7 +129,14 @@ class AsyncTransferManager:
         self.resource_manager = resource_manager
         self.kv_cache_manager = resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+
+        # Mapping of request id to the tuple:
+        # 1. llm_request
+        # 2. The value returned from store_blocks_for_reuse
+        # 3. The amount of currently pending transfers
         self.requests: Dict[int, (LlmRequest, Optional[int], int)] = dict()
+
+        # Mapping of request ids to whether we've called store_blocks_for_reuse on a request.
         self.request_should_store_blocks: dict[int, bool] = dict()
 
     def requests_in_transfer(self) -> dict[int, LlmRequest]:
