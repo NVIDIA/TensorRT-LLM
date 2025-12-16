@@ -700,6 +700,8 @@ def main(args: argparse.Namespace):
 
     if backend == "openai-chat":
         args.endpoint = "/v1/chat/completions"
+    elif backend == "openai-responses":
+        args.endpoint = "/v1/responses"
 
     if args.base_url is not None:
         api_url = f"{args.base_url}{args.endpoint}"
