@@ -19,7 +19,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 
 
 @ray.remote
-class trtllm_instance:
+class TRTLLMInstance:
     def __init__(self, async_llm_kwargs: dict, sampling_kwargs: dict):
         self.async_llm_kwargs = async_llm_kwargs
         self.sampling_kwargs = sampling_kwargs
@@ -62,7 +62,7 @@ class trtllm_instance:
         )
 
     async def generate(self, prompt: list[int]):
-        """Generate for a single prompt"""
+        """Generate for a single prompt."""
         outputs = await self.llm.generate_async(inputs=prompt, sampling_params=self.sampling_params)
         token_ids = outputs.outputs[0].token_ids
         log_probs = None
@@ -111,7 +111,7 @@ async def setup_rl_llm(args):
         llm_instances = []
         for i in range(num_instances):
             llm_instances.append(
-                trtllm_instance.options(
+                TRTLLMInstance.options(
                     num_cpus=0,
                     num_gpus=0,
                     runtime_env=runtime_env,
@@ -130,7 +130,7 @@ async def setup_rl_llm(args):
                             "free_gpu_memory_fraction": args.kv_cache_fraction,
                         },
                         "cuda_graph_config": {
-                            "enable_padding": args.enable_padding,
+                            "enable_padding": args.enable_cuda_graph_padding,
                             "batch_sizes": args.batch_sizes,
                             "max_batch_size": 0 if args.batch_sizes else args.max_batch_size,
                         },
@@ -171,7 +171,7 @@ async def setup_rl_llm(args):
 
         # Helper function to wrap Ray remote call as async coroutine
         async def generate_single_prompt(instance, prompt):
-            """Generate a single prompt asynchronously"""
+            """Generate a single prompt asynchronously."""
             object_ref = instance.generate.remote(prompt=prompt)
             result = await asyncio.to_thread(ray.get, object_ref)
             return result
@@ -182,7 +182,7 @@ async def setup_rl_llm(args):
             for idx, prompt in enumerate(prompts)
         ]
 
-        results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
         end_time = time.time()
 
         print(f"Time taken: {end_time - start_time:.2f} seconds")
@@ -216,7 +216,10 @@ def add_rl_llm_args(parser):
         help="Sampler type.",
     )
     parser.add_argument(
-        "--trust_remote_code", type=bool, default=True, help="Whether to trust remote code."
+        "--trust_remote_code",
+        action="store_true",
+        default=False,
+        help="Whether to trust remote code.",
     )
 
     # KV Cache Config parameters
@@ -228,16 +231,16 @@ def add_rl_llm_args(parser):
     )
     parser.add_argument(
         "--enable_block_reuse",
-        type=bool,
-        default=True,
+        action="store_true",
+        default=False,
         help="Whether to enable block reuse for KV cache.",
     )
 
     # Cuda Graph Config parameters
     parser.add_argument(
-        "--enable_padding",
-        type=bool,
-        default=True,
+        "--enable_cuda_graph_padding",
+        action="store_true",
+        default=False,
         help="Whether to enable padding for CUDA graphs.",
     )
     parser.add_argument(
