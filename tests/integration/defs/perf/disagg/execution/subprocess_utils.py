@@ -56,10 +56,8 @@ def exec_cmd_with_output(*popenargs, timeout: Optional[float] = None, **kwargs) 
         check=True,
         **kwargs,
     )
-
     # Log stderr if it exists
     if result.stderr:
         stderr_output = result.stderr.decode()
         logger.error(f"Command stderr: {stderr_output}")
-
     return result.stdout.decode()

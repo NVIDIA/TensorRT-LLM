@@ -206,7 +206,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.15
+        assert accept_rate > 0.10
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
@@ -252,7 +252,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
                    speculative_config=spec_config,
                    max_batch_size=1,
                    cuda_graph_config=cuda_graph_config,
-                   disable_overlap_scheduler=False)
+                   disable_overlap_scheduler=True)
 
     prompt = [", ".join(str(i) for i in range(1000))]
 

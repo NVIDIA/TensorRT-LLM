@@ -45,9 +45,8 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
-# TODO: Change back to 1800 when the disaggregated serving test slowdown issue is resolved.
-DEFAULT_TEST_TIMEOUT = 3600
-DEFAULT_SERVER_WAITING_TIMEOUT = 3600
+DEFAULT_TEST_TIMEOUT = 1200
+DEFAULT_SERVER_WAITING_TIMEOUT = 1200
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -864,7 +863,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
-            "cuda_graph_config": None,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128]
+            },
             "cache_transceiver_config": {
                 "backend": "UCX"
             },

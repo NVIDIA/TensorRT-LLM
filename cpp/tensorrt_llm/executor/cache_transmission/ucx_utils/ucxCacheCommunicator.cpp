@@ -504,7 +504,7 @@ UcxConnectionManager::~UcxConnectionManager()
         socket.close();
         mZmqRepThread.join();
     }
-
+    mIsRunning = false;
     mZmqRepSocket.close();
 
     mZmqContext.close();
@@ -671,6 +671,11 @@ std::vector<Connection const*> UcxConnectionManager::getConnections(CommState co
         ret.emplace_back(mConnections[mAddressToConnectionId[address]].get());
     }
     return ret;
+}
+
+bool UcxConnectionManager::isRunning() const
+{
+    return mIsRunning;
 }
 
 CommState const& UcxConnectionManager::getCommState() const

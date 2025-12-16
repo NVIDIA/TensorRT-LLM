@@ -48,7 +48,8 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
-from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
+                                  Eagle3ResourceManager, Eagle3SpecMetadata)
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
@@ -426,6 +427,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             kv_cache_manager_key=self.kv_cache_manager_key,
+            sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
@@ -568,13 +570,12 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_runner.padding_dummy_request = None
 
-        cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type is not None:
-            if cp_type in [CpType.ULYSSES, CpType.STAR]:
-                logger.info(
-                    "[ModelEngine::warmup] Skipping warmup for cp_type: ",
-                    cp_type.name)
-                return
+        if self.mapping.cp_size > 1:
+            cp_type = self.mapping.cp_config.get("cp_type", None)
+            logger.info(
+                f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
+            )
+            return
 
         self._run_torch_compile_warmup(resource_manager)
         self._run_autotuner_warmup(resource_manager)
@@ -625,7 +626,7 @@ class PyTorchModelEngine(ModelEngine):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
-
+        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -635,8 +636,7 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size * (self.max_seq_len - 1))
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        with self.no_cuda_graph(), autotune(cache_path=cache_path,
-                                            rank=self.mapping.rank):
+        with self.no_cuda_graph(), autotune(cache_path=cache_path):
             warmup_request = self._create_warmup_request(
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
@@ -704,31 +704,48 @@ class PyTorchModelEngine(ModelEngine):
                 draft_lengths.append(0)
             draft_lengths = [self.max_total_draft_tokens]
 
+        # Create CUDA graphs for short and long sequences separately for sparse attention.
+        sparse_config = self.sparse_attention_config
+        if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
+        ):
+            # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
+            # to make sure all of the past and current input tokens are within the sequence length threshold.
+            # For long sequences, use the default maximum sequence length (self.max_seq_len).
+            max_seq_len = sparse_config.seq_len_threshold - (
+                self.max_draft_len + 1)
+            if max_seq_len < self.max_seq_len:
+                max_seq_len_list = [self.max_seq_len, max_seq_len]
+            else:
+                max_seq_len_list = [self.max_seq_len]
+        else:
+            max_seq_len_list = [self.max_seq_len]
+
         for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
                 continue
 
             for draft_len in draft_lengths:
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        # No KV cache space, cannot continue capturing graphs
-                        return
+                for max_seq_len in max_seq_len_list:
+                    warmup_request = self._create_cuda_graph_warmup_request(
+                        resource_manager, bs, draft_len, max_seq_len)
+                    with self._release_batch_context(warmup_request,
+                                                     resource_manager) as batch:
+                        if batch is None:
+                            # No KV cache space, cannot continue capturing graphs
+                            return
 
-                    logger.info(
-                        f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
-                    )
+                        logger.info(
+                            f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
+                        )
 
-                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model
-                    self._update_draft_inference_state_for_warmup(
-                        batch, draft_len > 0, resource_manager)
+                        self.enable_spec_decode = draft_len > 0 or self.is_draft_model
+                        self._update_draft_inference_state_for_warmup(
+                            batch, draft_len > 0, resource_manager)
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -873,8 +890,11 @@ class PyTorchModelEngine(ModelEngine):
         return result
 
     def _create_cuda_graph_warmup_request(
-            self, resource_manager: ResourceManager, batch_size: int,
-            draft_len: int) -> Optional[ScheduledRequests]:
+            self,
+            resource_manager: ResourceManager,
+            batch_size: int,
+            draft_len: int,
+            max_seq_len: int = None) -> Optional[ScheduledRequests]:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -902,7 +922,8 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(draft_len)
 
         # Add one dummy request with the maximum possible sequence length.
-        token_num = max(1, min(available_tokens, self.max_seq_len - 1))
+        max_seq_len = self.max_seq_len if max_seq_len is None else max_seq_len
+        token_num = max(1, min(available_tokens, max_seq_len - 1))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
@@ -1671,12 +1692,12 @@ class PyTorchModelEngine(ModelEngine):
                     # Warmup doesn't have `total_input_len_cp` set because merge_helix_requests is not called.
                     if not self.is_warmup and not request.is_cuda_graph_dummy:
                         position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    # TODO: [TRTLLM-5972] Lift the limitation that last rank is always the active one for helix.
-                    if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                        past_seen_token_num = request.orig_prompt_len + request.py_decoding_iter - 1
+                    if request.py_helix_is_inactive_rank:
+                        past_seen_token_num = request.seqlen_this_rank_cp
                     else:
-                        # past_seen_token_num doesn't grow on inactive ranks.
-                        past_seen_token_num = request.orig_prompt_len
+                        # Discount the token added to active rank in resource manager as it hasn't
+                        # been previously seen.
+                        past_seen_token_num = request.seqlen_this_rank_cp - 1
 
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
@@ -2015,6 +2036,11 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        if helix_is_inactive_rank is not None and len(
+                helix_is_inactive_rank) > 0:
+            helix_is_inactive_rank = torch.tensor(helix_is_inactive_rank,
+                                                  dtype=torch.bool,
+                                                  device='cuda')
         attn_metadata.helix_is_inactive_rank = helix_is_inactive_rank
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         # Use num_chunked_ctx_requests to record the number of extend context requests,
@@ -2089,6 +2115,9 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
+            if isinstance(spec_metadata, Eagle3OneModelSpecMetadata):
+                spec_metadata.populate_sampling_params_for_one_model(
+                    scheduled_requests.all_requests())
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -2643,7 +2672,7 @@ class PyTorchModelEngine(ModelEngine):
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
+                self.model_is_wrapped)
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
@@ -2685,6 +2714,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata=spec_metadata,
                 draft_tokens_cuda=self.draft_tokens_cuda
                 if self.is_spec_decode else None,
+                new_tensors_device=new_tensors_device,
                 spec_resource_manager=spec_resource_manager,
             )
             can_run_graph = key is not None

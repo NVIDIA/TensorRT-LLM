@@ -34,7 +34,7 @@ torch::Tensor userbuffers_allreduce_finalize(torch::Tensor input, bool force_app
     int hidden_size = input.size(-1);
 
     auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
-    auto [output, ub_buffer] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+    auto [output, ub_buffer] = tensorrt_llm::torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
 

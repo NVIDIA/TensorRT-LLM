@@ -12,7 +12,7 @@ from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
-                      Fp4QuantizedTensor, ceil_div)
+                      Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
 
@@ -229,7 +229,7 @@ class CutlassFusedMoE(MoE):
 
     @property
     def has_int8_woq_per_channel(self):
-        return self.quant_config.layer_quant_mode.is_int8_weight_only(
+        return self.quant_config and self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
@@ -270,16 +270,22 @@ class CutlassFusedMoE(MoE):
     def quantize_input(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Quantize input tensor - CutlassFusedMoE implementation
 
         Handles all quantization cases for Cutlass backend.
-        """
-        # Determine if this is post-quant communication scenario
-        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
 
+        Args:
+            x: Input tensor to quantize
+            post_quant_comm: Whether this is for post-quantization communication
+                           (allgather or alltoall). If True, x_sf will be reshaped to 2D.
+
+        Returns:
+            Tuple of (quantized_x, x_sf)
+        """
         x_sf = None
         if self.has_any_quant:
             if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
@@ -298,25 +304,40 @@ class CutlassFusedMoE(MoE):
                 # No quantization needed here, handled in kernel
                 pass
             elif self.has_nvfp4:
-                if run_post_quant_allgather or self.enable_alltoall:
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    assert not isinstance(
+                        x, Fp4QuantizedTensor
+                    ), "Fp4QuantizedTensor is not expected for AWQ quantization."
+                    x = x * self.fc31_act_scale
+                # Quantize based on communication scenario
+                if post_quant_comm:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                         x, x_sf = x.fp4_tensor, x.scaling_factor
+                        x_row = x.shape[0]
                     else:
+                        x_row = x.shape[0]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, False)
-                    # Reshape x_sf to 2D
-                    x_sf = x_sf.view((x.shape[0], -1))
+                    # Reshape x_sf to 2D for post-quant communication
+                    if x_sf is not None:
+                        x_sf = x_sf.view((x_row, -1))
                 else:
                     if not isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
             elif self.has_w4a8_mxfp4_mxfp8:
-                if run_post_quant_allgather or self.enable_alltoall:
+                if post_quant_comm:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(
                         x, False, alignment=self.quant_method.weight_alignment)
+                    # Reshape x_sf to 2D for post-quant communication
+                    # x.shape[0] is padded
+                    if x_sf is not None:
+                        x_sf = x_sf.view((x.shape[0], -1))
                 else:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(
                         x, True, alignment=self.quant_method.weight_alignment)
@@ -367,6 +388,89 @@ class CutlassFusedMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
+
+    def run_moe(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: Optional[torch.Tensor] = None,
+        is_sf_swizzled: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        tuner_num_tokens: Optional[int] = None,
+        tuner_top_k: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Run MoE computation with Cutlass backend.
+
+        This method encapsulates the core MoE computation logic, handling different
+        quantization schemes.
+
+        Args:
+            x: Input hidden states (may be pre-quantized)
+            token_selected_experts: Expert IDs or expert slots [num_tokens, top_k]
+                                   If EPLB is enabled, represents expert slots; otherwise expert IDs
+            token_final_scales: Final scaling factors for each token
+            x_sf: Input scale factors (optional, for certain quantization schemes)
+            is_sf_swizzled: Whether scaling factors are swizzled
+            output_dtype: Output data type (optional)
+            tuner_num_tokens: Number of tokens for profiling tuner (optional)
+            tuner_top_k: Top-k value for profiling tuner (optional)
+            moe_output: Pre-allocated output buffer (optional)
+
+        Returns:
+            final_hidden_states: Output tensor from MoE computation
+        """
+        # Determine weight dtype based on quantization mode
+        weight_dtype = self.w3_w1_weight.dtype
+        if self.has_any_quant:
+            if self.has_w4afp8:
+                weight_dtype = torch.quint4x2
+            elif self.has_w4a16_mxfp4:
+                weight_dtype = torch.uint8
+
+        final_hidden_states = torch.ops.trtllm.fused_moe(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            self.w3_w1_weight.view(weight_dtype),
+            self.w3_w1_bias,
+            self.w2_weight.view(weight_dtype),
+            self.w2_bias,
+            output_dtype,
+            quant_scales=self.quant_scales,
+            input_sf=x_sf,
+            swizzled_input_sf=is_sf_swizzled,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            enable_alltoall=self.enable_alltoall,
+            use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
+            use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
+            use_int8_woq_per_channel=self.has_int8_woq_per_channel,
+            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8,
+            min_latency_mode=False,
+            use_fused_finalize=self.use_fused_finalize,
+            tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
+            activation_type=self.activation_type,
+            unpadded_hidden_size=self.unpadded_hidden_size,
+            out_tensor=moe_output,
+        )
+        # Custom op requires all inputs are in the same type.
+        # Only in cutlass_min_latency_mode, the output is a list of tensors.
+        # Otherwise, the output should be unpacked as a single tensor.
+        final_hidden_states = final_hidden_states[0]
+
+        return final_hidden_states
 
     def forward_chunk(
             self,
@@ -421,72 +525,11 @@ class CutlassFusedMoE(MoE):
             token_final_scales = None
 
         run_post_quant_allgather = self.use_dp and self.parallel_size > 1
-        # quantize inputs
-        use_deepseek_fp8_block_scale = False
-        use_w4_group_scaling = False
-        use_int8_woq_per_channel = False
-        use_mxfp8_act_scaling = False
-        weight_dtype = self.w3_w1_weight.dtype
-        x_sf = None
-        x_row = x.shape[0]
-        x_col = x.shape[1]
-        if self.has_any_quant:
-            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant)
-            elif self.has_deepseek_fp8_block_scales:
-                use_deepseek_fp8_block_scale = True
-            elif self.has_w4afp8:
-                use_w4_group_scaling = True
-                weight_dtype = torch.quint4x2
-            elif self.has_w4a16_mxfp4:
-                pad_size = self.hidden_size - x.shape[1]
-                x = torch.nn.functional.pad(x, (0, pad_size))
-                use_w4_group_scaling = True
-                weight_dtype = torch.uint8
-            elif self.has_int8_woq_per_channel:
-                use_int8_woq_per_channel = True
-            elif self.has_nvfp4:
-                # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
-                if hasattr(
-                        self,
-                        'fc31_act_scale') and self.fc31_act_scale is not None:
-                    assert not isinstance(
-                        x, Fp4QuantizedTensor
-                    ), "Fp4QuantizedTensor is not expected for AWQ quantization."
-                    x = x * self.fc31_act_scale
-                if run_post_quant_allgather or self.enable_alltoall:
-                    if isinstance(x, Fp4QuantizedTensor):
-                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
-                        x_row = x.shape[0]
-                        # note: we use uint8 to store 2 fp4 values
-                        x_col = x.shape[1] * 2
-                        x, x_sf = x.fp4_tensor, x.scaling_factor
-                    else:
-                        x_row = x.shape[0]
-                        x_col = x.shape[1]
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size,
-                            False, False)
-                else:
-                    if not isinstance(x, Fp4QuantizedTensor):
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size,
-                            False, True)
-            elif self.has_w4a8_mxfp4_mxfp8:
-                use_mxfp8_act_scaling = True
-                if run_post_quant_allgather or self.enable_alltoall:
-                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                        x, False, alignment=self.quant_method.weight_alignment)
-                else:
-                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
-                        x, True, alignment=self.quant_method.weight_alignment)
-                # Update x_row and x_col to the padded shape
-                x_row, x_col = x.shape[0], x.shape[1]
-            else:
-                raise ValueError(
-                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
-                )
+
+        # Quantize inputs using extracted method
+        # For post_quant_comm scenarios, x_sf will be reshaped to 2D inside quantize_input
+        post_quant_comm = run_post_quant_allgather or self.enable_alltoall
+        x, x_sf = self.quantize_input(x, post_quant_comm=post_quant_comm)
 
         # Prepare additional information for profiling in case padding is applied when using alltoall.
         # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -535,11 +578,6 @@ class CutlassFusedMoE(MoE):
                     self._load_balancer_update_statistic_with_gathered_statistic(
                         gathered_loadbalancer_local_statistic_info)
 
-                if x_sf is not None:
-                    x_sf = x_sf.view(x_row,
-                                     ceil_div(x_col, self.scaling_vector_size))
-                    is_sf_swizzled = False
-
                 # Dispatch x, x_sf, token_selected_slots, token_final_scales in one alltoall kernel
                 x, x_sf, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
                     [x, x_sf, token_selected_slots, token_final_scales],
@@ -552,10 +590,6 @@ class CutlassFusedMoE(MoE):
                     self.ep_size)
             elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                 # Python MoeAlltoAll path
-                if x_sf is not None:
-                    x_sf = x_sf.view(x_row,
-                                     ceil_div(x_col, self.scaling_vector_size))
-                    is_sf_swizzled = False
 
                 payloads = []
                 payloads.append(x)
@@ -593,20 +627,13 @@ class CutlassFusedMoE(MoE):
 
         elif run_post_quant_allgather:
             # Original allgather logic
-            if x_sf is not None:
-                x_sf = x_sf.view(x_row, ceil_div(x_col,
-                                                 self.scaling_vector_size))
-                assert len(
-                    x_sf.shape
-                ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
-                is_sf_swizzled = False
+            # x_sf is already 2D after quantize_input with post_quant_comm=True
 
             x, x_sf, token_selected_slots, token_final_scales = allgather(
                 [x, x_sf, token_selected_slots, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
-            x_row = x.shape[0]
 
         # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output: Optional[torch.Tensor] = None
@@ -617,45 +644,19 @@ class CutlassFusedMoE(MoE):
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.unpadded_hidden_size,
                 output_dtype)
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            self.w3_w1_weight.view(weight_dtype),
-            self.w3_w1_bias,
-            self.w2_weight.view(weight_dtype),
-            self.w2_bias,
-            output_dtype,
-            quant_scales=self.quant_scales,
-            input_sf=x_sf,
-            swizzled_input_sf=is_sf_swizzled,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            enable_alltoall=self.enable_alltoall,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
-            use_int8_woq_per_channel=use_int8_woq_per_channel,
-            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-            min_latency_mode=False,
-            use_fused_finalize=self.use_fused_finalize,
-            tune_max_num_tokens=self.tune_max_num_tokens,
+
+        # Call extracted run_moe method
+        final_hidden_states = self.run_moe(
+            x=x,
+            token_selected_experts=token_selected_slots,
+            token_final_scales=token_final_scales,
+            x_sf=x_sf,
+            is_sf_swizzled=not post_quant_comm,
+            output_dtype=output_dtype,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
-            activation_type=self.activation_type,
-            unpadded_hidden_size=self.unpadded_hidden_size,
-            out_tensor=moe_output,
+            moe_output=moe_output,
         )
-        # Custom op requires all inputs are in the same type.
-        # Only in cutlass_min_latency_mode, the output is a list of tensors.
-        # Otherwise, the output should be unpacked as a single tensor.
-        final_hidden_states = final_hidden_states[0]
 
         self._load_balancer_start_set_cpu_stage(is_last_call)
 

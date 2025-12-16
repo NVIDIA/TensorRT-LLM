@@ -26,13 +26,14 @@
 #include <cute/tensor.hpp>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 #include "fmhaRunnerParams.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -118,6 +119,9 @@ struct KernelParams
     int32_t mBatchSize;
     // The chunked attention size in log2.
     int32_t mChunkedAttentionSizeLog2;
+    // The factor to add to the maximum value to increase the probability
+    //   of skip correction during next iterations.
+    float mInflateMax;
     // The log of the Sage Attention block size for K.
     int32_t mLogNumEltsPerSageAttnBlkK;
     // The log of the Sage Attention block size for P.
@@ -851,4 +855,5 @@ struct KernelParams
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

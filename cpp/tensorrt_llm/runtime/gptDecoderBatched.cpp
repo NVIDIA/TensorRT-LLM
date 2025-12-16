@@ -127,7 +127,7 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
             auto batchSlotsRange = BufferRange<SizeType32 const>(*dInput.batchSlots);
             for (auto batchSlot : batchSlotsRange)
             {
-                TensorPtr finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
+                ::TensorPtr finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
                 bufferManager.setZero(*finishedStepsSlice);
             }
         }
