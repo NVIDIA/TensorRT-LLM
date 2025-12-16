@@ -52,7 +52,12 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .utils import TRTLLM_ENABLE_PDL, is_power_of_2
+from .utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+    is_power_of_2,
+)
 
 
 class Sm100BlockScaledContiguousGroupedGemmKernel:
@@ -934,7 +939,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
-        cute.arch.griddepcontrol_wait()
+        griddepcontrol_wait()
 
         #
         # Specialized Schedule warp
@@ -1600,7 +1605,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             #
             c_pipeline.producer_tail()
 
-        cute.arch.griddepcontrol_launch_dependents()
+        griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,

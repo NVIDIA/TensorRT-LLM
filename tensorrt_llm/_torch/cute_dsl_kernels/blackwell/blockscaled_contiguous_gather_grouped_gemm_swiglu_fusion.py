@@ -41,7 +41,12 @@ from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .custom_pipeline import PipelineCpAsyncUmma
-from .utils import TRTLLM_ENABLE_PDL, is_power_of_2
+from .utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+    is_power_of_2,
+)
 
 
 @dsl_user_op
@@ -1149,7 +1154,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
-        cute.arch.griddepcontrol_wait()
+        griddepcontrol_wait()
 
         #
         # Specialized Schedule warp
@@ -2285,7 +2290,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             c_pipeline.producer_tail()
 
-        cute.arch.griddepcontrol_launch_dependents()
+        griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,

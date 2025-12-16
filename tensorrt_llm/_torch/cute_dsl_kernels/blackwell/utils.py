@@ -49,7 +49,9 @@ from typing import Union
 
 import cutlass._mlir.dialects.cute as _cute_ir
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+from cutlass.cutlass_dsl import dsl_user_op
 
 TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
 
@@ -193,3 +195,43 @@ def make_ptr(
 
 def is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
+
+
+@dsl_user_op
+def griddepcontrol_wait(*, loc=None, ip=None) -> None:
+    """
+    This instruction is used to wait for the previous kernel's grid ending
+    (all blocks of the previous kernel have finished and memflushed), i.e.,
+    the instruction after this instruction will not be issued until the previous
+    grid has finished.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.wait;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
+    """
+    Issuing the launch_dependents instruction hints a dependent kernel to launch earlier.
+    launch_dependents doesn't impact the functionality but the performance:
+    Launching a dependent kernel too early can compete with current kernels,
+    while launching too late can lead to a long latency.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.launch_dependents;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
