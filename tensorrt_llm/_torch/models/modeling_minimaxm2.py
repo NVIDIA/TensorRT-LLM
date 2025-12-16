@@ -9,11 +9,11 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..models.modeling_utils import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -84,7 +84,7 @@ class MiniMaxM2MoE(nn.Module):
         return final_hidden_states
 
 
-class MiniMaxM2Attention(Attention):
+class MiniMaxM2Attention(QKNormRoPEAttention):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
