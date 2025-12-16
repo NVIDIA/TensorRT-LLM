@@ -30,6 +30,9 @@ def parse_args():
                         type=str,
                         default=None,
                         help='Log directory')
+    parser.add_argument('--dry-run',
+                        action='store_true',
+                        help='Dry run the Python part, test purpose only')
     return parser.parse_args()
 
 
@@ -108,7 +111,7 @@ def allocate_gpus(
     return allocations
 
 
-def submit_job(config, log_dir):
+def submit_job(config, log_dir, dry_run):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
@@ -336,12 +339,18 @@ def submit_job(config, log_dir):
     ]
     # yapf: enable
 
-    # Submit the job
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error submitting job: {e}", file=sys.stderr)
-        sys.exit(1)
+    if dry_run:
+        print("[WARNING] Dry run mode, will not submit the job. This should be used for test purpose only.")
+        print("sbatch command:")
+        print(" ".join(cmd))
+        return
+    else:
+        # Submit the job
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error submitting job: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 def main():
@@ -368,7 +377,7 @@ def main():
         print(f"Processing: {config_file}")
         try:
             config = load_config(config_file)
-            submit_job(config, args.log_dir)
+            submit_job(config, args.log_dir, args.dry_run)
             print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
             print(f"Error processing {config_file}: {e}", file=sys.stderr)
