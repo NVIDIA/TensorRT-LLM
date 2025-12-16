@@ -590,7 +590,7 @@ def build_llava_engine(args):
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             args.model_path, dtype=torch.float16)
         wrapper = LlavaOnevisionVisionWrapper(
-            model.vision_tower.vision_model.to(args.device),
+            model.vision_tower.to(args.device),
             model.multi_modal_projector.to(args.device), model.config)
 
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')

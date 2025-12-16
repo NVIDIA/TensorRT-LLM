@@ -345,8 +345,8 @@ def create_moe(
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
     if ENABLE_CONFIGURABLE_MOE or moe_cls == CuteDslFusedMoE:
-        # ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends
-        if moe_cls in (TRTLLMGenFusedMoE, CuteDslFusedMoE):
+        if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
+                       CutlassFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

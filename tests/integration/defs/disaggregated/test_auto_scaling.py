@@ -154,7 +154,7 @@ def _run_worker(model_name, worker_config, role, port, work_dir, device=-1):
         env = os.environ.copy()
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        log_path = os.path.join(work_dir, f"output_{role}.log")
+        log_path = os.path.join(work_dir, f"output_{role}_{port}.log")
         log_file = open(log_path, "w+")
         print(f"Running {role} on port {port}")
         return ProcessWrapper(subprocess.Popen(cmd,
