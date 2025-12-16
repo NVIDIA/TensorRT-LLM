@@ -1269,10 +1269,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        catchError(
-                            buildResult: 'SUCCESS',
-                            stageResult: 'UNSTABLE') {
-                            error "Build-Docker-Images job failed: ${e.toString()}"
+                        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+                        if (isOfficialPostMergeJob) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'UNSTABLE') {
+                                error "Build-Docker-Images job failed: ${e.toString()}"
+                            }
+                        } else {
+                            throw e
                         }
                     }
                 }
