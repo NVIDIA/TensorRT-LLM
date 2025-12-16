@@ -1173,19 +1173,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l, n = b.size(0), b.size(1)
 
             # TODO: Add full shmoo
-            mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+            mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 128),
+                                       (256, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2), (2, 1), (2, 2)]
+            raster_along_m_candidates = [True, False]
 
             valid_tactics = []
-            for mma_tiler_mn, cluster_shape_mn in itertools.product(
-                    mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+            for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
+                    mma_tiler_mn_candidates, cluster_shape_mn_candidates,
+                    raster_along_m_candidates):
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
                         sf_vec_size=self.scaling_vector_size,
-                        acc_dtype=cutlass.Float32,
                         out_dtype=cutlass.BFloat16,
-                        use_2cta_instrs=False,
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                         m=m,
@@ -1194,10 +1195,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         l=l,
                         a_major="k",
                         b_major="k",
-                        c_major="n",
-                        m_aligned=self.tile_size,
+                        out_major="n",
                 ):
-                    valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, raster_along_m))
 
             return valid_tactics
 
@@ -1311,19 +1312,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn = tactic
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                if self.tile_size == 256:
+                    mma_tiler_mn, cluster_shape_mn, raster_along_m = (
+                        256, 128), (2, 1), False
+                else:
+                    mma_tiler_mn, cluster_shape_mn, raster_along_m = (
+                        128, 128), (1, 1), False
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
-                    acc_dtype=cutlass.Float32,
-                    use_2cta_instrs=False,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
