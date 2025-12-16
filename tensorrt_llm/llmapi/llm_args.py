@@ -1837,7 +1837,7 @@ class BaseLlmArgs(StrictBaseModel):
         description="The mode to initialize the tokenizer.",
         json_schema_extra={"type": "Literal['auto', 'slow']"})
 
-    custom_tokenizer_type: Optional[str] = Field(
+    custom_tokenizer: Optional[str] = Field(
         default=None,
         description="Specify a custom tokenizer implementation. Accepts either: "
         "(1) a built-in alias (e.g., 'deepseek_v32'), or "
@@ -2194,12 +2194,12 @@ class BaseLlmArgs(StrictBaseModel):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
             self.tokenizer = None
-        elif self.custom_tokenizer_type:
-            # If tokenizer is already a tokenizer object, custom_tokenizer_type is not compatible
+        elif self.custom_tokenizer:
+            # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
             if isinstance(self.tokenizer,
                           (TokenizerBase, PreTrainedTokenizerBase)):
                 raise ValueError(
-                    "Cannot use custom_tokenizer_type when tokenizer is already a tokenizer object. "
+                    "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
@@ -2209,8 +2209,8 @@ class BaseLlmArgs(StrictBaseModel):
                 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
             }
 
-            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer_type,
-                                                   self.custom_tokenizer_type)
+            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
+                                                   self.custom_tokenizer)
 
             # Dynamically import and use custom tokenizer
             from importlib import import_module
@@ -2226,7 +2226,7 @@ class BaseLlmArgs(StrictBaseModel):
                     use_fast=self.tokenizer_mode != 'slow')
             except (ValueError, ImportError, AttributeError) as e:
                 raise ValueError(
-                    f"Failed to load custom tokenizer '{self.custom_tokenizer_type}': {e}. "
+                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
                     "Expected format: 'module.path.ClassName' or a recognized alias."
                 ) from e
         else:

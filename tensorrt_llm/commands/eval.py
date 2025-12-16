@@ -40,7 +40,7 @@ from ..logger import logger, severity_map
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
 @click.option(
-    "--custom_tokenizer_type",
+    "--custom_tokenizer",
     type=str,
     default=None,
     help=
@@ -118,7 +118,7 @@ from ..logger import logger, severity_map
               help="Flag for disabling KV cache reuse.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str],
-         custom_tokenizer_type: Optional[str], log_level: str, backend: str,
+         custom_tokenizer: Optional[str], log_level: str, backend: str,
          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
          max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
          gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
@@ -133,7 +133,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
     llm_args = {
         "model": model,
         "tokenizer": tokenizer,
-        "custom_tokenizer_type": custom_tokenizer_type,
+        "custom_tokenizer": custom_tokenizer,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "moe_expert_parallel_size": ep_size,

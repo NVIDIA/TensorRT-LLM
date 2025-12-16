@@ -60,7 +60,7 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
-      custom_tokenizer_type:
+      custom_tokenizer:
         annotation: Optional[str]
         default: null
         status: prototype
