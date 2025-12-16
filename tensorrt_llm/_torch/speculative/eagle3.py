@@ -14,6 +14,7 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, get_force_num_accepted_tokens
 from .mtp import MTPSampler
+from .one_model_sampler import sampling_batch_spec_dec_one_model
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -493,6 +494,40 @@ class Eagle3OneModelWorker(nn.Module):
             'next_new_tokens': next_new_tokens,
         }
 
+    def _sample_tokens_for_batch(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: Eagle3OneModelSpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Sample tokens from logits using per-request sampling parameters.
+        Supports both greedy and non-greedy sampling.
+
+        Args:
+            logits: [num_tokens, vocab_size] - Logits to sample from
+            spec_metadata: Metadata containing sampling parameters
+            batch_size: Number of requests in the batch
+
+        Returns:
+            sampled_tokens: [num_tokens] - Sampled token ids
+        """
+        if spec_metadata.allow_advanced_sampling:
+            num_gens = batch_size - num_contexts
+            num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
+
+            temperatures = spec_metadata.temperatures[:num_tokens]
+            top_ks = spec_metadata.top_ks[:num_tokens]
+            top_ps = spec_metadata.top_ps[:num_tokens]
+
+            sampled_tokens = sampling_batch_spec_dec_one_model(
+                logits, temperatures, top_ks, top_ps)
+        else:
+            sampled_tokens = torch.argmax(logits, dim=-1)
+
+        return sampled_tokens
+
     def sample_and_accept_draft_tokens(
         self,
         logits: torch.Tensor,
@@ -514,8 +549,9 @@ class Eagle3OneModelWorker(nn.Module):
                                          dtype=torch.int,
                                          device=logits.device)
 
-        # Do greedy sampling for the input logits
-        target_tokens = torch.argmax(logits, dim=-1)
+        # Sample tokens using per-request sampling parameters
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
@@ -557,6 +593,9 @@ class Eagle3OneModelWorker(nn.Module):
                 Draft token ids. Flattened.
         '''
 
+        # Note: using greedy for draft tokens is a bit easier to implement and
+        # faster. It doesn't affect the final output and seems to have a negligible
+        # impact on AR.
         draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).

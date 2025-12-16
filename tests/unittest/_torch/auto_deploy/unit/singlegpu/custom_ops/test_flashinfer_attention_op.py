@@ -89,16 +89,22 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         ),
         BATCH_SIZE * SEQ_LEN,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor(
+        [BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0], dtype=torch.int32, device=device
+    )
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
         v,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -219,16 +225,21 @@ def test_flashinfer_attention_op_decode(
         ),
         BATCH_SIZE * SEQ_LEN,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    # For decode phase: num_decode = BATCH_SIZE, num_prefill = 0
+    batch_info = torch.tensor([0, 0, BATCH_SIZE], dtype=torch.int32, device=device)
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
         v,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -338,16 +349,22 @@ def test_flashinfer_attention_context_and_generate(
         ),
         BATCH_SIZE * PREFILL_SEQ_LEN,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor(
+        [BATCH_SIZE, BATCH_SIZE * PREFILL_SEQ_LEN, 0], dtype=torch.int32, device=device
+    )
     flashinfer_output_1 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_1,
         k_1,
         v_1,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -413,16 +430,20 @@ def test_flashinfer_attention_context_and_generate(
         ),
         BATCH_SIZE * 1,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor([0, 0, BATCH_SIZE], dtype=torch.int32, device=device)
     flashinfer_output_3 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_3,
         k_3,
         v_3,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -522,16 +543,22 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         ),
         BATCH_SIZE * SEQ_LEN,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor(
+        [BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0], dtype=torch.int32, device=device
+    )
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
         v,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -669,16 +696,22 @@ def test_flashinfer_attention_with_fp8_cache(
         ),
         BATCH_SIZE * SEQ_LEN,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor(
+        [BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0], dtype=torch.int32, device=device
+    )
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
         v,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -766,16 +799,20 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         ),
         BATCH_SIZE * SEQ_LEN,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor([BATCH_SIZE, SEQ_LEN, 0], dtype=torch.int32, device=device)
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
         v,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES
@@ -849,16 +886,20 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         ),
         BATCH_SIZE * 1,
     )
+    # Create batch_info: [num_prefill, num_prefill_tokens, num_decode]
+    batch_info = torch.tensor([0, 0, BATCH_SIZE], dtype=torch.int32, device=device)
     flashinfer_output_gen = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_gen,
         k_gen,
         v_gen,
-        # METADATA
+        # STANDARD METADATA
+        batch_info,
         qo_indptr2,
         paged_kv_indptr2,
         paged_kv_indices2,
         paged_kv_last_page_len2,
+        # EXTRA METADATA
         batch_indices,
         positions,
         # CACHES

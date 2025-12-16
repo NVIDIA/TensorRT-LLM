@@ -360,6 +360,12 @@ public:
         RequestInfo info;
         auto const* connection = isAgent ? agentConnectionManager->recvConnectionAndRequestInfo(info)
                                          : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
+        if (connection == nullptr && !mManager->isRunning())
+        {
+            TLLM_LOG_WARNING(" recvRequestInfo connection is nullptr, maybe the server is terminating");
+            return info;
+        }
+
         if (!isAgent)
         {
             TLLM_CHECK(id == TransceiverTag::Id::REQUEST_SEND);
@@ -616,6 +622,10 @@ private:
                 if (!mReadyResponses.empty())
                 {
                     auto const& requestInfo = recvRequestInfo();
+                    if (mTerminate || !mManager->isRunning())
+                    {
+                        return;
+                    }
                     auto reqId = requestInfo.getRequestId();
 
                     {

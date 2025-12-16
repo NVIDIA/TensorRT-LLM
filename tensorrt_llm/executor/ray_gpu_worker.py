@@ -1,5 +1,7 @@
+import gc
 import importlib
 import os
+from functools import wraps
 from pathlib import Path
 from queue import Queue
 from typing import Any, List, Optional, Type, Union
@@ -42,8 +44,8 @@ class RayWorkerWrapper:
 
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         self.master_address = os.environ["MASTER_ADDR"]
-        self.master_port = os.environ["MASTER_PORT"]
-
+        self.world_size = world_size
+        self.rank = rank
         # Ray can't pickle TensorRT logger
         global logger
         from tensorrt_llm.logger import logger
@@ -55,39 +57,83 @@ class RayWorkerWrapper:
 
         # Physical gpu id
         self.gpu = int(ray.get_gpu_ids()[0])
-        local_gpu = self.physical_to_local_id(self.gpu)
+        self.local_gpu = self.physical_to_local_id(self.gpu)
 
-        torch.distributed.init_process_group(
-            backend="cuda:nccl,cpu:gloo",
-            init_method=f"tcp://{self.master_address}:{self.master_port}",
-            world_size=world_size,
-            rank=rank)
+        torch.cuda.set_device(self.local_gpu)
 
+        self.worker_cls = RayWorkerWrapper._inject_worker_extension(
+            worker_cls, worker_kwargs.pop("ray_worker_extension_cls", None))
+        self.worker_kwargs = worker_kwargs
+
+    def _create_tcp_store(self,
+                          port: Optional[int] = None
+                          ) -> torch.distributed.TCPStore:
+        # port=0 means let the OS pick an available port (only valid for master)
+        # For non-master, port must be specified to connect to master's port
+        actual_port = port if port is not None else 0
+        return torch.distributed.TCPStore(host_name=self.master_address,
+                                          port=actual_port,
+                                          world_size=self.world_size,
+                                          is_master=(self.rank == 0),
+                                          wait_for_workers=False)
+
+    def setup_tcp_store(self):
+        if self.rank != 0:
+            raise RuntimeError("Only the master worker can setup TCP store")
+        self.store = self._create_tcp_store()
+        return self.store.port
+
+    def setup_distributed_env_and_worker(self, port: int):
+        if self.rank != 0:
+            self.store = self._create_tcp_store(port)
+
+        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo",
+                                             store=self.store,
+                                             world_size=self.world_size,
+                                             rank=self.rank)
         logger.info(
-            f"[Rank {rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {local_gpu}"
+            f"[Rank {self.rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {self.local_gpu}"
         )
 
-        torch.cuda.set_device(local_gpu)
+        self.worker = self.worker_cls(device_id=self.local_gpu,
+                                      **self.worker_kwargs)
+        self._has_setup_distributed_env_and_worker = True
 
-        worker_cls = RayWorkerWrapper._inject_worker_extension(
-            worker_cls, worker_kwargs.pop("ray_worker_extension_cls", None))
-        self.worker = worker_cls(device_id=local_gpu, **worker_kwargs)
+    @property
+    def has_setup_distributed_env_and_worker(self) -> bool:
+        return getattr(self, '_has_setup_distributed_env_and_worker', False)
 
+    def ensure_distributed_setup(func):
+
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if not self.has_setup_distributed_env_and_worker:
+                raise RuntimeError(
+                    "Have not setup distributed environment and worker yet")
+            return func(self, *args, **kwargs)
+
+        return wrapper
+
+    @ensure_distributed_setup
     def submit(self, request: GenerationRequest) -> GenerationResult:
         return self.worker.submit(request)
 
+    @ensure_distributed_setup
     def enqueue_request(self,
                         request: GenerationRequest,
                         result_wait_queue: Queue | None = None) -> int:
         return self.worker.enqueue_request(request, result_wait_queue)
 
+    @ensure_distributed_setup
     def abort_request(self, request_id: int) -> None:
         self.worker.abort_request(request_id)
 
+    @ensure_distributed_setup
     def report_device_id(self) -> str:
         local_id = self.physical_to_local_id(self.gpu)
         return get_device_uuid(local_id)
 
+    @ensure_distributed_setup
     def call_worker_method(self, method_name: str, *args, **kwargs):
         """Generic method to call any method on the underlying worker."""
         if hasattr(self.worker, method_name):
@@ -103,7 +149,8 @@ class RayWorkerWrapper:
                 f"The RayGPUWorker has no method called '{method_name}'.")
 
     def shutdown(self):
-        return self.worker.shutdown()
+        if hasattr(self, 'worker'):
+            self.worker.shutdown()
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -168,6 +215,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
+        hmac_key: Optional[bytes] = None,
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
@@ -191,7 +239,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if rpc_addr is None:
             raise RuntimeError(
                 "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
-        self.init_rpc_worker(self.global_rank, rpc_addr)
+        self.init_rpc_worker(self.global_rank, rpc_addr, hmac_key)
         self.start_rpc_server()
 
     def setup_engine(self):
@@ -217,6 +265,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             torch.cuda.synchronize()
             release_with_tag(*tags)
             torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception as e:
             logger.error(f"Encountered an error in sleep: {e}")
             raise e

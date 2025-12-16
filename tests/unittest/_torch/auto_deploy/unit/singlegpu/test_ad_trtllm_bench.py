@@ -49,16 +49,16 @@ def run_benchmark(
 def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = Path(temp_dir, _DATASET_NAME)
-    dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
     script_dir = Path(root_dir, "benchmarks", "cpp")
 
     # Generate a small dataset to run a test - matching workload configuration
     command = [
-        "python3",
-        f"{dataset_tool}",
-        "--stdout",
-        "--tokenizer",
+        "trtllm-bench",
+        "--model",
         model_path_or_name,
+        "prepare-dataset",
+        "--output",
+        f"{dataset_path}",
         "token-norm-dist",
         "--input-mean",
         "128",
@@ -77,9 +77,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
     )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
-    # Grab the stdout and write it to a dataset file for passing to suite.
-    with open(dataset_path, "w") as dataset:
-        dataset.write(result.stdout)
+
     return dataset_path
 
 

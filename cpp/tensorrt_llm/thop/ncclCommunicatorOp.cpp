@@ -20,6 +20,8 @@
 
 namespace tr = tensorrt_llm::runtime;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -31,6 +33,7 @@ NcclCommunicatorOp::NcclCommunicatorOp(int64_t worldSize, int64_t rank)
 
 void NcclCommunicatorOp::send(th::Tensor tensor, int64_t toRank) const
 {
+    tensor.record_stream(at::cuda::getCurrentCUDAStream());
     auto ptr = static_cast<std::uint8_t*>(tensor.data_ptr());
     size_t const size = tensor.numel() * th::elementSize(th::typeMetaToScalarType(tensor.dtype()));
     tensorrt_llm::runtime::CudaStream cudaStream{at::cuda::getCurrentCUDAStream().stream(), mRank, false};
@@ -39,6 +42,7 @@ void NcclCommunicatorOp::send(th::Tensor tensor, int64_t toRank) const
 
 void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
 {
+    tensor.record_stream(at::cuda::getCurrentCUDAStream());
     auto ptr = static_cast<std::uint8_t*>(tensor.data_ptr());
     size_t const size = tensor.numel() * th::elementSize(th::typeMetaToScalarType(tensor.dtype()));
     tensorrt_llm::runtime::CudaStream cudaStream{at::cuda::getCurrentCUDAStream().stream(), mRank, false};
@@ -47,7 +51,10 @@ void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
 
 } // namespace torch_ext
 
-static auto trtllmNcclCommunicator = torch::jit::class_<torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
-                                         .def(torch::jit::init<int64_t, int64_t>())
-                                         .def("send", &torch_ext::NcclCommunicatorOp::send)
-                                         .def("recv", &torch_ext::NcclCommunicatorOp::recv);
+TRTLLM_NAMESPACE_END
+
+static auto trtllmNcclCommunicator
+    = torch::jit::class_<tensorrt_llm::torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
+          .def(torch::jit::init<int64_t, int64_t>())
+          .def("send", &tensorrt_llm::torch_ext::NcclCommunicatorOp::send)
+          .def("recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recv);

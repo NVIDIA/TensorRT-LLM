@@ -89,6 +89,13 @@ async def test_request_cancellation(server: RemoteOpenAIServer,
     # clunky test: send an ungodly amount of load in with short timeouts
     # then ensure that it still responds quickly afterwards
     chat_input = [{"role": "user", "content": "Write a long story"}]
+
+    # Warmup
+    client = server.get_async_client()
+    response = await client.chat.completions.create(messages=chat_input,
+                                                    model=model_name,
+                                                    max_tokens=10000)
+
     client = server.get_async_client(timeout=0.5, max_retries=3)
     tasks = []
     # Request about 2 million tokens

@@ -74,21 +74,21 @@ class TestCudaGraphBatchSizes:
         # Request CUDA graph batch sizes that exceed max_batch_size
         requested_batch_sizes = [1, 4, 8, 16, 32, 64]  # 32 and 64 should be clamped to 16
 
+        # Create a get_args_kwargs function for the compiler
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][:bs],), {}
+
         compiler = TorchCudagraphCompiler(
             model=data["gm"],
             args=(data["input_tensor"],),
             max_batch_size=max_batch_size,
             cuda_graph_batch_sizes=requested_batch_sizes,
+            get_args_kwargs_for_compile=get_args_kwargs,
         )
 
-        # Check that batch sizes are clamped to max_batch_size
-        expected_clamped = [1, 4, 8, 16]  # 32 and 64 should be clamped to 16, then deduped
-        assert compiler.cuda_graph_batch_sizes == sorted(expected_clamped, reverse=True)
-
-        # Verify that oversized batch sizes were filtered out
-        assert 32 not in compiler.cuda_graph_batch_sizes
-        assert 64 not in compiler.cuda_graph_batch_sizes
-        assert max(compiler.cuda_graph_batch_sizes) == max_batch_size
+        # The compiler stores batch sizes as-is; clamping happens during capture
+        # Filter batch sizes to max_batch_size for comparison
+        assert compiler.cuda_graph_batch_sizes == requested_batch_sizes
 
     def test_cuda_graph_batch_sizes_no_clamping_needed(self, simple_model_and_inputs):
         """Test that cuda_graph_batch_sizes are not modified when they're within limits."""
@@ -97,50 +97,64 @@ class TestCudaGraphBatchSizes:
         # Request CUDA graph batch sizes that are all within max_batch_size
         requested_batch_sizes = [1, 4, 8, 12]
 
+        # Create a get_args_kwargs function for the compiler
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][:bs],), {}
+
         compiler = TorchCudagraphCompiler(
             model=data["gm"],
             args=(data["input_tensor"],),
             cuda_graph_batch_sizes=requested_batch_sizes,
+            get_args_kwargs_for_compile=get_args_kwargs,
         )
 
-        # Check that batch sizes are preserved
-        assert compiler.cuda_graph_batch_sizes == sorted(requested_batch_sizes, reverse=True)
+        # Check that batch sizes are preserved as provided
+        assert compiler.cuda_graph_batch_sizes == requested_batch_sizes
 
         # Verify all requested sizes are within max_batch_size
         max_batch_size = data["batch_size"]
         assert all(bs <= max_batch_size for bs in compiler.cuda_graph_batch_sizes)
 
     def test_heuristic_cuda_graph_batch_sizes(self, simple_model_and_inputs):
-        """Test that heuristic batch sizes are generated when none are provided."""
+        """Test that empty batch sizes list is stored when none are provided."""
         data = simple_model_and_inputs
         max_batch_size = data["batch_size"]  # 16
+
+        # Create a get_args_kwargs function for the compiler
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][:bs],), {}
 
         compiler = TorchCudagraphCompiler(
             model=data["gm"],
             args=(data["input_tensor"],),
-            max_batch_size=max_batch_size,  # No cuda_graph_batch_sizes provided
+            max_batch_size=max_batch_size,
+            get_args_kwargs_for_compile=get_args_kwargs,
+            # No cuda_graph_batch_sizes provided - should default to empty list
         )
 
-        # Check that heuristic batch sizes were generated
-        assert len(compiler.cuda_graph_batch_sizes) > 0
-        assert max(compiler.cuda_graph_batch_sizes) <= max_batch_size
-        assert 1 in compiler.cuda_graph_batch_sizes  # Should always include 1
-        assert max_batch_size in compiler.cuda_graph_batch_sizes  # Should include max
+        # Check that cuda_graph_batch_sizes defaults to empty list
+        assert compiler.cuda_graph_batch_sizes == []
 
     def test_captured_graph_max_batch_size_consistency(self, simple_model_and_inputs):
-        """Test that CapturedGraph.max_batch_size equals max(cuda_graph_batch_sizes)."""
+        """Test that CapturedGraph captures graphs for specified batch sizes."""
         data = simple_model_and_inputs
 
         cuda_graph_batch_sizes = [1, 4, 8, 12]
 
         captured_graph = CapturedGraph(
             model=data["model"],
-            cuda_graph_batch_sizes=cuda_graph_batch_sizes,
             num_batched_inputs=1,
         )
 
-        assert captured_graph.cuda_graph_max_batch_size == max(cuda_graph_batch_sizes)
-        assert captured_graph.cuda_graph_batch_sizes == sorted(cuda_graph_batch_sizes, reverse=True)
+        # Create a get_args_kwargs function
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][:bs],), {}
+
+        # Capture graphs for the specified batch sizes
+        captured_graph.capture_graph(get_args_kwargs, cuda_graph_batch_sizes)
+
+        # Verify graphs were captured for all batch sizes
+        assert len(captured_graph.cudagraphs) == len(cuda_graph_batch_sizes)
 
     def test_forward_fallback_for_oversized_batch(self, simple_model_and_inputs):
         """Test that forward method falls back to regular execution for oversized batches."""
@@ -150,13 +164,15 @@ class TestCudaGraphBatchSizes:
         cuda_graph_batch_sizes = [1, 2, 4]
         captured_graph = CapturedGraph(
             model=data["model"],
-            cuda_graph_batch_sizes=cuda_graph_batch_sizes,
             num_batched_inputs=1,
         )
 
-        # Capture with small input
-        small_input = data["input_tensor"]  # batch size 16
-        captured_graph.capture_graph(small_input)
+        # Create a get_args_kwargs function
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][:bs],), {}
+
+        # Capture graphs
+        captured_graph.capture_graph(get_args_kwargs, cuda_graph_batch_sizes)
 
         # Test forward with oversized input (should fall back)
         oversized_input = data["input_tensor"]  # batch size 16
@@ -184,12 +200,15 @@ class TestCudaGraphBatchSizes:
         cuda_graph_batch_sizes = [1, 2, 4, 8]
         captured_graph = CapturedGraph(
             model=data["model"],
-            cuda_graph_batch_sizes=cuda_graph_batch_sizes,
             num_batched_inputs=1,
         )
 
-        # Capture with full-size input
-        captured_graph.capture_graph(data["input_tensor"][:8])  # batch size 8
+        # Create a get_args_kwargs function
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][:bs],), {}
+
+        # Capture graphs for all batch sizes
+        captured_graph.capture_graph(get_args_kwargs, cuda_graph_batch_sizes)
 
         # Test forward with various valid batch sizes
         for batch_size in [1, 2, 4, 8]:
@@ -213,38 +232,34 @@ class TestCudaGraphBatchSizes:
                 assert torch.allclose(output, expected_output, atol=1e-4)
 
     @pytest.mark.parametrize(
-        "requested_sizes,expected_max",
+        "requested_sizes,expected_sizes",
         [
-            ([1, 4, 8], 8),
-            ([2, 6, 10, 20], 16),  # 20 should be clamped to 16
-            ([32, 64, 128], 16),  # All should be clamped to 16
-            ([], None),  # Empty list should use heuristic
+            ([1, 4, 8], [1, 4, 8]),
+            ([2, 6, 10, 20], [2, 6, 10, 20]),  # Sizes are stored as-is
+            ([32, 64, 128], [32, 64, 128]),  # Sizes are stored as-is
+            ([], []),  # Empty list stays empty
         ],
     )
     def test_various_batch_size_configurations(
-        self, simple_model_and_inputs, requested_sizes, expected_max
+        self, simple_model_and_inputs, requested_sizes, expected_sizes
     ):
         """Test various configurations of cuda_graph_batch_sizes."""
         data = simple_model_and_inputs
         max_batch_size = data["batch_size"]  # 16
 
-        if requested_sizes:
-            compiler_kwargs = {"cuda_graph_batch_sizes": requested_sizes}
-            expected_max = expected_max or max_batch_size
-        else:
-            compiler_kwargs = {}
-            expected_max = max_batch_size
+        # Create a get_args_kwargs function for the compiler
+        def get_args_kwargs(bs):
+            return (data["input_tensor"][: min(bs, max_batch_size)],), {}
+
+        compiler_kwargs = {"cuda_graph_batch_sizes": requested_sizes} if requested_sizes else {}
 
         compiler = TorchCudagraphCompiler(
             model=data["gm"],
             args=(data["input_tensor"],),
             max_batch_size=max_batch_size,
+            get_args_kwargs_for_compile=get_args_kwargs,
             **compiler_kwargs,
         )
 
-        # Check that max batch size is as expected
-        actual_max = max(compiler.cuda_graph_batch_sizes)
-        assert actual_max == expected_max
-
-        # Check that all sizes are within max_batch_size
-        assert all(bs <= max_batch_size for bs in compiler.cuda_graph_batch_sizes)
+        # Check that batch sizes are stored as provided
+        assert compiler.cuda_graph_batch_sizes == expected_sizes

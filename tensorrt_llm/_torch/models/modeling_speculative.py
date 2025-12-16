@@ -428,12 +428,22 @@ class MTPDraftModel(nn.Module):
                                                        torch.cuda.Stream]):
         super().__init__()
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3MTP
-
-        mtp_layer = DeepseekV3MTP(model_config,
-                                  layer_idx,
-                                  aux_stream_dict,
-                                  is_separate_draft_engine=True)
+        model_type = model_config.pretrained_config.model_type
+        if model_type == "glm4_moe":
+            from .modeling_glm import Glm4MTP
+            mtp_layer = Glm4MTP(model_config,
+                                layer_idx,
+                                aux_stream_dict,
+                                is_separate_draft_engine=True)
+        elif model_type in ["deepseek_v3", "deepseek_v32"]:
+            from .modeling_deepseekv3 import DeepseekV3MTP
+            mtp_layer = DeepseekV3MTP(model_config,
+                                      layer_idx,
+                                      aux_stream_dict,
+                                      is_separate_draft_engine=True)
+        else:
+            raise ValueError(
+                f"MTPDraftModel does not support model_type: {model_type}")
         setattr(self, f"layers.{layer_idx}", mtp_layer)
         self.layers = mtp_layer
         self.layer_idx = layer_idx
@@ -455,6 +465,7 @@ class MTPDraftModel(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.layers(
@@ -464,6 +475,7 @@ class MTPDraftModel(nn.Module):
             embed_tokens=self.embed_tokens,
             attn_metadata=attn_metadata,
             all_rank_num_tokens=all_rank_num_tokens,
+            spec_metadata=spec_metadata,
         )
 
         return hidden_states
@@ -491,8 +503,18 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
     def load_weights(self, weights: Dict):
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3WeightLoader
-        weight_loader = DeepseekV3WeightLoader(self, is_draft_model=True)
+        model_type = self.model_config.pretrained_config.model_type
+        match model_type:
+            case "glm4_moe":
+                from .modeling_glm import Glm4WeightLoader
+                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
+            case "deepseek_v3" | "deepseek_v32":
+                from .modeling_deepseekv3 import DeepseekV3WeightLoader
+                weight_loader = DeepseekV3WeightLoader(self,
+                                                       is_draft_model=True)
+            case _:
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP")
         weight_loader.load_weights(weights)
 
     def load_weights_from_target_model(self,
@@ -518,6 +540,7 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            spec_metadata=spec_metadata,
             **kwargs)
         return self.logits_processor.forward(
             output,
@@ -649,10 +672,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional[BaseWeightMapper] = None,
+                     params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
                              skip_modules=["draft_model"],
+                             params_map=params_map,
                              allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,

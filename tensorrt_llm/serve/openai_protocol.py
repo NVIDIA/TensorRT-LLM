@@ -968,6 +968,16 @@ class ResponsesStreamResponse(OpenAIBaseModel):
                   "response.incomplete"]
 
 
+class MemoryUpdateRequest(OpenAIBaseModel):
+    tags: List[str] = Field(default=["model", "kv_cache"])
+
+
+class UpdateWeightsRequest(OpenAIBaseModel):
+    weights: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Weight handles dict, or None to finalize update")
+
+
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
     if opaque_state is None:
         return None
@@ -1004,3 +1014,7 @@ def to_llm_disaggregated_params(
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
         draft_tokens=disaggregated_params.draft_tokens)
+
+
+UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
+UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]

@@ -119,7 +119,7 @@ install_python_rockylinux() {
 }
 
 install_pyp_rockylinux() {
-  bash -c "pip3 install 'urllib3<2.0' pytest"
+  bash -c "pip3 install pytest"
 }
 
 install_gcctoolset_rockylinux() {

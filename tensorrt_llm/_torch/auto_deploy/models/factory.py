@@ -194,11 +194,6 @@ class ModelFactory(ABC):
         """Returns the sharding config for this model."""
         return self._sharding_config
 
-    @property
-    def chunk_size(self) -> Optional[int]:
-        """Returns the chunk size for this model."""
-        return None
-
     def get_cache_config(self) -> CacheConfig:
         """Return the cache configuration for the model.
 

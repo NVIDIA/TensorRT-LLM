@@ -11,7 +11,7 @@ from torch.fx import Graph, GraphModule, Node
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ...custom_ops.attention_interface import AttentionDescriptor, Constant
+from ...custom_ops.attention_interface import AttentionDescriptor, Constant, PrepareMetadataCallable
 from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -205,18 +205,30 @@ def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
 class HFReplaceCachedAttn(InsertCachedAttention):
     """Replace cached attention for the factory model, update inputs and outputs, and patch the gm forward."""
 
-    def _process_get_metadata(
-        self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
+    def _add_or_retrieve_input(
+        self, gm: GraphModule, cm: CachedSequenceInterface, name: str
+    ) -> Node:
+        """When this is needed, we just activate the argument and return the name."""
+        cm.info.activate_arg(name)
+        return name
+
+    def _insert_extra_metadata_op(
+        self,
+        gm: GraphModule,
+        prep_meta_op: PrepareMetadataCallable,
+        inputs_for_prep_meta: List[Node],
+        const_args: List[Constant],
+        num_meta_out: int,
     ) -> List[Node]:
-        """Store get metadata function as reference and simply return."""
-        get_metadata, num_ret_metadata = self.attn_descriptor.get_prepare_metadata_op()
+        """Store prepare metadata function as reference and simply return."""
+        ret_names = [f"metadata_{i}" for i in range(num_meta_out)]
         gm._prepare_metadata_info = {
-            "get_metadata": get_metadata,
-            "arg_names": m_args,
+            "get_metadata": prep_meta_op,
+            "arg_names": inputs_for_prep_meta,
             "const_args": const_args,
-            "return_names": [f"metadata_{i}" for i in range(num_ret_metadata)],
+            "return_names": ret_names,
         }
-        return gm._prepare_metadata_info["return_names"]  # we don't need actual nodes...
+        return ret_names
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """We don't need to actually do anything here, just return the cache name."""
@@ -227,14 +239,20 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         gm: GraphModule,
         attn_node: Node,
         qkv_nodes: List[Node],
-        meta_nodes: List[Node],
+        meta_nodes_std: List[Node],
+        meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         buffer_nodes: List[Node],
         constants: List[Constant],
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
         # store reference to metadata, caches, buffers, and constants for this attn node
-        attn_node.meta["metadata_cache_buffer_keys"] = (*meta_nodes, *cache_nodes, *buffer_nodes)
+        attn_node.meta["metadata_cache_buffer_keys"] = (
+            *meta_nodes_std,
+            *meta_nodes_extra,
+            *cache_nodes,
+            *buffer_nodes,
+        )
         attn_node.meta["constants"] = constants
 
     def _apply_to_full_model(
@@ -244,9 +262,6 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        # switch to cached attn inputs from now
-        cm.info.switch_to_cached_attn_inputs()
-
         # run actual insert cached attn transform with fake graph module
         mod._gm, info = super()._apply(mod._gm, cm, factory, shared_config)
 

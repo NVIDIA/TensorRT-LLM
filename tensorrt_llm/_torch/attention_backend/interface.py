@@ -578,8 +578,9 @@ class PositionalEmbeddingParams:
     rope: Optional[RopeParams] = None
     is_neox: bool = True
 
-    # mRoPE params (currently, Qwen2/2.5-VL uses it)
+    # mRoPE params
     mrope_section: Optional[List[int]] = None
+    mrope_interleaved: bool = False
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():

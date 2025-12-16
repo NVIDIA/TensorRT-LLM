@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -25,7 +26,9 @@
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 
-namespace tensorrt_llm::utils::customAllReduceUtils
+TRTLLM_NAMESPACE_BEGIN
+
+namespace utils::customAllReduceUtils
 {
 
 constexpr size_t NUM_POINTERS_PER_RANK = 7;
@@ -81,7 +84,6 @@ inline AllReduceStrategyType SelectStrategyLP(size_t seq_len, size_t hidden_size
     {
         return AllReduceStrategyType::ONESHOT;
     }
-    return AllReduceStrategyType::NCCL;
 }
 
 // use 1D vector to store the best strategy instead of a map for each sm version
@@ -143,7 +145,7 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
         sm_version = 100;
     }
 
-    // Check if the entry is out of bounds, otherwise return NCCL as fallback
+    // Check if the entry is out of bounds, otherwise return NCCL_SYMMETRIC as fallback
     if (AllReduceBestStrategyTable.find(sm_version) == AllReduceBestStrategyTable.end()
         || tp_index >= AllReduceBestStrategyTable.at(sm_version).size()
         || fusion_op_index >= AllReduceBestStrategyTable.at(sm_version).at(tp_index).size()
@@ -151,7 +153,7 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
         || num_token_index
             >= AllReduceBestStrategyTable.at(sm_version).at(tp_index).at(fusion_op_index).at(hidden_size_index).size())
     {
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     return static_cast<AllReduceStrategyType>(
@@ -293,4 +295,6 @@ inline const std::unordered_map<int, AllReduceBestStrategyTableType> AllReduceBe
     {90, AllReduceBestStrategyTableSM90},
     {100, AllReduceBestStrategyTableSM100},
 };
-} // namespace tensorrt_llm::utils::customAllReduceUtils
+} // namespace utils::customAllReduceUtils
+
+TRTLLM_NAMESPACE_END

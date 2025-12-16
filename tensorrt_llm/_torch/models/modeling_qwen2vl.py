@@ -1,5 +1,4 @@
 import copy
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -10,8 +9,8 @@ from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed, Qwen2_5_VisionRotaryEmbedding,
-    Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLMLP,
-    Qwen2_5_VLVisionBlock, apply_rotary_pos_emb_vision)
+    Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLVisionBlock,
+    apply_rotary_pos_emb_vision)
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
 
@@ -21,8 +20,9 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm._torch.modules.attention import Attention
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -38,6 +38,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
+from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
@@ -46,46 +47,7 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
 
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
-
-
-def process_weights(weights: Dict,
-                    prefix: str = "visual",
-                    weight_name_mapping: Dict[str, str] = None) -> Dict:
-    """
-    Filter and transform weights in a single modular function.
-
-    Args:
-        weights: Dictionary of all model weights
-        prefix: Prefix to filter weights by (default: "visual")
-        weight_name_mapping: Optional mapping to transform weight names
-
-    Returns:
-        Dictionary of processed weights ready for loading
-    """
-
-    # Filter weights by prefix (handles both direct and "model." prefixed keys)
-    filtered_weights = {}
-    for key, weight in weights.items():
-        if key.startswith(prefix):
-            filtered_weights[key] = weight
-        elif key.startswith("model." + prefix):
-            filtered_weights[key[len("model."):]] = weight
-
-    # Transform weight names if mapping provided
-    if weight_name_mapping:
-        transformed_weights = {}
-        for key, weight in filtered_weights.items():
-            new_key = key
-            for old_suffix, new_suffix in weight_name_mapping.items():
-                if key.endswith(old_suffix):
-                    new_key = key.replace(old_suffix, new_suffix)
-                    break
-            transformed_weights[new_key] = weight
-        return transformed_weights
-
-    return filtered_weights
 
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
@@ -310,7 +272,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
+    def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -323,8 +285,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-            # transformers=4.53.1 does not support GPU video tensors in Qwen2VL processor.
-            videos = [[frame.to("cpu") for frame in video] for video in videos]
         return self.processor(text=[text],
                               images=images,
                               videos=videos,
@@ -346,7 +306,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             image_grid_thw: torch.LongTensor,
             video_grid_thw: torch.LongTensor,
             attention_mask: torch.Tensor,
-            second_per_grid_ts: torch.Tensor = None) -> dict[str, torch.Tensor]:
+            second_per_grid_ts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         mrope_position_ids, mrope_position_deltas = Qwen2VLInputProcessorBase.get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
@@ -437,6 +397,10 @@ class Qwen2VisionModelBase(nn.Module):
     def load_weights(self, weights: Dict):
         visual_weights = filter_weights("visual", weights)
         converted_weights = dict()
+        if isinstance(self.visual, (Qwen2VisionTransformerPretrainedModel,
+                                    Qwen2_5_VisionTransformerPretrainedModel)):
+            self.visual.load_state_dict(visual_weights, strict=True)
+            return
 
         qkv_pattern = re.compile(r'(.*?)attn\.qkv\.(.*)')
         for name in visual_weights:
@@ -559,13 +523,13 @@ class Qwen2_5_VLVisionAttention(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         **kwargs,
     ) -> torch.Tensor:
         # NOTE: Need separate Attention forward() for Qwen2.5-VL for multiple reasons
         # 1. We don't have the route for handing over position_embeddings to the Attention forward()
         # 2. Could not override the apply_rope() as we don't have the position_ids in the Vision Attention's rotary embedding.
-        # (TODO: yechank-nvidia) Make OOTO path more modular and reusable for Attention's Rotary Embedding.
+        # (TODO: yechank-nvidia) Make OOTB path more modular and reusable for Attention's Rotary Embedding.
 
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv, None, None
@@ -593,10 +557,26 @@ class Qwen2_5_VLVisionAttention(Attention):
         return attn_output
 
 
+class Qwen2_5_VLMLP(GatedMLP):
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int):
+        config = model_config.pretrained_config.vision_config
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=True,
+            activation=F.silu,
+            dtype=model_config.pretrained_config.torch_dtype,
+            config=model_config,
+            layer_idx=layer_idx,
+        )
+
+
 class Qwen2_5_VLVisionBlock(torch.nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: Optional[int]):
+                 layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config.vision_config
         self.norm1 = RMSNorm(hidden_size=config.hidden_size,
@@ -606,14 +586,15 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
                              eps=model_config.pretrained_config.rms_norm_eps,
                              dtype=model_config.pretrained_config.torch_dtype)
         self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
-        self.mlp = Qwen2_5_VLMLP(config, bias=True)
+        self.mlp = Qwen2_5_VLMLP(model_config, layer_idx)
 
     @torch.inference_mode()
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -621,6 +602,7 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         hidden_states = self.norm1(hidden_states)
         hidden_states = residual + self.attn(
             hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -650,21 +632,25 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
                    out_features=self.hidden_size,
                    bias=True,
                    dtype=model_config.pretrained_config.torch_dtype,
-                   mapping=model_config.mapping),
+                   mapping=model_config.mapping,
+                   tensor_parallel_mode=TensorParallelMode.COLUMN,
+                   allreduce_strategy=model_config.allreduce_strategy),
             torch.nn.GELU(),
             Linear(in_features=self.hidden_size,
                    out_features=dim,
                    bias=True,
                    dtype=model_config.pretrained_config.torch_dtype,
-                   mapping=model_config.mapping),
+                   mapping=model_config.mapping,
+                   tensor_parallel_mode=TensorParallelMode.ROW,
+                   allreduce_strategy=model_config.allreduce_strategy),
         )
 
     @torch.inference_mode()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x)
-        x = x.view(-1, self.hidden_size)
-        x = self.mlp(x)
-        return x
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.ln_q(hidden_states)
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states
 
 
 class Qwen2_5_VisionModel(torch.nn.Module):
@@ -740,7 +726,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return rotary_pos_emb
 
     def get_window_index(self, grid_thw):
-        window_index: list = []
+        window_index: List[torch.Tensor] = []
         seq_lens = []
         window_index_id = 0
         vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
@@ -783,13 +769,12 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return window_index, seq_lens
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
-        # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
-        batch_size = len(seq_lens)
+        batch_size = 1  # NOTE: Qwen2/2.5-VL concats all the pixel_values into a single tensor, so batch_size is 1
         prompt_lens = seq_lens
         seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
         request_ids = list(range(1, batch_size + 1))
 
-        attn_metadata.num_contexts = batch_size
+        attn_metadata.num_contexts = len(seq_lens)
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lens
         attn_metadata.seq_lens = seq_lens
@@ -798,7 +783,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         return attn_metadata
 
     @torch.inference_mode()
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
         window_index, window_seq_lens = self.get_window_index(grid_thw)
         seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
@@ -814,7 +799,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             window_seq_lens, self.window_attn_metadata)
 
         # From this point, pure GPU operation
-        hidden_states = self.patch_embed(hidden_states)
+        hidden_states = self.patch_embed(pixel_values)
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
@@ -834,7 +819,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
                 attn_metadata = full_attn_metadata
             else:
                 attn_metadata = window_attn_metadata
-
             hidden_states = block(
                 hidden_states,
                 attn_metadata=attn_metadata,
@@ -857,30 +841,27 @@ class Qwen2VLModelBase(PreTrainedModel):
         self.original_arch = model_config.pretrained_config.architectures[0]
 
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
-        disabble_fuse_rope = kwargs.get('disable_fuse_rope', False)
-        model_config.pretrained_config.disable_fuse_rope = disabble_fuse_rope
+        disable_fuse_rope = kwargs.get('disable_fuse_rope', False)
+        model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
 
         self._supports_sdpa = True
         super().__init__(config)
 
-        if not disabble_fuse_rope:
-            self.init_mrope_embedding(model_config)
-
         self.model_config = model_config
         self.config = model_config.pretrained_config
 
         if model_config.attn_backend != 'TRTLLM':
             raise ValueError("Qwen2/2.5-VL only supports TRTLLM backend now")
-        if not disabble_fuse_rope:
+        if not disable_fuse_rope:
             self.init_mrope_embedding(model_config)
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        if not DISAGG:
+        if not _is_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Qwen2VisionModelBase(
                 mm_encoder_config, kwargs.get('vision_model_class', None))
@@ -977,21 +958,28 @@ class Qwen2VLModelBase(PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         mrope_config = {}
-        if len(multimodal_params) > 0:
-            if not DISAGG:
+        # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts, so we need to separate the mm_multimodal_params from the text-only prompts.
+        mm_multimodal_params = [
+            multimodal_param for multimodal_param in multimodal_params
+            if multimodal_param.multimodal_data.get("image", {}).get(
+                "pixel_values") is not None or multimodal_param.multimodal_data.
+            get("video", {}).get("pixel_values_videos") is not None
+        ]
+        if len(mm_multimodal_params) > 0:
+            if not _is_disagg():
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=multimodal_params[:num_context_requests])
+                    multimodal_params=mm_multimodal_params)
             else:
                 raise NotImplementedError(
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds, multimodal_params[:num_context_requests])
-            if not self.model_config.pretrained_config.disable_fuse_rope:
-                mrope_config = self.prepare_mrope_config(
-                    multimodal_params, num_context_requests)
+            mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
+
+        if not self.model_config.pretrained_config.disable_fuse_rope:
+            mrope_config = self.prepare_mrope_config(multimodal_params,
+                                                     num_context_requests)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds,
@@ -1038,9 +1026,8 @@ class Qwen2VLModel(Qwen2VLModelBase):
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
-        if not DISAGG:
-            vision_encoder_weights = process_weights(weights, "visual")
-            self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
+        if not _is_disagg():
+            self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights, weight_mapper)
 
@@ -1063,8 +1050,9 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         kwargs['vision_model_class'] = Qwen2_5_VisionModel
-        kwargs[
-            'disable_fuse_rope'] = False  # TODO: Make this ModelConfig's argument
+        kwargs['disable_fuse_rope'] = kwargs.get(
+            'disable_fuse_rope',
+            False)  # TODO: Make this ModelConfig's argument
         super().__init__(model_config, *args, **kwargs)
 
     @property
@@ -1078,7 +1066,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
         if isinstance(weight_mapper, Qwen2VLHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        if not DISAGG:
+        if not _is_disagg():
             self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights)

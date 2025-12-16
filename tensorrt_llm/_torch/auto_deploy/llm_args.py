@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
+from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, SamplerType, _ParallelConfig
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
@@ -128,6 +128,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         default="auto",
         description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
         "supported in AutoDeploy.",
+    )
+
+    sampler_type: Union[str, SamplerType] = Field(
+        default=SamplerType.TorchSampler,
+        description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
     )
 
     # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
@@ -263,6 +268,22 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
         return self
 
+    @model_validator(mode="after")
+    def update_cuda_graph_batch_sizes(self):
+        # if not set, use heuristic
+        if self.cuda_graph_batch_sizes is None:
+            cg_bs = {1, self.max_batch_size}
+            cg_bs.update(range(1, 128 + 1, 16))
+            cg_bs.update(range(128, self.max_batch_size + 1, 128))
+        else:
+            cg_bs = [b for b in self.cuda_graph_batch_sizes if b <= self.max_batch_size]
+        self.cuda_graph_batch_sizes = sorted(cg_bs, reverse=True)
+        ad_logger.info(f"Using cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}")
+
+        # ensure that the cuda_graph_batch_sizes are updated in the shortcut and transform config
+        self.update_transforms_with_shortcuts()
+        return self
+
     @field_validator("kv_cache_config", mode="after")
     @classmethod
     def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
@@ -302,6 +323,9 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         if "yaml_default" not in self.model_fields_set:
             kwargs.pop("yaml_default")
         return kwargs
+
+    def is_cuda_graph_enabled(self) -> bool:
+        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
 
     ### PRIVATE METHODS ############################################################################
     @classmethod

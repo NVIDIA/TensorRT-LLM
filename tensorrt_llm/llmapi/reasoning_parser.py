@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Type
+from typing import Any, Optional, Type
 
 
 @dataclass
@@ -109,15 +109,28 @@ class ReasoningParserFactory:
     parsers: dict[str, Type[BaseReasoningParser]] = {
         "deepseek-r1": DeepSeekR1Parser,
         "qwen3": DeepSeekR1Parser,
+        "nano-v3": DeepSeekR1Parser,
     }
 
     @staticmethod
-    def create_reasoning_parser(reasoning_parser: str) -> BaseReasoningParser:
+    def create_reasoning_parser(
+        reasoning_parser: str,
+        chat_template_kwargs: Optional[dict[str, Any]] = None
+    ) -> BaseReasoningParser:
         try:
             reasoning_parser_class = ReasoningParserFactory.parsers[
                 reasoning_parser.lower()]
             if reasoning_parser == "deepseek-r1":
                 return reasoning_parser_class(reasoning_at_start=True)
+            elif reasoning_parser == "nano-v3":
+                # Note: If the model is with reasoning (default behavior), `reasoning_at_start` should be True, and the starting response should be parsed into `reasoning_content`.
+                # While the model is without reasoning, `reasoning_at_start` should be False to parse the response into `content` fields.
+                is_reasoning_model = True
+                if isinstance(chat_template_kwargs, dict):
+                    is_reasoning_model = chat_template_kwargs.get(
+                        "enable_thinking", True)
+                return reasoning_parser_class(
+                    reasoning_at_start=is_reasoning_model)
             return reasoning_parser_class()
         except KeyError as e:
             raise ValueError(

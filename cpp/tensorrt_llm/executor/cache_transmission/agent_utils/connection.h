@@ -296,6 +296,7 @@ public:
     void waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo);
     void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo);
     void waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo);
+    [[nodiscard]] bool isRunning() const override;
 
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
@@ -309,6 +310,7 @@ private:
     int mDeviceId;
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    std::atomic<bool> mIsRunning{true};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

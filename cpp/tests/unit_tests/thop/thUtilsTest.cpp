@@ -19,7 +19,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <memory>
 
-using namespace torch_ext;
+using namespace tensorrt_llm::torch_ext;
 
 TEST(ThUtils, ConvertShape2D)
 {

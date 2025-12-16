@@ -32,7 +32,7 @@ from .test_llm import (
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
 from .test_llm_kv_cache_events import create_llm
-from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
+from utils.util import (skip_gpu_memory_less_than, skip_single_gpu, skip_ray,
                         unittest_name_func, force_ampere)
 # isort: on
 
@@ -455,6 +455,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
     llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
+@skip_ray
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 

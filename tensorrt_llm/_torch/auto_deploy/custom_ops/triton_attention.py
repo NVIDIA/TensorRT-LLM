@@ -1,7 +1,7 @@
 """Custom ops for MHA/XQA attention."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import triton
@@ -20,7 +20,6 @@ from .attention_interface import (
     CacheInitializerDict,
     Constant,
     MHACallable,
-    PrepareMetadataCallable,
     SequenceInfo,
 )
 from .triton_kernels.attention_with_kv_cache import (
@@ -188,11 +187,14 @@ def flattened_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    # METADATA
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -207,6 +209,15 @@ def flattened_mha_with_cache(
 
     NOTE: this op can also handle seq_len==0, which might be useful for CUDAGRAPH.
     """
+    # check for sequence info and truncate metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+
+    seq_len = seq_len[:num_seq]
+    input_pos = input_pos[:num_seq]
+    cache_loc = cache_loc[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+
     # b, s info
     # NOTE: b, s are just the shapes of the input tensor q; not necessarily the number of sequences.
     # Generally speaking, we expect one of two cases here:
@@ -239,7 +250,17 @@ def flattened_mha_with_cache(
     if s == 1:
         # generate-only phase
         _generate_mha(
-            q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y, sinks, sliding_window
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            cache_loc,
+            input_pos,
+            scale,
+            y,
+            sinks,
+            sliding_window,
         )
     else:
         # mixed context + generate phase
@@ -264,60 +285,29 @@ def flattened_mha_with_cache(
 
 @flattened_mha_with_cache.register_fake
 def flattened_mha_fake(
+    # Q, K, V
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
+    # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    # BUFFERS
+    # <none>
+    # CONSTANTS
     scale: Optional[float],
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
 ):
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
-
-
-@torch.library.custom_op(
-    "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
-)
-def prepare_fused_mha_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    # TODO: maybe use slot_idx instead of pages_per_seq??
-    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
-    seq_start = torch.zeros_like(seq_len[:num_seq])
-    seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
-    return (
-        seq_len[:num_seq].clone(),
-        input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
-        seq_start,
-    )
-
-
-# TODO: Move the truncation of inputs out of this custom op
-# SequenceInfo._get_sanitized_num_sequences could break in fake mode
-@prepare_fused_mha_metadata.register_fake
-def prepare_fused_mha_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
-):
-    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
-    return (
-        torch.empty_like(seq_len[:num_seq]),
-        torch.empty_like(input_pos[:num_seq]),
-        torch.empty_like(cache_loc[:num_seq]),
-        torch.empty_like(seq_len[:num_seq]),
-    )
 
 
 @AttentionRegistry.register("triton")
@@ -343,11 +333,11 @@ class TritonAttention(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache
+        return torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.triton_attention_prepare_fused_mha_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(

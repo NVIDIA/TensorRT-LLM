@@ -42,7 +42,7 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --max_batch_size 512 \
@@ -94,7 +94,7 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint.
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --max_batch_size 8 \
@@ -140,7 +140,7 @@ Explanation:
 
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
-TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
+TensorRT LLM supports nvidia Model Optimizer quantized FP8 checkpoint.
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
     --tp_size 8 \

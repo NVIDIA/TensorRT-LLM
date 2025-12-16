@@ -407,6 +407,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             req.sampling_config.beam_width = 1
             req.py_multimodal_data = {}
             req.total_input_len_cp = prompt_lens[idx] * 2
+            req.seqlen_this_rank_cp = prompt_lens[idx]
             req.py_decoding_iter = 1
             gen_requests.append(req)
         scheduled_requests.generation_requests = gen_requests

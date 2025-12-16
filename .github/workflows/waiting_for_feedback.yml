@@ -1,0 +1,127 @@
+name: Manage Waiting for Feedback Label
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  manage-waiting-for-feedback:
+    runs-on: ubuntu-latest
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    steps:
+      - name: Check membership and manage label
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const commenter = context.payload.comment.user.login;
+            const commenterType = context.payload.comment.user.type;
+            const label = 'waiting for feedback';
+
+            // Ignore bots and CI accounts
+            const ignoredAccounts = ['tensorrt-cicd'];
+            if (commenterType === 'Bot' || ignoredAccounts.includes(commenter)) {
+              console.log(`Ignoring comment from ${commenter} (type: ${commenterType}). Skipping.`);
+              return;
+            }
+
+            // Handle both issue_comment and pull_request_review_comment events
+            // context.issue.number is only available for issue_comment events
+            const issueNumber = context.issue?.number || context.payload.pull_request?.number;
+            const issue = context.payload.issue || context.payload.pull_request;
+            const author = issue?.user?.login;
+            const isAuthor = (commenter === author);
+
+            if (!issueNumber) {
+              console.log('Could not determine issue/PR number. Skipping.');
+              return;
+            }
+
+            console.log(`Comment by ${commenter} on #${issueNumber} (author: ${author})`);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Check if commenter is repository member
+            let isMember = false;
+            try {
+              await github.rest.repos.checkCollaborator({
+                owner,
+                repo,
+                username: commenter
+              });
+              isMember = true;
+            } catch (error) {
+              if (error.status === 404) {
+                isMember = false;
+              } else if (error.status === 302) {
+                console.log(`Cannot determine membership for ${commenter} (insufficient token permissions)`);
+                return;
+              } else {
+                console.error(`Error checking membership: ${error.message}`);
+                throw error;
+              }
+            }
+
+            // Logic:
+            // - Author responds → remove label (feedback provided)
+            // - NVIDIA non-author comments → add label (team is waiting for response)
+            // - External non-author comments → remove label (someone provided feedback)
+
+            if (isAuthor) {
+              // Author responded - remove 'waiting for feedback' label
+              console.log(`${commenter} is the author. Removing '${label}' label if present.`);
+
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: label
+                });
+                console.log(`Successfully removed '${label}' label from #${issueNumber}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  console.log(`Label '${label}' was not present on #${issueNumber}. No action needed.`);
+                } else {
+                  throw error;
+                }
+              }
+
+            } else if (isMember) {
+              // NVIDIA non-author commented - add 'waiting for feedback' label
+              console.log(`${commenter} is an NVIDIA member (not author). Adding '${label}' label.`);
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: [label]
+              });
+
+              console.log(`Successfully added '${label}' label to #${issueNumber}`);
+
+            } else {
+              // External non-author commented - remove 'waiting for feedback' label
+              console.log(`${commenter} is external (not author). Removing '${label}' label if present.`);
+
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: label
+                });
+                console.log(`Successfully removed '${label}' label from #${issueNumber}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  console.log(`Label '${label}' was not present on #${issueNumber}. No action needed.`);
+                } else {
+                  throw error;
+                }
+              }
+            }

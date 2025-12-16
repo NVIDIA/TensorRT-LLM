@@ -185,8 +185,7 @@ class AllreducePGTest:
         return True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.gpu2
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -253,8 +252,7 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.gpu2
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")
@@ -329,8 +327,7 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.gpu2
 @pytest.mark.parametrize("hidden_size", [128, 1024],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("seq_len", [16, 64], ids=lambda x: f"seqlen:{x}")

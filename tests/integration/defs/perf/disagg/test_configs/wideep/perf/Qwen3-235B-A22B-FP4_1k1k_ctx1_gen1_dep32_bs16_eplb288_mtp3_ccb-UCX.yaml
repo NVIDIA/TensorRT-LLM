@@ -8,13 +8,14 @@ metadata:
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
   config_index: 13
-  dataset_file: datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
+  dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
   account: <account>
   job_time: 02:00:00
   job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
   numa_bind: true
 benchmark:
   mode: gen_only
@@ -37,6 +38,8 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
 accuracy:

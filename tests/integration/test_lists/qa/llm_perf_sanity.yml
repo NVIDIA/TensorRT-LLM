@@ -28,9 +28,6 @@ llm_perf_sanity:
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:500,2000]
   - perf/test_perf.py::test_perf[nemotron_nano_9b_v2-bench-pytorch-bfloat16-input_output_len:512,512]
 
-  # Test list validation
-  - test_list_validation.py::test_list_validation
-
 
 # FP8 specific tests
 # A100, L40S, L20, H20, H100, H200, Blackwell

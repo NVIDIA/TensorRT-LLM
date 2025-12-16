@@ -35,12 +35,13 @@ def test_fp4_linear(dtype, mnk):
                                                       False)
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    l_fp4 = Linear(in_features=HIDDEN_SIZE,
-                   out_features=OUTPUT_SIZE,
-                   bias=False,
-                   dtype=dtype,
-                   quant_config=qc,
-                   nvfp4_backend='cutlass')  # Force CUTLASS to match reference
+    l_fp4 = Linear(
+        in_features=HIDDEN_SIZE,
+        out_features=OUTPUT_SIZE,
+        bias=False,
+        dtype=dtype,
+        quant_config=qc,
+        nvfp4_allowed_backends=['cutlass'])  # Force CUTLASS to match reference
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
@@ -117,7 +118,7 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
                    bias=False,
                    dtype=dtype,
                    quant_config=qc,
-                   nvfp4_backend='cutedsl')
+                   nvfp4_allowed_backends=['cutedsl'])
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
@@ -180,7 +181,7 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
                    bias=False,
                    dtype=dtype,
                    quant_config=qc,
-                   nvfp4_backend='cutedsl')
+                   nvfp4_allowed_backends=['cutedsl'])
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
@@ -215,7 +216,8 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
                        bias=False,
                        dtype=dtype,
                        quant_config=qc,
-                       nvfp4_backend='cutlass')  # Use CUTLASS as reference
+                       nvfp4_allowed_backends=['cutlass'
+                                               ])  # Use CUTLASS as reference
 
     assert l_fp4_ref.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4_ref.weight_scale.dtype == fp4_utils.float4_sf_dtype
@@ -311,15 +313,17 @@ def nvfp4_gemm_perf_test(
         x_sf_block_list = [x_sf_block]
         w_sf_block_list = [w_sf_block]
 
+    alpha_tensor = torch.tensor([1.0]).cuda()
     with torch.inference_mode(), autotune():
         with nvtx.annotate(
                 f"cute_dsl tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
                 color="orange",
         ):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                x_fp4, w_fp4, x_sf_block, w_sf_block, 1.0, dtype)
+                x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_tensor, dtype)
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    AutoTuner.get().print_statistics()
 
-    alpha_tensor = torch.tensor(1.0).cuda()
     if test_ref:
         with nvtx.annotate(
                 f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
@@ -340,7 +344,7 @@ def nvfp4_gemm_perf_test(
                 w_fp4_list[buffer_idx % workspace_count],
                 x_sf_block_list[buffer_idx % workspace_count],
                 w_sf_block_list[buffer_idx % workspace_count],
-                1.0,
+                alpha_tensor,
                 dtype,
             )
             buffer_idx = buffer_idx + 1
@@ -354,7 +358,7 @@ def nvfp4_gemm_perf_test(
                 w_fp4_list[buffer_idx % workspace_count],
                 x_sf_block_list[buffer_idx % workspace_count],
                 w_sf_block_list[buffer_idx % workspace_count],
-                1.0,
+                alpha_tensor,
                 dtype,
             )
             buffer_idx = buffer_idx + 1
@@ -455,7 +459,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
             x, x_sf_global, scaling_vector_size, False)
         alpha_ref = 1.0 / (w_sf_global * x_sf_global)
-        alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
+        alpha_tensor = torch.tensor([alpha_ref], dtype=torch.float32).cuda()
 
     # Reference: Use CUTLASS backend explicitly for reference output
     with torch.inference_mode():
@@ -466,18 +470,19 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                                                  alpha=alpha_tensor,
                                                  output_dtype=dtype,
                                                  to_userbuffers=False,
-                                                 backend='cutlass')
+                                                 allowed_backends='cutlass')
 
     # Test auto backend selection with autotuning
     with torch.inference_mode(), autotune():
-        output_auto = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
-                                                  weight=w_fp4,
-                                                  act_sf=x_sf_block,
-                                                  weight_scale=w_sf_block,
-                                                  alpha=alpha_tensor,
-                                                  output_dtype=dtype,
-                                                  to_userbuffers=False,
-                                                  backend='auto')
+        output_auto = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4=x_fp4,
+            weight=w_fp4,
+            act_sf=x_sf_block,
+            weight_scale=w_sf_block,
+            alpha=alpha_tensor,
+            output_dtype=dtype,
+            to_userbuffers=False,
+            allowed_backends='cutlass,cublaslt,cuda_core,cutedsl')
 
     AutoTuner.get().print_profiling_cache()
 
@@ -497,14 +502,15 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
 
     print(f"\n[Outer Layer] Capturing backend selection tactics...")
     with AutoTuner.get().capture() as outer_capture, torch.inference_mode():
-        output = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
-                                             weight=w_fp4,
-                                             act_sf=x_sf_block,
-                                             weight_scale=w_sf_block,
-                                             alpha=alpha_tensor,
-                                             output_dtype=dtype,
-                                             to_userbuffers=False,
-                                             backend='auto')
+        output = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4=x_fp4,
+            weight=w_fp4,
+            act_sf=x_sf_block,
+            weight_scale=w_sf_block,
+            alpha=alpha_tensor,
+            output_dtype=dtype,
+            to_userbuffers=False,
+            allowed_backends='cutlass,cublaslt,cuda_core,cutedsl')
 
     outer_tactics_list = list(outer_capture)
     print(f"  Found {len(outer_tactics_list)} outer layer tactics (backends)")
@@ -604,7 +610,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                 alpha=alpha_tensor,
                 output_dtype=dtype,
                 to_userbuffers=False,
-                backend='cuda_core')
+                allowed_backends='cuda_core')
 
             torch.testing.assert_close(output_cuda_core,
                                        output_ref,
@@ -624,7 +630,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
         print(f"\n  Note: cuda_core has no autotuning (single tactic)")
     print(f"  Note: Tested all inner layer tactics for each backend")
     print(
-        f"  Outer layer (backend selection) was tested separately with backend='auto'"
+        f"  Outer layer (backend selection) was tested separately with all backends allowed"
     )
     print(f"{'='*80}\n")
 
@@ -719,17 +725,18 @@ def test_fp4_linear_cuda_core(dtype, mnk):
                                                  alpha=alpha_tensor,
                                                  output_dtype=dtype,
                                                  to_userbuffers=False,
-                                                 backend='cutlass')
+                                                 allowed_backends='cutlass')
 
         # Test CUDA Core backend
-        output_cuda_core = torch.ops.trtllm.nvfp4_gemm(act_fp4=x_fp4,
-                                                       weight=w_fp4,
-                                                       act_sf=x_sf_block,
-                                                       weight_scale=w_sf_block,
-                                                       alpha=alpha_tensor,
-                                                       output_dtype=dtype,
-                                                       to_userbuffers=False,
-                                                       backend='cuda_core')
+        output_cuda_core = torch.ops.trtllm.nvfp4_gemm(
+            act_fp4=x_fp4,
+            weight=w_fp4,
+            act_sf=x_sf_block,
+            weight_scale=w_sf_block,
+            alpha=alpha_tensor,
+            output_dtype=dtype,
+            to_userbuffers=False,
+            allowed_backends='cuda_core')
 
     # Compare results
     torch.cuda.synchronize()
@@ -744,23 +751,19 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 if __name__ == "__main__":
     # m, n, k
-    fp4_linear_perf_test(torch.bfloat16, 128, 7168, 16384)
-    fp4_linear_perf_test(torch.bfloat16, 128, 24576, 1536)
-    fp4_linear_perf_test(torch.bfloat16, 128, 2112, 7168)
-    fp4_linear_perf_test(torch.bfloat16, 128, 4096, 7168)
-    fp4_linear_perf_test(torch.bfloat16, 128, 7168, 2048)
+    nvfp4_gemm_perf_test(torch.bfloat16, 128, 7168, 16384)
 
-    # group-1 test cases
-    for tokens in [128, 8192]:
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
-        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
+    # # group-1 test cases
+    # for tokens in [128, 8192]:
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
 
-    # group-2 test cases
-    for m in [128, 256, 512]:
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
-        nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
+    # # group-2 test cases
+    # for m in [128, 256, 512]:
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
+    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)

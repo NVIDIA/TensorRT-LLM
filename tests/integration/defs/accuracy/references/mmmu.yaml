@@ -1,3 +1,5 @@
+google/gemma-3-27b-it:
+  - accuracy: 52.0
 Qwen/Qwen2-VL-7B-Instruct:
   - accuracy: 48.44
 Qwen/Qwen2.5-VL-7B-Instruct:
@@ -17,3 +19,5 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16:
   - accuracy: 26.67
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 53.67
+Qwen/Qwen3-VL-30B-A3B-Instruct:
+  - accuracy: 55.33

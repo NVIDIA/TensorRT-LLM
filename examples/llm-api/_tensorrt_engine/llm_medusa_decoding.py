@@ -29,7 +29,7 @@ def run_medusa_decoding(use_modelopt_ckpt=False, model_dir=None):
     llm_kwargs = {}
 
     if use_modelopt_ckpt:
-        # This is a Llama-3.1-8B combined with Medusa heads provided by TensorRT Model Optimizer.
+        # This is a Llama-3.1-8B combined with Medusa heads provided by Model Optimizer.
         # Both the base model (except lm_head) and Medusa heads have been quantized in FP8.
         model = model_dir or "nvidia/Llama-3.1-8B-Medusa-FP8"
 
@@ -85,7 +85,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--use_modelopt_ckpt',
         action='store_true',
-        help="Use FP8-quantized checkpoint from TensorRT Model Optimizer.")
+        help="Use FP8-quantized checkpoint from Model Optimizer.")
     # TODO: remove this arg after ModelOpt ckpt is public on HF
     parser.add_argument('--model_dir', type=Path, default=None)
     args = parser.parse_args()

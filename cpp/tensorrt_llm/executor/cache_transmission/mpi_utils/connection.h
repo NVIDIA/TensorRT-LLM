@@ -42,14 +42,17 @@ class MpiConnectionManager : public ConnectionManager
 {
 public:
     MpiConnectionManager(mpi::MpiComm const* comm);
+    ~MpiConnectionManager();
     MpiConnection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
+    [[nodiscard]] bool isRunning() const override;
 
 private:
     mpi::MpiComm const* mComm;
     std::map<int, MpiConnection> mConnections;
     CommState mCommState;
+    std::atomic<bool> mIsRunning{true};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

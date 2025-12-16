@@ -245,11 +245,17 @@ class TestTorchBackendAttention:
         cache_loc = torch.arange(batch_size, device=self.device, dtype=torch.int32)
 
         if seq_len == 1:
+            # Generate phase: [num_prefill, num_prefill_tokens, num_decode]
+            batch_info = torch.tensor([0, 0, batch_size], device=self.device, dtype=torch.int32)
             seq_start = torch.arange(batch_size, device=self.device, dtype=torch.int32)
             q_flat = q.view(batch_size, seq_len, -1)
             k_flat = k.view(batch_size, seq_len, -1)
             v_flat = v.view(batch_size, seq_len, -1)
         else:
+            # Context phase: [num_prefill, num_prefill_tokens, num_decode]
+            batch_info = torch.tensor(
+                [batch_size, batch_size * seq_len, 0], device=self.device, dtype=torch.int32
+            )
             seq_start = torch.arange(
                 0, batch_size * seq_len, seq_len, device=self.device, dtype=torch.int32
             )
@@ -261,6 +267,7 @@ class TestTorchBackendAttention:
             "q": q_flat,
             "k": k_flat,
             "v": v_flat,
+            "batch_info": batch_info,
             "seq_len": seq_len_tensor,
             "input_pos": input_positions,
             "cache_loc": cache_loc,
@@ -274,15 +281,20 @@ class TestTorchBackendAttention:
     ):
         """Run torch backend attention operation with optional sinks parameter."""
         return torch.ops.auto_deploy.torch_cached_attention_with_cache(
+            # Q, K, V
             data["q"],
             data["k"],
             data["v"],
+            # STANDARD METADATA
+            data["batch_info"],
             data["seq_len"],
             data["input_pos"],
             data["cache_loc"],
-            data["seq_start"],
+            data["seq_start"],  # cu_seqlen
+            # CACHES
             data["k_cache"],
             data["v_cache"],
+            # CONSTANTS
             scale,
             sinks,
             sliding_window_size,
@@ -463,26 +475,3 @@ class TestTorchBackendAttention:
         assert torch.allclose(
             generate_output, generate_reference_torch, atol=self.atol, rtol=self.rtol
         ), "Generate phase doesn't match reference"
-
-    def test_metadata_preparation(self):
-        """Test metadata preparation operation."""
-        batch_size, seq_len_val = 4, 8
-        device = self.device
-
-        # input_ids = torch.randint(0, 1000, (batch_size, seq_len_val), device=device)
-        position_ids = torch.arange(seq_len_val, device=device).expand(batch_size, -1)
-        seq_len = torch.full((batch_size,), seq_len_val, device=device, dtype=torch.int32)
-        input_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
-        cache_loc = torch.arange(batch_size, device=device, dtype=torch.int32)
-        pages_per_seq = torch.ones(batch_size, device=device, dtype=torch.int32)
-        slot_idx = torch.arange(batch_size, device=device, dtype=torch.int32)
-
-        # Test metadata preparation
-        result = torch.ops.auto_deploy.torch_cached_attention_prepare_metadata(
-            position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, 128, 128
-        )
-
-        # Verify result structure
-        assert len(result) == 4, "Metadata preparation should return 4 tensors"
-        assert all(torch.is_tensor(t) for t in result), "All results should be tensors"
-        assert result[0].shape[0] == batch_size, "First tensor should have batch_size elements"

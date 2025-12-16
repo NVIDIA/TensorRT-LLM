@@ -538,6 +538,100 @@ class TestIpcAsyncBasics:
             client.close()
             server.close()
 
+    @pytest.mark.asyncio
+    async def test_async_router_without_hmac(self):
+        """Test async ROUTER socket without HMAC encryption."""
+        server = ZeroMqQueue(
+            address=None,
+            socket_type=zmq.ROUTER,
+            is_server=True,
+            is_async=True,
+            name="async_router_server_no_hmac",
+            use_hmac_encryption=False,
+        )
+
+        client = ZeroMqQueue(
+            address=server.address,
+            socket_type=zmq.DEALER,
+            is_server=False,
+            is_async=True,
+            name="async_dealer_client_no_hmac",
+            use_hmac_encryption=False,
+        )
+
+        try:
+            # Client sends async request
+            request = {"async_request": "process_no_hmac"}
+            await client.put_async(request)
+
+            # Server receives with identity
+            received = await server.get_async()
+            assert received == request
+
+            # Server replies
+            response = {"async_response": "completed_no_hmac"}
+            await server.put_async(response)
+
+            # Client receives
+            received = await client.get_async()
+            assert received == response
+        finally:
+            client.close()
+            server.close()
+
+    @pytest.mark.asyncio
+    async def test_async_router_get_noblock(self):
+        """Test get_async_noblock on ROUTER socket (handling multipart)."""
+        server = ZeroMqQueue(
+            address=None,
+            socket_type=zmq.ROUTER,
+            is_server=True,
+            is_async=True,
+            name="async_router_noblock_server",
+            use_hmac_encryption=False,
+        )
+
+        client = ZeroMqQueue(
+            address=server.address,
+            socket_type=zmq.DEALER,
+            is_server=False,
+            is_async=True,
+            name="async_dealer_noblock_client",
+            use_hmac_encryption=False,
+        )
+
+        try:
+            # Client sends async request
+            request = {"noblock_request": "test"}
+
+            # Send with small delay to ensure we test the polling/waiting
+            async def send_delayed():
+                await asyncio.sleep(0.1)
+                await client.put_async(request)
+
+            send_task = asyncio.create_task(send_delayed())
+
+            # Server receives using get_async_noblock
+            # This exercises the ROUTER specific recv_multipart path
+            received = await server.get_async_noblock(timeout=2.0)
+            assert received == request
+
+            # Ensure identity was captured so we can reply
+            assert server._last_identity is not None
+
+            # Server replies
+            response = {"noblock_response": "done"}
+            await server.put_async(response)
+
+            # Client receives
+            received = await client.get_async()
+            assert received == response
+
+            await send_task
+        finally:
+            client.close()
+            server.close()
+
 
 class TestIpcPressureTest:
     """Test performance and load handling."""

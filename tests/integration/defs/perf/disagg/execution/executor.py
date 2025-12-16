@@ -249,8 +249,8 @@ class JobManager:
             logger.error(f"Job submission exception: {error_msg}")
             # Clean up temporary file on exception
             temp_config_path = test_config.temp_config_path
-            if os.path.exists(temp_config_path):
-                os.remove(temp_config_path)
+            # if os.path.exists(temp_config_path):
+            #     os.remove(temp_config_path)
             return False, error_msg
 
     @staticmethod

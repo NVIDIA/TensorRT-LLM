@@ -15,18 +15,20 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm::kernels::moe_comm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::moe_comm
 {
 
 // Configuration constants
-static constexpr int kMaxExperts = 256; // Maximum number of experts per rank
-static constexpr int kMaxTopK = 8;      // Maximum top-k experts per token
-static constexpr int kMaxPayloads = 8;  // Maximum number of different payload types
-static constexpr int kMaxRanks = 64;    // Maximum supported EP size
+static constexpr int kMaxTopK = 16;    // Maximum top-k experts per token
+static constexpr int kMaxPayloads = 4; // Maximum number of different payload types
+static constexpr int kMaxRanks = 64;   // Maximum supported EP size
 
 // Describes a single payload type to be communicated
 struct PayloadDescriptor
@@ -177,4 +179,6 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
     int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::moe_comm
+} // namespace kernels::moe_comm
+
+TRTLLM_NAMESPACE_END

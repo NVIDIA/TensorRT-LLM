@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "userbuffers.h"
 #include "utils.h"
 
-namespace tensorrt_llm::kernels::ub
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ub
 {
-using namespace tensorrt_llm::runtime::ub;
 #define MAX_THREADS 1024
 #define TIMEOUT 200000000000ull
 
@@ -1953,4 +1955,6 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     default: TLLM_THROW("Unsupported dataType for allreduce2_userbuff_inplace_rmsnorm_quant_impl");
     }
 }
-} // namespace tensorrt_llm::kernels::ub
+} // namespace kernels::ub
+
+TRTLLM_NAMESPACE_END

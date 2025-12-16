@@ -1,19 +1,38 @@
+import itertools
 import os
+import pickle
+import sys
 import tempfile
-from typing import Dict, List
+from typing import Any, List
 
+import cloudpickle
+import pytest
 import torch
+from mpi4py import MPI
 
+import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
-from tensorrt_llm._torch.autotuner import (AutoTuner, DynamicDim,
-                                           DynamicTensorSpec, FakeTensor,
-                                           OptimizationProfile, StaticDim,
-                                           TunableRunner, TuningConfig,
-                                           autotune)
+from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
+                                           DynamicDim, DynamicTensorSpec,
+                                           FakeTensor, OptimizationProfile,
+                                           StaticDim, TunableRunner,
+                                           TuningConfig, autotune)
 from tensorrt_llm._torch.utils import (get_power_of_2_num_tokens_buckets,
                                        next_positive_power_of_2)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
+
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def test_multi_dynamic_dims():
@@ -112,13 +131,13 @@ class GemmRunner(TunableRunner):
                          mutates_args=())
 def get_best_gemm_tactic(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     runners = [GemmRunner()]
-    tunner = AutoTuner.get()
+    tuner = AutoTuner.get()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         input_idx=0,
         dim_idx=0,
         gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
         map_to_tuning_buckets=next_positive_power_of_2), ), )
-    runner, tactic = tunner.choose_one(
+    runner, tactic = tuner.choose_one(
         "autotuner_test::get_best_gemm_tactic",
         runners,
         tuning_config,
@@ -175,20 +194,20 @@ def test_autotuner_try_block():
 
     x, w = torch.randn(M, 64), torch.randn(64, 128)
     runners = [PartialCrashedRunner()]
-    tunner = AutoTuner.get()
+    tuner = AutoTuner.get()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         input_idx=0,
         dim_idx=0,
         gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
         map_to_tuning_buckets=next_positive_power_of_2), ), )
     with autotune():
-        runner, tactic = tunner.choose_one("test_autotuner_try_block", runners,
-                                           tuning_config, [x, w])
+        runner, tactic = tuner.choose_one("test_autotuner_try_block", runners,
+                                          tuning_config, [x, w])
 
     m = M // 2
     while m >= 1:
-        _, tactic = tunner.choose_one("test_autotuner_try_block", runners,
-                                      tuning_config, [torch.randn(m, 64), w])
+        _, tactic = tuner.choose_one("test_autotuner_try_block", runners,
+                                     tuning_config, [torch.randn(m, 64), w])
         assert tactic in [
             -1, 0
         ], f"Expect only tactic -1, 0 being chosen, but got tactic {tactic}."
@@ -327,7 +346,12 @@ def test_multiple_dynamic_shapes_cache():
 
 
 class GemmRunnerComplexTuningConfigs(TunableRunner):
+
+    # test serialization of different types of tactics
     valid_tactic_ids = [-1, 0, 1]
+    valid_tile_sizes = [(128, 128), (256, 256)]
+    valid_cluster_sizes = [[1, 1, 1], [2, 2, 1]]
+
     tune_max_num_tokens = 32
 
     def get_valid_tactics(
@@ -335,40 +359,50 @@ class GemmRunnerComplexTuningConfigs(TunableRunner):
         inputs: List[FakeTensor],
         profile: OptimizationProfile,
         **kwargs,
-    ) -> List[Dict[str, int]]:
+    ) -> List[Any]:
         # During the tuning process, we verify if the tuning config behaves as expected
-
         assert inputs[0].shape[0] <= self.tune_max_num_tokens, \
             f"Input shape {inputs[0].shape[0]} is larger than the max num tokens {self.tune_max_num_tokens}"
 
         assert inputs[0][-1, 0] == inputs[0].shape[0], \
             f"Input shape {inputs[0].shape[0]} is not set through the pre_hook correctly"
 
-        # The simulated delay is not deterministic, so we need to return specific tactics here
         return [{
-            "block_size": block_size,
-            "tactic_id": tactic_id
-        } for tactic_id in self.valid_tactic_ids for block_size in [128, 256]]
+            "int_tactic_id": tactic_id,
+            "tuple_tile_size": tile_size,
+            "list_cluster_size": cluster_size,
+        } for tactic_id, tile_size, cluster_size in itertools.product(
+            self.valid_tactic_ids,
+            self.valid_tile_sizes,
+            self.valid_cluster_sizes,
+        )]
 
     def forward(
         self,
         /,
         inputs: List[torch.Tensor],
         *,
-        tactic: dict = {},
+        tactic: Any = -1,
     ) -> torch.Tensor:
         # Notice that in fallback case tactic is -1
         if tactic == -1:
             # assign default configs for fallback case
-            block_size, tactic_id = 128, -1
+            tactic_id, tile_size, cluster_size = -1, (128, 256), [1, 1, 1]
         else:
-            block_size, tactic_id = tactic["block_size"], tactic["tactic_id"]
-        assert tactic_id in self.valid_tactic_ids
+            tactic_id, tile_size, cluster_size = tactic[
+                "int_tactic_id"], tactic["tuple_tile_size"], tactic[
+                    "list_cluster_size"]
+
+        assert isinstance(tactic_id, int) and tactic_id in self.valid_tactic_ids
+        assert isinstance(tile_size, tuple) and len(tile_size) == 2 \
+            and tile_size in self.valid_tile_sizes
+        assert isinstance(cluster_size, list) and len(cluster_size) == 3 \
+            and cluster_size in self.valid_cluster_sizes
         return [gemm_0, gemm_1, gemm_fallback][tactic_id](*inputs)
 
     @staticmethod
     def inputs_pre_hook(inputs: List[torch.Tensor]):
-        # always set the first element to bo iota in x
+        # always set the first element to be the number of tokens in x
         x, w = inputs
         x_hooked = torch.zeros_like(x)
         x_hooked[-1, 0] = x.shape[0]
@@ -389,13 +423,29 @@ def test_autotuner_tuning_configs():
         # Test if the number of tuning tokens is clipped to 32
         tune_max_num_tokens=GemmRunnerComplexTuningConfigs.tune_max_num_tokens,
         inputs_pre_hook=GemmRunnerComplexTuningConfigs.inputs_pre_hook,
+        use_cold_l2_cache=True,
+        use_cuda_graph=False,
     )
-    with autotune():
+    temp_dir = tempfile.TemporaryDirectory()
+    with autotune(cache_path=os.path.join(
+            temp_dir.name, "test_autotuner_tactic_configs.json")):
         tuner = AutoTuner.get()
-        runner, tactic = tuner.choose_one("test_autotuner_tactic_configs",
-                                          runners, tuning_config, [x, w])
+        runner, best_tactic = tuner.choose_one("test_autotuner_tactic_configs",
+                                               runners, tuning_config, [x, w])
 
-    runner_0.forward(inputs=[x, w], tactic=tactic)
+    runner_0([x, w], tactic=best_tactic)
+
+    # Test if the tactic can be loaded from cache correctly
+    AutoTuner.get().profiling_cache.clear()
+    AutoTuner.get().profiling_cache.load_cache(
+        os.path.join(temp_dir.name, "test_autotuner_tactic_configs.rank0.json"))
+
+    # No further tuning should be performed.
+    runner, deserialized_tactic = tuner.choose_one(
+        "test_autotuner_tactic_configs", runners, tuning_config, [x, w])
+    assert best_tactic == deserialized_tactic, "Tactic should be the same after deserialization"
+
+    runner_0([x, w], tactic=deserialized_tactic)
 
 
 def test_kernel_testing_single_context():
@@ -567,3 +617,105 @@ def test_kernel_testing_mismatched_ops():
         assert "Custom op mismatch" in error_msg, f"Expected 'Custom op mismatch' in error message, got: {error_msg}"
         assert "test_op_A" in error_msg, f"Expected 'test_op_A' in error message, got: {error_msg}"
         assert "test_op_B" in error_msg, f"Expected 'test_op_B' in error message, got: {error_msg}"
+
+
+class DistributedGemmRunner(TunableRunner):
+
+    def __init__(self, prefer_tactics: List[int] = [0, 1]):
+        self.prefer_tactics = prefer_tactics
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        # Return all tactics so merge strategy can choose between them
+        return self.prefer_tactics
+
+    def forward(self, inputs, *, tactic=-1, **kwargs):
+        # tactic 0 is slower
+        if tactic % 2 == 0:
+            for _ in range(5):
+                inputs[0] @ inputs[1]
+        return inputs[0] @ inputs[1]
+
+    def unique_id(self):
+        return ()
+
+
+def _distributed_worker_function(world_size, strategy):
+    """Worker function to run on each MPI rank."""
+    rank = tensorrt_llm.mpi_rank()
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      tp_size=world_size,
+                      pp_size=1)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+
+    x = torch.randn(16, 32, device='cuda')
+    w = torch.randn(32, 64, device='cuda')
+    inputs = [x, w]
+
+    if strategy == DistributedTuningStrategy.PARALLEL:
+        # All ranks get the same set of tactics
+        prefer_tactics = [0, 1, 2, 3]
+    else:
+        # Each rank prefers different tactics
+        prefer_tactics = [rank]
+    runner = DistributedGemmRunner(prefer_tactics=prefer_tactics)
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+
+    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+    with autotune(tune_mode=True, cache_path=cache_path):
+        tuner.choose_one(custom_op=f"test_distributed_{strategy}",
+                         runners=[runner],
+                         tuning_config=config,
+                         inputs=inputs)
+    selected_runner, best_tactic = tuner.choose_one(
+        custom_op=f"test_distributed_{strategy}",
+        runners=[runner],
+        tuning_config=config,
+        inputs=inputs)
+
+    if strategy == DistributedTuningStrategy.BROADCAST:
+        # All ranks should select tactic 0
+        assert best_tactic == 0
+    elif strategy == DistributedTuningStrategy.INDEPENDENT:
+        # Each rank should select the tactic it prefers
+        assert best_tactic == rank
+    elif strategy == DistributedTuningStrategy.MERGE:
+        # Because tactic 0 is slower, two ranks should always select tactic 1
+        assert best_tactic == 1
+    elif strategy == DistributedTuningStrategy.PARALLEL:
+        # Tactic 1 or 3 should be selected since they are faster.
+        # TODO: This might not cover the case that rank1 tunes nothing
+        assert best_tactic % 2 == 1
+    else:
+        assert False, f"Unknown strategy: {strategy}"
+
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        DistributedTuningStrategy.BROADCAST,
+        DistributedTuningStrategy.INDEPENDENT,
+        DistributedTuningStrategy.MERGE,
+        DistributedTuningStrategy.PARALLEL,
+    ],
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_distributed_broadcast_strategy(strategy, mpi_pool_executor):
+    """Test broadcast strategy with real MPI processes."""
+    world_size = 2
+    # Use MPIPoolExecutor to run distributed test
+    results = mpi_pool_executor.map(
+        _distributed_worker_function,
+        *zip(*[(
+            world_size,
+            strategy,
+        )] * world_size),
+    )
+    for r in results:
+        assert r is True

@@ -40,9 +40,7 @@ list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
 
 function(filter_cuda_archs ARCH SOURCES_VAR)
   if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    set(FILTER_REGEX
-        ".*_sm(_)?${ARCH}[.]cubin[.]cpp|^.*Sm(_)?${ARCH}.*cubin.cpp$|.*_sm(_)?${ARCH}[.]cu|^.*Sm(_)?${ARCH}.*cu$"
-    )
+    set(FILTER_REGEX ".*[Ss][Mm]_?${ARCH}(af)?.*(cubin\.cpp|\.cu)$")
     list(APPEND SOURCES ${${SOURCES_VAR}})
     list(APPEND SOURCES_FILTERED ${SOURCES})
     list(FILTER SOURCES_FILTERED INCLUDE REGEX "${FILTER_REGEX}")

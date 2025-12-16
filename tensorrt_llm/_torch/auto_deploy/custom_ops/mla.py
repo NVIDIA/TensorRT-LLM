@@ -1,6 +1,6 @@
 """Custom ops for MultiHead Latent attention."""
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -14,7 +14,6 @@ from .attention_interface import (
     CacheConfig,
     CacheInitializerDict,
     MHACallable,
-    PrepareMetadataCallable,
     SequenceInfo,
 )
 from .triton_attention import _flattened_context_mha, _generate_mha
@@ -31,11 +30,14 @@ def fused_flattened_mla_with_cache(
     q_pe: torch.Tensor,
     kv: torch.Tensor,
     k_pe: torch.Tensor,
-    # METADATA
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -51,6 +53,15 @@ def fused_flattened_mla_with_cache(
     # 1. b > 0, s==1: this indicates a generate-only batch of tokens.
     # 2. b==1, s > 0: this indicates a mixed context+generate phase. The actual number of sequences
     #    and number of tokens per sequence are encoded in seq_len and seq_start.
+
+    # check for sequence info and truncate metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+
+    seq_len = seq_len[:num_seq]
+    input_pos = input_pos[:num_seq]
+    cache_loc = cache_loc[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
 
     # Get parameters
     b, num_heads, s, qk_nope_head_dim = q_nope.shape
@@ -154,11 +165,14 @@ def fused_flattened_mla_with_cache_fake(
     q_pe: torch.Tensor,
     kv: torch.Tensor,
     k_pe: torch.Tensor,
-    # METADATA
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -169,42 +183,6 @@ def fused_flattened_mla_with_cache_fake(
 ):
     v_head_dim = kv.shape[-1] - q_nope.shape[-1]
     return torch.empty_like(kv[..., -v_head_dim:])
-
-
-@torch.library.custom_op(
-    "auto_deploy::triton_attention_prepare_fused_mla_metadata", mutates_args=()
-)
-def prepare_fused_mla_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
-    seq_start = torch.zeros_like(seq_len[:num_seq])
-    seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
-    return (
-        seq_len[:num_seq].clone(),
-        input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
-        seq_start,
-    )
-
-
-@prepare_fused_mla_metadata.register_fake
-def prepare_fused_mla_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
-):
-    return (
-        torch.empty_like(seq_len),
-        torch.empty_like(input_pos),
-        torch.empty_like(cache_loc),
-        torch.empty_like(seq_len),
-    )
 
 
 @AttentionRegistry.register("MultiHeadLatentAttention")
@@ -230,11 +208,11 @@ class MultiHeadLatentAttention(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache
+        return torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.triton_attention_prepare_fused_mla_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(
