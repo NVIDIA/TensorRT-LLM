@@ -1,3 +1,4 @@
+import json
 import threading
 from typing import List, Optional
 
@@ -91,9 +92,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             List[dict]: A list of runtime stats as dict.
         """
         try:
-            # Stats are already serialized by the worker's fetch_stats_async()
-            stats = self.rpc_client.fetch_stats_async().remote(timeout=timeout)
-            return stats
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(s) if isinstance(s, str) else s for s in stats]
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             return []
@@ -107,7 +108,6 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         Returns:
             IterationResult: An async iterable object containing runtime stats.
         """
-        # Initialize iteration result if needed
         self._maybe_initialize_iteration_results()
 
         if self._iter_stats_result is None:
@@ -134,10 +134,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             List[dict]: A list of runtime events as dict.
         """
         try:
-            # Events are already serialized by the worker's fetch_kv_cache_events_async()
-            events = self.rpc_client.fetch_kv_cache_events_async().remote(
-                timeout=timeout)
-            return events
+            # Events are already serialized by the worker's fetch_kv_cache_events_wait_async()
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(e) if isinstance(e, str) else e for e in events]
         except Exception as e:
             logger.debug(f"Error fetching kv events via RPC: {e}")
             return []

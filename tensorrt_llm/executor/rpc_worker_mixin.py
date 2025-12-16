@@ -1,4 +1,5 @@
 import asyncio
+import time
 from queue import Queue
 from threading import Event
 from typing import AsyncGenerator, Optional
@@ -99,6 +100,42 @@ class RpcWorkerMixin:
         logger_debug(
             f"[worker] RpcWorker {self.rank} quitting fetch_responses_loop_async", color="yellow"
         )
+
+    async def fetch_stats_wait_async(self, timeout: Optional[float] = None) -> list:
+        """Poll for stats until available or timeout.
+
+        Args:
+            timeout: Max wait time in seconds. If None, fetch once without waiting.
+        """
+        logger_debug(
+            f"[worker] RpcWorker {self.rank} is fetching stats with timeout {timeout}",
+            color="yellow",
+        )
+        start = time.time()
+        while True:
+            stats = await asyncio.to_thread(self.fetch_stats)
+            if stats or timeout is None:
+                break
+            if (time.time() - start) >= timeout:
+                break
+            await asyncio.sleep(0.1)
+        return [self._stats_serializer(s) for s in stats]
+
+    async def fetch_kv_cache_events_wait_async(self, timeout: Optional[float] = None) -> list:
+        """Poll for KV cache events until available or timeout.
+
+        Args:
+            timeout: Max wait time in seconds. If None, fetch once without waiting.
+        """
+        start = time.time()
+        while True:
+            events = await asyncio.to_thread(self.fetch_kv_cache_events)
+            if events or timeout is None:
+                break
+            if (time.time() - start) >= timeout:
+                break
+            await asyncio.sleep(0.1)
+        return [self._kv_cache_events_serializer(e) for e in events]
 
     async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_stats using asyncio.to_thread.

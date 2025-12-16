@@ -1,5 +1,6 @@
 import atexit
 import concurrent.futures
+import json
 import os
 import threading
 import weakref
@@ -372,13 +373,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning("RPC client not initialized, cannot get stats")
             return []
 
-        try:
-            # Stats are already serialized by the worker's fetch_stats_async()
-            stats = self.rpc_client.fetch_stats_async().remote(timeout=timeout)
-            return stats
-        except Exception as e:
-            logger.debug(f"Error fetching stats via RPC: {e}")
-            return []
+        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
+        return [json.loads(s) if isinstance(s, str) else s for s in stats]
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
@@ -420,12 +416,11 @@ class GenerationExecutorProxy(GenerationExecutor):
             return []
 
         try:
-            # Events are already serialized by the worker's fetch_kv_cache_events_async()
-            events = self.rpc_client.fetch_kv_cache_events_async().remote(
-                timeout=timeout)
-            return events
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(e) if isinstance(e, str) else e for e in events]
         except Exception as e:
-            logger.debug(f"Error fetching kv events via RPC: {e}")
+            logger.error(f"Error fetching kv events via RPC: {e}")
             return []
 
     def aget_kv_events(self, timeout: float) -> IterationResult:

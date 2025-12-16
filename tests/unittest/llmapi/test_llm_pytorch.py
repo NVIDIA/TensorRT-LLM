@@ -992,13 +992,7 @@ def test_llm_rpc_get_stats():
                 prompts, sampling_params=SamplingParams(max_tokens=5)):
             print(output)
 
-        # Poll for stats with timeout
-        stats = []
-        for _ in range(10):
-            stats = llm.get_stats(timeout=0.5)
-            if stats:
-                break
-            time.sleep(0.1)
+        stats = llm.get_stats(timeout=5)
 
         assert len(stats) > 0, "Should have at least one stats entry"
         # Stats should be JSON strings that can be parsed
@@ -1079,24 +1073,9 @@ def test_llm_context_only_timed_out():
                                disaggregated_params=disaggregated_params):
         print(output)
 
-    def get_stats_with_wait(llm, timeout: float = 2, expected_len: int = None):
-        """Poll for stats with timeout since RPC calls return immediately."""
-        import json
-        start = time.time()
-        while time.time() - start < timeout:
-            results = llm.get_stats(timeout=0.1)
-            if results and (expected_len is None
-                            or len(results) >= expected_len):
-                # Parse JSON strings to dicts if needed
-                return [
-                    json.loads(r) if isinstance(r, str) else r for r in results
-                ]
-            time.sleep(0.1)
-        return []
-
     max_retries = 10
     for _ in range(max_retries):
-        results = get_stats_with_wait(llm, 2, expected_len=1)
+        results = llm.get_stats(2)
         if len(results) == 1:
             break
         time.sleep(1)
@@ -1116,7 +1095,7 @@ def test_llm_context_only_timed_out():
         print(output)
 
     # Get number of allocated blocks
-    results = get_stats_with_wait(llm, 2, expected_len=1)
+    results = llm.get_stats(2)
     assert len(results) == 1
     final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
 
@@ -1170,21 +1149,6 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
         * 10
     ]
 
-    def get_stats_with_wait(llm, timeout: float = 2, expected_len: int = None):
-        """Poll for stats with timeout since RPC calls return immediately."""
-        import json
-        start = time.time()
-        while time.time() - start < timeout:
-            results = llm.get_stats(timeout=0.1)
-            if results and (expected_len is None
-                            or len(results) >= expected_len):
-                # Parse JSON strings to dicts if needed
-                return [
-                    json.loads(r) if isinstance(r, str) else r for r in results
-                ]
-            time.sleep(0.1)
-        return []
-
     # Send context-only request
     for output in llm.generate(prompts1 * 10,
                                sampling_params=sampling_params,
@@ -1194,7 +1158,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     max_retries = 10
     all_results = []
     for _ in range(max_retries):
-        results = get_stats_with_wait(llm, 2)
+        results = llm.get_stats(2)
         all_results.extend(results)
 
     assert len(all_results) > 0
@@ -1211,7 +1175,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
         print(output)
 
     # Get number of allocated blocks
-    results = get_stats_with_wait(llm, 2, expected_len=1)
+    results = llm.get_stats(2)
     assert len(results) == 1
     final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
 
