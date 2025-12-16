@@ -145,9 +145,7 @@ def extract_weight_node(node: Node) -> int:
         # for modelopt quantized graph, there will be a quantize_op
         _, weight_params, _ = get_quantization_params_from_linear_node(node)
         weight_node = weight_params.input_node if weight_params else weight_node
-        assert weight_node is not None, (
-            "Expected exactly at least one weight node in the parametrized node"
-        )
+        assert weight_node is not None, "Expected at least one weight node in the parametrized node"
     return find_get_attr_node(weight_node)
 
 
