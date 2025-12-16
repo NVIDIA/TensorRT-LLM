@@ -4,12 +4,11 @@ import ast
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple
 
-import requests
 import yaml
+from test_common.http_utils import wait_for_endpoint_ready
 
 
 def get_node_name() -> str:
@@ -568,19 +567,6 @@ class PerfServerBenchmarkCmds(NamedTuple):
     names: List[str]
     working_dir: str
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(10)
-                if requests.get(url, timeout=5).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
     def run_cmd(self,
                 cmd_idx: int,
                 node_name: str,
@@ -601,8 +587,8 @@ class PerfServerBenchmarkCmds(NamedTuple):
                                                stderr=subprocess.STDOUT)
 
             # Wait for server to be ready
-            self.wait_for_endpoint_ready("http://localhost:8000/v1/models",
-                                         timeout=max_timeout)
+            wait_for_endpoint_ready("http://localhost:8000/v1/models",
+                                    timeout=max_timeout)
 
             # Save node name, gpu info, server config, client config output to server file path
             with open(client_file_path, 'w') as client_ctx:

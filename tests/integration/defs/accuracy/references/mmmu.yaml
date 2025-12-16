@@ -19,3 +19,5 @@ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16:
   - accuracy: 26.67
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 53.67
+Qwen/Qwen3-VL-30B-A3B-Instruct:
+  - accuracy: 55.33

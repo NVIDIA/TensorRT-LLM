@@ -31,6 +31,7 @@ from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
                                        print_info)
+from test_common.http_utils import wait_for_endpoint_ready
 
 from tensorrt_llm._utils import get_free_port
 
@@ -251,29 +252,6 @@ class PerfAggrScriptTestCmds(NamedTuple):
     timeout: int
     output_dir: str
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 7200):
-        start = time.monotonic()
-        while True:
-            elapsed_time = time.monotonic() - start
-            if elapsed_time > timeout:
-                print_error(
-                    f"Timeout waiting for endpoint {url} to be ready after {timeout} seconds"
-                )
-                break
-            try:
-                print_info(
-                    f"Waiting for endpoint {url} to be ready, elapsed time: {elapsed_time}s"
-                )
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print_info(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print_info(
-                    f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         server_proc = None
@@ -294,7 +272,7 @@ class PerfAggrScriptTestCmds(NamedTuple):
                     stderr=subprocess.STDOUT,
                     env=copy.deepcopy(os.environ),
                 )
-            self.wait_for_endpoint_ready(
+            wait_for_endpoint_ready(
                 f"http://{server_hostname}:{server_port}/health",
                 timeout=self.timeout)
             client_cmd = add_host_port_to_cmd(self.client_cmds[cmd_idx],
@@ -323,19 +301,6 @@ class PerfDisaggScriptTestCmds(NamedTuple):
     client_cmd: List[str]
     benchmark_cmd: List[str]
 
-    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                time.sleep(1)
-                if requests.get(url).status_code == 200:
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
-        print_error(
-            f"Endpoint {url} did not become ready within {timeout} seconds")
-
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         try:
@@ -360,7 +325,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
-                self.wait_for_endpoint_ready(
+                wait_for_endpoint_ready(
                     f"http://localhost:8000/health",
                     timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
