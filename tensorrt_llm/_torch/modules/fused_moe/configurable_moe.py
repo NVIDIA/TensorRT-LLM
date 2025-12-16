@@ -38,6 +38,8 @@ from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 
+from tensorrt_llm.models.modeling_utils import QuantConfig
+
 from .communication import (
     AllGatherReduceScatter,
     Communication,
@@ -106,6 +108,7 @@ class ConfigurableMoE(MoE):
         weight_loading_mode=None,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        override_quant_config: Optional['QuantConfig'] = None,
         **kwargs,
     ):
         super().__init__(
@@ -131,8 +134,8 @@ class ConfigurableMoE(MoE):
         # ========== Create MoE Backend (Default: Cutlass) ==========
         from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 
-        # Get MoE backend class based on model_config
-        moe_cls = get_moe_cls(model_config, override_quant_config=None)
+        # Get MoE backend class based on override_quant_config or model_config
+        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
 
         # Call create_moe_backend with all necessary parameters
         # init_load_balancer=False: Prevents backend from registering itself with load balancer
@@ -476,8 +479,11 @@ class ConfigurableMoE(MoE):
 
         # Calculate the number of rows
         num_rows = x.shape[0]
-        if self.use_dp:
-            num_rows = sum(all_rank_num_tokens)
+        if self.use_dp and self.comm is not None:
+            # When using communication, dispatch will create tensors with shape:
+            # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
+            # So we need to allocate workspace based on this size
+            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
 
         workspaces = self.backend.get_workspaces([num_rows])
         return workspaces[0]
