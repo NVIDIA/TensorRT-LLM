@@ -373,6 +373,14 @@ class SamplingParams:
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
+            # kimi_k2 model uses the eos_token_id in generation config
+            if (
+                hf_model_config is not None
+                and hf_model_config.model_type == "kimi_k2"
+                and generation_config is not None
+                and isinstance(generation_config.eos_token_id, int)
+            ):
+                self.end_id = generation_config.eos_token_id
 
             if self.pad_id is None:
                 self.pad_id = self.end_id
@@ -392,26 +400,24 @@ class SamplingParams:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
             self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
-        # Add eos_token_id in generation_config to _stop_word_ids
-        # Refer to https://huggingface.co/docs/hub/en/transformers#transformers-repository-files and
-        # https://github.com/huggingface/transformers/blob/1ae4d917ed3badbdb1ffc167e0529f5a6d3c080d/src/transformers/generation/stopping_criteria.py#L451C1-L451C42
-        # The eos_token_id in generation_config are really mean to stop the text generation.
-        if generation_config is not None and generation_config.eos_token_id is not None:
-            if isinstance(generation_config.eos_token_id, int):
-                generation_eos_token_ids = [generation_config.eos_token_id]
-            else:  # always List[int]
-                generation_eos_token_ids = generation_config.eos_token_id
-
-            if self._stop_word_ids is None:
-                self._stop_word_ids = [generation_eos_token_ids]
-            else:
+        # add generation_config to stop word list, only in qwen3-next now
+        if (
+            hf_model_config is not None
+            and hf_model_config.model_type == "qwen3_next"
+            and generation_config is not None
+            and isinstance(generation_config.eos_token_id, List)
+            and all(isinstance(i, int) for i in generation_config.eos_token_id)
+        ):
+            if self._stop_word_ids:
                 all_stop_tokens_id = set(i for sublist in self._stop_word_ids for i in sublist)
-                from_generation_stop_token_ids = [
-                    i for i in generation_eos_token_ids if i not in all_stop_tokens_id
+                from_generation_stop_tokens = [
+                    i for i in generation_config.eos_token_id if i not in all_stop_tokens_id
                 ]
 
-                if from_generation_stop_token_ids:
-                    self._stop_word_ids.append(from_generation_stop_token_ids)
+                if from_generation_stop_tokens:
+                    self._stop_word_ids.append(from_generation_stop_tokens)
+            else:
+                self._stop_word_ids = [generation_config.eos_token_id]
 
         return self
 

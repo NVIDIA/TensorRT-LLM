@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
@@ -55,6 +55,7 @@ class ChatPostprocArgs(PostprocArgs):
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -69,6 +70,7 @@ class ChatPostprocArgs(PostprocArgs):
             stream_options=request.stream_options,
             return_logprobs=bool(request.logprobs),
             top_logprobs=bool(request.top_logprobs),
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
 
@@ -108,9 +110,10 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
+            chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
             args.reasoning_parser_dict[
                 output_index] = ReasoningParserFactory.create_reasoning_parser(
-                    args.reasoning_parser)
+                    args.reasoning_parser, chat_template_kwargs)
         reasoning_parser = args.reasoning_parser_dict[output_index]
 
     if reasoning_parser is not None:
@@ -501,6 +504,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -508,6 +512,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             model=request.model,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
 
