@@ -312,7 +312,10 @@ class MistralConfigLoader(BaseConfigLoader):
                 ]
         elif hf_quant_config.get("quant_method") == "fp8":
             # Used for Eagle3 weight
-            if hf_quant_config.get("weight_block_size") is not None or hf_quant_config.get("activation_scheme", None) == "static":
+            if (
+                hf_quant_config.get("weight_block_size") is not None
+                or hf_quant_config.get("activation_scheme", None) == "static"
+            ):
                 # hf_quant_config.get("weight_block_size") is for Eagle3 weight
                 # hf_quant_config.get("activation_scheme", None) == "static" is for DeepSeek V3 FP8 per tensor hack
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
