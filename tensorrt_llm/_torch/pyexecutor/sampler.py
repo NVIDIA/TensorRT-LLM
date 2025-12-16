@@ -2423,7 +2423,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
             group_strategies_per_step = [  # convert from per-request to per-step
                 strat
-                for strat, steps in zip(group_strategies, req_num_steps[group_req_indices])
+                for strat, steps in zip(group_strategies, req_num_steps[group_req_indices].tolist())
                 for _ in range(steps)
             ]
 
