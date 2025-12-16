@@ -297,6 +297,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        if self.use_fused_finalize:
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -316,8 +321,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         if self.use_fused_finalize:
-            self.event_dict[EventType.Main].record()
-
             with torch.cuda.stream(
                     self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
                 self.event_dict[EventType.Main].wait()
