@@ -39,7 +39,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import Int32, T, dsl_user_op
 
-from .utils import is_power_of_2
+from .utils import TRTLLM_ENABLE_PDL, is_power_of_2
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
@@ -931,6 +931,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
@@ -1285,6 +1286,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             cute.arch.cluster_wait()
         else:
             self.cta_sync_barrier.arrive_and_wait()
+
+        cute.arch.griddepcontrol_wait()
 
         #
         # Specialized Schedule warp
@@ -1939,6 +1942,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+
+        cute.arch.griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,

@@ -44,11 +44,14 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
+import os
 from typing import Union
 
 import cutlass._mlir.dialects.cute as _cute_ir
 from cutlass._mlir import ir
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
 
 
 # WAR for CuTeDSL make_ptr implementation

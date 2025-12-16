@@ -55,7 +55,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
-from .utils import is_power_of_2
+from .utils import TRTLLM_ENABLE_PDL, is_power_of_2
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
@@ -578,6 +578,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=TRTLLM_ENABLE_PDL,
         )
         return
 
@@ -868,6 +869,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         else:
             cute.arch.barrier(barrier_id=self.cta_sync_bar_id,
                               number_of_threads=self.threads_per_cta)
+
+        cute.arch.griddepcontrol_wait()
 
         #
         # Specialized TMA load warp
@@ -1472,6 +1475,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+        cute.arch.griddepcontrol_launch_dependents()
 
     def mainloop_s2t_copy_and_partition(
         self,
