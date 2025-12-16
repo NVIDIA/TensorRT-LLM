@@ -35,48 +35,17 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import math, nvvm
+from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.typing import Float32
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    silu_f32,
 )
-
-
-@dsl_user_op
-def fmin(
-    a: Union[float, Float32], b: Union[float, Float32], *, nan=False, loc=None, ip=None
-) -> Float32:
-    return Float32(
-        nvvm.fmin(
-            T.f32(),
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            nan=nan,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-def sigmoid_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """
-    Compute the sigmoid of the input tensor.
-    """
-    return cute.arch.rcp_approx(1.0 + cute.math.exp(-a, fastmath=fastmath))
-
-
-def silu_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
-    """
-    Compute the silu of the input tensor.
-    """
-    return a * sigmoid_f32(a, fastmath=fastmath)
-
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for

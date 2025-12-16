@@ -35,15 +35,17 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import Int32, T, dsl_user_op
+from cutlass.cutlass_dsl import Int32
 
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    atomic_add_func,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    vectorized_atomic_add_bf16x8,
+    vectorized_atomic_add_fp32x2,
 )
 
 """
@@ -290,69 +292,6 @@ cutlass.utils.PersistentTileSchedulerParams.__init__ = hooked_PersistentTileSche
 cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = (
     hooked_get_cluster_work_idx_with_fastdivmod
 )
-
-
-# TODO(zhichenj): try to move these to NVVM wrapper or helper functions
-@dsl_user_op
-def vectorized_atomic_add_bf16x8(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [
-            scatter_out_offset.iterator.llvm_ptr,
-            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
-            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
-            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
-            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
-        ],
-        "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
-        has_side_effects=True,
-    )
-
-
-@dsl_user_op
-def vectorized_atomic_add_fp32x2(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [
-            scatter_out_offset.iterator.llvm_ptr,
-            rOut_epi_packed[0].ir_value(),
-            rOut_epi_packed[1].ir_value(),
-        ],
-        "red.global.v2.f32.add [$0], {$1, $2};",
-        "l,f,f",
-        has_side_effects=True,
-    )
-
-
-@dsl_user_op
-def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
-    if cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float32):
-        llvm.inline_asm(
-            None,
-            [
-                scatter_out_offset.iterator.llvm_ptr,
-                rOut_epi_packed.ir_value(),
-            ],
-            "red.global.add.f32 [$0], $1;",
-            "l,f",
-            has_side_effects=True,
-            loc=loc,
-            ip=ip,
-        )
-    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.BFloat16):
-        llvm.inline_asm(
-            None,
-            [
-                scatter_out_offset.iterator.llvm_ptr,
-                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
-            ],
-            "red.add.noftz.bf16 [$0], $1;",
-            "l,h",
-            has_side_effects=True,
-            loc=loc,
-            ip=ip,
-        )
 
 
 class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
