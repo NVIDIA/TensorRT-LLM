@@ -16,6 +16,7 @@ while [[ $# -gt 0 ]]; do
         --benchmark-ratio) benchmark_ratio="$2"; shift 2 ;;
         --streaming) streaming="$2"; shift 2 ;;
         --use-nv-sa-benchmark) use_nv_sa_benchmark="$2"; shift 2 ;;
+        --benchmark-mode) benchmark_mode="$2"; shift 2 ;;
 
         # Environment and paths
         --dataset-file) dataset_file="$2"; shift 2 ;;
@@ -59,6 +60,7 @@ echo "  multi_round: ${multi_round}"
 echo "  benchmark_ratio: ${benchmark_ratio}"
 echo "  streaming: ${streaming}"
 echo "  use_nv_sa_benchmark: ${use_nv_sa_benchmark}"
+echo "  benchmark_mode: ${benchmark_mode}"
 echo
 echo "Environment Configuration:"
 echo "  dataset_file: ${dataset_file}"
