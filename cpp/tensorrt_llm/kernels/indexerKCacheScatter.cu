@@ -16,9 +16,12 @@
 
 #include "IndexerKCacheScatter.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace
@@ -149,4 +152,6 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

@@ -4,7 +4,7 @@
 
 ## About TensorRT LLM
 
-[TensorRT LLM](https://developer.nvidia.com/tensorrt) is NVIDIA's comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs. 
+[TensorRT LLM](https://developer.nvidia.com/tensorrt) is NVIDIA's comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs.
 
 ## Key Capabilities
 
@@ -40,7 +40,7 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 ### 🚀 **Advanced Optimization & Production Features**
 - **[In-Flight Batching & Paged Attention](./features/paged-attention-ifb-scheduler.md)**: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
 - **[Multi-GPU Multi-Node Inference](./features/parallel-strategy.md)**: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.
-- **[Advanced Quantization](./features/quantization.md)**: 
+- **[Advanced Quantization](./features/quantization.md)**:
   - **FP4 Quantization**: Native support on NVIDIA B200 GPUs with optimized FP4 kernels
   - **FP8 Quantization**: Automatic conversion on NVIDIA H100 GPUs leveraging Hopper architecture
 - **[Speculative Decoding](./features/speculative-decoding.md)**: Multiple algorithms including EAGLE, MTP and NGram
@@ -54,7 +54,7 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 ### 🔧 **Latest GPU Architecture Support**
 
 TensorRT LLM supports the full spectrum of NVIDIA GPU architectures:
-- **NVIDIA Blackwell**: B200, GB200, RTX Pro 6000 SE with FP4 optimization
+- **NVIDIA Blackwell**: B200, GB200, B300, GB300, and RTX Pro 6000 SE with FP4 optimization
 - **NVIDIA Hopper**: H100, H200,GH200 with FP8 acceleration
 - **NVIDIA Ada Lovelace**: L40/L40S, RTX 40 series with FP8 acceleration
 - **NVIDIA Ampere**: A100, RTX 30 series for production workloads

@@ -51,7 +51,7 @@ Before running benchmarks, ensure you have:
 1. **SLURM Cluster Access**: Valid account and partition allocation
 2. **Container Environment**:
    - NVIDIA Container Toolkit configured
-   - Required device mappings (e.g., `/dev/nvidia-caps-imex-channels` for GB200, `/dev/gdrdrv` for GDRCopy)
+   - Required device mappings (e.g., `/dev/nvidia-caps-imex-channels` for GB200/GB300 NVL72, `/dev/gdrdrv` for GDRCopy)
 3. **Model Files**: Checkpoint files accessible from all cluster nodes
 4. **Configuration**: Updated `config.yaml` with your cluster-specific settings
 
