@@ -719,9 +719,13 @@ class MoE(nn.Module):
         """
         return False
 
-    @property
     def expand_intermediate_size_per_partition(self):
         return self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
+
+    def supports_moe_output_in_alltoall_workspace(self):
+        """ Supports moe_output in alltoall workspace
+        """
+        return False
 
     def reducescatter_or_allreduce(
         self,

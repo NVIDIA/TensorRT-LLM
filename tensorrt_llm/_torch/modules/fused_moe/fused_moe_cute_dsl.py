@@ -210,6 +210,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 return NVFP4CuteDslFusedMoEMethod()
         return super()._get_quant_method()
 
+    def supports_moe_output_in_alltoall_workspace(self):
+        return self.has_nvfp4
+
     def quantize_input(self,
                        x: Union[torch.Tensor, Fp4QuantizedTensor],
                        post_quant_comm: bool = True):
@@ -367,7 +370,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_selected_experts: torch.Tensor,
         token_final_scales: Optional[torch.Tensor],
         x_sf: Optional[torch.Tensor] = None,
-        moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
@@ -448,8 +450,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self.ep_size,
             self.ep_rank,
         )
-        moe_output.copy_(x, non_blocking=True)
-        return moe_output
+        return x
 
     def run_moe(
         self,
@@ -493,7 +494,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
                 x_sf=x_sf,
-                moe_output=moe_output,
                 enable_alltoall=enable_alltoall)
         else:
             raise ValueError(
