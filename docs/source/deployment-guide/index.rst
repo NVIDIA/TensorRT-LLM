@@ -17,7 +17,7 @@ The TensorRT LLM Docker container makes these config files available at ``/app/t
 
    export TRTLLM_DIR="/app/tensorrt_llm" # path to the TensorRT LLM repo in your local environment
 
-.. include:: note_sections.rst
+.. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-quick-start-isl-osl
    :end-before: .. end-note-quick-start-isl-osl
 

@@ -2,6 +2,13 @@
 
 # TensorRT LLM Benchmarking
 
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 TensorRT LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
 easier for users to reproduce our officially published [performance overview](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 

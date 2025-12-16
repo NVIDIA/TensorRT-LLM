@@ -3,6 +3,12 @@
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
+```{eval-rst}
+.. include:: ../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
  * Methodology Introduction
  * Launch the OpenAI-Compatible Server with NGC container
@@ -44,7 +50,7 @@ TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalo
 You can launch the container using the following command:
 
 ```bash
-docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --ulimit stack=67108864 nvcr.io/nvidia/tensorrt-llm/release:x.y.z
+docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --ulimit stack=67108864 nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6
 ```
 
 

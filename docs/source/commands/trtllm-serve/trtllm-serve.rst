@@ -272,13 +272,16 @@ Example output:
         }
     ]
 
+.. _configuring-with-yaml-files:
+
 Configuring with YAML Files
 ----------------------------
 
 You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. The arguments in the file override the corresponding command line arguments.
 
-.. note::
-   ``--extra_llm_api_options`` is supported as an alias for backwards compatibility.
+.. include:: ../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
 
 The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
 
