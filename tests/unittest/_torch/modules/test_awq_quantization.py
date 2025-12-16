@@ -108,21 +108,21 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
     intermediate_size = 256
     top_k = 2
     seq_len = 4
-    
+
     # Create pretrained_config with necessary parameters (following test_fused_moe.py pattern)
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = torch.bfloat16
-    
+
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         mapping=mapping,
         quant_config=quant_config,
-        moe_backend="TRTLLM"
+        moe_backend="TRTLLM",
     )
 
     routing_method = DefaultMoeRoutingMethod(top_k=top_k)
@@ -140,7 +140,7 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
     # Set fc31_act_scale directly (simulating AWQ pre_quant_scale)
     if has_scale:
         scale = torch.full((hidden_size,), 0.5, dtype=torch.bfloat16, device="cuda")
-        
+
         # For ConfigurableMoE, set fc31_act_scale on backend instead of the wrapper
         if isinstance(moe, ConfigurableMoE):
             moe.backend.fc31_act_scale = torch.nn.Parameter(scale, requires_grad=False)

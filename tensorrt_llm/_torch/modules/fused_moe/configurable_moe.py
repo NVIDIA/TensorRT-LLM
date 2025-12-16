@@ -37,7 +37,6 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
-
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import (
@@ -108,7 +107,7 @@ class ConfigurableMoE(MoE):
         weight_loading_mode=None,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        override_quant_config: Optional['QuantConfig'] = None,
+        override_quant_config: Optional["QuantConfig"] = None,
         **kwargs,
     ):
         super().__init__(
@@ -751,20 +750,16 @@ class ConfigurableMoE(MoE):
 
         # Always need at least workspace_0
         chunk_size_0 = (
-            sum(all_rank_num_tokens_list[0])
+            self.mapping.moe_ep_size * max(all_rank_num_tokens_list[0])
             if self.use_dp and all_rank_num_tokens_list[0] is not None
             else chunk_size_list[0]
         )
         workspace_chunk_sizes = [chunk_size_0]
 
         # Add workspace_1 if using multi-stream for alternating between streams
+        # Reuse chunk_size_0 since it's always >= chunk_size_1 (first chunk is largest)
         if use_multi_stream:
-            chunk_size_1 = (
-                sum(all_rank_num_tokens_list[1])
-                if self.use_dp and all_rank_num_tokens_list[1] is not None
-                else chunk_size_list[1]
-            )
-            workspace_chunk_sizes.append(chunk_size_1)
+            workspace_chunk_sizes.append(chunk_size_0)
 
         workspaces = self.backend.get_workspaces(workspace_chunk_sizes)
         workspace_0 = workspaces[0]
