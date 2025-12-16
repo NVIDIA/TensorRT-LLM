@@ -255,12 +255,12 @@ def submit_job(config, log_dir):
             env_config['model_path'],
             str(allocation["port"]),
             config['benchmark']['mode'],
-            config['benchmark']['concurrency_list'],
+            f"'{config['benchmark']['concurrency_list']}'", 
             str(slurm_config['numa_bind']),
             log_dir,
             str(profiling_config['nsys_on']),
-            profiling_config['gen_profile_range']
-            if server_type == "GEN" else profiling_config['ctx_profile_range'],
+            f"'{profiling_config['gen_profile_range']}'"
+            if server_type == "GEN" else f"'{profiling_config['ctx_profile_range']}'",
             gen_config_path if server_type == "GEN" else ctx_config_path,
             f"'{worker_env_var}'",
             f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
