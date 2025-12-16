@@ -159,6 +159,7 @@ class OpenAIHttpClient(OpenAIClient):
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
             try:
+                lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(url, json=json_data) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
@@ -172,6 +173,7 @@ class OpenAIHttpClient(OpenAIClient):
                         async for line in self._response_generator(
                             request, http_response, start_time, server, hooks
                         ):
+                            lines_yielded += 1
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
@@ -183,6 +185,12 @@ class OpenAIHttpClient(OpenAIClient):
                         await self._finish_request(request)
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if lines_yielded > 0:
+                    logger.error(
+                        f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
+                        traceback.format_exc(),
+                    )
+                    raise
                 if attempt == self._max_retries:
                     logger.error(
                         f"Client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
