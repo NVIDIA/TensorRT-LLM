@@ -719,6 +719,7 @@ class MoE(nn.Module):
         """
         return False
 
+    @property
     def expand_intermediate_size_per_partition(self):
         return self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
 
