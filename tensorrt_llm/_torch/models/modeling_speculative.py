@@ -672,10 +672,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional[BaseWeightMapper] = None,
+                     params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
                              skip_modules=["draft_model"],
+                             params_map=params_map,
                              allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
