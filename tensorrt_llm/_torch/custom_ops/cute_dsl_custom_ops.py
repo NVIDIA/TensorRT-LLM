@@ -1314,12 +1314,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                if self.tile_size == 256:
-                    mma_tiler_mn, cluster_shape_mn, raster_along_m = (
-                        256, 128), (2, 1), False
-                else:
-                    mma_tiler_mn, cluster_shape_mn, raster_along_m = (
-                        128, 128), (1, 1), False
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
+                    self.tile_size, 128), (self.tile_size // 128, 1), False
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn)

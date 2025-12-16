@@ -2317,6 +2317,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         a_major: str,
         b_major: str,
         out_major: str,
+        mma_tiler_mn: Tuple[int, int],
     ) -> bool:
         """
         Check if the tensor alignment is valid
@@ -2356,6 +2357,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
             or not check_contigous_16B_alignment(out_dtype, out_major == "m", (m, n, l))
         ):
+            is_valid = False
+
+        # m should be aligned to tile_m
+        if m % mma_tiler_mn[0] != 0:
             is_valid = False
         return is_valid
 
@@ -2428,7 +2433,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major
+            m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major, mma_tiler_mn
         ):
             can_implement = False
         # Skip unsupported A/B layout
