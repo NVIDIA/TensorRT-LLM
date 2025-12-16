@@ -1554,6 +1554,9 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
     bool contextDP = std::get<13>(param);
     bool generationDP = std::get<14>(param);
     bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
+    int indexerDimPerHead = std::get<17>(param);
+    int indexerKCacheQuantBlockSize = std::get<18>(param);
 
     if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
     {
@@ -1677,12 +1680,8 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
                     break;
                 }
             }
-            for (size_t requestIndex = 0; requestIndex < generationRequests.size(); ++requestIndex)
+            for (size_t requestIndex = 0; requestIndex < designatedSuccessfulRequestCount + 1; ++requestIndex)
             {
-                if (requestIndex == designatedSuccessfulRequestCount + 1)
-                {
-                    break;
-                }
                 generationVerifyKVCache(generationRequests[requestIndex]);
             }
         }
