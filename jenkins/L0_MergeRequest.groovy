@@ -1326,11 +1326,200 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
-def runRetagImage(pipeline)
-{
-    script {
-        echo "Running retag image"
+def getImageTags(pipeline, globalVars) {
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT)
+
+    def pr_id = ""
+    def pytorch_version = ""
+    def cuda_version = ""
+    def trt_version = ""
+    def timestamp = ""
+
+    // 1. Get pytorch_version from docker/Dockerfile.multi
+    def dockerfilePath = "${LLM_ROOT}/docker/Dockerfile.multi"
+    def dockerfileContent = readFile(file: dockerfilePath)
+    def baseTagMatch = dockerfileContent =~ /ARG\s+BASE_TAG\s*=\s*([^\s]*)/
+    if (baseTagMatch) {
+        pytorch_version = baseTagMatch[0][1].split('-')[0]
+    } else {
+        error "Failed to find ARG BASE_TAG in Dockerfile.multi"
     }
+
+    // Extract cuda_version from docker/common/install_cuda_toolkit.sh
+    def cudaToolkitPath = "${LLM_ROOT}/docker/common/install_cuda_toolkit.sh"
+    def cudaToolkitContent = readFile(file: cudaToolkitPath)
+    def cudaVerMatch = cudaToolkitContent =~ /CUDA_VER\s*=\s*"([^"]+)"/
+    if (cudaVerMatch) {
+        cuda_version = cudaVerMatch[0][1].split('_')[0]  // e.g. "13.0.2"
+    } else {
+        error "Failed to find CUDA_VER in install_cuda_toolkit.sh"
+    }
+
+    // Extract trt_version from docker/common/install_tensorrt.sh
+    def tensorrtInstallPath = "${LLM_ROOT}/docker/common/install_tensorrt.sh"
+    def tensorrtInstallContent = readFile(file: tensorrtInstallPath)
+    def trtVerMatch = tensorrtInstallContent =~ /TRT_VER\s*=\s*"([^"]+)"/
+    if (trtVerMatch) {
+        trt_version = trtVerMatch[0][1]
+    } else {
+        error "Failed to find TRT_VER in install_tensorrt.sh"
+    }
+
+    // Generate timestamp in the format yyyyMMddHHmm
+    def now = new Date()
+    def ts = now.format("yyyyMMddHHmm", TimeZone.getTimeZone('UTC'))
+    timestamp = ts
+
+    if (globalVars[GITHUB_PR_API_URL]) {
+        pr_id = globalVars[GITHUB_PR_API_URL].split('/').last()
+    } else {
+        error "No GitHub PR API URL found"
+    }
+    newImageTags = [
+        "LLM_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-${pytorch_version}-py3-x86_64-ubuntu24.04-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_SBSA_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-${pytorch_version}-py3-aarch64-ubuntu24.04-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-${cuda_version}-devel-rocky8-x86_64-rocky8-py310-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE" : "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-${cuda_version}-devel-rocky8-x86_64-rocky8-py312-trt${trt_version}-skip-tritondevel-${timestamp}-${pr_id}",
+    ]
+    pipeline.echo("Generated new image tags:\n" + newImageTags.collect { key, value -> "${key} = ${value}" }.join('\n'))
+
+    def oldTagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
+    def oldImageTags = [:]
+    oldTagProps.each { key, value ->
+        oldImageTags[key] = value
+    }
+    def oldTagToNewTagMap = [:]
+    oldImageTags.each { key, value ->
+        oldTagToNewTagMap[value] = newImageTags[key]
+    }
+    pipeline.echo("Old to new image tag map:\n" + oldTagToNewTagMap.collect { k, v -> "${k} => ${v}" }.join('\n'))
+    return oldTagToNewTagMap
+}
+
+def renameDockerImages(oldTagToNewTagMap) {
+    oldTagToNewTagMap.each { oldTag, newTag ->
+        retry(3) {
+            sh "docker pull ${oldTag}"
+            sh "docker tag ${oldTag} ${newTag}"
+            sh "docker push ${newTag}"
+        }
+    }
+}
+
+def updateImageTag(oldTagToNewTagMap) {
+    withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_PASSWORD')]) {
+        // 1. Validate and parse source repo and branch
+        def srcRepoAndBranch = globalVars[GITHUB_SOURCE_REPO_AND_BRANCH]
+        if (!srcRepoAndBranch || !srcRepoAndBranch.contains(":")) {
+            echo "WARNING: No GitHub source repo and branch found. Skipping update."
+            return
+        }
+
+        def parts = srcRepoAndBranch.split(":", 2)
+        if (parts.size() != 2) {
+            error "Invalid GITHUB_SOURCE_REPO_AND_BRANCH format: '${srcRepoAndBranch}'. Expected 'owner/repo:branch'"
+        }
+        def repoPart = parts[0]  // e.g., "ZhanruiSunCh/TensorRT-LLM"
+        def branchName = parts[1]  // e.g., "user/zhanruis/feature_branch"
+        echo "Target fork repo: ${repoPart}, branch: ${branchName}"
+
+        // 2. Setup workspace with upstream repo
+        def workDir = "update_ci_image_tag_workspace"
+
+        // Extract repo path from LLM_REPO (e.g., "https://github.com/NVIDIA/TensorRT-LLM" -> "NVIDIA/TensorRT-LLM")
+        def upstreamRepoPath = 'NVIDIA/TensorRT-LLM'
+        def upstreamRepoUrl = "https://${GITHUB_PASSWORD}@github.com/${upstreamRepoPath}.git"
+        def forkRepoUrl = "https://${GITHUB_PASSWORD}@github.com/${repoPart}.git"
+
+        echo "Setting up workspace with upstream repo: ${upstreamRepoPath}"
+        echo "Fork repo: ${repoPart}"
+
+        // Clean up and prepare workspace
+        sh "rm -rf ${workDir}"
+        sh "mkdir -p ${workDir}"
+
+        // Disable git-lfs globally to avoid lock verification
+        sh "git lfs uninstall || true"
+
+        // Clone upstream repository without LFS
+        sh """
+        export GIT_LFS_SKIP_SMUDGE=1
+        cd ${workDir}
+        git clone --depth 20 ${upstreamRepoUrl} repo
+        """
+
+        // Disable LFS in the cloned repo
+        sh "cd ${workDir}/repo && git lfs uninstall --local || true"
+        sh "cd ${workDir}/repo && git config --local lfs.locksverify false"
+
+        // Add contributor's fork as remote
+        sh "cd ${workDir}/repo && git remote add contributor ${forkRepoUrl}"
+
+        // Fetch PR branch from contributor's fork
+        sh "cd ${workDir}/repo && git fetch contributor ${branchName}"
+
+        // Checkout the PR branch
+        sh "cd ${workDir}/repo && git checkout -b pr-branch contributor/${branchName}"
+
+        // Configure Git user
+        sh "cd ${workDir}/repo && git config user.name 'tensorrt-cicd'"
+        sh "cd ${workDir}/repo && git config user.email '90828364+tensorrt-cicd@users.noreply.github.com'"
+
+        // 3. Read current file and update content
+        def filePath = "jenkins/current_image_tags.properties"
+        echo "Reading and updating ${filePath}"
+        def currentContent = readFile("${workDir}/repo/${filePath}")
+        def lines = currentContent.split("\n") as List
+        def updatedLines = lines.collect { line ->
+            // For each line, check if it contains an old tag that needs to be replaced
+            def updatedLine = line
+            oldTagToNewTagMap.each { oldTag, newTag ->
+                if (line.contains(oldTag)) {
+                    updatedLine = line.replace(oldTag, newTag)
+                }
+            }
+            return updatedLine
+        }
+        def updatedContent = updatedLines.join("\n") + "\n"
+
+        // Write updated content
+        writeFile file: "${workDir}/repo/${filePath}", text: updatedContent
+
+        // 4. Commit and push back to contributor's fork
+        echo "Committing and pushing changes"
+
+        // Ensure LFS is still disabled (prevent lock verification)
+        sh "cd ${workDir}/repo && git lfs uninstall --local || true"
+        sh "cd ${workDir}/repo && git config --local lfs.locksverify false"
+
+        // Stage changes
+        sh "cd ${workDir}/repo && git add ${filePath}"
+
+        // Commit with sign-off
+        sh "cd ${workDir}/repo && git commit -s -m '[auto] Retag Docker image tags'"
+
+        // Push to contributor's fork branch (maintainer permission allows this)
+        sh """
+        export GIT_LFS_SKIP_SMUDGE=1
+        cd ${workDir}/repo
+        git push contributor HEAD:${branchName}
+        """
+
+        echo "✅ Successfully updated ${filePath} and pushed to ${repoPart}/${branchName}"
+
+        // Cleanup
+        sh "rm -rf ${workDir}"
+    }
+}
+
+def runRetagImage(pipeline, globalVars)
+{
+    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+        oldTagToNewTagMap = getImageTags(globalVars)
+        renameDockerImages(oldTagToNewTagMap)
+        updateImageTag(oldTagToNewTagMap)
+    })
 }
 
 pipeline {
