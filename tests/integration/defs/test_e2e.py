@@ -3369,3 +3369,15 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
         f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
     assert not repetitive_pattern.search(output_ref), (
         f"Baseline output contains repetitive characters: {output_ref[:500]}")
+
+
+def test_get_ci_container_port():
+    container_port_start = os.environ.get("CONTAINER_PORT_START", None)
+    container_port_num = os.environ.get("CONTAINER_PORT_NUM", None)
+    assert container_port_start is not None
+    assert container_port_num is not None
+    container_port_start = int(container_port_start)
+    container_port_num = int(container_port_num)
+    assert container_port_start > 0
+    assert container_port_num > 0
+    assert container_port_start + container_port_num <= 60000
