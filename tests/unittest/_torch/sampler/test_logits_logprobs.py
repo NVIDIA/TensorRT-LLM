@@ -419,10 +419,16 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int,
 @pytest.mark.threadleak(enabled=False)
 def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
     """Test logprobs when requests are reordered by sampling strategy grouping"""
+    if logprobs_k == 0 and simple_llm.args.disable_flashinfer_sampling:
+        pytest.skip(
+            "top_0 does currently not work without flashinfer sampling. Remove this skip once this is fixed."
+        )
 
     test_prompts = [
         "The capital of France is",
         "The future of AI is",
+        "Hello, my name is",
+        "Write a short story about a cat",
         "Hello, my name is",
         "Write a short story about a cat",
     ]
