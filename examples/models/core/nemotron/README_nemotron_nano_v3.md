@@ -2,19 +2,21 @@
 
 ## Overview
 
-The Nemotron Nano V3 model uses a hybrid Mamba-Transformer MoE architecture and supports a 256k
+The Nemotron Nano V3 model uses a hybrid Mamba-Transformer MoE architecture and supports a 1M
 token context length. This enables developers to build reliable, high-throughput agents across
 complex, multi-document, and long-duration applications.
 
 This document outlines the procedures for executing Nemotron Nano V3 using TensorRT LLM. The
 implementation supports both single and multi-GPU configurations via the AutoDeploy backend.
-Additionally, ModelOpt was employed to derive FP8 and NVFP4 checkpoints from the source checkpoint
-[BF16 repository](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-3-30B-A3B-BF16).
+Additionally, ModelOpt was employed to derive FP8 and NVFP4 checkpoints from the source checkpoint.
+The model repositories are:
+* [BF16 repository](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
+* [FP8 repository](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)
 
 Nemotron Nano V3 supports the following features:
 * BF16, FP8 with KV cache FP8, NVFP4 model formats.
 * Single and multi-GPU inference.
-* Support 256k token context with long context/generation sequences.
+* Support 1M token context with long context/generation sequences.
 
 # Usage
 
@@ -187,5 +189,6 @@ python examples/auto_deploy/build_and_run_ad.py \
 
 # Notes
 
+* More examples can be found in [trtllm_cookbook](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/usage-cookbook/Nemotron-3-Nano/trtllm_cookbook.ipynb).
 * prefix-cache is not supported for Nano v3 yet, so please set `enable_block_reuse: false` when launching a server.
 * mamba-cache-dtype should be set to float32 to support better long sequences when launching a server.
