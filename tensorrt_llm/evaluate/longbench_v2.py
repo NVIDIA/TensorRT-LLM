@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 import click
+import numpy as np
 from datasets import load_dataset
 
 from .. import LLM as PyTorchLLM
@@ -119,6 +120,9 @@ class LongBenchV2(Evaluator):
 
         # Load and filter dataset
         self.dataset = self._load_and_filter_dataset()
+
+        # Benchmark data
+        self.benchmark_data = []
 
     def _load_templates(self, prompts_dir: Optional[str]) -> Dict[str, str]:
         """Load prompt templates from directory or use defaults.
@@ -500,6 +504,22 @@ class LongBenchV2(Evaluator):
 
         for output, ref, sample_id, sample in zip(outputs, references,
                                                   sample_ids, samples):
+            # Collect benchmarking data
+            try:
+                # Use prompt_token_ids from output (handled by TRT-LLM) and generated token ids
+                input_ids = output.prompt_token_ids
+                output_ids = output.outputs[0].token_ids
+
+                self.benchmark_data.append({
+                    "task_id": len(self.benchmark_data),
+                    "input_ids": list(input_ids),
+                    "input_tokens": len(input_ids),
+                    "output_tokens": len(output_ids)
+                })
+            except Exception as e:
+                logger.warning(
+                    f"Failed to collect bench data for sample {sample_id}: {e}")
+
             prediction = output.outputs[0].text.strip()
             processed_prediction = self._post_process(prediction)
 
@@ -713,6 +733,40 @@ class LongBenchV2(Evaluator):
             )
             return
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # Save benchmark data
+        benchmark_file = os.path.join(self.output_dir, "benchmark_data.json")
+        try:
+            with open(benchmark_file, 'w', encoding='utf-8') as f:
+                for item in self.benchmark_data:
+                    json.dump(item, f, ensure_ascii=False)
+                    f.write('\n')
+            logger.info(f"Benchmark data saved to {benchmark_file}")
+
+            # Calculate and log statistics
+            if self.benchmark_data:
+                input_tokens = [x['input_tokens'] for x in self.benchmark_data]
+                output_tokens = [
+                    x['output_tokens'] for x in self.benchmark_data
+                ]
+
+                logger.info("-" * 80)
+                logger.info("Token Statistics:")
+
+                if input_tokens:
+                    logger.info(
+                        f"Input Tokens - Min: {np.min(input_tokens)}, Max: {np.max(input_tokens)}, "
+                        f"Avg: {np.mean(input_tokens):.2f}, Median: {np.median(input_tokens)}"
+                    )
+
+                if output_tokens:
+                    logger.info(
+                        f"Output Tokens - Min: {np.min(output_tokens)}, Max: {np.max(output_tokens)}, "
+                        f"Avg: {np.mean(output_tokens):.2f}, Median: {np.median(output_tokens)}"
+                    )
+                logger.info("-" * 80)
+        except Exception as e:
+            logger.warning(f"Failed to save benchmark data: {e}")
 
         # Save detailed results
         results_file = os.path.join(self.output_dir,
