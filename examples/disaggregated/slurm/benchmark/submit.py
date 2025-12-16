@@ -262,7 +262,7 @@ def submit_job(config, log_dir):
             profiling_config['gen_profile_range']
             if server_type == "GEN" else profiling_config['ctx_profile_range'],
             gen_config_path if server_type == "GEN" else ctx_config_path,
-            f'"{worker_env_var}"',
+            f"'{worker_env_var}'",
             f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
         ]
         start_worker_cmds.append(" ".join(cmd))
