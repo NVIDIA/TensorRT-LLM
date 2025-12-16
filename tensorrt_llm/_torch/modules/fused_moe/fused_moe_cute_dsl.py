@@ -278,6 +278,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_final_scales.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+        else:
+            assert moe_output.size() == (token_final_scales.size(0),
+                                         self.hidden_size)
+            assert moe_output.dtype == output_dtype
+
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -295,16 +305,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=self.slot_start,
             tile_size=tile_size,
         )
-
-        if moe_output is None:
-            moe_output = torch.empty(
-                (token_final_scales.size(0), self.hidden_size),
-                dtype=output_dtype,
-                device=x.device)
-        else:
-            assert moe_output.size() == (token_final_scales.size(0),
-                                         self.hidden_size)
-            assert moe_output.dtype == output_dtype
 
         if self.use_fused_finalize:
             torch.ops.trtllm.moe_output_memset_inplace(
@@ -355,13 +355,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
-            # TODO: Make moe_unpermute inplace
-            x = torch.ops.trtllm.moe_unpermute(
+            torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,
+                output=moe_output,
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 topk_scales=token_final_scales,
             )
-            moe_output.copy_(x, non_blocking=True)
         return moe_output
 
     def run_moe_fp8_block_scales(
@@ -430,7 +429,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
 
-        # TODO: Make moe_finalize_scale_op inplace
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
