@@ -9,8 +9,7 @@ from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import \
-    Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModel
 
 QWEN3_VL_8B_CONFIG = {
@@ -217,13 +216,13 @@ class TestQwen3VL(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # TestQwen3VLScenario(
-            #     modality="video",
-            #     use_cuda_graph=False,
-            #     disable_fuse_rope=False,
-            #     chunked_prefill=False,
-            #     kv_cache_reuse=False,
-            # ),
+            TestQwen3VLScenario(
+                modality="video",
+                use_cuda_graph=False,
+                disable_fuse_rope=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
             TestQwen3VLScenario(
                 modality="multiple_image",
                 use_cuda_graph=False,

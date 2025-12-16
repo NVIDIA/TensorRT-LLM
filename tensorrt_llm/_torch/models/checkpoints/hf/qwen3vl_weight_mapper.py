@@ -1,5 +1,4 @@
-from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
-    HfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
 
