@@ -15,8 +15,6 @@
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
@@ -67,8 +65,8 @@ def test_start_transfer_single_request():
     manager.start_transfer(request)
 
     # Check request is tracked
-    assert 42 in manager.requests
-    req, block_id, counter = manager.requests[42]
+    assert 42 in manager._requests
+    req, block_id, counter = manager._requests[42]
     assert req is request
     assert block_id == 100
     assert counter == 1
@@ -82,9 +80,6 @@ def test_start_transfer_single_request():
     # Check seq slot manager was called to free resources
     seq_slot_manager.free_resources.assert_called_once_with(request)
 
-    # Check should_store_blocks is tracked
-    assert manager.request_should_store_blocks[42] is True
-
     manager.end_transfer(request)
     kv_cache_manager.unpin_blocks_by_id.assert_called_once()
 
@@ -97,12 +92,12 @@ def test_start_transfer_multiple_transfers_same_request():
     manager = AsyncTransferManager(resource_manager)
 
     request = create_mock_request(42)
-    manager.start_transfer(request, True)
-    manager.start_transfer(request, True)
-    manager.start_transfer(request, True)
+    manager.start_transfer(request)
+    manager.start_transfer(request)
+    manager.start_transfer(request)
 
     # Counter should be incremented
-    _, block_id, counter = manager.requests[42]
+    _, block_id, counter = manager._requests[42]
     assert counter == 3
 
     # store_blocks_for_reuse should only be called once
@@ -116,68 +111,32 @@ def test_start_transfer_multiple_transfers_same_request():
     kv_cache_manager.unpin_blocks_by_id.assert_called_once()
 
 
-def test_start_transfer_without_storing_blocks():
+def test_transfer_without_storing_blocks():
     """Test starting a transfer with should_store_blocks=False."""
     kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = 0
     spec_resource_manager = MagicMock()
     resource_manager = create_mock_resource_manager(
         kv_cache_manager=kv_cache_manager, spec_resource_manager=spec_resource_manager
     )
-    manager = AsyncTransferManager(resource_manager)
+    manager = AsyncTransferManager(resource_manager, should_store_blocks=False)
 
     request = create_mock_request(42)
-    manager.start_transfer(request, should_store_blocks=False)
+    manager.start_transfer(request)
 
     # Check request is tracked
-    assert 42 in manager.requests
-    req, block_id, counter = manager.requests[42]
+    assert 42 in manager._requests
+    req, block_id, counter = manager._requests[42]
     assert block_id is None  # No block stored
     assert counter == 1
 
     # Check KV cache manager was NOT called
     kv_cache_manager.store_blocks_for_reuse.assert_not_called()
     spec_resource_manager.free_resources.assert_called_once_with(request)
-    # Check should_store_blocks is tracked
-    assert manager.request_should_store_blocks[42] is False
 
     assert manager.end_transfer(request)
 
     kv_cache_manager.unpin_blocks_by_id.assert_not_called()
-
-
-def test_start_transfer_inconsistent_should_store_blocks():
-    """Test that starting a transfer with inconsistent should_store_blocks raises an error."""
-    kv_cache_manager = MagicMock()
-    kv_cache_manager.store_blocks_for_reuse.return_value = 100
-    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
-    manager = AsyncTransferManager(resource_manager)
-
-    request = create_mock_request(42)
-    manager.start_transfer(request, should_store_blocks=True)
-
-    with pytest.raises(ValueError, match="already in transfer.*should_store_blocks"):
-        manager.start_transfer(request, should_store_blocks=False)
-
-
-def test_end_transfer_without_storing_blocks():
-    """Test ending a transfer when should_store_blocks was False."""
-    kv_cache_manager = MagicMock()
-    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
-    manager = AsyncTransferManager(resource_manager)
-
-    request = create_mock_request(42)
-    manager.start_transfer(request, should_store_blocks=False)
-
-    should_terminate = manager.end_transfer(request)
-
-    # Request should be removed
-    assert 42 not in manager.requests
-
-    # Blocks should NOT be unpinned (since we didn't store any)
-    kv_cache_manager.unpin_blocks_by_id.assert_not_called()
-
-    # Should terminate (because we didn't store blocks)
-    assert should_terminate is True
 
 
 def test_end_transfer_preserves_error_state():

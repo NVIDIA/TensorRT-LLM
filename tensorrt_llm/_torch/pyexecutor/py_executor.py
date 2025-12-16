@@ -125,26 +125,25 @@ class AsyncTransferManager:
     TODO(jthomson04): This only handles async send/saving, not loading. Loading kv cache is handled through a separate codepath. Eventually, we'll want to merge these two paths.
     """
 
-    def __init__(self, resource_manager: "ResourceManager"):
+    def __init__(self,
+                 resource_manager: "ResourceManager",
+                 should_store_blocks: bool = True):
         self.resource_manager = resource_manager
         self.kv_cache_manager = resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+
+        self.should_store_blocks = should_store_blocks
 
         # Mapping of request id to the tuple:
         # 1. llm_request
         # 2. The value returned from store_blocks_for_reuse
         # 3. The amount of currently pending transfers
-        self.requests: Dict[int, (LlmRequest, Optional[int], int)] = dict()
-
-        # Mapping of request ids to whether we've called store_blocks_for_reuse on a request.
-        self.request_should_store_blocks: dict[int, bool] = dict()
+        self._requests: Dict[int, (LlmRequest, Optional[int], int)] = dict()
 
     def requests_in_transfer(self) -> dict[int, LlmRequest]:
-        return {k: v[0] for k, v in self.requests.items()}
+        return {k: v[0] for k, v in self._requests.items()}
 
-    def start_transfer(self,
-                       request: LlmRequest,
-                       should_store_blocks: bool = True):
+    def start_transfer(self, request: LlmRequest):
         """
         Called when a Cache transceiver or connector transfer is started.
         1. Increment the counter for the request.
@@ -152,13 +151,7 @@ class AsyncTransferManager:
         3. Store KV cache blocks for reuse.
         """
 
-        if request.py_request_id in self.requests and should_store_blocks != self.request_should_store_blocks[
-                request.py_request_id]:
-            raise ValueError(
-                f"Request {request.py_request_id} is already in transfer, but should_store_blocks is different"
-            )
-
-        if request.py_request_id not in self.requests:
+        if request.py_request_id not in self._requests:
             for resource_mgr_type in (
                     ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER):
@@ -169,19 +162,17 @@ class AsyncTransferManager:
 
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-            if should_store_blocks:
+            if self.should_store_blocks:
                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                     request, True)
             else:
                 block_id = None
 
-            self.requests[request.py_request_id] = (request, block_id, 1)
-            self.request_should_store_blocks[
-                request.py_request_id] = should_store_blocks
+            self._requests[request.py_request_id] = (request, block_id, 1)
         else:
-            _, block_id, counter = self.requests[request.py_request_id]
-            self.requests[request.py_request_id] = (request, block_id,
-                                                    counter + 1)
+            _, block_id, counter = self._requests[request.py_request_id]
+            self._requests[request.py_request_id] = (request, block_id,
+                                                     counter + 1)
 
     def end_transfer(self, request: LlmRequest):
         """
@@ -189,12 +180,12 @@ class AsyncTransferManager:
         1. Decrements counter for request.
         2. If there are no more inflight transfers for this request, unpin the blocks and mark the request as complete.
         """
-        request, block_id, counter = self.requests.pop(request.py_request_id)
+        request, block_id, counter = self._requests.pop(request.py_request_id)
 
         should_terminate = False
 
         if counter == 1:
-            if self.request_should_store_blocks.pop(request.py_request_id):
+            if self.should_store_blocks:
                 self.kv_cache_manager.unpin_blocks_by_id(block_id)
             else:
                 should_terminate = True
@@ -203,10 +194,13 @@ class AsyncTransferManager:
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
         else:
-            self.requests[request.py_request_id] = (request, block_id,
-                                                    counter - 1)
+            self._requests[request.py_request_id] = (request, block_id,
+                                                     counter - 1)
 
         return should_terminate
+
+    def has_any_inflight_requests(self) -> bool:
+        return len(self._requests) > 0
 
 
 class PyExecutor:
@@ -328,7 +322,9 @@ class PyExecutor:
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         self.async_transfer_manager = AsyncTransferManager(
-            self.resource_manager)
+            self.resource_manager,
+            should_store_blocks=self.block_reuse_enabled
+            and not self.kv_cache_manager.is_vswa)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -1020,7 +1016,7 @@ class PyExecutor:
             raise RuntimeError(
                 "KV cache transceiver is not enabled, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
             )
-        if not self.async_transfer_manager.requests_in_transfer():
+        if not self.async_transfer_manager.has_any_inflight_requests():
             raise RuntimeError(
                 "No context cache transmission is in progress, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
             )
@@ -2218,9 +2214,6 @@ class PyExecutor:
 
         return
 
-    def _disagg_should_store_blocks(self):
-        return self.block_reuse_enabled and not self.kv_cache_manager.is_vswa
-
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
 
@@ -2237,15 +2230,13 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
-            disagg_should_store_blocks = self._disagg_should_store_blocks()
             for req in scheduled_requests:
                 if req.is_context_only_request and (
                         req.is_context_finished
                         or req.is_finished_due_to_length):
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
-                    self.async_transfer_manager.start_transfer(
-                        req, should_store_blocks=disagg_should_store_blocks)
+                    self.async_transfer_manager.start_transfer(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
