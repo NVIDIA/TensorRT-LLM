@@ -54,7 +54,6 @@ cleanup_on_failure() {
     exit 1
 }
 
-echo "SLURM_JOB_ID: ${SLURM_JOB_ID}" > ${full_logdir}/job_info.txt
 env > ${full_logdir}/environment.txt
 
 # Start container
