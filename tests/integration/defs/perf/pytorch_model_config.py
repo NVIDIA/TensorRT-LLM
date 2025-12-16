@@ -217,7 +217,7 @@ def get_model_yaml_config(model_label: str,
         },
         {
             'patterns': [
-                'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4]',
+                'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
             ],
             'config': {
                 'speculative_config': {
