@@ -145,8 +145,8 @@ cat ${start_server_cmds_file} | while read cmd; do
     eval "${cmd}"
 done
 
-# Wait for servers to be ready (runs synchronously)
-echo "Waiting for servers to be ready..."
+# Wait for server to be ready (runs synchronously)
+echo "Waiting for server to be ready..."
 if ! srun -l --container-name=${container_name} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
