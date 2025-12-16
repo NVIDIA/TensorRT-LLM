@@ -37,6 +37,8 @@ from tensorrt_llm._torch.modules.fused_moe import (
     BaseMoeRoutingMethod, CutlassFusedMoE, TRTLLMGenFusedMoE,
     DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod, TritonFusedMoE,
     create_moe, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe.quantization import \
+    NVFP4CutlassFusedMoEMethod
 # isort: on
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
@@ -2792,3 +2794,123 @@ class RefGatedMLPFusedMoE(nn.Module):
 
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+
+# Create a mock module with required attributes for NVFP4CutlassFusedMoEMethod.get_weights_shapes test.
+class MockModule:
+
+    def __init__(self, hidden_size, intermediate_size, expand_ratio,
+                 expert_size, bias):
+        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = intermediate_size
+        self.intermediate_size_expand_ratio = expand_ratio
+        self.expand_intermediate_size_per_partition = intermediate_size * self.intermediate_size_expand_ratio
+        self.expert_size_per_partition = expert_size
+        self.bias = bias
+        # Constants for NVFP4.
+        self.scaling_vector_size = 16  # Standard for NVFP4
+        self.weight_vec_size = 16  # 16 fp4 values packed into int64
+        self.block_scales_vec_size = 4  # 4 fp8 values packed into int32
+
+
+def test_nvfp4_cutlass_get_weights_shapes_error_cases():
+    """Test NVFP4CutlassFusedMoEMethod.get_weights_shapes for error cases."""
+    method = NVFP4CutlassFusedMoEMethod()
+    module = MockModule(hidden_size=13,
+                        intermediate_size=16,
+                        expand_ratio=1,
+                        expert_size=4,
+                        bias=False)
+    with pytest.raises(ValueError,
+                       match="hidden_size 13 must be divisible by 4"):
+        method.get_weights_shapes(module, module.weight_vec_size,
+                                  module.block_scales_vec_size)
+
+
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size, expand_ratio, expert_size, bias", [
+        (512, 1024, 1, 32, True),
+        (512, 1024, 2, 32, True),
+        (256, 512, 1, 16, False),
+        (256, 512, 2, 16, False),
+        (128, 120, 1, 8, False),
+        (128, 120, 2, 8, False),
+        (128, 120, 1, 8, True),
+        (128, 120, 2, 8, True),
+    ])
+def test_nvfp4_cutlass_get_weights_shapes(hidden_size, intermediate_size,
+                                          expand_ratio, expert_size, bias):
+    """Test NVFP4CutlassFusedMoEMethod.get_weights_shapes for alignment requirements."""
+    module = MockModule(hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        expand_ratio=expand_ratio,
+                        expert_size=expert_size,
+                        bias=bias)
+    method = NVFP4CutlassFusedMoEMethod()
+    NVFP4_ROW_ALIGNMENT = method.NVFP4_ROW_ALIGNMENT
+
+    # Get weight shapes
+    (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape, w2_bias_shape,
+     w3_w1_weight_scale_shape,
+     w2_weight_scale_shape) = method.get_weights_shapes(
+         module, module.weight_vec_size, module.block_scales_vec_size)
+
+    # Calculate expected aligned sizes
+    intermediate_size_expand = intermediate_size * module.intermediate_size_expand_ratio
+    intermediate_size_expand_aligned = (
+        (intermediate_size_expand + NVFP4_ROW_ALIGNMENT - 1) //
+        NVFP4_ROW_ALIGNMENT * NVFP4_ROW_ALIGNMENT)
+    hidden_size_aligned = hidden_size
+
+    expected_w3_w1_weight_shape = (expert_size,
+                                   intermediate_size_expand_aligned,
+                                   hidden_size_aligned //
+                                   module.weight_vec_size)
+    assert w3_w1_weight_shape == expected_w3_w1_weight_shape, (
+        f"w3_w1_weight_shape mismatch: got {w3_w1_weight_shape}, "
+        f"expected {expected_w3_w1_weight_shape}")
+
+    expected_w2_weight_shape = (expert_size, hidden_size_aligned,
+                                intermediate_size_expand_aligned //
+                                module.intermediate_size_expand_ratio //
+                                module.weight_vec_size)
+    assert w2_weight_shape == expected_w2_weight_shape, (
+        f"w2_weight_shape mismatch: got {w2_weight_shape}, "
+        f"expected {expected_w2_weight_shape}")
+
+    expected_w3_w1_weight_scale_shape = (expert_size,
+                                         intermediate_size_expand_aligned,
+                                         hidden_size_aligned //
+                                         module.scaling_vector_size //
+                                         module.block_scales_vec_size)
+    assert w3_w1_weight_scale_shape == expected_w3_w1_weight_scale_shape, (
+        f"w3_w1_weight_scale_shape mismatch: got {w3_w1_weight_scale_shape}, "
+        f"expected {expected_w3_w1_weight_scale_shape}")
+
+    expected_w2_weight_scale_shape = (expert_size, hidden_size_aligned,
+                                      intermediate_size_expand_aligned //
+                                      module.intermediate_size_expand_ratio //
+                                      module.scaling_vector_size //
+                                      module.block_scales_vec_size)
+    assert w2_weight_scale_shape == expected_w2_weight_scale_shape, (
+        f"w2_weight_scale_shape mismatch: got {w2_weight_scale_shape}, "
+        f"expected {expected_w2_weight_scale_shape}")
+
+    # Verify bias shapes
+    if bias:
+        expected_w3_w1_bias_shape = (expert_size,
+                                     intermediate_size_expand_aligned)
+        expected_w2_bias_shape = (expert_size, hidden_size_aligned)
+        assert w3_w1_bias_shape == expected_w3_w1_bias_shape, (
+            f"w3_w1_bias_shape mismatch: got {w3_w1_bias_shape}, "
+            f"expected {expected_w3_w1_bias_shape}")
+        assert w2_bias_shape == expected_w2_bias_shape, (
+            f"w2_bias_shape mismatch: got {w2_bias_shape}, "
+            f"expected {expected_w2_bias_shape}")
+    else:
+        assert w3_w1_bias_shape is None, f"Expected None for w3_w1_bias_shape, got {w3_w1_bias_shape}"
+        assert w2_bias_shape is None, f"Expected None for w2_bias_shape, got {w2_bias_shape}"
+
+    assert intermediate_size_expand_aligned % NVFP4_ROW_ALIGNMENT == 0, (
+        f"intermediate_size_expand_aligned {intermediate_size_expand_aligned} "
+        f"not aligned to {NVFP4_ROW_ALIGNMENT}")
