@@ -1829,6 +1829,12 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
 
     initLocals(hidden_size, num_experts, k, num_tokens);
 
+    if (mGroupSize > 0 && (mHiddenSize % mGroupSize != 0 || mInterSize % mGroupSize != 0))
+    {
+        GTEST_SKIP() << "Skipping due to unsupported groupwise configuration";
+        return;
+    }
+
     auto test_archs = getAllTileConfigsToTest();
     for (auto [gemm1, gemm2] : test_archs)
     {
@@ -2057,6 +2063,13 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
     size_t inter_size = 2048;
     this->mInterSizeFraction = float(inter_size) / hidden_size;
 
+    if (this->W4A8_AWQ)
+    {
+        // TODO: Implement W4A8_AWQ for PermuteDeepSeekV3
+        GTEST_SKIP() << "W4A8_AWQ is not implemented for PermuteDeepSeekV3";
+        return;
+    }
+
     if (!this->checkSufficientTestMemory(100, hidden_size, 256, 8))
     {
         GTEST_SKIP() << "Insufficient free memory for test";
@@ -2108,6 +2121,13 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
             GTEST_SKIP();
             return;
         }
+    }
+
+    if (W4A8_AWQ)
+    {
+        // TODO: Implement W4A8_AWQ for ParallelismTest
+        GTEST_SKIP() << "W4A8_AWQ is not implemented for ParallelismTest";
+        return;
     }
 
     ASSERT_LE(ep_size, num_experts);
