@@ -50,8 +50,8 @@ class DeepSeekV3Parser(BaseToolParser):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜tool▁calls▁begin｜>"
-        self.eot_token = "<｜tool▁calls▁end｜>"
+        self.bot_token = "<｜tool▁calls▁begin｜>"  # nosec B105
+        self.eot_token = "<｜tool▁calls▁end｜>"  # nosec B105
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
         self.func_detail_regex = (
             r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
