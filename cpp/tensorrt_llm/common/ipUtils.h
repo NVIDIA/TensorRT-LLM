@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <string>
 
 TRTLLM_NAMESPACE_BEGIN
