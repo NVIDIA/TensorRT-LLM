@@ -620,7 +620,8 @@ class ADEngine(ModelEngine):
             seq_len.append(len(input_ids[-1]))
             cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
 
-            logits_gather_indices.append(cu_seqlen[-1] - 1)
+            # for generate requests, we always keep all logits (target logits + draft logits)
+            logits_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
 
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
