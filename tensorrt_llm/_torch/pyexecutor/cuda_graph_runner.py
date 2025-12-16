@@ -319,7 +319,7 @@ class CUDAGraphRunner:
         }
         if self.config.use_mrope:
             sliced_static_tensors["position_ids"] = self.shared_static_tensors[
-                "position_ids"][:, :, :num_tokens_for_capture],
+                "position_ids"][:, :, :num_tokens_for_capture]
             sliced_static_tensors[
                 "multimodal_params"] = self.shared_static_tensors[
                     "multimodal_params"][:batch_size * self.max_beam_width]

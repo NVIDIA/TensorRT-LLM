@@ -324,7 +324,7 @@ class Attention(nn.Module):
                     head_dim=self.head_dim,
                     is_neox=self.pos_embd_params.is_neox,
                     mrope_section=self.pos_embd_params.mrope_section,
-                )
+                    mrope_interleaved=self.pos_embd_params.mrope_interleaved)
             else:
                 self.rotary_emb = RotaryEmbedding(
                     self.pos_embd_params.rope,

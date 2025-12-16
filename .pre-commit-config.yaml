@@ -1395,6 +1395,8 @@ repos:
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
+        exclude: |
+            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-yaml
         args: [--allow-multiple-documents]
         exclude: ".*/gitlab/.*.yml"
