@@ -2,7 +2,11 @@ import os
 import sys
 
 import pytest
-import ray
+
+try:
+    import ray
+except ModuleNotFoundError:
+    from tensorrt_llm import ray_stub as ray
 
 from tensorrt_llm._utils import mpi_disabled
 
@@ -33,7 +37,7 @@ def setup_ray_cluster():
     }
     ray_init_args = {
         "include_dashboard": False,
-        "namespace": "test_allreduce_pg_op",
+        "namespace": "test",
         "ignore_reinit_error": True,
         "runtime_env": runtime_env
     }
