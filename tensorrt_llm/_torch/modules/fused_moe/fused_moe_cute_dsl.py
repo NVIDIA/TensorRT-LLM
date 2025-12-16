@@ -374,7 +374,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
         weight_dtype = self.w3_w1_weight.dtype
-        output_dtype = x.dtype
 
         (
             permuted_row_to_unpermuted_row,
@@ -418,17 +417,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[1],
             offset_array=expert_first_token_offset,
         )
-
-        if moe_output is None:
-            moe_output = torch.empty(
-                (token_final_scales.size(0), self.hidden_size),
-                dtype=output_dtype,
-                device=x.device)
-        else:
-            assert moe_output.size() == (token_final_scales.size(0),
-                                         self.hidden_size)
-            assert moe_output.dtype == output_dtype
-
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
