@@ -246,17 +246,17 @@ def submit_job(config, log_dir, dry_run):
         cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
         cmd = [
             "srun -l",
-            f"--nodelist {",".join(allocation["nodes"].keys())}",
-            f"-N {len(allocation["nodes"])}",
-            f"--ntasks {gen_world_size if server_type == "GEN" else ctx_world_size}",
+            f"--nodelist {','.join(allocation['nodes'].keys())}",
+            f"-N {len(allocation['nodes'])}",
+            f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
             f"--ntasks-per-node {gpus_per_node}",
             f"--container-image {env_config['container_image']}",
             f"--container-name {container_name}",
             f"--container-mounts {env_config['container_mount']}",
             "--mpi=pmix --overlap",
-            f"bash {os.path.join(env_config['work_dir'], "start_worker.sh")}",
+            f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
             server_type,
-            str(allocation["server_id"]),
+            str(allocation['server_id']),
             env_config['model_path'],
             str(allocation["port"]),
             benchmark_config['mode'],
@@ -287,7 +287,7 @@ def submit_job(config, log_dir, dry_run):
 
     # Generate client commands
     client_cmds = []
-    client_slurm_prefix=[
+    client_slurm_prefix = [
         f"srun -l --container-name={container_name}",
         f"--container-mounts={env_config['container_mount']}",
         f"--mpi=pmix --overlap -N 1 -n 1",
@@ -333,7 +333,7 @@ def submit_job(config, log_dir, dry_run):
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
 
-        # Sequence and benchmark parameters
+        # Benchmark Configuration
         '--benchmark-mode', benchmark_config['mode'],
 
         # Environment and paths
@@ -349,7 +349,9 @@ def submit_job(config, log_dir, dry_run):
     # yapf: enable
 
     if dry_run:
-        print("[WARNING] Dry run mode, will not submit the job. This should be used for test purpose only.")
+        print(
+            "[WARNING] Dry run mode, will not submit the job. This should be used for test purpose only."
+        )
         print("sbatch command:")
         print(" ".join(cmd))
         return
