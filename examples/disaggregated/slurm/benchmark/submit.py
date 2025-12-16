@@ -119,6 +119,7 @@ def submit_job(config, log_dir, dry_run):
 
     hw_config = config['hardware']
     env_config = config['environment']
+    benchmark_config = config['benchmark']
 
     # Set default accuracy configuration for backward compatibility
     if 'accuracy' not in config:
@@ -143,7 +144,7 @@ def submit_job(config, log_dir, dry_run):
 
     worker_env_var = env_config.get('worker_env_var')
     server_env_var = env_config.get('server_env_var')
-    if config['benchmark']['mode'] == "gen_only_no_context":
+    if benchmark_config['mode'] == "gen_only_no_context":
         worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
         server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
 
@@ -181,8 +182,8 @@ def submit_job(config, log_dir, dry_run):
     total_tasks = total_nodes * gpus_per_node
 
     # Generate log directory path based on configuration
-    isl = config['benchmark']['input_length']
-    osl = config['benchmark']['output_length']
+    isl = benchmark_config['input_length']
+    osl = benchmark_config['output_length']
     gen_batch_size = config['worker_config']['gen']['max_batch_size']
     gen_enable_attention_dp = config['worker_config']['gen'][
         'enable_attention_dp']
@@ -258,8 +259,8 @@ def submit_job(config, log_dir, dry_run):
             str(allocation["server_id"]),
             env_config['model_path'],
             str(allocation["port"]),
-            config['benchmark']['mode'],
-            config['benchmark']['concurrency_list'],
+            benchmark_config['mode'],
+            benchmark_config['concurrency_list'],
             str(slurm_config['numa_bind']).lower(),
             log_dir,
             str(profiling_config['nsys_on']).lower(),
@@ -270,7 +271,6 @@ def submit_job(config, log_dir, dry_run):
             f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
         ]
         start_worker_cmds.append(" ".join(cmd))
-
     with open(os.path.join(log_dir, "start_worker_cmds.sh"), "w") as f:
         f.write("\n".join(start_worker_cmds) + "\n")
 
@@ -280,13 +280,43 @@ def submit_job(config, log_dir, dry_run):
         f"--container-image={env_config['container_image']}",
         f"--container-mounts={env_config['container_mount']}",
         f"--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {env_config['work_dir']}/start_server.sh {ctx_num} {gen_num} {log_dir} {env_config['work_dir']} {server_env_var}",
+        f"bash {env_config['work_dir']}/start_server.sh {ctx_num} {gen_num} {log_dir} {env_config['work_dir']} \"{server_env_var}\"",
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmd=" ".join(cmd)
-
     with open(os.path.join(log_dir, "start_server_cmd.sh"), "w") as f:
         f.write(start_server_cmd + "\n")
+
+    # Generate client commands
+    client_cmds = []
+    client_slurm_prefix=[
+        f"srun -l --container-name={container_name}",
+        f"--container-mounts={env_config['container_mount']}",
+        f"--mpi=pmix --overlap -N 1 -n 1",
+    ]
+    if benchmark_config['use_nv_sa_benchmark']:
+        benchmark_cmd = [
+            f"bash {env_config['work_dir']}/run_benchmark_nv_sa.sh",
+            f"{env_config['model_path']} {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} {benchmark_config['concurrency_list']} {benchmark_config['streaming']} {log_dir}",
+            f"&> {log_dir}/6_bench.log"
+        ]
+        client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
+    else:
+        benchmark_cmd = [
+            f"bash {env_config['work_dir']}/run_benchmark.sh",
+            f"{env_config['model_path']} {benchmark_config['dataset_file']} {benchmark_config['multi_round']} {gen_num} {benchmark_config['concurrency_list']} {benchmark_config['streaming']} {log_dir}",
+            f"&> {log_dir}/6_bench.log"
+        ]
+        client_cmds.append(" ".join(client_slurm_prefix + benchmark_cmd))
+    if config['accuracy']['enable_accuracy_test']:
+        accuracy_cmd = [
+            f"bash {env_config['work_dir']}/accuracy_eval.sh",
+            f"{log_dir} {config['accuracy']['model']} {config['accuracy']['tasks']} {env_config['model_path']} {config['accuracy']['model_args_extra']} {log_dir}/accuracy_eval",
+            f"&> {log_dir}/7_accuracy_eval.log"
+        ]
+        client_cmds.append(" ".join(client_slurm_prefix + accuracy_cmd))
+    with open(os.path.join(log_dir, "client_cmds.sh"), "w") as f:
+        f.write("\n".join(client_cmds) + "\n")
 
     # Prepare sbatch command
     # yapf: disable
@@ -302,25 +332,24 @@ def submit_job(config, log_dir, dry_run):
         *([] if not slurm_config['set_segment'] else [f'--segment={total_nodes}']),
         f'--output={log_dir}/slurm-%j.out',
         f'--error={log_dir}/slurm-%j.err',
-        f'--gpus-per-node={hw_config["gpus_per_node"]}',
         *([arg for arg in slurm_config['extra_args'].split() if arg]),
         slurm_config['script_file'],
 
         # Worker configuration
         '--num-gen-servers', str(gen_num),
-        '--concurrency-list', config['benchmark']['concurrency_list'],
+        '--concurrency-list', benchmark_config['concurrency_list'],
 
         # Sequence and benchmark parameters
-        '--isl', str(config['benchmark']['input_length']),
-        '--osl', str(config['benchmark']['output_length']),
-        '--multi-round', str(config['benchmark']['multi_round']),
-        '--benchmark-ratio', str(config['benchmark']['benchmark_ratio']),
-        '--streaming', str(config['benchmark']['streaming']).lower(),
-        '--use-nv-sa-benchmark', str(config['benchmark']['use_nv_sa_benchmark']).lower(),
-        '--benchmark-mode', config['benchmark']['mode'],
+        '--isl', str(benchmark_config['input_length']),
+        '--osl', str(benchmark_config['output_length']),
+        '--multi-round', str(benchmark_config['multi_round']),
+        '--benchmark-ratio', str(benchmark_config['benchmark_ratio']),
+        '--streaming', str(benchmark_config['streaming']).lower(),
+        '--use-nv-sa-benchmark', str(benchmark_config['use_nv_sa_benchmark']).lower(),
+        '--benchmark-mode', benchmark_config['mode'],
 
         # Environment and paths
-        '--dataset-file', config['benchmark']['dataset_file'],
+        '--dataset-file', benchmark_config['dataset_file'],
         '--model-path', env_config['model_path'],
         '--trtllm-repo', env_config['trtllm_repo'],
         '--work-dir', env_config['work_dir'],

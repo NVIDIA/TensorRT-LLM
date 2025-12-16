@@ -145,6 +145,11 @@ elif [ -d "${trtllm_repo}" ]; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
     fi
     echo "TensorRT-LLM installation completed successfully"
+else
+    echo "trtllm_wheel_path and trtllm_repo are not provided, will use the installed TensorRT-LLM from the container"
+    if [ -v TRT_LLM_GIT_COMMIT ]; then
+        echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
+    fi
 fi
 
 # Get node lists and replace the placeholder with the actual node names
@@ -193,47 +198,18 @@ if ! srun -l --container-name=${container_name} \
 fi
 echo "Server is ready!"
 
-# Start benchmarking
-echo "Starting benchmark..."
-if [ "${use_nv_sa_benchmark}" = "true" ]; then
-    echo "Using NVIDIA SA benchmark script..."
-    if ! srun -l --container-name=${container_name} \
-            --container-mounts=${container_mount} \
-            --mpi=pmix --overlap -N 1 -n 1 \
-            bash ${work_dir}/run_benchmark_nv_sa.sh \
-            "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/6_bench.log; then
-        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/6_bench.log for details"
+# Start client commands
+client_cmds_file=${full_logdir}/client_cmds.sh
+echo "Starting client commands from ${client_cmds_file}..."
+while read -r cmd <&3; do
+    echo "Starting client command: ${cmd}"
+    eval "${cmd}"
+    if [ $? -ne 0 ]; then
+        cleanup_on_failure "Command failed: ${cmd}."
     fi
-else
-    echo "Using default benchmark script..."
-    if ! srun -l --container-name=${container_name} \
-            --container-mounts=${container_mount} \
-            --mpi=pmix --overlap -N 1 -n 1 \
-            bash ${work_dir}/run_benchmark.sh \
-            "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
-            &> ${full_logdir}/6_bench.log; then
-        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/6_bench.log for details"
-    fi
-fi
-echo "Benchmark completed successfully"
+done 3< "${client_cmds_file}"
 
-# Run accuracy evaluation if enabled
-if [ "${enable_accuracy_test}" = "true" ]; then
-    echo "Starting accuracy evaluation..."
-    if ! srun -l --container-name=${container_name} \
-        --container-mounts=${container_mount} \
-        --mpi=pmix --overlap -N 1 -n 1 \
-        bash ${work_dir}/accuracy_eval.sh \
-        "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
-        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
-        &> ${full_logdir}/7_accuracy_eval.log; then
-        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/7_accuracy_eval.log for details"
-    fi
-    echo "Accuracy evaluation completed successfully"
-fi
-
-echo "Total runtime: $SECONDS seconds"
+echo "Job completed successfully, total runtime: $SECONDS seconds"
 
 # try to kill the server and workers
 scancel ${SLURM_JOB_ID}
