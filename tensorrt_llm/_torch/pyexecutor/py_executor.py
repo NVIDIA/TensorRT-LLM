@@ -323,7 +323,6 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
 
-        self.use_flexkv = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0") == "1"
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
@@ -360,14 +359,8 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
             
-            if self.use_flexkv:
-                self._wait_for_flexkv_manager()
-    
-    def _wait_for_flexkv_manager(self):
-        if self.kv_connector_manager is not None and self.dist.rank == 0:
-            while not self.kv_connector_manager.scheduler.is_ready():
-                time.sleep(0.1)
-            logger.info("FlexKV manager is ready")
+            if self.dist.rank == 0: 
+                self.kv_connector_manager.wait_for_ready()
 
     def _event_loop_wrapper(self):
         try:
@@ -1317,16 +1310,13 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
-    def _kv_connector_refresh_unfinished_tasks(self):
-        if not self.use_flexkv:
-            return
-        if len(self.active_requests) == 0:
-            return
-        if not self.kv_connector_manager:
-            return
-        logger.warning(f"No scheduled requests, but flexkv have pending put requests")
-        self.kv_connector_manager.handle_metadata()
-        time.sleep(0.01)
+    def _kv_connector_refresh_unfinished_tasks(self, scheduled_batch):
+        if self.kv_connector_manager and \
+            scheduled_batch.batch_size == 0 and \
+            os.environ.get('TENSORRT_LLM_USE_FLEXKV') == '1':
+
+            self.kv_connector_manager.handle_metadata()
+            time.sleep(0.01)
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
@@ -1364,10 +1354,7 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
-                
-                if scheduled_batch.batch_size == 0:
-                    self._kv_connector_refresh_unfinished_tasks()
-
+                self._kv_connector_refresh_unfinished_tasks(scheduled_batch)
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
@@ -1602,10 +1589,7 @@ class PyExecutor:
                             can_forward = True
 
                 self._pause_requests(scheduled_batch.paused_requests)
-                
-                if scheduled_batch.batch_size == 0:
-                    self._kv_connector_refresh_unfinished_tasks()
-
+                self._kv_connector_refresh_unfinished_tasks(scheduled_batch)
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -2662,7 +2646,8 @@ class PyExecutor:
                                  self.ctx_in_transmission_counter))
                     else:
                         requests_to_terminate.append(request)
-                if self.use_flexkv and (request.is_finished or request.state == LlmRequestState.GENERATION_COMPLETE):
+                
+                if os.environ.get('TENSORRT_LLM_USE_FLEXKV') == '1':
                     self.resource_manager.free_slot_only(request)
             else:
                 new_active_requests.append(request)
