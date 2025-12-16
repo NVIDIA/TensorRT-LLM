@@ -4,22 +4,10 @@ set -euo pipefail
 # Parse named arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        # Worker configuration
-        --num-gen-servers) num_gen_servers="$2"; shift 2 ;;
-        --concurrency-list) concurrency_list="$2"; shift 2 ;;
-
-        # Sequence and benchmark parameters
-        --isl) isl="$2"; shift 2 ;;
-        --osl) osl="$2"; shift 2 ;;
-        --multi-round) multi_round="$2"; shift 2 ;;
-        --benchmark-ratio) benchmark_ratio="$2"; shift 2 ;;
-        --streaming) streaming="$2"; shift 2 ;;
-        --use-nv-sa-benchmark) use_nv_sa_benchmark="$2"; shift 2 ;;
+        # Benchmark Configuration
         --benchmark-mode) benchmark_mode="$2"; shift 2 ;;
 
         # Environment and paths
-        --dataset-file) dataset_file="$2"; shift 2 ;;
-        --model-path) model_path="$2"; shift 2 ;;
         --trtllm-repo) trtllm_repo="$2"; shift 2 ;;
         --work-dir) work_dir="$2"; shift 2 ;;
         --full-logdir) full_logdir="$2"; shift 2 ;;
@@ -28,12 +16,6 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
-
-        # Accuracy evaluation
-        --enable-accuracy-test) enable_accuracy_test="$2"; shift 2 ;;
-        --accuracy-model) accuracy_model="$2"; shift 2 ;;
-        --accuracy-tasks) accuracy_tasks="$2"; shift 2 ;;
-        --model-args-extra) model_args_extra="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -44,35 +26,18 @@ done
 # Print all parsed arguments
 echo "Parsed arguments:"
 echo
-echo "Worker Configuration:"
-echo "  num_gen_servers: ${num_gen_servers}"
-echo "  concurrency_list: ${concurrency_list}"
-echo
 echo "Benchmark Configuration:"
-echo "  isl: ${isl}"
-echo "  osl: ${osl}"
-echo "  multi_round: ${multi_round}"
-echo "  benchmark_ratio: ${benchmark_ratio}"
-echo "  streaming: ${streaming}"
-echo "  use_nv_sa_benchmark: ${use_nv_sa_benchmark}"
 echo "  benchmark_mode: ${benchmark_mode}"
 echo
 echo "Environment Configuration:"
-echo "  dataset_file: ${dataset_file}"
-echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
 echo "  work_dir: ${work_dir}"
 echo "  full_logdir: ${full_logdir}"
 echo "  container_mount: ${container_mount}"
 echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
+echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
-echo
-echo "Accuracy Configuration:"
-echo "  enable_accuracy_test: ${enable_accuracy_test}"
-echo "  accuracy_model: ${accuracy_model}"
-echo "  accuracy_tasks: ${accuracy_tasks}"
-echo "  model_args_extra: ${model_args_extra}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
