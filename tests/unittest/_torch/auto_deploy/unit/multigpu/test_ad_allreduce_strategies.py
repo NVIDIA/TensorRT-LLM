@@ -23,6 +23,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.commands.bench import main
 from tensorrt_llm.functional import AllReduceStrategy
 
+# needed since LLM API uses MPI executor pool internally for TP>1, which leaks a thread on shutdown
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 class TimeoutError(Exception):
     """Exception raised when a test times out."""
@@ -53,6 +56,71 @@ def timeout(seconds):
         # Restore the old signal handler and cancel the alarm
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def prewarm_flashinfer_jit():
+    """Pre-warm FlashInfer JIT kernels before multi-GPU tests.
+
+    This prevents a race condition where multiple MPI ranks try to JIT-compile
+    FlashInfer kernels simultaneously to the same cache directory, causing
+    Ninja build failures like: "ninja: error: opening build log: No such file or directory"
+
+    By triggering the compilation in the main process first, the kernels are
+    cached and available for all worker ranks.
+    """
+    try:
+        import flashinfer
+        import flashinfer.page
+        import flashinfer.sampling
+
+        if torch.cuda.is_available():
+            # Prevent concurrent JIT warmup across multiple pytest processes (e.g., xdist).
+            try:
+                import fcntl  # Linux-only
+            except ImportError:
+                fcntl = None
+
+            lock_f = None
+            if fcntl is not None:
+                import pathlib
+                import tempfile
+
+                lock_path = pathlib.Path(tempfile.gettempdir()) / "flashinfer_jit_prewarm.lock"
+                lock_f = open(lock_path, "w")
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            # Create dummy tensors to trigger kernel JIT compilation
+            with torch.no_grad():
+                device = torch.device("cuda:0")
+
+                # Trigger page kernel compilation
+                try:
+                    # Force module loading (this triggers JIT compilation)
+                    _ = flashinfer.page.gen_page_module()
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+
+                    warnings.warn(f"FlashInfer page-kernel prewarm failed: {exc!r}", RuntimeWarning)
+
+                # Trigger sampling kernel compilation
+                try:
+                    dummy_probs = torch.softmax(torch.randn(1, 100, device=device), dim=-1)
+                    _ = flashinfer.sampling.sampling_from_probs(dummy_probs, deterministic=True)
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+
+                    warnings.warn(
+                        f"FlashInfer sampling-kernel prewarm failed: {exc!r}", RuntimeWarning
+                    )
+
+                torch.cuda.empty_cache()
+            if lock_f is not None:
+                lock_f.close()
+
+    except ImportError:
+        pass  # FlashInfer not available
+
+    yield
 
 
 @pytest.fixture(scope="module")
