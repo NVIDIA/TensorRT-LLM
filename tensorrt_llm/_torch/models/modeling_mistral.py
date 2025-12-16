@@ -359,7 +359,6 @@ class Mistral3VLM(PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
-        self.is_multimodal = True
         if _is_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "
@@ -452,6 +451,18 @@ class Mistral3VLM(PreTrainedModel):
         logger.debug(
             f"Successfully loaded weights for {type(self._multi_modal_projector)}"
         )
+
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def load_draft_weights(self):
+        return self.llm.load_draft_weights
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

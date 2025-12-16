@@ -4950,7 +4950,8 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model_dir=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True)
+                eagle3_one_model=True,
+                eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
                 checkpoint_format="mistral",
@@ -5000,7 +5001,8 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model_dir=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True)
+                eagle3_one_model=True,
+                eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
                 checkpoint_format="mistral",
