@@ -1516,6 +1516,190 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
+// ---------------------------------------
+//   UnexpectedTerminationRaceTest
+// ---------------------------------------
+
+class UnexpectedTerminationRaceTest : public AsymmetricalCacheTest
+{
+};
+
+TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
+{
+    if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
+    {
+        setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
+    }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
+
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    nvinfer1::DataType dataType = std::get<10>(param);
+
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
+
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
+    if (contextDP || generationDP)
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with DP enabled.";
+    }
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    if (mIsContext || mIsGeneration)
+    {
+        bool enableDP = mIsContext ? contextDP : generationDP;
+        setUpCacheManager(
+            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
+        setUpCacheTransceiver();
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+        int requestId = 0;
+        for (auto len : {30, 10, 60, 30, 60, 10})
+        {
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            ++requestId;
+        }
+        std::vector<std::future<void>> contextFutures;
+        std::vector<std::future<void>> generationFutures;
+        std::vector<std::shared_ptr<WrappedLlmRequest>> generationRequests;
+        size_t constexpr designatedSuccessfulRequestCount = 2;
+
+        if (mIsContext)
+        {
+            std::vector<std::shared_ptr<WrappedLlmRequest>> contextRequests;
+            if (contextDP)
+            {
+                for (size_t i = 0; i < requests.size(); ++i)
+                {
+                    if (i % mTpSize == mTpRank)
+                    {
+                        // Round robin
+                        contextRequests.push_back(requests[i]);
+                    }
+                }
+            }
+            else
+            {
+                contextRequests = requests;
+            }
+            for (auto&& request : contextRequests)
+            {
+                contextFutures.push_back(std::move(addRequestAndTransportCacheForContext(request)));
+            }
+            mComm->barrier();
+        }
+        else
+        {
+            if (generationDP)
+            {
+                for (size_t i = 0; i < requests.size(); ++i)
+                {
+                    if (i % mTpSize == mTpRank)
+                    {
+                        generationRequests.push_back(requests[i]);
+                    }
+                }
+            }
+            else
+            {
+                generationRequests = requests;
+            }
+            mComm->barrier();
+            for (auto&& request : generationRequests)
+            {
+                generationFutures.push_back(std::move(addRequestAndTransportCacheForGeneration(request)));
+            }
+        }
+        if (mIsContext)
+        {
+            for (size_t requestIndex = 0; requestIndex < contextFutures.size(); ++requestIndex)
+            {
+                contextFutures[requestIndex].get();
+                // CRITICAL: Destroy the connection manager after some sends complete
+                // This triggers the race condition on the receiver side
+                if (requestIndex == designatedSuccessfulRequestCount)
+                {
+                    TLLM_LOG_WARNING(mRank, "Context: Destroying CacheSender");
+                    try
+                    {
+                        mSender.reset();
+                        TLLM_LOG_DEBUG(mRank, "CacheSender reset");
+                        mConnectionManager.reset();
+                        TLLM_LOG_DEBUG(mRank, "ConnectionManager reset");
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR(mRank, "Error resetting mSender: %s", e.what());
+                        EXPECT_TRUE(false);
+                    }
+                    break;
+                }
+            }
+        }
+        else
+        {
+            for (size_t requestIndex = 0; requestIndex < generationFutures.size(); ++requestIndex)
+            {
+                generationFutures[requestIndex].get();
+                if (requestIndex == designatedSuccessfulRequestCount)
+                {
+                    TLLM_LOG_WARNING(mRank, "Generation: Destroying CacheReceiver");
+                    try
+                    {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        mRequester.reset();
+                        TLLM_LOG_DEBUG(mRank, "CacheReceiver reset");
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_ERROR(mRank, "Error resetting mRequester: %s", e.what());
+                        EXPECT_TRUE(false);
+                    }
+                    break;
+                }
+            }
+            for (size_t requestIndex = 0; requestIndex < generationRequests.size(); ++requestIndex)
+            {
+                if (requestIndex == designatedSuccessfulRequestCount + 1)
+                {
+                    break;
+                }
+                generationVerifyKVCache(generationRequests[requestIndex]);
+            }
+        }
+        mComm->barrier();
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// Test for race condition during destructor with DP enabled (2 context ranks, 4 generation ranks)
+INSTANTIATE_TEST_CASE_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest,
+    testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(0),
+        testing::Values(128)));
+
+// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
