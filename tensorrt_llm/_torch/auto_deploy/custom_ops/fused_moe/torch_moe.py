@@ -170,14 +170,14 @@ def torch_moe(
             raise ValueError("Stacked tensor format only supports gated MLP style")
 
         w3_w1_stacked = w1_weight[0]  # (E, 2*I, H)
+        intermediate_size = w3_w1_stacked.shape[1] // 2
         w2_stacked = w2_weight[0]  # (E, H, I)
 
-        def make_mlp(i: int):
-            gate_up = w3_w1_stacked[i]  # (2*I, H)
-            intermediate_size = gate_up.shape[0] // 2
+        def make_mlp(idx: int):
+            gate_up = w3_w1_stacked[idx]  # (2*I, H)
             W3 = gate_up[:intermediate_size, :]  # (I, H)
             W1 = gate_up[intermediate_size:, :]  # (I, H)
-            W2 = w2_stacked[i]  # (H, I)
+            W2 = w2_stacked[idx]  # (H, I)
             weight_dtype = W1.dtype
             return lambda inp: F.linear(
                 torch_act_fn(F.linear(inp.to(weight_dtype), W1))
@@ -185,7 +185,7 @@ def torch_moe(
                 W2,
             )
 
-        mlps = [make_mlp(i) for i in range(w3_w1_stacked.shape[0])]
+        mlps = [make_mlp(idx) for idx in range(w3_w1_stacked.shape[0])]
 
     elif is_gated_mlp:
         # Standard per-expert list format with gated MLP
