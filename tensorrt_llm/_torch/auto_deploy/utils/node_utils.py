@@ -48,6 +48,7 @@ class LayerSubgraph(BaseModel):
     subgraph_nodes: List[Node]
     terminating_node: Union[Node, None]
     layer_type: LayerType
+    min_local_shape: int = 1
 
 
 @dataclass
@@ -739,8 +740,9 @@ def get_weight_shape(
     if not is_any_lin_op(node):
         return None
     if dim is None:
-        return extract_weight_node(node).meta["val"].shape
-    return extract_weight_node(node).meta["val"].shape[dim]
+        return shape(extract_weight_node(node))
+    else:
+        return shape(extract_weight_node(node))[dim]
 
 
 def get_layer_after_linear_node(
@@ -848,26 +850,43 @@ def get_layer_after_linear_node(
         n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
     ]
 
-    ssm_nodes = list(filtered_nodes(backward_subgraph, is_any_ssm_op))
-    attention_nodes = list(filtered_nodes(backward_subgraph, is_any_attention_op))
-    intermediate_lin_nodes = list(
-        filtered_nodes(set(backward_subgraph).difference(opening_linear_nodes), is_any_lin_op)
-    )
+    # subgraph_nodes should not include opening nodes.
+    # the entire layer =  opening_nodes + subgraph_nodes + terminating_node,
+    # with these three sets being disjoint.
+    interior_nodes = [
+        n
+        for n in set(backward_subgraph).union(forward_subgraph)
+        if n not in set(opening_linear_nodes).union([terminating_linear_node])
+    ]
+    ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
+    attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
+    intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
 
     layer_type = LayerType.MLP
+    min_local_shape = 1
     if len(ssm_nodes) > 0:
+        assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
         layer_type = LayerType.SSM
+        # determine head size
+        min_local_shape = get_weight_shape(ssm_nodes[0], dim=-1)
     if len(attention_nodes) > 0:
+        assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
         layer_type = LayerType.ATTENTION
+        # determine head size
+        min_local_shape = attention_nodes[0].meta["val"].shape[-1]
     if len(intermediate_lin_nodes) > 0:
+        assert len(intermediate_lin_nodes) == 2, (
+            "MLA layer must have exactly two intermediate linear nodes"
+        )
         assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
         layer_type = LayerType.MLA
 
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,
-        subgraph_nodes=backward_subgraph,
+        subgraph_nodes=interior_nodes,
         terminating_node=terminating_linear_node,
         layer_type=layer_type,
+        min_local_shape=min_local_shape,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
         "Linear node not found in opening linear nodes"
@@ -877,14 +896,13 @@ def get_layer_after_linear_node(
     if terminating_linear_node == linear_nodes[-1]:
         terminating_index = len(linear_nodes)
     else:
-        terminating_index = start_lin_index + len(opening_linear_nodes)
+        terminating_index = (
+            start_lin_index + len(opening_linear_nodes) + len(intermediate_lin_nodes)
+        )
     if terminating_index < len(linear_nodes):
-        if linear_nodes[terminating_index] != terminating_linear_node:
-            # this means that the forward and backward subgraphs misalign:
-            # there are more opening nodes that we started with, so our
-            # terminating node is "linear node reachable" from unexpected
-            # paths. Therefore, we cannot safely col-row shard this layer.
-            terminating_index = linear_nodes.index(terminating_linear_node)
+        assert linear_nodes[terminating_index] == terminating_linear_node, (
+            "ill-formed layer subgraph"
+        )
     terminating_indices.append(terminating_index)
     # otherwise, we are done. We processed the last linear node.
     return layer_subgraph
