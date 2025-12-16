@@ -23,7 +23,7 @@ from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
                                           KvCacheConnectorConfig)
 
-from ..conftest import llm_models_root, llm_model_name
+from ..conftest import llm_models_root
 
 
 @pytest.fixture(scope="function")
@@ -45,7 +45,7 @@ def model_with_connector():
         def model_fn(*args, **kwargs):
 
             default_kwargs = {
-                "model": f"{llm_models_root()}/{llm_model_name()}",
+                "model": f"{llm_models_root()}/Qwen2-0.5B",
                 "backend": "pytorch",
                 "kv_connector_config": kv_connector_config,
                 "cuda_graph_config": None,
