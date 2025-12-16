@@ -901,7 +901,7 @@ def collectTestResults(pipeline, testFilter)
             if (env.alternativeTRT) {
                 catchError(
                     buildResult: 'FAILURE',
-                    stageResult: 'UNSTABLE') {
+                    stageResult: 'FAILURE') {
                     error "Some failed tests were reruned, please check the rerun report."
                 }
             } else {
