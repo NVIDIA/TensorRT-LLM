@@ -7,7 +7,7 @@ import socket
 import subprocess  # nosec B404
 import sys
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
 import click
 import torch
@@ -42,7 +42,9 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 _child_p_global: Optional[subprocess.Popen] = None
 
 
-def help_info_with_stability_tag(help_str: str, tag: str) -> str:
+def help_info_with_stability_tag(
+        help_str: str, tag: Literal["stable", "beta", "prototype",
+                                    "deprecated"]) -> str:
     """Append stability info to help string."""
     return f":tag:`{tag}` {help_str}"
 
@@ -303,12 +305,12 @@ class ChoiceWithAlias(click.Choice):
     default=None,
     multiple=True,
     help=help_info_with_stability_tag(
-        "Paths to custom module directories to import.", "Prototype"),
+        "Paths to custom module directories to import.", "prototype"),
 )
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
-              help=help_info_with_stability_tag("The logging level.", "stable"))
+              help=help_info_with_stability_tag("The logging level.", "beta"))
 @click.option("--max_beam_width",
               type=int,
               default=BuildConfig.model_fields["max_beam_width"].default,
