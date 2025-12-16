@@ -673,7 +673,8 @@ def fp8_block_scaling_bmm_out(
                                                    output)
         out.copy_(output)
     elif sm_version == 120:
-        mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(mat1)
+        mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(
+            mat1, need_permute102=True)
         output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
                                                    mat1_scale, mat2_scale,
@@ -2192,19 +2193,23 @@ class MLA(nn.Module):
                                   all_reduce_params=all_reduce_params)
         return attn_output
 
-    def resmooth_parameters(self, weight, scale, recipe=(1, 128, 128)):
-        weight_param, scale_param = fp8_utils.resmooth_to_fp8_e8m0(
-            weight, scale)
+    def resmooth_parameters(self,
+                            module_weight,
+                            module_weight_scale,
+                            recipe=(1, 128, 128)):
+        weight, weight_scale = fp8_utils.resmooth_to_fp8_e8m0(
+            module_weight, module_weight_scale)
 
-        scale_param = fp8_utils.transform_sf_into_required_layout(
-            scale_param,
-            mn=weight_param.shape[0],
-            k=weight_param.shape[1],
+        transfromed_scale = fp8_utils.transform_sf_into_required_layout(
+            weight_scale,
+            mn=weight.shape[1],
+            k=weight.shape[2],
             recipe=recipe,
+            num_groups=weight.shape[0],
             is_sfa=False)
 
-        weight_param = torch.nn.Parameter(weight_param, requires_grad=False)
-        scale_param = torch.nn.Parameter(scale_param, requires_grad=False)
+        weight_param = torch.nn.Parameter(weight, requires_grad=False)
+        scale_param = torch.nn.Parameter(transfromed_scale, requires_grad=False)
 
         return weight_param, scale_param
 
