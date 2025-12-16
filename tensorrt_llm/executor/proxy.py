@@ -389,13 +389,18 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._maybe_initialize_iteration_results()
 
         if self._iter_stats_result is None:
-            print_colored("Iteration statistics are not available yet.\n",
-                          "yellow")
+            logger.warning("Iteration statistics are not available yet.")
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
         # Fetch stats via RPC and populate the result
-        stats = self.get_stats(timeout)
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+        except Exception as e:
+            logger.debug(f"Error fetching stats via RPC: {e}")
+            stats = []
+
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
@@ -440,7 +445,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             return empty_async_iterable()
 
         # Fetch kv events via RPC and populate the result
-        events = self.get_kv_events(timeout)
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+        except Exception as e:
+            logger.debug(f"Error fetching kv events via RPC: {e}")
+            events = []
+
         for event in events:
             self._iter_kv_events_result.queue.put(event)
 

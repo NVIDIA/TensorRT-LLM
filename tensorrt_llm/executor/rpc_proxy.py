@@ -117,7 +117,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             return empty_async_iterable()
 
         # Fetch stats via RPC and populate the result
-        stats = self.get_stats(timeout)
+        try:
+            stats = self.rpc_client.fetch_stats_wait_async(
+                timeout=timeout).remote()
+        except Exception:
+            stats = []
+
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
@@ -159,7 +164,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             return empty_async_iterable()
 
         # Fetch kv events via RPC and populate the result
-        events = self.get_kv_events(timeout)
+        try:
+            events = self.rpc_client.fetch_kv_cache_events_wait_async(
+                timeout=timeout).remote()
+        except Exception:
+            events = []
+
         for event in events:
             self._iter_kv_events_result.queue.put(event)
 
