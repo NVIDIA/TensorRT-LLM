@@ -80,12 +80,23 @@ public:
             output_list[il] = output;
             auto type = tensorrt_llm::runtime::TorchUtils::dataType(input_list[off].scalar_type());
             auto nccl_type = (*getDtypeMap())[type];
+
+#if defined(NCCL_VERSION_CODE) && (NCCL_VERSION_CODE >= 22800)
+            NCCLCHECK(ncclAlltoAll(
+                input_list[off].data_ptr(),
+                output.mutable_data_ptr(),
+                static_cast<size_t>(input_list[off].numel()),
+                nccl_type,
+                *mNcclComm,
+                stream));
+#else
             for (int r = 0; r < num_ranks; ++r)
             {
                 auto const& input = input_list[off + r];
-                ncclSend(input.data_ptr(), input.numel(), nccl_type, r, *mNcclComm, stream);
-                ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, *mNcclComm, stream);
+                NCCLCHECK(ncclSend(input.data_ptr(), input.numel(), nccl_type, r, *mNcclComm, stream));
+                NCCLCHECK(ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, *mNcclComm, stream));
             }
+#endif
         }
         NCCLCHECK_THROW(ncclGroupEnd());
         return output_list;
