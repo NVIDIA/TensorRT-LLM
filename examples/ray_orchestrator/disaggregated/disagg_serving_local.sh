@@ -127,12 +127,21 @@ fi
 echo "Launching context servers..."
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=0
+elif [[ "$BACKEND" == "ray" ]]; then
+    # For Ray with TP>1, explicitly set CUDA_VISIBLE_DEVICES to ensure GPU isolation
+    CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TP_SIZE - 1)))
+    export CUDA_VISIBLE_DEVICES
+    echo "Context server using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 fi
 
 trtllm-serve $MODEL_DIR --host localhost --tp_size $TP_SIZE --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch --config extra_llm_config.yaml &> output_ctx0 &
 
 if [[ "$BACKEND" == "mpi" ]]; then
     export CUDA_VISIBLE_DEVICES=1
+elif [[ "$BACKEND" == "ray" ]]; then
+    CUDA_VISIBLE_DEVICES=$(seq -s, $TP_SIZE $((2 * TP_SIZE - 1)))
+    export CUDA_VISIBLE_DEVICES
+    echo "Generation server using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 fi
 # Launching generation servers
 echo "Launching generation servers..."
