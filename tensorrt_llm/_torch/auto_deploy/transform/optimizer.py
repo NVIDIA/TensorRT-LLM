@@ -10,6 +10,7 @@ import torch.nn as nn
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..utils._graph import dump_graphmodules
 from .interface import (
     InferenceOptimizerConfig,
     SharedConfig,
@@ -68,11 +69,18 @@ class InferenceOptimizer:
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
+            if t_name == "compile_model":
+                dump_graphmodules(mod, "ad_pre_compile_")
+
             mod = transform(mod, cm, self.factory, self.shared_config)
+
+            if t_name == "tag_vlm_mask_kind":
+                dump_graphmodules(mod, "ad_post_tag_vlm_mask_kind_")
 
         ############################################################################################
         # RETURN OPTIMIZED MODEL
         ############################################################################################
+        # Dump out the module code and GraphModule info into files in the current working directory for inspection.
         torch.cuda.empty_cache()
         gc.collect()
         return mod

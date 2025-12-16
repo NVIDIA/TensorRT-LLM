@@ -82,6 +82,76 @@ class InsertCachedAttention(BaseTransform):
 
         return meta_nodes_extra
 
+    @staticmethod
+    def _is_flashinfer_cached_attn_op(cached_attn_op) -> bool:
+        """Return True if cached_attn_op is FlashInfer's paged cached-attention op.
+
+        We keep this check isolated since OpOverload equality can be brittle in some environments.
+        """
+        try:
+            return cached_attn_op == torch.ops.auto_deploy.flashinfer_attention_mha_with_cache
+        except Exception:
+            return False
+
+    def _maybe_init_flashinfer_vlm_custom_mask_inputs(
+        self, gm: GraphModule, source_attn_nodes: List[Node]
+    ) -> None:
+        """Create optional VLM custom mask graph inputs once if any layer needs them.
+
+        A layer needs VLM masks if its source attention node has `mask_kind != "none"`.
+        We create the placeholders once in _apply() (if any layer needs masks).
+        Later, each _insert_cached_attn_node() call needs to reference the same placeholder nodes; storing them on self
+        is the simplest way to share them across the per-node calls without re-adding duplicate graph inputs.
+        """
+        # Only relevant for FlashInfer backend
+        cached_attn_op = self.attn_descriptor.get_cached_attention_op()
+        if not self._is_flashinfer_cached_attn_op(cached_attn_op):
+            return
+
+        def _get_mask_kind(n: Node) -> str:
+            # Prefer metadata (set during export-time attention wrapping); fall back to kwargs.
+            try:
+                mk = getattr(n, "meta", {}).get("mask_kind", None)
+                if isinstance(mk, str):
+                    return mk
+            except Exception:
+                pass
+            return getattr(n, "kwargs", {}).get("mask_kind", "none")
+
+        needs_vlm_masks_any = any(_get_mask_kind(n) != "none" for n in source_attn_nodes)
+        if needs_vlm_masks_any and not hasattr(self, "_vlm_custom_mask_inputs"):
+            self._vlm_custom_mask_inputs = {
+                "custom_mask_full": add_graph_input(gm, "custom_mask_full", val=None),
+                "custom_mask_sliding": add_graph_input(gm, "custom_mask_sliding", val=None),
+            }
+
+    def _maybe_append_flashinfer_vlm_custom_masks(
+        self, attn_node: Node, cached_attn_op, args: Tuple
+    ) -> Tuple:
+        """Append FlashInfer VLM custom mask args (or None placeholders) to `args`."""
+        if not self._is_flashinfer_cached_attn_op(cached_attn_op):
+            return args
+
+        mask_kind = getattr(attn_node, "meta", {}).get(
+            "mask_kind", getattr(attn_node, "kwargs", {}).get("mask_kind", "none")
+        )
+        need_vlm_masks = mask_kind != "none"
+
+        if need_vlm_masks:
+            if not hasattr(self, "_vlm_custom_mask_inputs"):
+                raise RuntimeError(
+                    "need_vlm_masks=True but _vlm_custom_mask_inputs is missing. "
+                    "Expected VLM custom mask graph inputs to be created in InsertCachedAttention._apply."
+                )
+            return (
+                *args,
+                self._vlm_custom_mask_inputs["custom_mask_full"],
+                self._vlm_custom_mask_inputs["custom_mask_sliding"],
+            )
+
+        # This layer does not require VLM masks: pass explicit None placeholders to satisfy the op schema.
+        return (*args, None, None)
+
     def _process_metadata_extra(
         self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
     ) -> List[Node]:
@@ -127,14 +197,10 @@ class InsertCachedAttention(BaseTransform):
             args = (*qkv_nodes, *meta_nodes_std, *meta_nodes_extra, *cache_nodes, *buffer_nodes, *constants)
             # FlashInfer cached attention op optionally accepts two extra args for VLM custom masks:
             #   custom_mask_full, custom_mask_sliding
-            # In graph-mode we may not have these tensors available; still pass explicit None
-            # placeholders to satisfy the operator schema (important for torch.compile / Dynamo).
-            try:
-                if cached_attn_op == torch.ops.auto_deploy.flashinfer_attention_mha_with_cache:
-                    args = (*args, None, None)
-            except Exception:
-                # Be conservative: if op resolution fails in some environments, don't special-case.
-                pass
+            # In graph-mode we want to be able to compute these masks outside the exported HF graph
+            # (e.g., from token_type_ids) and pass them in as extra graph inputs. If the caller
+            # doesn't provide them, they can still be None.
+            args = self._maybe_append_flashinfer_vlm_custom_masks(attn_node, cached_attn_op, args)
             cached_attn_node = gm.graph.call_function(
                 cached_attn_op,
                 args=args,
@@ -179,6 +245,7 @@ class InsertCachedAttention(BaseTransform):
         meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
 
         buffer_in_lookup: Dict[str, Node] = {}
+        self._maybe_init_flashinfer_vlm_custom_mask_inputs(gm, source_attn_nodes)
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0

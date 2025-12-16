@@ -1,5 +1,6 @@
 """Graph-related utilities for transformations."""
 
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
@@ -344,3 +345,17 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
                 return True
 
     return False
+
+
+def dump_graphmodules(mod: nn.Module, fname_prefix: str):
+    for name, gm in named_graphmodules(mod):
+        # Dump module code
+        code_path = os.path.join(os.getcwd(), f"{fname_prefix}_{name}_graphmodule_code.txt")
+        with open(code_path, "w") as f:
+            f.write("====== GraphModule code ======\n")
+            f.write(gm.code)
+        # Dump module graph
+        graph_path = os.path.join(os.getcwd(), f"{fname_prefix}_{name}_graphmodule_graph.txt")
+        with open(graph_path, "w") as f:
+            f.write("====== GraphModule graph ======\n")
+            f.write(str(gm.graph))

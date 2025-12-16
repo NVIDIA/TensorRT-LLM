@@ -356,7 +356,7 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
-        return cls(
+        engine = cls(
             build_and_optimize,
             seq_info,
             device,
@@ -364,6 +364,8 @@ class ADEngine(ModelEngine):
             mapping=mapping,
             reporting_info=reporting_info,
         )
+        _configure_vlm_mask_settings(engine, ad_config)
+        return engine
 
     @torch.inference_mode()
     def __init__(
@@ -699,12 +701,78 @@ class ADEngine(ModelEngine):
 
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
+        kwargs = self._prepare_vlm_kwargs(dict(self.cache_seq_interface.named_args))
+
         # run the model
-        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
+        logits: torch.Tensor = self.model(**kwargs)[0]
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
         return logits.float()
+
+    def _prepare_vlm_kwargs(self, kwargs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Prepare kwargs for calling the exported inference model in VLM scenarios.
+
+        Goals:
+        - Generate FlashInfer-compatible VLM custom masks outside the exported HF GraphModule.
+        - Strip VLM-only kwargs (e.g., token_type_ids) before calling the exported GraphModule to
+          avoid torch.export strict in_spec mismatches.
+        """
+        # Ensure custom mask inputs exist if the graph expects them; default to None.
+        # (Graph-mode kvcache insertion adds these placeholders for FlashInfer.)
+        if getattr(self, "_expects_vlm_custom_masks", False):
+            kwargs["custom_mask_full"] = None
+            kwargs["custom_mask_sliding"] = None
+
+            # Only compute masks if we have token type ids available and the batch contains images.
+            token_type_ids = kwargs.get("token_type_ids", None)
+            if token_type_ids is None:
+                token_type_ids = kwargs.get("mm_token_type_ids", None)
+
+            position_ids = kwargs.get("position_ids", None)
+            seq_len = kwargs.get("seq_len", None)
+            if token_type_ids is not None and position_ids is not None and seq_len is not None:
+                # Flatten token types to align with the flattened token stream used by cached attention.
+                total_tokens = position_ids.numel()
+                token_type_ids_flat = token_type_ids.reshape(-1)[:total_tokens]
+                image_token_mask = token_type_ids_flat == 1
+
+                if image_token_mask.any():
+                    # Ensure custom op is registered.
+                    from ..custom_ops import flashinfer_gemma3_mask  # noqa: F401
+
+                    # Match FlashInfer metadata conventions: sanitize seq_len like the metadata op does.
+                    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
+                    qo_indptr = torch.zeros(
+                        len(seq_len_sanitized) + 1,
+                        dtype=torch.int,
+                        device=seq_len_sanitized.device,
+                    )
+                    qo_indptr[1:] = torch.cumsum(seq_len_sanitized, 0)
+
+                    # Sliding window is model-dependent; default to 0 (i.e., no extra constraint).
+                    sliding_window = 0
+                    if hasattr(self, "_vlm_mask_config") and isinstance(
+                        self._vlm_mask_config, dict
+                    ):
+                        sliding_window = int(self._vlm_mask_config.get("sliding_window") or 0)
+
+                    custom_mask_full, custom_mask_sliding = (
+                        torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
+                            image_token_mask,
+                            qo_indptr,
+                            seq_len_sanitized,
+                            sliding_window,
+                        )
+                    )
+                    kwargs["custom_mask_full"] = custom_mask_full
+                    kwargs["custom_mask_sliding"] = custom_mask_sliding
+
+        # Strip kwargs that we intentionally keep outside the exported HF GraphModule.
+        kwargs.pop("token_type_ids", None)
+        kwargs.pop("mm_token_type_ids", None)
+
+        return kwargs
 
     def get_max_num_sequences(self) -> int:
         """Maximum number of sequences supported by the engine."""
@@ -736,6 +804,42 @@ class ADEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
         return outputs
+
+
+def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
+    """Configure VLM custom mask settings on the engine.
+
+    This is used to:
+    - enable/disable external VLM custom mask generation based on attention backend
+    - best-effort extract VLM mask parameters (e.g., sliding_window) from HF config
+    """
+    # Graph-mode KV-cache insertion adds optional custom mask inputs for FlashInfer.
+    engine._expects_vlm_custom_masks = ad_config.attn_backend == "flashinfer"
+
+    # Best-effort extraction of VLM mask configuration (sliding_window) from HF config so we can
+    # generate FlashInfer custom masks outside the exported graph when needed.
+    try:
+        from transformers import AutoConfig
+
+        cfg, _ = AutoConfig.from_pretrained(
+            ad_config.model, return_unused_kwargs=True, trust_remote_code=True
+        )
+        model_type = getattr(cfg, "model_type", None)
+        if model_type is None and hasattr(cfg, "text_config"):
+            model_type = getattr(cfg.text_config, "model_type", None)
+
+        sliding_window = getattr(cfg, "sliding_window", None)
+        if sliding_window is None:
+            for sub_config_key in getattr(cfg, "sub_configs", []):
+                sub_cfg = getattr(cfg, sub_config_key, None)
+                if sub_cfg is not None and getattr(sub_cfg, "sliding_window", None) is not None:
+                    sliding_window = getattr(sub_cfg, "sliding_window", None)
+                    break
+
+        engine._vlm_mask_config = {"model_type": model_type, "sliding_window": sliding_window}
+    except Exception:
+        # Not all environments/models have an HF config with these fields; ignore.
+        engine._vlm_mask_config = {"model_type": None, "sliding_window": None}
 
 
 def create_draft_model_engine_maybe(

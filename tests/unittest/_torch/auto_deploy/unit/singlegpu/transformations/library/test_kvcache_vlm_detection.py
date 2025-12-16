@@ -241,6 +241,49 @@ class TestMaskKindMapping:
         assert mask_kind == "none"
 
 
+class TestUnifiedAttnExportMaskKind:
+    """Tests unified attention wrapper does not pass unsupported kwargs to torch_attention."""
+
+    def test_gemma3_nested_text_config_layer_types(self):
+        from tensorrt_llm._torch.auto_deploy.export.library.unified_attn import (
+            torch_attention_hf_wrapper,
+        )
+
+        class TextCfg:
+            layer_types = ["full_attention", "sliding_attention"]
+
+        class Cfg:
+            text_config = TextCfg()
+
+        class Mod(torch.nn.Module):
+            def __init__(self, layer_idx: int):
+                super().__init__()
+                self.layer_idx = layer_idx
+                self.config = Cfg()
+
+        # Monkeypatch torch op to capture kwargs passed by wrapper.
+        captured = {"kwargs": {}}
+        original = torch.ops.auto_deploy.torch_attention
+
+        def _fake(*args, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            return args[0]
+
+        torch.ops.auto_deploy.torch_attention = _fake  # type: ignore[assignment]
+        try:
+            q = torch.zeros(1, 2, 3, 4)
+            k = torch.zeros(1, 2, 3, 4)
+            v = torch.zeros(1, 2, 3, 4)
+
+            torch_attention_hf_wrapper(Mod(0), q, k, v, None)
+            assert "mask_kind" not in captured["kwargs"]
+
+            torch_attention_hf_wrapper(Mod(1), q, k, v, None)
+            assert "mask_kind" not in captured["kwargs"]
+        finally:
+            torch.ops.auto_deploy.torch_attention = original  # type: ignore[assignment]
+
+
 class TestForwardWithPrepareMetadataMaskGeneration:
     """Tests for mask generation in forward_with_prepare_metadata."""
 

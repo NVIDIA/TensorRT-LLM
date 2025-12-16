@@ -147,6 +147,8 @@ transforms:
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
+  tag_vlm_mask_kind:
+    stage: cache_init
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer

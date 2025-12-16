@@ -465,10 +465,11 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
-        # Determine mask_kind based on layer's attention type
-        # This is extracted from the source attention node's context (set during transform)
-        # Default to "none" for standard causal attention
-        mask_kind = source_attn_node.kwargs.get("mask_kind", "none")
+        # Determine mask_kind based on layer's attention type.
+        # Prefer FX node metadata (set during transforms); fall back to kwargs (legacy/profiling path).
+        mask_kind = source_attn_node.meta.get(
+            "mask_kind", source_attn_node.kwargs.get("mask_kind", "none")
+        )
 
         return [
             scale,  # softmax scale
