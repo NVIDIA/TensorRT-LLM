@@ -340,6 +340,7 @@ def submit_job(config, log_dir, dry_run):
         '--trtllm-repo', env_config['trtllm_repo'],
         '--work-dir', env_config['work_dir'],
         '--full-logdir', log_dir,
+        '--container-name', container_name,
         '--container-mount', env_config['container_mount'],
         '--container-image', env_config['container_image'],
         '--build-wheel', str(env_config['build_wheel']).lower(),

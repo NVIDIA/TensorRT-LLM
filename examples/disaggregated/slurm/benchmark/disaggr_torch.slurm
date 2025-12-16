@@ -11,6 +11,7 @@ while [[ $# -gt 0 ]]; do
         --trtllm-repo) trtllm_repo="$2"; shift 2 ;;
         --work-dir) work_dir="$2"; shift 2 ;;
         --full-logdir) full_logdir="$2"; shift 2 ;;
+        --container-name) container_name="$2"; shift 2 ;;
         --container-mount) container_mount="$2"; shift 2 ;;
         --container-image) container_image="$2"; shift 2 ;;
         --build-wheel) build_wheel="$2"; shift 2 ;;
@@ -44,8 +45,6 @@ if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
     export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
     echo "Setting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode"
 fi
-
-container_name="disaggr-test"
 
 # Function to cleanup on failure
 cleanup_on_failure() {
