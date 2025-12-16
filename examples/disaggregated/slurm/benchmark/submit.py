@@ -138,6 +138,12 @@ def submit_job(config, log_dir):
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
 
+    worker_env_var = env_config.get('worker_env_var')
+    server_env_var = env_config.get('server_env_var')
+    if config['benchmark']['mode'] == "gen_only_no_context":
+        worker_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+        server_env_var += " TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+
     profiling_config = config.get('profiling', {})
     profiling_config.setdefault('nsys_on', False)
     profiling_config.setdefault('ctx_profile_range', '10-30')
@@ -227,36 +233,24 @@ def submit_job(config, log_dir):
         json.dump(allocations, f, indent=2)
 
     # Generate start worker commands with placeholder hostnames
+    container_name = "disaggr-test"
     start_worker_cmds = []
     for allocation in allocations:
         server_type = allocation["server_type"]
         cuda_devices = ",".join(
             [str(device) for device in list(allocation["nodes"].values())[0]])
-        worker_env_var = env_config[
-            'worker_env_var'] + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+        cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
         cmd = [
-            "srun",
-            "-l",
-            "--nodelist",
-            ",".join(allocation["nodes"].keys()),
-            "-N",
-            str(len(allocation["nodes"])),
-            "--ntasks",
-            str(gen_world_size)
-            if server_type == "GEN" else str(ctx_world_size),
-            "--ntasks-per-node",
-            str(gpus_per_node),
-            "--container-image",
-            env_config['container_image'],
-            "--container-name",
-            "disaggr-test",
-            "--container-mounts",
-            env_config['container_mount'],
-            "--mpi",
-            "pmix",
-            "--overlap",
-            "bash",
-            os.path.join(env_config['work_dir'], "start_worker.sh"),
+            "srun -l",
+            f"--nodelist {",".join(allocation["nodes"].keys())}",
+            f"-N {len(allocation["nodes"])}",
+            f"--ntasks {gen_world_size if server_type == "GEN" else ctx_world_size}",
+            f"--ntasks-per-node {gpus_per_node}",
+            f"--container-image {env_config['container_image']}",
+            f"--container-name {container_name}",
+            f"--container-mounts {env_config['container_mount']}",
+            "--mpi=pmix --overlap",
+            f"bash {os.path.join(env_config['work_dir'], "start_worker.sh")}",
             server_type,
             str(allocation["server_id"]),
             env_config['model_path'],
@@ -269,13 +263,27 @@ def submit_job(config, log_dir):
             profiling_config['gen_profile_range']
             if server_type == "GEN" else profiling_config['ctx_profile_range'],
             gen_config_path if server_type == "GEN" else ctx_config_path,
-            f'"{worker_env_var}"',
+            f'"{cur_worker_env_var}"',
             f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
         ]
         start_worker_cmds.append(" ".join(cmd))
 
-    with open(os.path.join(log_dir, "start_worker_cmds.txt"), "w") as f:
+    with open(os.path.join(log_dir, "start_worker_cmds.sh"), "w") as f:
         f.write("\n".join(start_worker_cmds) + "\n")
+
+    # Generate start server commands
+    cmd = [
+        f"srun -l --container-name={container_name}",
+        f"--container-image={env_config['container_image']}",
+        f"--container-mounts={env_config['container_mount']}",
+        f"--mpi=pmix --overlap -N 1 -n 1",
+        f"bash {env_config['work_dir']}/start_server.sh {ctx_num} {gen_num} {log_dir} {env_config['work_dir']} {server_env_var}",
+        f"&> {log_dir}/4_output_server.log &",
+    ]
+    start_server_cmd=" ".join(cmd)
+
+    with open(os.path.join(log_dir, "start_server_cmd.sh"), "w") as f:
+        f.write(start_server_cmd + "\n")
 
     # Prepare sbatch command
     # yapf: disable
@@ -296,7 +304,6 @@ def submit_job(config, log_dir):
         slurm_config['script_file'],
 
         # Worker configuration
-        '--num-ctx-servers', str(ctx_num),
         '--num-gen-servers', str(gen_num),
         '--concurrency-list', config['benchmark']['concurrency_list'],
 
@@ -326,9 +333,6 @@ def submit_job(config, log_dir):
         '--accuracy-model', config['accuracy']['model'],
         '--accuracy-tasks', config['accuracy']['tasks'],
         '--model-args-extra', config['accuracy']['model_args_extra'],
-
-        # Server environment variables
-        '--server-env-var', env_config['server_env_var']
     ]
     # yapf: enable
 

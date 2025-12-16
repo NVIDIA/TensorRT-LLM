@@ -5,7 +5,6 @@ set -euo pipefail
 while [[ $# -gt 0 ]]; do
     case $1 in
         # Worker configuration
-        --num-ctx-servers) num_ctx_servers="$2"; shift 2 ;;
         --num-gen-servers) num_gen_servers="$2"; shift 2 ;;
         --concurrency-list) concurrency_list="$2"; shift 2 ;;
 
@@ -35,9 +34,6 @@ while [[ $# -gt 0 ]]; do
         --accuracy-model) accuracy_model="$2"; shift 2 ;;
         --accuracy-tasks) accuracy_tasks="$2"; shift 2 ;;
         --model-args-extra) model_args_extra="$2"; shift 2 ;;
-
-        # Server environment variables
-        --server-env-var) server_env_var="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -49,7 +45,6 @@ done
 echo "Parsed arguments:"
 echo
 echo "Worker Configuration:"
-echo "  num_ctx_servers: ${num_ctx_servers}"
 echo "  num_gen_servers: ${num_gen_servers}"
 echo "  concurrency_list: ${concurrency_list}"
 echo
@@ -78,15 +73,10 @@ echo "  enable_accuracy_test: ${enable_accuracy_test}"
 echo "  accuracy_model: ${accuracy_model}"
 echo "  accuracy_tasks: ${accuracy_tasks}"
 echo "  model_args_extra: ${model_args_extra}"
-echo
-echo "Server Environment Variables:"
-echo "  server_env_var: ${server_env_var}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
     export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
-    worker_env_var="${worker_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
-    server_env_var="${server_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
     echo "Setting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode"
 fi
 
@@ -163,7 +153,7 @@ all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
-start_worker_cmds_file=${full_logdir}/start_worker_cmds.txt
+start_worker_cmds_file=${full_logdir}/start_worker_cmds.sh
 IFS=',' read -r -a node_array <<< "$all_nodes_str"
 for i in "${!node_array[@]}"; do
     current_val="${node_array[$i]}"
@@ -188,13 +178,9 @@ cat ${start_worker_cmds_file} | while read cmd; do
 done
 
 # start the server (in background)
-echo "Starting server..."
-srun -l --container-name=${container_name} \
-    --container-image=${container_image} \
-    --container-mounts=${container_mount} \
-    --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
-    &> ${full_logdir}/4_output_server.log &
+start_server_cmd_file=${full_logdir}/start_server_cmd.sh
+echo "Starting server command from ${start_server_cmd_file}..."
+eval $(cat ${start_server_cmd_file})
 
 # Wait for server to be ready (runs synchronously)
 echo "Waiting for server to be ready..."
