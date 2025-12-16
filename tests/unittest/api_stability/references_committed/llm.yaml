@@ -10,7 +10,7 @@ methods:
           tensorrt_llm.llmapi.tokenizer.TokenizerBase, NoneType]
         default: null
       tokenizer_mode:
-        annotation: Literal['auto', 'slow', 'deepseek_v32']
+        annotation: Literal['auto', 'slow']
         default: auto
       skip_tokenizer_init:
         annotation: bool
