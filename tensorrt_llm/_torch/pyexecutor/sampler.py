@@ -406,7 +406,7 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    if not hasattr(request, "py_sampling_strategy"):
+    if not hasattr(request, "py_sampling_strategy") or _get_max_beam_width(request) > 1:
         params = _request_get_sampling_params(request)
         request.py_sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
     return request.py_sampling_strategy
