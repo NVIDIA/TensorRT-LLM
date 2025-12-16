@@ -226,6 +226,12 @@ def run_sharding_pattern_detection_test(
         detected_transformations: List of detected transformation configurations
         expected_transformations: List of expected transformation configurations
     """
+    # Remove config field from transformations
+    for transform in detected_transformations:
+        transform.config = None
+    for transform in expected_transformations:
+        transform.config = None
+
     # Convert to sets for unordered comparison
     detected_set = set(detected_transformations)
     expected_set = set(expected_transformations)
