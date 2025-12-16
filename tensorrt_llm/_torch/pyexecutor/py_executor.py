@@ -1640,6 +1640,10 @@ class PyExecutor:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 
+                # If the batch is not empty on this rank, but empty on other ranks,
+                # we need to delay the update of the previous batch's sample state,
+                # and let the later iteration to update it.
+                should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
 
                     # The generation requests that are do not have batch_idx,
@@ -1689,11 +1693,7 @@ class PyExecutor:
                         scheduled_batch, previous_tensors_device,
                         num_accepted_tokens_device)
 
-                # If the batch is not empty on this rank, but empty on other ranks,
-                # we need to delay the update of the previous batch's sample state,
-                # and let the later iteration to update it.
-                if self.previous_batch is not None and not (can_queue_this_rank
-                                                            and not can_queue):
+                if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
 
                     if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
@@ -1708,8 +1708,7 @@ class PyExecutor:
                                         (req, block_id,
                                          self.ctx_in_transmission_counter))
 
-                if self.drafter is not None and self.use_spec_decode and not (
-                        can_queue_this_rank and not can_queue):
+                if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
@@ -1737,8 +1736,7 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                if self.previous_batch is not None and not (can_queue_this_rank
-                                                            and not can_queue):
+                if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
 
                 if can_queue:
@@ -2121,7 +2119,7 @@ class PyExecutor:
                         or req.is_generation_to_complete_state)
             ])
 
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0 and self.dist.world_size > 1:
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
