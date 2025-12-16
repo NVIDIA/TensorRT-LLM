@@ -406,8 +406,10 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    params = _request_get_sampling_params(request)
-    return resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if not hasattr(request, "py_sampling_strategy"):
+        params = _request_get_sampling_params(request)
+        request.py_sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    return request.py_sampling_strategy
 
 
 def _group_requests_by_strategy_key(
