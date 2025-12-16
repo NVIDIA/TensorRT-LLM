@@ -29,7 +29,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [Enabling Embedding Table Offloading](#enabling-embedding-table-offloading)
 
 ## Runtime Modes
-TensorRT-LLM supports three runtime modes for running multimodal models.
+TensorRT LLM supports three runtime modes for running multimodal models.
 - `cpp_llm_only` (default): vision engine runs in python runtime, LLM in pybind C++ runtime
 - `python`: everything runs in python runtime
 - `cpp`: everything runs in C++ runtime
@@ -592,7 +592,7 @@ Firstly, please install transformers with 4.37.2
 
 ## LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA
 
-[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT. [LLaVA-OneVision](https://huggingface.co/collections/llava-hf/llava-onevision-66bb1e9ce8856e210a7ed1fe) is another extension of LLaVA.
+[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT. [LLaVA-OneVision](https://huggingface.co/collections/llava-hf/llava-onevision-66bb1e9ce8856e210a7ed1fe) is another extension of LLaVA.
 
 1. Download Huggingface model weights. These models have both visual and LLM components
    unlike BLIP2 example which downloads only LLM components from Huggingface.
@@ -901,7 +901,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 
 ## NeVA
 
-[NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/multimodal/mllm/neva.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
+[NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/vlms/neva.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
 
 1. Generate TRT-LLM engine for NVGPT following example in `examples/models/core/gpt/README.md`. To adhere to the NVGPT conventions of the conversion script, some layer keys have to be remapped using `--nemo_rename_key`.
 

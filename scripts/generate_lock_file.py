@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Generates pyproject.toml and poetry.lock files from requirements.txt
 
@@ -27,11 +32,13 @@ python3 scripts/generate_lock_files.py --path <path>/requirements.txt
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.getcwd())
@@ -74,6 +81,25 @@ def get_project_info(path: str):
     return {"name": name, "version": version}
 
 
+def generate_metadata_json():
+    try:
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                              text=True).strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving git commit hash: {e}")
+        raise
+
+    data = {
+        "commit_hash": commit_hash,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    }
+    with open(f"{FOLDER_SECURITY_SCANNING}/metadata.json",
+              "w",
+              encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Lock files generator",
@@ -93,6 +119,7 @@ if __name__ == "__main__":
     if os.path.exists(FOLDER_SECURITY_SCANNING):
         shutil.rmtree(FOLDER_SECURITY_SCANNING)
     os.mkdir(FOLDER_SECURITY_SCANNING)
+    generate_metadata_json()
 
     # generate pyproject.toml and poetry.lock files in the same location
     for path in paths:
@@ -108,7 +135,7 @@ if __name__ == "__main__":
         print(f"Initializing PyProject.toml in {file_path}")
         project_info = get_project_info(file_path)
         name = project_info["name"]
-        author = '"TensorRT LLM [svc_tensorrt_llm@nvidia.com]"'
+        author = '"TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"'
         version = project_info["version"]
         py_version = '">=3.10,<3.13"'
         poetry_init_cmd = f'poetry init --no-interaction --name {name} --author {author} --python {py_version}'

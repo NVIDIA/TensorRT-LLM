@@ -26,13 +26,14 @@
 #include <cute/tensor.hpp>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 #include "fmhaRunnerParams.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -107,6 +108,8 @@ struct KernelParams
     // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
     // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
     int32_t const* ptrSeqLensKv;
+    // Reserved buffer.
+    int32_t* ptrReservedBuffer;
     // The softmax stats buffer.
     float2* ptrSoftmaxStats;
 
@@ -116,6 +119,9 @@ struct KernelParams
     int32_t mBatchSize;
     // The chunked attention size in log2.
     int32_t mChunkedAttentionSizeLog2;
+    // The factor to add to the maximum value to increase the probability
+    //   of skip correction during next iterations.
+    float mInflateMax;
     // The log of the Sage Attention block size for K.
     int32_t mLogNumEltsPerSageAttnBlkK;
     // The log of the Sage Attention block size for P.
@@ -142,6 +148,8 @@ struct KernelParams
     int64_t mNumHiddenEltsO;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
+    int32_t mNumTokensPerPageLog2;
     // The output scale for FP8 quantization.
     float mOutputScale;
     // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -150,11 +158,17 @@ struct KernelParams
     float mScaleSfKv;
     // The SF scale for O.
     float mScaleSfO;
+    // The reserved parameter.
+    float mReservedParam;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
     // kernel when inflight batching is enabled in TRT-LLM.
     int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+    // The top k value for sparse MLA.
+    int32_t mSparseMlaTopK;
+    // The flag to use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -578,8 +592,8 @@ struct KernelParams
 
         // Check shape must be in range [1, 2^32]
         int32_t dim = shapes.size();
-        // Max five dimension and min 3 dimension.
-        TLLM_CHECK((dim <= 5) && (dim >= 3));
+        // Max five dimension and min 2 dimension.
+        TLLM_CHECK((dim <= 5) && (dim >= 2));
         // Check shape range.
         for (int32_t ii = 0; ii < dim; ++ii)
         {
@@ -675,14 +689,15 @@ struct KernelParams
         // The number of elements in 128B for Q.
         int32_t numEltsIn128BKv = (128 * 8) / get_size_in_bits(kernelMeta.mDataTypeKv);
         // The number of head elts (per token) in each block of shared memory (see above explanation).
-        int32_t numEltsInClampedHeadDimKv = std::min(numEltsIn128BKv, maxHeadDimKv);
+        // HeadDim will be split into multiple headDimStages (128) if maxHeadDimKv > 128.
+        int32_t numEltsInClampedHeadDimKv = std::min({numEltsIn128BKv, maxHeadDimKv, 128});
 
         // Do we have to transform K/V before MMA?
         bool const transformsKv{kernelMeta.mDataTypeKv != kernelMeta.mDataTypeQ};
         // Whether store transformed K/V in TMEM.
         bool const isSwapsMmaAb = isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType));
         bool const storeTransformedKvInTmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1
-            && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 && maxHeadDimKv == 128 && isSwapsMmaAb};
+            && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 && maxHeadDimKv >= 128 && isSwapsMmaAb};
 
         // Shape/stride for gmem tensor Kv.
         auto [shapeK, strideK]
@@ -690,13 +705,23 @@ struct KernelParams
         auto [shapeV, strideV]
             = makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv, /*isK*/ false, storeTransformedKvInTmem);
         // Whether swizzle is needed for K/V.
-        bool const swizzleKv{storeTransformedKvInTmem ? true : !transformsKv};
+        bool const swizzleKv{storeTransformedKvInTmem || !transformsKv};
         // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
         auto const numEltsDivisor = kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;
         // The tileShapes for K/V.
         std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
+
+        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
+        // headDimQk).
+        if (options.mSparseMla)
+        {
+            shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
+            strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+            tileShapeKv[1] = 1;
+        }
+
         // Build tma descriptor for K.
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
@@ -807,9 +832,21 @@ struct KernelParams
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
         params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumTokensPerPageLog2 = 0;
+        if (isPagedKv(options.mQkvLayout))
+        {
+            TLLM_CHECK_WITH_INFO((options.mNumTokensPerPage & (options.mNumTokensPerPage - 1)) == 0,
+                "NumTokensPerPage must be a power of 2");
+            params.mNumTokensPerPageLog2 = static_cast<int32_t>(std::log2(options.mNumTokensPerPage));
+        }
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
+        // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
+        TLLM_CHECK_WITH_INFO(
+            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
+        params.mSparseMlaTopK = options.mSparseMlaTopK;
+        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
 
         return params;
     }
@@ -818,4 +855,5 @@ struct KernelParams
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

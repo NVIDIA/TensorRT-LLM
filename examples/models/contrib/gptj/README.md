@@ -1,6 +1,6 @@
 # GPT-J
 
-This document explains how to build the [GPT-J](https://huggingface.co/EleutherAI/gpt-j-6b) model using TensorRT-LLM and run on a single GPU.
+This document explains how to build the [GPT-J](https://huggingface.co/EleutherAI/gpt-j-6b) model using TensorRT LLM and run on a single GPU.
 
 - [GPT-J](#gpt-j)
   - [Overview](#overview)
@@ -18,10 +18,10 @@ This document explains how to build the [GPT-J](https://huggingface.co/EleutherA
 
 ## Overview
 
-The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
+The TensorRT LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT LLM GPT-J example
 code is located in [`examples/models/contrib/gptj`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -61,7 +61,7 @@ wget https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/merges.txt
 
 ### 2. Build TensorRT engine(s)
 
-TensorRT-LLM builds TensorRT engine(s) using a HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) using
+TensorRT LLM builds TensorRT engine(s) using a HF checkpoint. If no checkpoint directory is specified, TensorRT LLM will build engine(s) using
 dummy weights.
 
 Examples of build invocations:
@@ -76,7 +76,7 @@ python convert_checkpoint.py --model_dir ./gpt-j-6b \
 ***For all kinds of checkpoints, they share the same trtllm-build command like:***
 
 ```bash
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Enable several TensorRT LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build --checkpoint_dir ./trt_ckpt/gptj_fp16_tp1/ \
              --output_dir ./trt_engines/gptj_fp16_tp1/ \
              --gemm_plugin float16 \
@@ -229,7 +229,7 @@ Building command is identical to the common one above.
 ### 3. Run
 
 
-To run a TensorRT-LLM GPT-J model:
+To run a TensorRT LLM GPT-J model:
 
 ```bash
 python3 ../../../run.py --max_output_len=50 --engine_dir=gptj_engine --tokenizer_dir=gptj_model
@@ -237,7 +237,7 @@ python3 ../../../run.py --max_output_len=50 --engine_dir=gptj_engine --tokenizer
 
 ## Summarization using the GPT-J model
 
-The following section describes how to run a TensorRT-LLM GPT-J model to summarize the articles from the
+The following section describes how to run a TensorRT LLM GPT-J model to summarize the articles from the
 [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 The script can also perform the same summarization using the HF GPT-J model.

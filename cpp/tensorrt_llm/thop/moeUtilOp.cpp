@@ -32,6 +32,8 @@ namespace common = tensorrt_llm::common;
 namespace kernels = tensorrt_llm::kernels;
 namespace cutlass_kernels = tensorrt_llm::kernels::cutlass_kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -329,6 +331,8 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -341,14 +345,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_finalize_scale_op(Tensor gemm2_output, Tensor? biases, Tensor unpermuted_final_scales, Tensor "
         "unpermuted_row_to_permuted_row, Tensor permuted_row_to_unpermuted_row, Tensor token_selected_experts, Tensor "
         "expert_first_token_offset_tensor, bool enable_alltoall, SymInt num_rows, SymInt hidden_size, SymInt "
-        "unpadded_hidden_size, int "
-        "experts_per_token, int "
-        "num_experts_per_node, int tp_size, int tp_rank, int ep_size, int ep_rank)"
-        "-> (Tensor)");
+        "unpadded_hidden_size, int experts_per_token, int num_experts_per_node, int tp_size, int tp_rank, int ep_size, "
+        "int ep_rank) -> (Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_permute_op", &torch_ext::moe_permute_op);
-    m.impl("moe_finalize_scale_op", &torch_ext::run_moe_finalize_scale_op);
+    m.impl("moe_permute_op", &tensorrt_llm::torch_ext::moe_permute_op);
+    m.impl("moe_finalize_scale_op", &tensorrt_llm::torch_ext::run_moe_finalize_scale_op);
 }

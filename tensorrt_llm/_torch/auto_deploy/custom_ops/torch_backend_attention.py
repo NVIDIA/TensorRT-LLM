@@ -1,7 +1,7 @@
 """Torch backend attention using pure PyTorch reference implementations."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -19,7 +19,6 @@ from .attention_interface import (
     CacheInitializerDict,
     Constant,
     MHACallable,
-    PrepareMetadataCallable,
     SequenceInfo,
 )
 from .torch_attention import repeat_kv, update_kv_cache
@@ -253,11 +252,14 @@ def torch_backend_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    # METADATA
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -274,6 +276,14 @@ def torch_backend_mha_with_cache(
     num_kv_heads, qk_head_dim = k_cache.shape[-2:]
     v_head_dim = v_cache.shape[-1]
     b, s = q.shape[:2]
+
+    # get cleaned up metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    input_pos = input_pos[:num_seq]
+    cache_loc = cache_loc[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
 
     # check for num_heads
     num_heads = q.shape[2] // qk_head_dim if q.ndim == 3 else q.shape[2]
@@ -337,56 +347,30 @@ def torch_backend_mha_with_cache(
 
 @torch_backend_mha_with_cache.register_fake
 def torch_backend_mha_with_cache_fake(
+    # Q, K, V
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    # STANDARD METADATA
+    batch_info: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
+    # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    # BUFFERS
+    # <none>
+    # CONSTANTS
     scale: Optional[float],
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
 ):
     return q.new_empty(*q.shape[:-1], v.shape[-1]).contiguous()
-
-
-@torch.library.custom_op("auto_deploy::torch_cached_attention_prepare_metadata", mutates_args=())
-def torch_backend_prepare_metadata(
-    input_ids: torch.Tensor,
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    page_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for torch backend attention (similar to triton backend)."""
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
-    seq_start = torch.zeros_like(seq_len[:num_seq])
-    seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
-    return (
-        seq_len[:num_seq].clone(),
-        input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
-        seq_start,
-    )
-
-
-@torch_backend_prepare_metadata.register_fake
-def torch_backend_prepare_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
-):
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
-    return (
-        torch.empty_like(seq_len[:num_seq]),
-        torch.empty_like(input_pos[:num_seq]),
-        torch.empty_like(cache_loc[:num_seq]),
-        torch.empty_like(seq_len[:num_seq]),
-    )
 
 
 @AttentionRegistry.register("torch")
@@ -408,15 +392,15 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_attention_with_cache
+        return torch.ops.auto_deploy.torch_cached_attention_with_cache.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.auto_deploy.torch_cached_attention_prepare_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(
@@ -459,6 +443,21 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Sanity check: layout == "bsnd"
+        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        layout = source_attn_node.kwargs.get("layout", None)
+        if (
+            layout is None
+            and len(source_attn_node.args) > 0
+            and isinstance(source_attn_node.args[-1], str)
+        ):
+            layout = source_attn_node.args[-1]
+        if layout != "bsnd":
+            raise RuntimeError(
+                f"Expected torch_attention layout='bsnd' but got {layout!r} "
+                f"for node: {source_attn_node.format_node()}"
+            )
+
         # Check other arguments
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
@@ -476,8 +475,8 @@ class TorchBackendAttention(AttentionDescriptor):
             scale = source_attn_node.kwargs.get("scale", None)
 
         # Validate scale
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
         # Get sinks, sliding_window, and logit_cap from args or kwargs

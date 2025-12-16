@@ -1,229 +1,253 @@
 #!/bin/bash
-#SBATCH --nodes=2
-#SBATCH --ntasks=8
-#SBATCH --ntasks-per-node=4
-#SBATCH --partition=${partition} # add your partition here or specify in the sbatch command
-#SBATCH --account=${account} # add your account here or specify in the sbatch command
-#SBATCH --job-name=${job_name} # add your job name here or specify in the sbatch command
-#SBATCH --time=02:00:00
+set -euo pipefail
 
-set -u
-set -e
-set -x
+# Parse named arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        # Worker configuration
+        --num-ctx-servers) num_ctx_servers="$2"; shift 2 ;;
+        --num-gen-servers) num_gen_servers="$2"; shift 2 ;;
+        --concurrency-list) concurrency_list="$2"; shift 2 ;;
 
-# Context servers arguments
-num_ctx_servers=${1}
-ctx_tp_size=${2}
-ctx_pp_size=${3}
-ctx_batch_size=${4}
-ctx_max_num_tokens=${5}
-ctx_enable_attention_dp=${6}
-ctx_gpu_memory_fraction=${7}
+        # Sequence and benchmark parameters
+        --isl) isl="$2"; shift 2 ;;
+        --osl) osl="$2"; shift 2 ;;
+        --multi-round) multi_round="$2"; shift 2 ;;
+        --benchmark-ratio) benchmark_ratio="$2"; shift 2 ;;
+        --streaming) streaming="$2"; shift 2 ;;
+        --use-nv-sa-benchmark) use_nv_sa_benchmark="$2"; shift 2 ;;
+        --benchmark-mode) benchmark_mode="$2"; shift 2 ;;
 
-# Generation servers arguments
-num_gen_servers=${8}
-gen_tp_size=${9}
-gen_pp_size=${10}
-gen_batch_size=${11}
-gen_max_num_tokens=${12}
-gen_enable_attention_dp=${13}
-gen_gpu_memory_fraction=${14}
+        # Environment and paths
+        --dataset-file) dataset_file="$2"; shift 2 ;;
+        --model-path) model_path="$2"; shift 2 ;;
+        --trtllm-repo) trtllm_repo="$2"; shift 2 ;;
+        --work-dir) work_dir="$2"; shift 2 ;;
+        --full-logdir) full_logdir="$2"; shift 2 ;;
+        --container-mount) container_mount="$2"; shift 2 ;;
+        --container-image) container_image="$2"; shift 2 ;;
+        --build-wheel) build_wheel="$2"; shift 2 ;;
+        --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
+        --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
 
-# Other arguments
-eplb_num_slots=${15}
-mtp_size=${16}
+        # Accuracy evaluation
+        --enable-accuracy-test) enable_accuracy_test="$2"; shift 2 ;;
+        --accuracy-model) accuracy_model="$2"; shift 2 ;;
+        --accuracy-tasks) accuracy_tasks="$2"; shift 2 ;;
+        --model-args-extra) model_args_extra="$2"; shift 2 ;;
 
-# Benchmarking arguments
-concurrency=${17}
-isl=${18}
-osl=${19}
-multi_round=${20}
-streaming=${21}
+        # Server environment variables
+        --server-env-var) server_env_var="$2"; shift 2 ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
 
-# User specific arguments
-container_image=${22}
-mounts=${23}
-workdir=${24}
-model_dir=${25}
-benchmark_mode=${26}
-trtllm_repo=${27:-""}
+# Print all parsed arguments
+echo "Parsed arguments:"
+echo
+echo "Worker Configuration:"
+echo "  num_ctx_servers: ${num_ctx_servers}"
+echo "  num_gen_servers: ${num_gen_servers}"
+echo "  concurrency_list: ${concurrency_list}"
+echo
+echo "Benchmark Configuration:"
+echo "  isl: ${isl}"
+echo "  osl: ${osl}"
+echo "  multi_round: ${multi_round}"
+echo "  benchmark_ratio: ${benchmark_ratio}"
+echo "  streaming: ${streaming}"
+echo "  use_nv_sa_benchmark: ${use_nv_sa_benchmark}"
+echo "  benchmark_mode: ${benchmark_mode}"
+echo
+echo "Environment Configuration:"
+echo "  dataset_file: ${dataset_file}"
+echo "  model_path: ${model_path}"
+echo "  trtllm_repo: ${trtllm_repo}"
+echo "  work_dir: ${work_dir}"
+echo "  full_logdir: ${full_logdir}"
+echo "  container_mount: ${container_mount}"
+echo "  container_image: ${container_image}"
+echo "  build_wheel: ${build_wheel}"
+echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
+echo
+echo "Accuracy Configuration:"
+echo "  enable_accuracy_test: ${enable_accuracy_test}"
+echo "  accuracy_model: ${accuracy_model}"
+echo "  accuracy_tasks: ${accuracy_tasks}"
+echo "  model_args_extra: ${model_args_extra}"
+echo
+echo "Server Environment Variables:"
+echo "  server_env_var: ${server_env_var}"
 
-# Get GPUs per node dynamically from SLURM
-ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
-
-echo "================= parameters ================="
-echo "num_ctx_servers: ${num_ctx_servers}"
-echo "ctx_tp_size: ${ctx_tp_size}"
-echo "ctx_pp_size: ${ctx_pp_size}"
-echo "ctx_batch_size: ${ctx_batch_size}"
-echo "ctx_max_num_tokens: ${ctx_max_num_tokens}"
-echo "ctx_enable_attention_dp: ${ctx_enable_attention_dp}"
-echo "ctx_gpu_memory_fraction: ${ctx_gpu_memory_fraction}"
-echo "num_gen_servers: ${num_gen_servers}"
-echo "gen_tp_size: ${gen_tp_size}"
-echo "gen_pp_size: ${gen_pp_size}"
-echo "gen_batch_size: ${gen_batch_size}"
-echo "gen_max_num_tokens: ${gen_max_num_tokens}"
-echo "gen_enable_attention_dp: ${gen_enable_attention_dp}"
-echo "gen_gpu_memory_fraction: ${gen_gpu_memory_fraction}"
-echo "eplb_num_slots: ${eplb_num_slots}"
-echo "mtp_size: ${mtp_size}"
-echo "concurrency: ${concurrency}"
-echo "isl: ${isl}"
-echo "osl: ${osl}"
-echo "multi_round: ${multi_round}"
-echo "streaming: ${streaming}"
-echo "container_image: ${container_image}"
-echo "mounts: ${mounts}"
-echo "workdir: ${workdir}"
-echo "model_dir: ${model_dir}"
-echo "benchmark_mode: ${benchmark_mode}"
-echo "trtllm_repo: ${trtllm_repo}"
-echo "ntasks_per_node: ${ntasks_per_node}"
-echo "==========================================="
-
-
-numa_bind=true # Only allocate memory from nodes, this only works on GB200
-ctx_max_seq_len=$((isl + 10))
-gen_max_seq_len=$((isl + osl + 10))
-ctx_gpu_frac=${ctx_gpu_memory_fraction}
-cache_transceiver_max_num_tokens=8448
-
-container_name=disaggregated_serving
-logdir=${workdir}/slurm-${SLURM_JOB_ID}/benchmark-${isl}-${osl}
-mkdir -p ${logdir}
-full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
-
-nsys_on=""
-# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
-
-echo "concurrency: ${concurrency}"
-
-ctx_gpus=$((num_ctx_servers * ctx_tp_size * ctx_pp_size))
-gen_gpus=$((num_gen_servers * gen_tp_size * gen_pp_size))
-
-echo "enable_attention_dp: ${ctx_enable_attention_dp}, ${gen_enable_attention_dp}, gpu_memory_fraction: ${gen_gpu_memory_fraction}"
-
-enable_pdl=false
-if [ "${gen_enable_attention_dp}" = "false" ]; then
-    enable_pdl=true
-    echo "enable_pdl: ${enable_pdl}"
-    full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_tep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
-fi
-mkdir -p ${full_logdir}
-echo "Log will be saved to: ${full_logdir}"
-
-# check benchmark_mode
-if [ "${benchmark_mode}" != "gen_only" ] && [ "${benchmark_mode}" != "e2e" ]; then
-    echo "benchmark_mode: ${benchmark_mode} is not supported, change to default value: e2e"
-    benchmark_mode="e2e"
+# Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
+if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
+    export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1
+    worker_env_var="${worker_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    server_env_var="${server_env_var} TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1"
+    echo "Setting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode"
 fi
 
-if [ -z "${TRT_LLM_GIT_COMMIT:-}" ]; then
-    export TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
-fi
+container_name="disaggr-test"
 
-# start the container
-srun -l --container-image=${container_image} \
+# Function to cleanup on failure
+cleanup_on_failure() {
+    echo "Error: $1"
+    scancel ${SLURM_JOB_ID}
+    exit 1
+}
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID}" > ${full_logdir}/job_info.txt
+env > ${full_logdir}/environment.txt
+
+# Start container
+echo "Starting container..."
+if ! srun -l --container-image=${container_image} \
         --container-name=${container_name} \
-        --container-mounts=${mounts} \
+        --container-mounts=${container_mount} \
         --mpi=pmix \
-        echo "Container up."
+        echo "Container up." &> ${full_logdir}/1_container_launch.log; then
+    cleanup_on_failure "Failed to start container. Check ${full_logdir}/1_container_launch.log"
+fi
 
-if [ -n "${trtllm_repo}" ]; then
-    srun --container-name=${container_name} \
-        --container-mounts=${mounts} \
+# Install TensorRT-LLM
+if [ -n "${trtllm_wheel_path}" ]; then
+    # Install from pre-built wheel if path is provided
+    echo "Installing TensorRT-LLM from wheel: ${trtllm_wheel_path}..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && echo 'Running install operation...' && pip install -e .  " 2>&1 | tee ${full_logdir}/install.log
+        bash -c "pip install ${trtllm_wheel_path}" \
+        &> ${full_logdir}/2_install.log; then
+        cleanup_on_failure "TensorRT-LLM wheel installation failed. Check ${full_logdir}/2_install.log for details"
+    fi
+    echo "TensorRT-LLM wheel installation completed successfully"
+elif [ -d "${trtllm_repo}" ]; then
+    # Build and install from repository if no wheel path provided
+    echo "Installing TensorRT-LLM from ${trtllm_repo}..."
+    TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
+
+    if [ "${build_wheel}" = "true" ]; then
+        echo "Building TensorRT-LLM wheel on one node..."
+        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
+        if [ -n "${cuda_architectures:-}" ]; then
+            build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
+        fi
+        if ! srun --container-name=${container_name} \
+            --container-mounts=${container_mount} \
+            --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
+            bash -c "cd ${trtllm_repo} && ${build_command}" \
+            &> ${full_logdir}/2_build.log; then
+            cleanup_on_failure "TensorRT-LLM build failed. Check ${full_logdir}/2_build.log for details"
+        fi
+        echo "TensorRT-LLM build completed successfully"
+    fi
+
+    echo "Installing TensorRT-LLM..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "cd ${trtllm_repo} && pip install -e ." \
+        &> ${full_logdir}/2_install.log; then
+        cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/2_install.log for details"
+    fi
+    echo "TensorRT-LLM installation completed successfully"
 fi
 
-echo "Generating YAML file for workers."
-srun -l -N 1 -n 1 \
-        --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix --overlap \
-        python3 ${workdir}/gen_worker_config.py \
-                --work_dir ${full_logdir} \
-                --ctx_tp_size ${ctx_tp_size} \
-                --ctx_pp_size ${ctx_pp_size} \
-                --ctx_batch_size ${ctx_batch_size} \
-                --ctx_max_num_tokens ${ctx_max_num_tokens} \
-                --ctx_max_seq_len ${ctx_max_seq_len} \
-                --ctx_free_gpu_memory_fraction ${ctx_gpu_frac} \
-                --gen_tp_size ${gen_tp_size} \
-                --gen_pp_size ${gen_pp_size} \
-                --gen_batch_size ${gen_batch_size} \
-                --gen_max_num_tokens ${gen_max_num_tokens} \
-                --gen_max_seq_len ${gen_max_seq_len} \
-                --gen_gpu_memory_fraction ${gen_gpu_memory_fraction} \
-                --eplb_num_slots ${eplb_num_slots} \
-                --mtp_size ${mtp_size} \
-                --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
-                $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
-                $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
-                2>&1 | tee ${full_logdir}/gen_worker_config.log
-
-echo "YAML file generated."
-
-ctx_nodes_num=$(((ctx_tp_size + ntasks_per_node - 1) / ntasks_per_node))
-gen_nodes_num=$(((gen_tp_size + ntasks_per_node - 1) / ntasks_per_node))
-
+# Get node lists and replace the placeholder with the actual node names
+echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
-total_nodes_num=${#all_nodes[@]}
-echo "all_nodes: ${all_nodes[@]}, total_nodes_num: ${total_nodes_num}"
+all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
+echo "all_nodes_str: ${all_nodes_str}"
 
-# get the node list for the gen workers
-total_gen_nodes_num=$((gen_nodes_num * num_gen_servers))
-gen_nodes=(${all_nodes[@]:0:${total_gen_nodes_num}})
-echo "gen_nodes: ${gen_nodes[@]}, total_gen_nodes_num: ${total_gen_nodes_num}"
+start_worker_cmds_file=${full_logdir}/start_worker_cmds.txt
+IFS=',' read -r -a node_array <<< "$all_nodes_str"
+for i in "${!node_array[@]}"; do
+    current_val="${node_array[$i]}"
+    placeholder="<node${i}_placeholder>"
 
-# get the node list for the ctx workers
-total_ctx_nodes_num=$((ctx_nodes_num * num_ctx_servers))
-ctx_nodes=(${all_nodes[@]:${total_gen_nodes_num}:${total_nodes_num}})
-echo "ctx_nodes: ${ctx_nodes[@]}, total_ctx_nodes_num: ${total_ctx_nodes_num}"
-
-rm -rf ${full_logdir}/hostnames
-
-# start the gen workers
-for i in $(seq 0 $((num_gen_servers - 1))); do
-    srun -l -N ${gen_nodes_num} \
-        --ntasks=${gen_tp_size} \
-        --ntasks-per-node=${ntasks_per_node} \
-        --container-image=${container_image} \
-        --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix \
-        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
-        &> ${full_logdir}/output_gen_${i}.log &
+    # Use sed to replace the placeholder with the value in-place
+    sed -i "s|$placeholder|$current_val|g" "${start_worker_cmds_file}"
+    echo "Replaced $placeholder with $current_val"
 done
 
-# start the ctx workers
-for i in $(seq 0 $((num_ctx_servers - 1))); do
-    srun -l -N ${ctx_nodes_num} \
-        --ntasks=${ctx_tp_size} \
-        --ntasks-per-node=${ntasks_per_node} \
-        --container-image=${container_image} \
-        --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix \
-        bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
-            &> ${full_logdir}/output_ctx_${i}.log &
+# start the workers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
+echo "Starting worker commands from ${start_worker_cmds_file}..."
+cat ${start_worker_cmds_file} | while read cmd; do
+    # Skip ctx worker commands if in gen-only mode
+    # CTX appears as argument to start_worker.sh and in log filename
+    if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" = "1" ] && [[ "$cmd" == *"start_worker.sh CTX"* ]]; then
+        echo "Skipping ctx worker command (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set): ${cmd}"
+        continue
+    fi
+    echo "Starting worker command: ${cmd}"
+    eval "${cmd}"
 done
 
-# start the server
+# start the server (in background)
+echo "Starting server..."
 srun -l --container-name=${container_name} \
     --container-image=${container_image} \
-    --container-mounts=${mounts} \
+    --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${workdir} \
-        &> ${full_logdir}/output_server.log &
+    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} "${server_env_var}" \
+    &> ${full_logdir}/4_output_server.log &
 
-# start benchmarking
-srun -l --container-name=${container_name} \
-    --container-mounts=${mounts} \
+# Wait for server to be ready (runs synchronously)
+echo "Waiting for server to be ready..."
+if ! srun -l --container-name=${container_name} \
+    --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} \
-        &> ${full_logdir}/benchmark.log 2>&1
+    bash ${work_dir}/wait_server.sh ${full_logdir} \
+    &> ${full_logdir}/5_wait_server.log; then
+    cleanup_on_failure "Server failed to become ready. Check ${full_logdir}/5_wait_server.log for details"
+fi
+echo "Server is ready!"
 
+# Start benchmarking
+echo "Starting benchmark..."
+if [ "${use_nv_sa_benchmark}" = "true" ]; then
+    echo "Using NVIDIA SA benchmark script..."
+    if ! srun -l --container-name=${container_name} \
+            --container-mounts=${container_mount} \
+            --mpi=pmix --overlap -N 1 -n 1 \
+            bash ${work_dir}/run_benchmark_nv_sa.sh \
+            "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
+            &> ${full_logdir}/6_bench.log; then
+        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/6_bench.log for details"
+    fi
+else
+    echo "Using default benchmark script..."
+    if ! srun -l --container-name=${container_name} \
+            --container-mounts=${container_mount} \
+            --mpi=pmix --overlap -N 1 -n 1 \
+            bash ${work_dir}/run_benchmark.sh \
+            "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
+            &> ${full_logdir}/6_bench.log; then
+        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/6_bench.log for details"
+    fi
+fi
+echo "Benchmark completed successfully"
+
+# Run accuracy evaluation if enabled
+if [ "${enable_accuracy_test}" = "true" ]; then
+    echo "Starting accuracy evaluation..."
+    if ! srun -l --container-name=${container_name} \
+        --container-mounts=${container_mount} \
+        --mpi=pmix --overlap -N 1 -n 1 \
+        bash ${work_dir}/accuracy_eval.sh \
+        "${full_logdir}" "${accuracy_model}" "${accuracy_tasks}" "${model_path}" \
+        "${model_args_extra}" "${full_logdir}/accuracy_eval" \
+        &> ${full_logdir}/7_accuracy_eval.log; then
+        cleanup_on_failure "Accuracy evaluation failed. Check ${full_logdir}/7_accuracy_eval.log for details"
+    fi
+    echo "Accuracy evaluation completed successfully"
+fi
+
+echo "Total runtime: $SECONDS seconds"
+
+# try to kill the server and workers
 scancel ${SLURM_JOB_ID}

@@ -1,14 +1,32 @@
 # Run benchmarking with `trtllm-serve`
 
-TensorRT LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
+TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
  * Methodology Introduction
- * Launch the OpenAI-Compatibale Server with NGC container
+ * Launch the OpenAI-Compatible Server with NGC container
  * Run the performance benchmark
  * Using `extra_llm_api_options`
  * Multimodal Serving and Benchmarking
+
+## Table of Contents
+- [Run benchmarking with `trtllm-serve`](#run-benchmarking-with-trtllm-serve)
+  - [Table of Contents](#table-of-contents)
+  - [Methodology Introduction](#methodology-introduction)
+  - [Preparation](#preparation)
+    - [Launch the NGC container](#launch-the-ngc-container)
+    - [Start the trtllm-serve service](#start-the-trtllm-serve-service)
+  - [Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`](#benchmark-using-tensorrt_llmservescriptsbenchmark_serving)
+    - [Key Metrics](#key-metrics)
+  - [About `extra_llm_api_options`](#about-extra_llm_api_options)
+      - [`kv_cache_config`](#kv_cache_config)
+      - [`cuda_graph_config`](#cuda_graph_config)
+      - [`moe_config`](#moe_config)
+      - [`attention_backend`](#attention_backend)
+  - [Multimodal Serving and Benchmarking](#multimodal-serving-and-benchmarking)
+    - [Setting up Multimodal Serving](#setting-up-multimodal-serving)
+    - [Multimodal Benchmarking](#multimodal-benchmarking)
 
 
 ## Methodology Introduction
@@ -17,18 +35,20 @@ The overall performance benchmarking involves:
    1. Launch the OpenAI-compatible service with `trtllm-serve`
    2. Run the benchmark with [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
+## Preparation
 
-## Launch the NGC container
+### Launch the NGC container
 
 TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags).
 
 You can launch the container using the following command:
 
 ```bash
-docker run --rm --ipc host -p 8000:8000 --gpus all -it nvcr.io/nvidia/tensorrt-llm/release
+docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --ulimit stack=67108864 nvcr.io/nvidia/tensorrt-llm/release:x.y.z
 ```
 
-## Start the trtllm-serve service
+
+### Start the trtllm-serve service
 > [!WARNING]
 > The commands and configurations presented in this document are for illustrative purposes only.
 > They serve as examples and may not deliver the optimal performance for your specific use case.
@@ -78,9 +98,9 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 ```
 
-## Run the benchmark
+## Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`
 
-Similar to starting trtllm-serve, create a script to execute the benchmark using the following code and name it bench.sh.
+Similar to starting `trtllm-serve`, create a script to execute the benchmark using the following code and name it bench.sh.
 
 ```bash
 concurrency_list="1 2 4 8 16 32 64 128 256"
@@ -150,16 +170,50 @@ P99 E2EL (ms):                           1643.44
 
 ### Key Metrics
 
-* Median Time to First Token (TTFT)
+#### Time to First Token (TTFT)
   * The typical time elapsed from when a request is sent until the first output token is generated.
-* Median Time Per Output Token (TPOT)
-  * The typical time required to generate each token *after* the first one.
-* Median Inter-Token Latency (ITL)
-  * The typical time delay between the completion of one token and the completion of the next.
-* Median End-to-End Latency (E2EL)
+
+#### Time Per Output Token (TPOT) and Inter-Token Latency (ITL)
+  * TPOT is the typical time required to generate each token *after* the first one.
+  * ITL is the typical time delay between the completion of one token and the completion of the next.
+  * Both TPOT and ITL ignore TTFT.
+
+For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
+
+$$
+\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
+$$
+
+Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
+
+$$
+\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+$$
+
+$$
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
+$$
+
+#### End-to-End (E2E) Latency
   * The typical total time from when a request is submitted until the final token of the response is received.
-* Total Token Throughput
+
+#### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
+
+$$
+\text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
+
+#### Tokens Per Second (TPS) or Output Token Throughput
+  * how many output tokens the system generates each second.
+
+$$
+\text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
+$$
+
+### Request Time Breakdown
+
+To get more detailed metrics besides the key metrics above, there is an [experimental tool](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown) for request time breakdown.
 
 ## About `extra_llm_api_options`
    trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.
@@ -266,28 +320,28 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.
 ```
 ============ Serving Benchmark Result ============
-Successful requests:                     1         
-Benchmark duration (s):                  0.83      
-Total input tokens:                      128       
-Total generated tokens:                  128       
-Request throughput (req/s):              1.20      
-Output token throughput (tok/s):         153.92    
-Total Token throughput (tok/s):          307.85    
-User throughput (tok/s):                 154.15    
-Mean Request AR:                         0.9845    
-Median Request AR:                       0.9845    
+Successful requests:                     1
+Benchmark duration (s):                  0.83
+Total input tokens:                      128
+Total generated tokens:                  128
+Request throughput (req/s):              1.20
+Output token throughput (tok/s):         153.92
+Total Token throughput (tok/s):          307.85
+User throughput (tok/s):                 154.15
+Mean Request AR:                         0.9845
+Median Request AR:                       0.9845
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          84.03     
-Median TTFT (ms):                        84.03     
-P99 TTFT (ms):                           84.03     
+Mean TTFT (ms):                          84.03
+Median TTFT (ms):                        84.03
+P99 TTFT (ms):                           84.03
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          5.88      
-Median TPOT (ms):                        5.88      
-P99 TPOT (ms):                           5.88      
+Mean TPOT (ms):                          5.88
+Median TPOT (ms):                        5.88
+P99 TPOT (ms):                           5.88
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           5.83      
-Median ITL (ms):                         5.88      
-P99 ITL (ms):                            6.14      
+Mean ITL (ms):                           5.83
+Median ITL (ms):                         5.88
+P99 ITL (ms):                            6.14
 ==================================================
 ```
 

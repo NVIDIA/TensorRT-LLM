@@ -30,10 +30,11 @@
 #include "cutlass/epilogue/thread/linear_combination_relu.h"
 #include "cutlass/epilogue/thread/linear_combination_silu.h"
 #include "cutlass_extensions/epilogue/thread/fused_activations.h"
+#include "tensorrt_llm/common/config.h"
 #include <cutlass/epilogue/fusion/operations.hpp>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace cutlass_extensions
 {
 
@@ -58,6 +59,10 @@ struct EpilogueOpDefaultSilu
 };
 
 struct EpilogueOpDefaultReLU
+{
+};
+
+struct EpilogueOpDefaultRelu2
 {
 };
 
@@ -123,6 +128,14 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
 };
 
 template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
+struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpDefaultRelu2>
+{
+    using Op = cutlass::epilogue::thread::LinearCombinationGeneric<cutlass::epilogue::thread::Relu2, ElementType,
+        ElementsPerVectorAccess, ElementAccumulator, ElementAccumulator, DefaultScaleMode,
+        cutlass::FloatRoundStyle::round_to_nearest, true>;
+};
+
+template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
 struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpDefaultFtGelu>
 {
     using Op = cutlass::epilogue::thread::LinearCombinationGeneric<cutlass::epilogue::thread::GELU_taylor, ElementType,
@@ -138,4 +151,5 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
 };
 
 } // namespace cutlass_extensions
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

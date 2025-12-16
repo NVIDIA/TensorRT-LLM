@@ -55,39 +55,39 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         network = builder.create_network()
         network.plugin_config.weight_only_groupwise_quant_matmul_plugin = dtype
         with tensorrt_llm.net_guard(network):
-            # Init TensorRT-LLM tensor for activation
+            # Init TensorRT LLM tensor for activation
             activation = Tensor(
                 name='activation',
                 shape=th_activation.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
-            # Init TensorRT-LLM tensor for pre_quant_scale
+            # Init TensorRT LLM tensor for pre_quant_scale
             pre_quant_scale = Tensor(
                 name='pre_quant_scale',
                 shape=th_pre_quant_scale.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
-            # Init TensorRT-LLM tensor for weight
+            # Init TensorRT LLM tensor for weight
             weight = Tensor(name='weight',
                             shape=th_weight.shape,
                             dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
-            # Init TensorRT-LLM tensor for scale
+            # Init TensorRT LLM tensor for scale
             scale = Tensor(name='scale',
                            shape=th_scale.shape,
                            dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
-            # Init TensorRT-LLM tensor for zero
+            # Init TensorRT LLM tensor for zero
             if th_zero is not None:
                 zero = Tensor(name='zero',
                               shape=th_zero.shape,
                               dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             else:
                 zero = None
-            # Init TensorRT-LLM tensor for bias
+            # Init TensorRT LLM tensor for bias
             if th_bias is not None:
                 bias = Tensor(name='bias',
                               shape=th_bias.shape,
                               dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             else:
                 bias = None
-            # Init TensorRT-LLM tensor for alpha
+            # Init TensorRT LLM tensor for alpha
             if th_alpha is not None:
                 alpha = Parameter(th_alpha.cpu().numpy(),
                                   shape=th_alpha.shape,

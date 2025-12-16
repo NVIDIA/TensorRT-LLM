@@ -13,7 +13,7 @@ from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.multimodal import MultimodalParams
 from ....sampling_params import SamplingParams
-from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
+from ...pyexecutor.sampling_utils import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
@@ -110,10 +110,16 @@ class DemoEngine(ADEngine):
                     extra_args[k].append(v)
 
         sequence_info.reset()
+        page_assignments = self._assign_pages(total_lens)
+        cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
+            page_assignments
+        )
         sequence_info.nest_sequences(
             input_ids=input_ids,
             input_pos=0,
-            page_assignments=self._assign_pages(total_lens),
+            cache_loc=cache_loc,
+            pages_per_seq=pages_per_seq,
+            slot_idx=list(range(len(input_ids))),
             **extra_args,
         )
 
@@ -141,10 +147,15 @@ class DemoEngine(ADEngine):
             seq_lens_current = sequence_info.seq_len
             input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]
             total_lens_next = [ip + len(t_ids) for ip, t_ids in zip(input_pos_next, token_ids)]
+            page_assignments = self._assign_pages(total_lens_next)
+            cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
+                page_assignments
+            )
             sequence_info.nest_sequences(
                 token_ids,
                 input_pos=input_pos_next,
-                page_assignments=self._assign_pages(total_lens_next),
+                cache_loc=cache_loc,
+                pages_per_seq=pages_per_seq,
             )
 
             # nest new tokens and run stop check
@@ -233,8 +244,10 @@ class DemoEngine(ADEngine):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_shape = logits.shape
         logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
-        if isinstance(sampling_params.top_k, int):
-            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        if isinstance(sampling_params.top_k, int) and sampling_params.top_k > 1:
+            idx_next, probs = top_k_sampling_batch(
+                logits, top_k=sampling_params.top_k, temperature=1.0
+            )
         else:
             idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])

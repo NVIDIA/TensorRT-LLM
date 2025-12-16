@@ -17,6 +17,18 @@ The following subfolder contains test definitions for Tensorrt LLM.
         └── waives.txt  #         Test waive list
 ~~~
 
+## Test Waives
+
+The `waives.txt` file supports skipping tests based on:
+- **Platform name**: e.g., `full:RTX/`, `full:DGX-A100-40GB/`, `full:GH200/`
+- **SM version**: e.g., `full:sm90/`, `full:sm89/`, `full:sm100/`
+
+SM version mapping:
+- `sm89` = Ada (e.g., RTX 4090, L40S)
+- `sm90` = Hopper (e.g., H100, H200)
+- `sm100` = Blackwell (e.g., B100, B200)
+- `sm103` = Blackwell-Ultra (e.g., B300, GB300)
+
 - To run perf tests, you also need to first build the cpp benchmark by calling `build_wheel.py` with `--benchmarks` flag.
 
 ## Run perf tests
@@ -26,7 +38,7 @@ All the perf test names are in the form of `perf/test_perf.py::test_perf[...]` w
 Below are some specific pytest options used for perf tests
 
 ```bash
-# execute these in the tensorrt-llm source repo root dir.
+# execute these in the TensorRT LLM source repo root dir.
 # install dependencies, do not need to do it every time if already installed.
 pip install -r requirements-dev.txt
 

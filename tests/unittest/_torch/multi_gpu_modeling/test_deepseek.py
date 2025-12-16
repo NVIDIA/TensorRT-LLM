@@ -17,7 +17,6 @@ def similar(a, b, threshold=0.9):
     return SequenceMatcher(None, a, b).ratio() >= threshold
 
 
-@pytest.mark.skip(reason="https://nvbugs/5470782")
 @pytest.mark.parametrize("model_name", ["DeepSeek-V3-Lite"],
                          ids=["deepseekv3_lite"])
 @pytest.mark.parametrize("backend", ["TRTLLM"], ids=["trtllm"])

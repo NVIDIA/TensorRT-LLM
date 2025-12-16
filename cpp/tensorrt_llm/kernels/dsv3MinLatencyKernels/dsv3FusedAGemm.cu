@@ -21,6 +21,7 @@
 #include "cuda.h"
 #include "cuda_bf16.h"
 #include "cuda_runtime.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3FusedAGemm.h"
 
@@ -29,7 +30,9 @@ using bf16_t = __nv_bfloat16;
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::dsv3MinLatencyKernels
 {
 
 __device__ void hmma_16_8_16_f32acc_bf16ab(
@@ -296,7 +299,7 @@ public:
     __device__ void issue_mainloop()
     {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        asm volatile("griddepcontrol.wait;");
+        cudaGridDependencySynchronize();
 #pragma unroll 1
         for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++)
         {
@@ -601,6 +604,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
         }
     }
     __syncthreads();
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
 
     if (warp_idx < 2)
     {
@@ -622,7 +627,6 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
         mma_computer.issue_mainloop();
         mma_computer.epi();
     }
-    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -680,4 +684,6 @@ template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
-} // namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+} // namespace kernels::dsv3MinLatencyKernels
+
+TRTLLM_NAMESPACE_END

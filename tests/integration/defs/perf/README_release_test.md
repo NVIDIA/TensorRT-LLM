@@ -1,12 +1,12 @@
-# TensorRT-LLM Performance Test Flow (Default PyTorch Flow)
+# TensorRT LLM Performance Test Flow (Default PyTorch Flow)
 
 ## Overview
-This document describes the complete TensorRT-LLM performance testing workflow, particularly for the default PyTorch backend testing process for release testing.
+This document describes the complete TensorRT LLM performance testing workflow, particularly for the default PyTorch backend testing process for release testing.
 
 ## 1. Test Scripts
 
 ### Main Test Script
-The main script for TensorRT-LLM performance testing is `test_perf.py`, which is responsible for executing all performance test cases.
+The main script for TensorRT LLM performance testing is `test_perf.py`, which is responsible for executing all performance test cases.
 
 ### Performance Metrics
 For trtllm-bench, the test extracts the following key performance metrics from logs:
@@ -24,27 +24,25 @@ For trtllm-bench, the test extracts the following key performance metrics from l
 
 #### Without LoRA
 ```python
-prepare_data_script = os.path.join(self._llm_root, "benchmarks", "cpp", "prepare_dataset.py")
 data_cmd += [
-    "python3", prepare_data_script, "--stdout",
-    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
-    f"--num-requests={self._config.num_reqs}",
-    f"--input-mean={input_len}", f"--output-mean={output_len}",
-    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-    f" > {dataset_path}"
+    "trtllm-bench", f"--model={tokenizer_dir}",
+        "prepare-dataset", "--output", dataset_path, "token-norm-dist",
+        f"--num-requests={self._config.num_reqs}",
+        f"--input-mean={input_len}", f"--output-mean={output_len}",
+        f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
 ]
 ```
 
 #### With LoRA
 ```python
-"python3", prepare_data_script, f"--stdout",
+"trtllm-bench", f"--model={tokenizer_dir}",
+    "prepare-dataset", "--output", dataset_path,
     f"--rand-task-id 0 {nloras-1}",
-    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+    f"--lora-dir={lora_dir}",
     f"token-norm-dist",
     f"--num-requests={self._config.num_reqs}",
     f"--input-mean={input_len}", f"--output-mean={output_len}",
-    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-    f" > {dataset_path}"
+    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
 ```
 
 ### 2.2 PyTorch Configuration Generation

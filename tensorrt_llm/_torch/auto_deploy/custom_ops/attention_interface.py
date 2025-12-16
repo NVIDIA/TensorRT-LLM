@@ -10,25 +10,309 @@ and operates on a purely functional paradigm that is compatible with the torch c
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch._ops import OpOverloadPacket
-from torch.export import Dim
 from torch.fx import Node
+from torch.types import Number
 
 from ...._utils import nvtx_range
+from ..utils.logger import ad_logger
 
-DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
-DynamicShapeCallback = Callable[[], DynamicShape]
+Constant = Union[int, float, str, None]
 
 
-@dataclass
-class CacheConfig:
-    """A dataclass to hold information how to configure the cache."""
+class InputBuffer:
+    """Manages contiguous memory buffers for efficient host-to-device transfers.
 
-    dtype: Optional[torch.dtype] = None
+    This class consolidates multiple tensors into a single contiguous buffer on both
+    host (pinned memory) and device. This enables efficient bulk transfers with a
+    single async H2D copy instead of multiple small copies.
+
+    The buffer layout places the truncatable tensor (typically cache_loc) last,
+    allowing partial copies when the full buffer isn't needed.
+
+    Usage:
+        1. Create InputBuffer with tensor specifications (name, max_numel, dtype)
+        2. Use store() to write data to the pinned host buffer
+        3. Call copy_to_device() to perform a single async H2D transfer
+        4. Access device tensors via get_view()
+    """
+
+    def __init__(self, tensor_specs: List[Tuple[str, int, torch.dtype]]):
+        """Initialize the InputBuffer.
+
+        Args:
+            tensor_specs: Ordered list of (name, max_numel, dtype) tuples.
+                         The last tensor is treated as truncatable during copy.
+        """
+        self._tensor_specs = {name: (numel, dtype) for name, numel, dtype in tensor_specs}
+        self._tensor_order = [name for name, _, _ in tensor_specs]
+
+        # Calculate offsets for each tensor (aligned to dtype's element size)
+        self._offsets: Dict[str, int] = {}
+        self._byte_sizes: Dict[str, int] = {}
+
+        current_offset = 0
+        for name, numel, dtype in tensor_specs:
+            # Align to the tensor's element size for proper memory access
+            alignment = dtype.itemsize
+            aligned_offset = (current_offset + alignment - 1) // alignment * alignment
+            byte_size = numel * dtype.itemsize
+            self._offsets[name] = aligned_offset
+            self._byte_sizes[name] = byte_size
+            current_offset = aligned_offset + byte_size
+
+        # Total buffer size
+        self._total_bytes = current_offset
+
+        # Allocate contiguous buffers (device buffer starts on default device, use to() to move)
+        self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
+        self._host_buffer = torch.empty(
+            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+
+        # Create persistent views into device and host buffers
+        # Persistent views help us identify the arguments as static during graph capture.
+        self._device_views = self._create_views(self._device_buffer)
+        self._host_views = self._create_views(self._host_buffer)
+
+        # Track current lengths for each tensor (for truncation optimization)
+        self._current_lengths: Dict[str, int] = {name: 0 for name in self._tensor_order}
+
+    def _create_views(self, buffer: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Create views into the given buffer for each tensor."""
+        views = {}
+        for name in self._tensor_order:
+            offset = self._offsets[name]
+            byte_size = self._byte_sizes[name]
+            _, dtype = self._tensor_specs[name]
+            views[name] = buffer[offset : offset + byte_size].view(dtype)
+        return views
+
+    @property
+    def tensor_names(self) -> List[str]:
+        """Return the list of tensor names in buffer order."""
+        return self._tensor_order.copy()
+
+    @property
+    def _truncatable_name(self) -> str:
+        """Return the name of the truncatable tensor."""
+        return self._tensor_order[-1]
+
+    @property
+    def total_bytes(self) -> int:
+        """Total size of the buffer in bytes."""
+        return self._total_bytes
+
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the device buffer."""
+        return self._device_buffer.device
+
+    def get_view(self, name: str) -> torch.Tensor:
+        """Get the device tensor view for the specified name.
+
+        Args:
+            name: Name of the tensor.
+
+        Returns:
+            A view into the device buffer for the specified tensor.
+        """
+        return self._device_views[name]
+
+    def get_view_at_current_length(self, name: str) -> torch.Tensor:
+        """Get the device tensor view for the specified name at the current length.
+
+        Args:
+            name: Name of the tensor.
+
+        Returns:
+            A view into the device buffer for the specified tensor at the current length.
+        """
+        return self._device_views[name][: self._current_lengths[name]]
+
+    def get_host_view(self, name: str) -> torch.Tensor:
+        """Get the host tensor view for the specified name.
+
+        Args:
+            name: Name of the tensor.
+
+        Returns:
+            A view into the pinned host buffer for the specified tensor.
+        """
+        return self._host_views[name]
+
+    def get_capacity(self, name: str) -> int:
+        """Get the maximum number of elements for the specified tensor.
+
+        Args:
+            name: Name of the tensor.
+
+        Returns:
+            Maximum number of elements that can be stored.
+        """
+        numel, _ = self._tensor_specs[name]
+        return numel
+
+    def get_current_length(self, name: str) -> int:
+        """Get the current stored length for the specified tensor.
+
+        Args:
+            name: Name of the tensor.
+
+        Returns:
+            Number of elements currently stored in the tensor.
+        """
+        return self._current_lengths[name]
+
+    def store(
+        self,
+        name: str,
+        data: List[Number],
+        fill_value: Optional[Number] = None,
+    ) -> int:
+        """Store data into the host buffer.
+
+        Args:
+            name: Name of the tensor to store to.
+            data: List of values to store.
+            fill_value: Optional value to fill the entire tensor with before storing.
+                       If None, only the provided data is written.
+
+        Returns:
+            Number of elements stored.
+        """
+        numel, dtype = self._tensor_specs[name]
+        host_view = self.get_host_view(name)
+
+        # Fill with default value if specified
+        if fill_value is not None:
+            host_view.fill_(fill_value)
+
+        # Convert list to tensor and copy to host buffer
+        length = len(data)
+        assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+
+        temp_tensor = torch.tensor(data, dtype=dtype)
+        host_view[:length].copy_(temp_tensor)
+
+        self._current_lengths[name] = length
+        return length
+
+    def copy_to_device(self) -> None:
+        """Copy from host buffer to device buffer.
+
+        Uses the current length of the truncatable tensor (last in spec) to minimize
+        transfer size. All tensors before the truncatable one are fully copied.
+        """
+        # Calculate bytes to copy based on truncatable tensor's current length
+        truncatable_len = self._current_lengths[self._truncatable_name]
+        truncatable_offset = self._offsets[self._truncatable_name]
+        truncatable_dtype = self._tensor_specs[self._truncatable_name][1]
+        copy_bytes = truncatable_offset + truncatable_len * truncatable_dtype.itemsize
+
+        # Single async copy
+        with nvtx_range("ad_input_buffer_h2d_copy"):
+            self._device_buffer[:copy_bytes].copy_(
+                self._host_buffer[:copy_bytes], non_blocking=True
+            )
+
+    def resize(self, name: str, new_capacity: int) -> None:
+        """Resize a tensor's capacity.
+
+        This operation is only supported for the last tensor in the buffer to avoid
+        complex offset recalculations.
+
+        Args:
+            name: Name of the tensor to resize.
+            new_capacity: New maximum number of elements for the tensor.
+        """
+        assert name == self._truncatable_name, (
+            f"Can only resize the last tensor in the buffer ('{self._truncatable_name}'). "
+            f"Attempted to resize '{name}'."
+        )
+
+        old_numel, dtype = self._tensor_specs[name]
+        if new_capacity <= old_numel:
+            return  # No need to resize if new capacity is smaller or equal
+
+        # Update tensor specs
+        self._tensor_specs[name] = (new_capacity, dtype)
+
+        # Calculate new byte size for this tensor
+        new_byte_size = new_capacity * dtype.itemsize
+        self._byte_sizes[name] = new_byte_size
+
+        # Update total bytes (offset stays the same since it's the last tensor)
+        self._total_bytes = self._offsets[name] + new_byte_size
+
+        # Resize device buffer in-place
+        self._device_buffer.resize_(self._total_bytes)
+
+        # Host buffer must be re-allocated to ensure we have pinned memory
+        old_host_buffer = self._host_buffer
+        self._host_buffer = torch.empty(
+            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+        self._host_buffer[: old_host_buffer.numel()].copy_(old_host_buffer)
+        del old_host_buffer
+
+        # Recreate views after the update
+        self._device_views = self._create_views(self._device_buffer)
+        self._host_views = self._create_views(self._host_buffer)
+
+    def to(self, *args, **kwargs) -> None:
+        """Move the device buffer to a new device/dtype.
+
+        Note: This recreates the device views after moving.
+        """
+        old_device = self._device_buffer.device
+        self._device_buffer = self._device_buffer.to(*args, **kwargs)
+
+        # Recreate views if device changed
+        if old_device != self._device_buffer.device:
+            self._device_views = self._create_views(self._device_buffer)
+
+
+class CacheConfig(BaseModel):
+    """Cache configuration for attention-related dtypes."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+
+    dtype: Optional[torch.dtype] = Field(default=None, description="KV cache dtype.")
+    mamba_dtype: Optional[torch.dtype] = Field(default=None, description="Mamba cache dtype.")
+    delta_dtype: Optional[torch.dtype] = Field(
+        default=torch.float32, description="Delta cache dtype. Defaults to float32."
+    )
+
+    @field_validator("dtype", "mamba_dtype", "delta_dtype", mode="before")
+    @classmethod
+    def _coerce_dtype(cls, value):
+        if value is None or isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str):
+            dtype = getattr(torch, value, None)
+            assert isinstance(dtype, torch.dtype), f"Invalid {dtype=}"
+            return dtype
+        return value
+
+    def __or__(self, other: "CacheConfig") -> "CacheConfig":
+        """Combine two CacheConfig objects field-wise using Python's `or` semantics.
+
+        For each field, selects the first non-None value between `self` and `other`.
+        """
+        if not isinstance(other, CacheConfig):
+            raise NotImplementedError(f"Cannot combine CacheConfig with {type(other)}")
+        merged_kwargs = {}
+        for field_name in type(self).model_fields.keys():
+            merged_kwargs[field_name] = getattr(self, field_name) or getattr(other, field_name)
+        return CacheConfig(**merged_kwargs)
 
 
 class SequenceInfo:
@@ -51,26 +335,42 @@ class SequenceInfo:
     ### EXTRA ARGUMENTS PROVIDED TO THE INTERFACE ##################################################
     Those are extra arguments that can be provided to the interface and they are stored as follows:
     - _extra_args: dictionary of extra arguments with currently active values.
-    - _extra_none_inputs: dictionary of none inputs to the extra arguments.
-      NOTE: we assume that extra arguments are *optional* arguments to the model. However, we
-            cannot represent them via `None` since fx graphs require a fixed input type. Instead,
-            we require a special placeholder tensor to represent the `None` input.
-    - _extra_dynamic_shapes_callbacks: dictionary of callbacks to initialize the dynamic shapes of
-      the extra arguments.
 
-    ### CACHE ARGUMENTS NEEDED FOR ATTENTION OPERATORS FOR FLATTENED SEQUENCES + CACHES ############
+    ### AVAILABLE ARGUMENTS TO BE ADDED BY THE TRANSFORMS IF NEEDED ################################
     - seq_len: [s_0, s_1, ..., s_{b-1}] such that s_total = sum(s_i)
       Describes how long each sequence is. For example,
       input_ids[:s_0] will correspond to sequence 0 in the batch and input_ids[s_0:s_1] will
       correspond to sequence 1 in the batch.
+    - cu_seqlen: [0, s_0, s_0+s_1, ..., s_total]
+      Cumulative sequence lengths of shape [b+1]. cu_seqlen[i+1] - cu_seqlen[i] gives the length
+      of sequence i.
     - input_pos: [pos_0, ..., pos_{b-1}]
-      Corresponds to the total number of tokens that has been already been cached for each sequence
-      in the batch.
-    - cache_loc: [c0, ...., c_{np-1}] where np is total number of pages allocated to describe all
-      sequences in the batch.
+      Corresponds to the total number of tokens that have already been cached for each sequence
+      in the batch (i.e., the starting position in the cache for new tokens).
     - pages_per_seq: [ps_0, ps_1, ..., ps_{b-1}] where ps_i is the number of pages allocated for
-      sequence i. Note that, for example, cache_loc[p_0:p_1] will correspond to the pages associated
-      with sequence 1 in the batch.
+      sequence i. Note that, for example, cache_loc[sum(ps_0:ps_{i-1}):sum(ps_0:ps_i)] will
+      correspond to the pages associated with sequence i in the batch.
+    - cu_num_pages: [0, ps_0, ps_0+ps_1, ..., sum(ps_i)]
+      Cumulative number of pages of shape [b+1]. cu_num_pages[i+1] - cu_num_pages[i] gives the
+      number of pages for sequence i.
+    - seq_len_with_cache: [pos_0+s_0, pos_1+s_1, ..., pos_{b-1}+s_{b-1}]
+      Total sequence length including cached tokens for each sequence (input_pos + seq_len).
+    - last_page_len: [lpl_0, lpl_1, ..., lpl_{b-1}]
+      Number of valid tokens in the last page for each sequence. Computed as
+      (seq_len_with_cache - 1) % page_size + 1.
+    - slot_idx: [slot_0, slot_1, ..., slot_{b-1}]
+      Corresponds to the slot index of each sequence in the batch.
+    - use_initial_states: [bool_0, bool_1, ..., bool_{b-1}]
+      Per-sequence boolean indicating whether initial states should be used (True if input_pos > 0).
+    - batch_info: [num_prefill, num_prefill_tokens, num_decode]
+      Batch metadata containing the number of prefill sequences, total prefill tokens, and number
+      of decode sequences.
+    - cache_loc: [c_0, c_1, ..., c_{np-1}] where np is total number of pages allocated to describe
+      all sequences in the batch. Each value is a page index in the cache.
+    - _gather_idx: [g_0, g_1, ..., g_{s_total-1}]
+      Gather indices used by the overlap scheduler to reorder input tokens.
+    - _mask_scatter_indices: [m_0, m_1, ..., m_{s_total-1}]
+      Mask scatter indices used by the overlap scheduler to scatter results back.
 
     ################################################################################################
 
@@ -91,6 +391,7 @@ class SequenceInfo:
         max_batch_size: int = 1,
         page_size: int = 0,
         max_num_tokens: Optional[int] = None,
+        vocab_size_padded: Optional[int] = None,
     ):
         """Initialize the SequenceInfo object.
 
@@ -108,7 +409,7 @@ class SequenceInfo:
                 batch is min (max_batch_size, max_num_tokens // ISL). Similarly, if a batch is
                 composed of generate-only requests, then the maximum number of sequences possible in
                 the batch is min (max_batch_size, max_num_tokens).
-
+            vocab_size_padded: corresponds to the padded vocabulary size of the model.
         Returns:
             None
         """
@@ -116,63 +417,93 @@ class SequenceInfo:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.page_size = page_size if page_size > 0 else max_seq_len
-
+        self.vocab_size_padded = vocab_size_padded
         # NOTE (lucaslie): WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1
 
-        if max_num_tokens is None or max_num_tokens < 1:
-            self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
-        else:
-            self.max_num_tokens = max_num_tokens
+        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9883 clean up this hack
+        self.max_state_slots = max_batch_size + 1
 
-        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
-        # we use the provided max_num_tokens to calculate the number of pages
-        total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
+        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len_adjusted,
+        # we use the provided max_num_tokens. If max_num_tokens provided is more, we still use
+        # max_batch_size * max_seq_len_adjusted since the extra tokens cannot be used.
+        self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
+        if max_num_tokens is not None and max_num_tokens > 0:
+            self.max_num_tokens = min(self.max_num_tokens, max_num_tokens)
+
         # Num pages can not be less than max_batch_size.
         self._num_pages = max(
             self.max_batch_size,
-            (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
+            (self.max_num_tokens) // self.page_size  # floored number of pages
+            + (self.max_num_tokens / self.max_batch_size % self.page_size > 0)  # check for overflow
+            * self.max_batch_size,  # +1 page per sequence if overflow is required
         )
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
 
+        # cache_loc requires some special treatment due to block reuse. Note that the constraint for
+        # cache_loc with block_reuse is as follows:
+        # 0 <= cache_loc < num_pages
+        # len(cache_loc) <= max_num_cache_loc_assignments
+        max_num_cache_loc_assignments = (
+            max_seq_len_adjusted // self.page_size + 1
+        ) * self.max_batch_size
+
+        # log parameters
+        ad_logger.info(
+            f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.page_size=}, "
+            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}, "
+            f"{max_num_cache_loc_assignments=}"
+        )
+
         # indicator if extra args are activated that are needed for cached attention backends
-        self._is_cached_attn = False
-
-        # indicator how to handle the "None" input for extra args
-        self._use_strict_args = True
-
-        # container for dynamic shapes
-        self._dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
+        self._use_flattened_layout = False
 
         # TENSOR FIELDS ############################################################################
-        self._args_device: Dict[str, torch.Tensor] = {
+        # Define tensor specifications for the InputBuffer
+        # Order matters: cache_loc is placed LAST for truncation optimization during H2D copy
+        # Format: (name, max_numel, dtype)
+        tensor_specs: List[Tuple[str, int, torch.dtype]] = [
             # TENSOR FIELDS FOR UNCACHED ATTENTION
-            "input_ids": torch.ones(self.max_num_tokens, dtype=torch.int),
-            "position_ids": torch.zeros(self.max_num_tokens, dtype=torch.long),
+            ("input_ids", self.max_num_tokens, torch.int),
+            ("position_ids", self.max_num_tokens, torch.long),
             # TENSOR FIELDS FOR CACHED ATTENTION
-            "seq_len": torch.empty(self.max_batch_size, dtype=torch.int),
-            "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
-            "cache_loc": torch.empty(self.num_pages, dtype=torch.int),
-            "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
+            ("seq_len", self.max_batch_size, torch.int),
+            ("cu_seqlen", self.max_batch_size + 1, torch.int),
+            ("input_pos", self.max_batch_size, torch.int),
+            ("pages_per_seq", self.max_batch_size, torch.int),
+            ("cu_num_pages", self.max_batch_size + 1, torch.int),
+            ("seq_len_with_cache", self.max_batch_size, torch.int),
+            ("last_page_len", self.max_batch_size, torch.int),
+            ("slot_idx", self.max_batch_size, torch.long),
+            ("use_initial_states", self.max_batch_size, torch.bool),
+            ("batch_info", 3, torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
-            "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
+            ("_gather_idx", self.max_num_tokens, torch.int),
+            ("_mask_scatter_indices", self.max_num_tokens, torch.int),
+            # cache_loc is LAST for truncation optimization (it's the largest tensor)
+            ("cache_loc", max_num_cache_loc_assignments, torch.int),
+        ]
+
+        # Create the InputBuffer that manages contiguous host and device memory
+        # Starts on default device; use to() to move to target device
+        self._input_buffer = InputBuffer(tensor_specs)
+
+        # Initialize args_list from tensor specs
+        self._args_list: Dict[str, List[int]] = {
+            name: [0] * numel for name, numel, _ in tensor_specs
         }
-        self._args_host: Dict[str, List[int]] = {
-            k: v.tolist() for k, v in self._args_device.items()
-        }
-        # NOTE: order of keys is relevant here!
-        self._uncached_arg_names = ("input_ids", "position_ids")
-        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq")
+
+        self._active_args = ("input_ids", "position_ids")
+        self._shapeable_args = ("input_ids", "position_ids")
+        # Args that should be returned from host (pinned memory) instead of device in _named_args
+        self._host_return_args = ("batch_info",)
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
-        self._extra_none_inputs: Dict[str, torch.Tensor] = {}
-        self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
-        self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
         ############################################################################################
 
         # call reset once to set a consistent initial state
@@ -180,34 +511,7 @@ class SequenceInfo:
 
     @property
     def device(self) -> torch.device:
-        return self._args_device["input_ids"].device
-
-    @property
-    def use_strict_args(self) -> bool:
-        return self._use_strict_args
-
-    @use_strict_args.setter
-    def use_strict_args(self, val: bool) -> None:
-        """Configure whether to use strict graph arguments only.
-
-        Args:
-            val: strict graph arguments only or not.
-
-        In strict arguments mode,
-            * only stock arguments (like input_ids, position_ids, etc.) or extra
-              arguments that are explicitly added via the ``add_extra_arg`` interface are allowed.
-              Other arguments that are provided in ``nest_sequences`` will be rejected and throw an
-              error.
-            * registered extra arguments that are not provided to ``nest_sequences`` will be added to
-              the argument list automatically using the registered None-like tensor.
-
-        In non-strict argument mode,
-            * all arguments including all **kwargs that are provided to ``nest_sequences`` and will
-              simply be passed to the model in the order received.
-            * registered extra arguments that are not provided to ``nest_sequences`` will be added
-              _not_ be added to the argument list.
-        """
-        self._use_strict_args = val
+        return self._input_buffer.device
 
     def _shape_for_forward(self, tnsr: torch.Tensor) -> torch.Tensor:
         """Shape the tensor for the forward pass based on the current attention mode.
@@ -221,7 +525,7 @@ class SequenceInfo:
         # check if we are still running uncached attention in which case we are also still
         # operate on unflattened tensors with explicit [batch_size, seq_len, ...] shape
         # generate-only batches are also formatted like this (i.e. [b, 1])
-        if not self._is_cached_attn or self.is_generate:
+        if not self._use_flattened_layout or self.is_generate:
             bs = len(self.seq_len)
             sl = self.seq_len[0]
         # use [1,total_len] shape to indicate non-generate-only batch for cached attention
@@ -231,20 +535,26 @@ class SequenceInfo:
         # truncate to total tokens now, reshape, and return
         return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
-    def _named_args(
-        self, include_extra_args: bool = True, include_cached_args: bool = True
-    ) -> Dict[str, torch.Tensor]:
-        # start with uncached args and shape them along the way
-        args = {k: self._shape_for_forward(self._args_device[k]) for k in self._uncached_arg_names}
+    def _named_args(self, include_extra_args: bool = True) -> Dict[str, torch.Tensor]:
+        # Build args dict, using host views for _host_return_args, device views otherwise
+        args = {}
+        for name in self._active_args:
+            if name in self._host_return_args:
+                view = self._input_buffer.get_host_view(name)
+            else:
+                view = self._input_buffer.get_view(name)
+            args[name] = self._shape_for_forward(view) if name in self._shapeable_args else view
 
         # check other args to include
         if include_extra_args:
             args.update(self._extra_args)
 
-        if include_cached_args:
-            args.update({k: self._args_device[k] for k in self._cached_arg_names})
-
         return args
+
+    @property
+    def available_args(self) -> Set[str]:
+        """Return a list of available arguments."""
+        return set(self._input_buffer.tensor_names)
 
     @property
     def named_args(self) -> Dict[str, torch.Tensor]:
@@ -256,19 +566,7 @@ class SequenceInfo:
         Cached arguments are only included if the attention mode is cached to reflect that after
         switching to cached attention, the cached arguments are required for a forward pass.
         """
-        return self._named_args(include_extra_args=True, include_cached_args=self._is_cached_attn)
-
-    @property
-    def named_standard_args(self) -> Dict[str, torch.Tensor]:
-        """Return a dictionary of named standard arguments.
-
-        We define standard arguments as the arguments that are part of the model's forward function
-        by default (i.e., without the extra arguments).
-
-        Just liked ``named_args``, this property includes cached attention arguments if the
-        attention mode is cached.
-        """
-        return self._named_args(include_extra_args=False, include_cached_args=self._is_cached_attn)
+        return self._named_args(include_extra_args=True)
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -276,65 +574,20 @@ class SequenceInfo:
         return tuple(self.named_args.values())
 
     @property
-    def const_args_for_prepare_metadata(self) -> Tuple:
-        """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op.
-
-        The ``prepare_metadata`` interface expects the following arguments:
-
-        1. ``named_standard_args`` as nodes,i.e., as input-dependent tensors.
-        2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
-           to the corresponding ``prepare_metadata`` node/op.
-
-        This interface handles the constant arguments part and can be used by compiler passes like
-        ``insert_cached_attention`` to extract the constant arguments and add them to the
-        ``prepare_metadata`` node/op.
-        """
-        return (self.page_size,)
-
-    @property
-    def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
-        """Return dynamic shapes of sequence info tensors.
-
-        NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
-        """
-        # lazy initialization of dynamic shapes with Dim objects
-        if self._dynamic_shapes is None:
-            # set up shape for uncached args (same for all, i.e., batch_size and seq_len)
-            bs_seq_len_shape: DynamicShape = {}
-            if self.max_batch_size > 1:
-                bs_seq_len_shape[0] = Dim("batch_size", max=self.max_batch_size)
-            bs_seq_len_shape[1] = Dim("seq_len", max=self.max_seq_len)
-            self._dynamic_shapes = {k: bs_seq_len_shape for k in self._uncached_arg_names}
-            # cached args are static
-            self._dynamic_shapes.update({k: {} for k in self._cached_arg_names})
-
-        for k, callback in self._extra_dynamic_shapes_callbacks.items():
-            if k not in self._dynamic_shapes:
-                self._dynamic_shapes[k] = callback()
-
-        # return dynamic shapes according to currently active named_args with consistent order
-        return {k: self._dynamic_shapes[k] for k in self.named_args.keys()}
-
-    @property
-    def dynamic_shapes(self) -> Tuple[DynamicShape, ...]:
-        """Return dynamic shapes of sequence info tensors."""
-        return tuple(self.named_dynamic_shapes.values())
-
-    @property
     def seq_len(self) -> List[int]:
-        return self._args_host["seq_len"].copy()
+        return self._args_list["seq_len"].copy()
 
     @property
     def input_pos(self) -> List[int]:
-        return self._args_host["input_pos"].copy()
+        return self._args_list["input_pos"].copy()
 
     @property
     def cache_loc(self) -> List[int]:
-        return self._args_host["cache_loc"].copy()
+        return self._args_list["cache_loc"].copy()
 
     @property
     def pages_per_seq(self) -> List[int]:
-        return self._args_host["pages_per_seq"].copy()
+        return self._args_list["pages_per_seq"].copy()
 
     @property
     def num_sequences(self) -> int:
@@ -355,8 +608,18 @@ class SequenceInfo:
     @num_pages.setter
     def num_pages(self, value):
         self._num_pages = value
-        # update the cache_loc tensor
-        self._args_device["cache_loc"].resize_(value)
+        # Check if we need to resize cache_loc (it's the last tensor in the buffer)
+        cache_loc_capacity = self._input_buffer.get_capacity("cache_loc")
+        if value > cache_loc_capacity:
+            ad_logger.info(
+                f"Resizing cache_loc capacity from {cache_loc_capacity} to {value} "
+                f"to accommodate num_pages={value}"
+            )
+            # Resize the input buffer (cache_loc is the last tensor, so this is supported)
+            self._input_buffer.resize("cache_loc", value)
+            # Also resize the args_list to match
+            old_size = len(self._args_list["cache_loc"])
+            self._args_list["cache_loc"].extend([0] * (value - old_size))
 
     @property
     def is_paged(self) -> bool:
@@ -411,8 +674,11 @@ class SequenceInfo:
         pages_per_seq = [len(p) for p in page_assignments]
         return cache_loc_flat, pages_per_seq
 
+    # TODO: remove after updating all cached backends
     @classmethod
-    def _get_sanitized_seq_len(cls, input_ids: torch.Tensor, seq_len: torch.Tensor) -> torch.Tensor:
+    def _get_sanitized_seq_len(
+        cls, input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
+    ) -> torch.Tensor:
         """Sanitize sequence lengths.
 
         We want to cover the following scenarios with this function:
@@ -445,22 +711,24 @@ class SequenceInfo:
             # valid cache location in the batch. This would ensure that the dummy sequences just
             # repeats valid computation...
         """
-        _, s = input_ids.shape[:2]
-        num_seq = cls._get_sanitized_num_sequences(input_ids, seq_len)
+        _, s = input_or_position_ids.shape[:2]
+        num_seq = cls._get_sanitized_num_sequences(input_or_position_ids, seq_len)
         if s > 1:
-            return seq_len[:num_seq].detach().clone()
+            return seq_len[:num_seq].clone()
         else:
             return torch.ones(num_seq, dtype=seq_len.dtype, device=seq_len.device)
 
     @staticmethod
-    def _get_sanitized_num_sequences(input_ids: torch.Tensor, seq_len: torch.Tensor) -> int:
+    def _get_sanitized_num_sequences(
+        input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
+    ) -> int:
         """Get number of sequences.
 
         We makes sure that this function is compatible with both torch graph capture and cudagraph.
         Both can be a bit temparamental when trying to extract the number of sequences from a tensor
         with max_batch_size or max_batch_size*max_seq_len.
         """
-        b, s = input_ids.shape[:2]
+        b, s = input_or_position_ids.shape[:2]
         if s > 1:
             num_seq = torch.sum(seq_len > 0)
             assert seq_len[num_seq:].sum() == 0, "seq_len should be zero-padded"
@@ -468,37 +736,34 @@ class SequenceInfo:
             num_seq = b
         return num_seq
 
-    def switch_to_cached_attn_inputs(self) -> List[str]:
-        """Switch to inputs for cached+flattened attention operators.
+    def activate_arg(self, arg_name: str) -> bool:
+        """Activate a desired argument.
+
+        The first time this function is called we will also switch to the flattened input layout.
 
         Returns:
-            List[str]: List of new argument names that are now activated.
-
-        This function will change the inputs provided by the interface from the arguments expected
-        by regular attention in PyTorch (SDPA-style) to the arguments needed once we use attention
-        operators with cache support and flattened sequences.
-
-        NOTE: The graph inference optimizer is responsible for ensuring the the new inputs are
-        correctly reflected in the graph after this function is called.
+            True if the argument was activated, False if already activated.
         """
-        assert not self._is_cached_attn, "Cached+flattened attention already activated"
-        self._is_cached_attn = True
-        return list(self._cached_arg_names)
+        assert arg_name in self.available_args, f"{arg_name=} not found in {self.available_args}"
+        self._use_flattened_layout = True
+        if arg_name not in self._active_args:
+            self._active_args += (arg_name,)
+            return True
+        return False
 
     def to(self, *args, **kwargs) -> None:
-        def _move_dict(d: Dict[str, torch.Tensor]) -> None:
-            for k, v in d.items():
-                if v is not None:
-                    d[k] = v.to(*args, **kwargs)
+        # Move the InputBuffer (which recreates views automatically)
+        self._input_buffer.to(*args, **kwargs)
 
-        _move_dict(self._args_device)
-        _move_dict(self._extra_args)
-        _move_dict(self._extra_none_inputs)
+        # Move extra args
+        for k, v in self._extra_args.items():
+            if v is not None:
+                self._extra_args[k] = v.to(*args, **kwargs)
 
     def set_example_sequence(
         self,
-        input_ids: Sequence[Sequence[int]] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[Sequence[Sequence[int]]] = None,
+        position_ids: Optional[Sequence[Sequence[int]]] = None,
         **extra_args,
     ) -> None:
         """Set an example sequence useful for testing and export purposes without cache history."""
@@ -513,13 +778,17 @@ class SequenceInfo:
             for ids_one_seq in input_ids
         ]
         cache_loc = list(range(sum(pages_per_seq)))
-        page_assignments = self._get_page_assignments(cache_loc, pages_per_seq)
+
+        # vanilla slot indices
+        slot_idx = list(range(len(input_ids)))
 
         self.nest_sequences(
             input_ids,
             position_ids,  # will be auto-inferred if None
             input_pos=0,  # no cache history
-            page_assignments=page_assignments,  # vanilla page assignments
+            cache_loc=cache_loc,  # vanilla page assignments
+            pages_per_seq=pages_per_seq,  # vanilla page assignments
+            slot_idx=slot_idx,  # vanilla slot indices
             **extra_args,
         )
 
@@ -530,9 +799,9 @@ class SequenceInfo:
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int).tolist()
         self.set_example_sequence(input_ids)
 
-    def set_generate_only_batch(self) -> None:
+    def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
         """Set an example sequence for generate-only batch."""
-        self.set_example_sequence([[1]] * self.max_batch_size)
+        self.set_example_sequence([[1]] * (batch_size or self.max_batch_size))
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -553,29 +822,31 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[int | float],
-        reset: bool = False,
+        tnsr_like: List[Number],
+        reset_val: Optional[Number] = None,
+        force_copy: bool = False,
     ) -> None:
-        """Store the argument on the host and copy to the device in a non-blocking fashion.
+        """Store the argument into the pinned host buffer for later batch transfer to device.
+
+        The data is stored in the host-side pinned memory buffer managed by InputBuffer.
+        The actual H2D transfer happens in a single batch at the end of nest_sequences().
 
         Args:
             name: Name of the argument to store.
             tnsr_like: List of values to store.
-            reset: Whether to reset the full tensor on the device to 0 before writing to it.
+            reset_val: Value to reset/fill the tensor with before writing data.
+            force_copy: Whether to force immediate copy to device (for use outside nest_sequences).
         """
-        with nvtx_range(f"ad_store_seq_info_arg_{name}"):
-            tnsr_device = self._args_device[name]
+        with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
+            # Always store list object for Python access
+            self._args_list[name] = tnsr_like.copy()
 
-            # store list object on the host
-            self._args_host[name] = tnsr_like.copy()
+            # Only store to buffer when the argument is active or force_copy is True
+            if not (name in self._active_args or force_copy):
+                return
 
-            # pin the memory on the host
-            tnsr_host = torch.tensor(tnsr_like, dtype=tnsr_device.dtype, pin_memory=True)
-
-            # reset/copy to the device in a non-blocking fashion
-            if reset:
-                tnsr_device.zero_()
-            tnsr_device[: len(tnsr_like)].copy_(tnsr_host, non_blocking=True)
+            # Store to the InputBuffer's pinned host memory
+            self._input_buffer.store(name, tnsr_like, fill_value=reset_val)
 
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
@@ -588,37 +859,76 @@ class SequenceInfo:
                     else:
                         tnsr_like = tnsr_like[0]
                 self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
-            elif self.use_strict_args:
-                self._extra_args[name] = self._extra_none_inputs[name]
             else:
                 self._extra_args[name] = None
+
+    @nvtx_range("ad_get_unique_value")
+    def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
+        """Get un unoccupied value from the range indicated by max_val."""
+        # Return the smallest free value; fall back to 0 if none
+        for candidate in range(max_val):
+            if candidate not in occupied:
+                return candidate
+        return 0
 
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
         self,
         input_ids: Sequence[Sequence[int]],
         position_ids: Optional[Sequence[Sequence[int]]] = None,
+        seq_len: Optional[Sequence[int]] = None,
         input_pos: Optional[Union[Sequence[int], int]] = None,
-        page_assignments: Optional[Sequence[Sequence[int]]] = None,
+        batch_info: Optional[Sequence[int]] = None,
+        cu_seqlen: Optional[Sequence[int]] = None,
+        cache_loc: Optional[Sequence[int]] = None,
+        pages_per_seq: Optional[Sequence[int]] = None,
+        cu_num_pages: Optional[Sequence[int]] = None,
+        seq_len_with_cache: Optional[Sequence[int]] = None,
+        last_page_len: Optional[Sequence[int]] = None,
+        slot_idx: Optional[Sequence[int]] = None,
+        use_initial_states: Optional[Sequence[bool]] = None,
+        _gather_idx: Optional[Sequence[int]] = None,
+        _mask_scatter_indices: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
 
         Args:
             input_ids: List of sequences of input_ids.
-            position_ids: List of sequences of position_ids for each token.
-            input_pos: Absolute starting position in the cache for each sequence.
-            page_assignments: List of sequences of page assignments for each sequence.
+            position_ids: List of sequences of position_ids for each token. If None, auto-inferred
+                from input_pos and seq_len.
+            seq_len: List of sequence lengths for each sequence. If None, inferred from input_ids.
+            input_pos: Absolute starting position in the cache for each sequence. Can be a single
+                int (applied to all sequences) or a list of ints.
+            batch_info: Batch metadata as [num_prefill, num_prefill_tokens, num_decode]. If None,
+                auto-computed from seq_len.
+            cu_seqlen: Cumulative sequence lengths of shape [b+1]. If None, auto-computed from
+                seq_len.
+            cache_loc: Flat list of page indices for all sequences. Must be provided together with
+                pages_per_seq.
+            pages_per_seq: Number of pages allocated per sequence. Must be provided together with
+                cache_loc.
+            cu_num_pages: Cumulative number of pages of shape [b+1]. If None, auto-computed from
+                pages_per_seq.
+            seq_len_with_cache: Total sequence length including cached tokens (input_pos + seq_len)
+                for each sequence. If None, auto-computed.
+            last_page_len: Number of valid tokens in the last page for each sequence. If None,
+                auto-computed from seq_len_with_cache.
+            slot_idx: Slot index for each sequence in the batch.
+            use_initial_states: Per-sequence boolean indicating if the initial states should be
+                used. If None, auto-computed as (input_pos > 0).
+            _gather_idx: Gather indices for the overlap scheduler to reorder input tokens.
+            _mask_scatter_indices: Mask scatter indices for the overlap scheduler.
             extra_args: Extra arguments to be stored in the interface.
 
-        This i/f will ensure that all sequence info args are updated accordingly.
+        This i/f will ensure that all sequence info args are updated accordingly. Reset values are
+        chosen as "neutral" values so that for cases like rounding up batch sizes for cudagraph we
+        only write to unused buffers/caches.
         """
-        ### UPDATE METADATA ########################################################################
-        # update metadata first since it's useful for other updates to have up-to-date information
-
-        # set new sequence lengths --> resetting the remaining entries to zero is important to help
-        # us discern the actual number of sequences in the batch.
-        self._store_arg("seq_len", [len(ids) for ids in input_ids], reset=True)
+        ### UPDATE SEQUENCE LENGTH AND INPUT POSITION FIRST SINCE IT'S USED FOR OTHER UPDATES ######
+        if seq_len is None:
+            seq_len = [len(ids) for ids in input_ids]
+        self._store_arg("seq_len", seq_len)
 
         # check for updated input_pos (i.e. cache start position)
         if input_pos is not None:
@@ -626,14 +936,6 @@ class SequenceInfo:
                 "input_pos",
                 [input_pos] * self.num_sequences if isinstance(input_pos, int) else input_pos,
             )
-
-        # check for updated page_assignments
-        if page_assignments is not None:
-            cache_loc, pages_per_seq = self._get_cache_locations_and_pages_per_sequence(
-                page_assignments
-            )
-            self._store_arg("cache_loc", cache_loc)
-            self._store_arg("pages_per_seq", pages_per_seq)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
@@ -647,77 +949,103 @@ class SequenceInfo:
             ]
         self._store_arg("position_ids", self._flatten(position_ids))
 
+        ### UPDATE OTHER (DERIVATIVE) METADATA #####################################################
+        # check for updated batch_info_tensor
+        if batch_info is None:
+            num_prefill = sum(s_l > 1 for s_l in seq_len)
+            num_prefill_tokens = sum(s_l for s_l in seq_len if s_l > 1)
+            num_decode = len(seq_len) - num_prefill
+            batch_info = [num_prefill, num_prefill_tokens, num_decode]
+        self._store_arg("batch_info", batch_info)
+
+        if cu_seqlen is None:
+            cu_seqlen = torch.zeros(len(seq_len) + 1, dtype=torch.int)
+            cu_seqlen[1:] = torch.cumsum(torch.tensor(seq_len), dim=0)
+            cu_seqlen = cu_seqlen.tolist()
+        self._store_arg("cu_seqlen", cu_seqlen)
+
+        # check for updated page_assignments
+        assert (cache_loc is None) == (pages_per_seq is None), (
+            "cache_loc and pages_per_seq must beeither both None or both set"
+        )
+        if cache_loc is not None and pages_per_seq is not None:
+            self._store_arg("cache_loc", cache_loc)
+            self._store_arg("pages_per_seq", pages_per_seq)
+
+        # update cumulative number of pages
+        if cu_num_pages is None:
+            pages_per_seq = self.pages_per_seq
+            cu_num_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
+            cu_num_pages[1:] = torch.cumsum(torch.tensor(pages_per_seq), dim=0)
+            cu_num_pages = cu_num_pages.tolist()
+        self._store_arg("cu_num_pages", cu_num_pages)
+
+        # update sequence length with cache
+        if seq_len_with_cache is None:
+            seq_len_with_cache = [i_p + s_l for i_p, s_l in zip(self.input_pos, self.seq_len)]
+        self._store_arg("seq_len_with_cache", seq_len_with_cache)
+
+        # update last page length
+        if last_page_len is None:
+            last_page_len = [(slwc - 1) % self.page_size + 1 for slwc in seq_len_with_cache]
+        self._store_arg("last_page_len", last_page_len)
+
+        # check for updated slot_idx
+        if slot_idx is not None:
+            self._store_arg("slot_idx", slot_idx)
+
+        # check for updated use_initial_states
+        if use_initial_states is None:
+            use_initial_states = [i_p > 0 for i_p in self.input_pos]
+        self._store_arg("use_initial_states", use_initial_states)
+
+        ### UPDATE OVERLAP SCHEDULER METADATA ######################################################
+        # check for updated _gather_idx
+        if _gather_idx is not None:
+            self._store_arg("_gather_idx", _gather_idx, force_copy=True)
+
+        # check for updated _mask_scatter_indices
+        if _mask_scatter_indices is not None:
+            self._store_arg("_mask_scatter_indices", _mask_scatter_indices, force_copy=True)
+
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
-        # in strict argument mode, we only accept registered extra arguments
-        if self.use_strict_args:
-            for name in self._extra_none_inputs.keys():
-                self._store_extra_arg(name, extra_args.pop(name, None))
-            assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
-        # otherwise, we simply pass in all extra arguments
-        else:
-            for key, value in extra_args.items():
-                self._store_extra_arg(key, value)
+        for key, value in extra_args.items():
+            self._store_extra_arg(key, value)
+
+        ### BATCH COPY TO DEVICE ###################################################################
+        # Perform a single async H2D copy for all device tensors
+        # The copy is truncated at the end of cache_loc to minimize transfer size
+        self._input_buffer.copy_to_device()
 
     @nvtx_range("ad_rescatter_input_ids")
-    def rescatter_input_ids(
-        self, ungathered_input_ids: torch.Tensor, gather_idx: List[int], scatter_ref: int
-    ):
+    def rescatter_input_ids(self, ungathered_input_ids: torch.Tensor):
         """Re-scatter the provided ungathered input ids into the input_ids tensor.
 
         Args:
-            ungathered_input_ids: The input ids on the device from which to gather.
-            gather_idx: The list of indices to gather from the ungathered_input_ids.
-            scatter_ref: The reference index to scatter to in input_ids via masked scatter.
+            ungathered_input_ids: The input ids on the device from which to gather using the stored
+                gather and mask scatter indices.
 
         Returns:
             None
 
         This function will assume that we are in a generate-only batch.
         """
-        # store the new gather indices
-        self._store_arg("_gather_idx", gather_idx)
+        # retrieve input_ids and gather_ids on device
+        input_ids_device = self._input_buffer.get_view_at_current_length("input_ids")
+        gather_ids_device = self._input_buffer.get_view_at_current_length("_gather_idx")
+        mask_scatter_indices_device = self._input_buffer.get_view_at_current_length(
+            "_mask_scatter_indices"
+        )
 
-        # gather the provided input ids in a streaming fashion
-        gather_ids_device = self._args_device["_gather_idx"][: len(gather_idx)]
-        packed_input_ids = ungathered_input_ids[gather_ids_device]
-
-        # re-scatter the provided input ids into the input_ids tensor
-        input_ids_device = self._args_device["input_ids"]
-        input_ids_device.masked_scatter_(input_ids_device == scatter_ref, packed_input_ids)
+        torch.ops.auto_deploy.triton_utils_fused_gather_scatter(
+            ungathered_input_ids, gather_ids_device, mask_scatter_indices_device, input_ids_device
+        )
 
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.seq_len))
-
-    def add_extra_arg(
-        self,
-        name: str,
-        none_input: torch.Tensor,
-        dynamic_shape_callback: Optional[DynamicShapeCallback] = None,
-    ) -> None:
-        """Add an extra argument to the sequence info object.
-
-        Args:
-            name: The name of the extra argument.
-            none_input: None input value of the extra argument.
-            dynamic_shape_callback: The callback to get the dynamic shape of the extra argument.
-
-        Note that the extra argument is expected to be a tensor.
-        """
-        assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
-
-        self._extra_args[name] = none_input.to(self.device)
-        self._extra_none_inputs[name] = self._extra_args[name]
-
-        if dynamic_shape_callback is None:
-            self._extra_dynamic_shapes_callbacks[name] = lambda: {}
-        else:
-            self._extra_dynamic_shapes_callbacks[name] = dynamic_shape_callback
-
-
-Constant = Union[int, float, str, None]
 
 
 class MHACallable(Protocol):
@@ -730,12 +1058,12 @@ class MHACallable(Protocol):
 class PrepareMetadataCallable(Protocol):
     def __call__(
         self,
-        input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         seq_len: torch.Tensor,
         input_pos: torch.Tensor,
         cache_loc: torch.Tensor,
         pages_per_seq: torch.Tensor,
+        slot_idx: torch.Tensor,
         page_size: int,
     ) -> List[torch.Tensor]: ...
 
@@ -791,7 +1119,8 @@ class AttentionDescriptor(ABC):
         ```
         def attention_op(
             *qkv,       # list of tensors corresponding to Q, K, V as in source attention op
-            *metadata,  # global info about the sequences as returned by the prepare_metadata op
+            *meta_std,  # standard metadata fields identified by matching arg names!
+            *meta_extra,# metadata about the sequences as returned by the prepare_metadata op
             *caches,    # contains layer-specific caches per provided cache initializers
             *buffers,   # global buffers used by the attention op as provided by buffer initializers
             *constants, # basic arguments (int, float, str, None) added as CONSTANTS in the graph
@@ -809,29 +1138,42 @@ class AttentionDescriptor(ABC):
 
     @classmethod
     @abstractmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
+    def get_standard_metadata_args(cls) -> List[str]:
+        """Get the list of standard metadata arguments that are expected by the attention op."""
+        raise NotImplementedError
+
+    @classmethod
+    def get_prepare_extra_metadata_info(
+        cls, any_source_attn_node: Node
+    ) -> Tuple[Optional[PrepareMetadataCallable], int, List[Constant]]:
         """Get the prepare_metadata op.
 
         The prepare_metadata op should follow the below signature:
 
         ```
-        def prepare_metadata(
-            input_ids: torch.Tensor,
-            position_ids: torch.Tensor,
-            seq_len: torch.Tensor,
-            input_pos: torch.Tensor,
-            cache_loc: torch.Tensor,
+        def prepare_extra_metadata(
+            *desired_graph_inputs,  # matched by arg names in the signature of the prepare_metadata op
+            *constant_inputs, # as returned by this function
         ) -> List[torch.Tensor]: ...
         ```
-        The metadata should contain all necessary global information required for the underlying
-        attention op to process the input sequence and the returned list of tensors will be passed
-        on to each invocation of the attention op in the graph.
+        The metadata should contain all necessary extra global information required for the
+        underlying attention op to process the input sequence and the returned list of tensors will
+        be passed as additional arguments to each invocation of the attention op in the graph.
 
-        prepare_metadata is called once at the beginning of the forward pass.
+        This may not be needed for all attention ops if the standard metadata is sufficient.
+
+        prepare_metadata is called once at the beginning of the forward pass for each attention op
+        detected in the graph.
 
         **Note that the prepare_metadata op should be a valid torch custom op, which comes with
         restrictions on the supported types in the signature.**
+
+        Returns:
+            - prepare_metadata_op: The prepare_metadata op callable.
+            - num_meta_out: The number of extra metadata tensors to return.
+            - const_args: A list of constant arguments to pass to the prepare_metadata op.
         """
+        return None, 0, []
 
     @classmethod
     @abstractmethod
@@ -871,15 +1213,16 @@ class AttentionDescriptor(ABC):
         If the buffer initializer requires information about the attention op, it can retrieve
         the necessary information from the source attention node.
         """
+        return {}
 
     @classmethod
-    @abstractmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Provide a list of constant arguments to be passed to the attention op.
 
         The constant arguments are passed to the attention op as additional arguments after the
         caches and buffers. The constants are expected to be of type int, float, str, or None.
         """
+        return []
 
 
 class AttentionRegistry:

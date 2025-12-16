@@ -300,7 +300,7 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
         hf_model = AutoModel.from_pretrained(
             hf_model_or_dir,
             trust_remote_code=trust_remote_code,
-            torch_dtype='auto' if config.chatglm_version != 'glm' else getattr(
+            dtype='auto' if config.chatglm_version != 'glm' else getattr(
                 torch, config.dtype),
             device_map=device_map)
         weights = load_weights_from_hf_model(hf_model, config)

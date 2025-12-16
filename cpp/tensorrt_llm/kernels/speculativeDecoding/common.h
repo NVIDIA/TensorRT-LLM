@@ -17,13 +17,16 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding
 {
 
 //! \brief Linearly packs accepted paths in memory according to the accceptedLengths and bestPathIds
@@ -205,4 +208,6 @@ template <typename T>
 size_t getTypicalAcceptanceWorkspaceSize(
     runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 vocabSizePadded);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+
+TRTLLM_NAMESPACE_END

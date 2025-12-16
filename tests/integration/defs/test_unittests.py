@@ -76,6 +76,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     else:
         test_prefix = "unittest"
 
+    waives_file = request.config.getoption("--waives-file")
+
     num_workers = 1
 
     # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on test execution results.
@@ -123,7 +125,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                               f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m', 'pytest', ignore_opt, "-v", "--timeout=2400",
+        '-m', 'pytest', ignore_opt, "-v", "--tb=short", "-rF", "--timeout=2400",
         "--timeout-method=thread"
     ]
     if test_prefix:
@@ -132,19 +134,38 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if dry_run:
         command += ['--collect-only']
 
+    if waives_file:
+        waives_file = os.path.abspath(waives_file)
+        command += [f"--waives-file={waives_file}"]
+
     command += arg_list
 
-    print(f"Running unit test:'{command}'")
+    print(f"Running unit test:\"python {' '.join(command)}\"")
 
-    def run_command(cmd):
+    def run_command(cmd, num_workers=1):
         try:
             pythonpath = os.environ.get("PYTHONPATH", "")
+            env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            if num_workers > 1:
+                env['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
             llm_venv.run_cmd(
                 cmd,
                 cwd=test_root,
-                env={'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"},
+                env=env,
             )
-        except CalledProcessError:
+        except CalledProcessError as e:
+            print(f"\n{'='*60}")
+            print(f"UNITTEST FAILED with exit code: {e.returncode}")
+            print(f"Command: {' '.join(cmd)}")
+            if hasattr(e, 'stdout') and e.stdout:
+                print(
+                    f"STDOUT:\n{e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout}"
+                )
+            if hasattr(e, 'stderr') and e.stderr:
+                print(
+                    f"STDERR:\n{e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}"
+                )
+            print(f"{'='*60}\n")
             return False
         return True
 
@@ -160,7 +181,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         parallel_command = command + [
             "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
         ]
-        passed = run_command(parallel_command)
+        passed = run_command(parallel_command, num_workers)
 
         assert os.path.exists(
             parallel_output_xml

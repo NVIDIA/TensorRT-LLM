@@ -20,6 +20,7 @@
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
+#include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -32,6 +33,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -40,37 +42,107 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP)
 {
-    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
-    constexpr SizeType32 beam{0};
-    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
-    auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    auto poolNum = cacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+
+    // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
+    // distributed among CP ranks. So, we transfer all blocks from send side.
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
     {
-        // disable selective cache transfer for poolNum > 1
+        // disable reuse path, and vwsa don't support reuse.
+        bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
+
+        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+
+        auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
+
+        if (windowsMetadata.size() == 1 || needSendAllForWindow || recvSideHasCP)
+        {
+            return blockRange;
+        }
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+
+        for (auto const& [windowSize, metadata] : windowsMetadata)
+        {
+            auto windowStartBlockIdx = needSendAllForWindow
+                ? 0
+                : static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
+                    - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
+            // TODO: promptLen to get the startBlockIdx
+            SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
+            TLLM_LOG_DEBUG("getBlockRangeForSending windowSize: %d, startBlockIdx: %d  windowStartBlockIdx: %d",
+                windowSize, startBlockIdx, windowStartBlockIdx);
+            blockRange.setBlockIdsForWindow(windowSize,
+                std::vector<SizeType32>(
+                    blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
+        }
+
         return blockRange;
     }
-    if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
-    {
-        // handle block reuse, the prefix blocks are reused
-        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
-        auto const& ids = blockRange.getBlockIds();
-        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
-    }
-    return blockRange;
+
+    TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
+    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
-BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+BlockRange getBlockRangeForReceiving(
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse, bool recvSideHasCP)
 {
-
-    auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    // Note: When recv side has CP, we request all blocks from send side right now.
+    auto poolNum = cacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+    if (poolNum == 1 && srcEnableBlockReuse && !recvSideHasCP)
     {
-        constexpr SizeType32 beam{0};
-        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+        // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
+        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
+        auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        auto const& allBlockIds = range.getBlockIdsPerWindow().at(windowSize);
+        auto const totalBlocks = static_cast<SizeType32>(allBlockIds.size());
+        // Derive reused blocks count from number of unique prepopulated tokens
+        auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const prepopulatedTokens = llmRequest.getPrepopulatedPromptLen();
+        auto const totalUniqueTokens = llmRequest.getPromptLen();
+        auto const usedBlocks = std::min<SizeType32>(
+            static_cast<SizeType32>((totalUniqueTokens + tokensPerBlock - 1) / tokensPerBlock), totalBlocks);
+        auto const reusedBlocks
+            = std::min<SizeType32>(static_cast<SizeType32>((prepopulatedTokens / tokensPerBlock)), usedBlocks);
+
+        std::vector<SizeType32> newBlockIds;
+        if (reusedBlocks < usedBlocks)
+        {
+            newBlockIds.assign(allBlockIds.begin() + reusedBlocks, allBlockIds.begin() + usedBlocks);
+        }
+        else
+        {
+            if (usedBlocks > 0 && usedBlocks <= totalBlocks)
+            {
+                newBlockIds.push_back(allBlockIds[usedBlocks - 1]);
+            }
+        }
+        range.setBlockIdsForWindow(windowSize, std::move(newBlockIds));
+        return range;
     }
-    return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+
+    auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
+    if (windowsMetadata.size() == 1 || common::getEnvKVCacheTransferAllBlocksForWindow() || recvSideHasCP)
+    {
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+    }
+    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+
+    for (auto const& [windowSize, metadata] : windowsMetadata)
+    {
+        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+        auto windowStartBlockIdx = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
+            - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
+        SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
+        blockRange.setBlockIdsForWindow(windowSize,
+            std::vector<SizeType32>(
+                blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
+    }
+    return blockRange;
 }
 
 bool CacheFormatter::needSendCache(
@@ -90,9 +162,9 @@ bool CacheFormatter::needSendCache(
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
         selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
     }
+    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
 
-    // only TP rank % dupHeadFactor == 0 need to send cache.
-    return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
+    return (destDPRank % targetInfo.mDupHeadFactor) == (selfTpRankInDpGroup % targetInfo.mDupHeadFactor);
 }
 
 void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
@@ -102,7 +174,8 @@ void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::
     // if gen PP and context PP are different, cache formatter only support alternative window like gpt-oss.
     // which is one layer is WSA, and another layer is Full attention.
 
-    auto numPools = cacheManager->getBlockManager().getNumPools();
+    auto numPools = cacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     auto layerNum = cacheManager->getBlockManager().getNumLayers();
 
     auto selfPPNum = selfConfig.getParallelConfig().mPipelineParallelism;
@@ -140,11 +213,12 @@ std::vector<size_t> CacheFormatter::pickRecvConnections(
         return ret;
     }
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
+    int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     std::vector<size_t> ret;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
-        if (i % targetInfo.mPeerDupHeadFactor == 0)
+        if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
         {
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
@@ -158,6 +232,7 @@ std::vector<size_t> CacheFormatter::pickRecvConnections(
 void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_format);
+    session.setTime(TransferSession::kTimeFormatter);
     auto const& llmRequest = session.getLlmRequest();
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
@@ -167,6 +242,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto indexFromEnd = session.getIndexFromEnd();
     auto& bufferManager = session.getBufferManager();
     // Some TP rank don't need to send cache since duplicate header is not needed.
     if (!needSendCache(selfConfig, destConfig, selfIdx))
@@ -174,13 +250,11 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         return;
     }
     auto& blockManager = mCacheManager->getBlockManager();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
-
-    auto const numPools = blockManager.getNumPools();
+    auto const& lastBlockKey = session.getLastBlockKey();
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd);
+    auto const numPools
+        = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
-
-    auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
-    bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
 
     bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
     if (layerWise)
@@ -197,20 +271,24 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             {
                 progress->wait(layerIdx);
             }
-            blockRange.updatePoolIdx(poolIdx);
-            for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+            auto const& windowSizes = blockRange.getWindowSizes();
+            for (auto const& windowSize : windowSizes)
             {
-                // Block dim: [1, numLayersInPool, ...], offset = {0, layerIndexInPool}
-                auto layer = runtime::ITensor::slice(it, offset, 1);
-                if (offset.d[1] == 0)
+                auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+                for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
                 {
-                    TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
-                        runtime::ITensor::toString(it->getShape()).c_str());
-                }
-                for (size_t i = 0; i < connections.size(); i++)
-                {
-                    TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
-                    session.send(i, layer->data(), layer->getSizeInBytes());
+                    // Block dim: [1, numLayersInPool, ...], offset = {0, layerIndexInPool}
+                    auto layer = runtime::ITensor::slice(it, offset, 1);
+                    if (offset.d[1] == 0)
+                    {
+                        TLLM_LOG_DEBUG("Block %p of pool %d shape = %s", it->data(), poolIdx,
+                            runtime::ITensor::toString(it->getShape()).c_str());
+                    }
+                    for (size_t i = 0; i < connections.size(); i++)
+                    {
+                        TLLM_LOG_DEBUG("Send layer %d(%d-%d)", layerIdx, poolIdx, layerIdxInPool);
+                        session.send(i, layer->data(), layer->getSizeInBytes());
+                    }
                 }
             }
         }
@@ -220,30 +298,29 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         int blockNum = 0;
 
         size_t allCacheBlockSize = 0;
-        // gather cache blocks of the request.
+        auto const& windowSizes = blockRange.getWindowSizes();
+        TLLM_LOG_DEBUG(
+            mpi::MpiComm::world().getRank(), " blockRange.getWindowSizes(); windowSizes size: %d", windowSizes.size());
+        TLLM_CHECK_WITH_INFO(
+            static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
+
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
-        for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
+
+        for (auto const& windowSize : windowSizes)
         {
-            blockRange.updatePoolIdx(poolIdx);
-            SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
-            TLLM_CHECK_WITH_INFO(inputKvCacheBlocksPerWindow.find(window) == inputKvCacheBlocksPerWindow.end(),
-                "window size already exists, which is not supported");
-            inputKvCacheBlocksPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
-            auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
-            // only block in window will be sent.
-            SizeType32 blockNumThisWindow = 0;
-            for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " format  windowSize: %d blockRangeForWindow size: %d",
+                windowSize, blockRangeForWindow.size());
+            inputKvCacheBlocksPerWindow.emplace(windowSize, std::vector<runtime::ITensor::SharedPtr>());
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
             {
-                blockNum++;
-                inputKvCacheBlocksPerWindow.at(window).push_back(it);
+                inputKvCacheBlocksPerWindow.at(windowSize).push_back(it);
                 allCacheBlockSize += it->getSize();
-                blockNumThisWindow++;
-                if (blockNumThisWindow >= maxBlockThisWindow)
-                {
-                    break;
-                }
+                blockNum++;
             }
         }
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "inputKvCacheBlocks size: %ld,blockNum: %d , windowSizes: %ld",
+            inputKvCacheBlocksPerWindow.size(), blockNum, windowSizes.size());
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
@@ -326,6 +403,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         auto bufferEleSizes = getBufferSizeForTarget();
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
+
         auto& outputSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
         auto& onlyUseDynamicBuffer = std::get<2>(result);
@@ -346,6 +424,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
         bufferManager.getStream().synchronize();
+        session.setTime(TransferSession::kTimePreprocess);
 
         auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
         if (preAllocSendBuffer != nullptr)
@@ -360,7 +439,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             TLLM_CHECK(connections.size() > (processIdx / peerDuplicateHeadFactor));
             TLLM_CHECK(outputSplitCaches.size() > (processIdx / peerDuplicateHeadFactor));
-            auto startTime = std::chrono::steady_clock::now();
+            auto startTime = LlmRequest::getSteadyClockNow();
 
             size_t ppDomainSize = targetInfo.mDomainPPSize;
             size_t bufferTpRank = (processIdx / ppDomainSize) / peerDuplicateHeadFactor;
@@ -378,7 +457,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             }
             else
             {
-
                 // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
                 // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
                 // cudaMalloc buffer,and then start send.
@@ -400,7 +478,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     auto sendSize = std::min(remainSendSize, sendBufferEleSize);
                     auto copySlice = runtime::ITensor::slice(
                         outputSplitCaches[bufferIdx], needSendSize - remainSendSize, sendSize);
-
                     auto copyTargetSlice = runtime::ITensor::slice(sendUseAllocBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
@@ -409,15 +486,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 }
             }
 
-            auto endTime = std::chrono::steady_clock::now();
-            double delay = 0.0;
-            if (recordDelay)
-            {
-                delay = std::chrono::duration<double, std::milli>(startTime - lastTokenTime).count();
-            }
-            double cacheTransferTime
-                = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            session.appendMeasure(delay, cacheTransferTime, size);
+            auto endTime = LlmRequest::getSteadyClockNow();
+            session.appendMeasure(startTime, endTime, size);
         };
 
         if (connections.size() > 1)
@@ -462,8 +532,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         {
             sendBufferFun(deviceId, 0);
         }
+        session.setTime(TransferSession::kTimeTransmissions);
 
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+        session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
@@ -472,6 +544,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
+    session.setTime(TransferSession::kTimeFormatter);
     auto const& llmRequest = session.getLlmRequest();
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -481,41 +554,37 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
-
-    auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
-    bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
 
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 
     TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputBuffersPerWindow;
-    auto const numPools = mCacheManager->getBlockManager().getNumPools();
+    auto const numPools = mCacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
     size_t blockNum = 0;
     size_t cacheBlockSizeSum = 0;
-    for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
+
+    auto windowSizes = blockRange.getWindowSizes();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " unformat windowSizes size: %d", windowSizes.size());
+    for (auto const& windowSize : windowSizes)
     {
-        blockRange.updatePoolIdx(poolIdx);
-        SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
-        TLLM_CHECK_WITH_INFO(outputBuffersPerWindow.find(window) == outputBuffersPerWindow.end(),
-            "window size already exists, which is not supported");
-        outputBuffersPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
-        auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
-        SizeType32 blockNumThisWindow = 0;
-        for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+        auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "  unformat windowSize: %d blockRangeForWindow size: %d",
+            windowSize, blockRangeForWindow.size());
+        outputBuffersPerWindow.emplace(windowSize, std::vector<runtime::ITensor::SharedPtr>());
+
+        for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
         {
-            blockNum++;
-            blockNumThisWindow++;
-            outputBuffersPerWindow.at(window).push_back(it);
+            outputBuffersPerWindow.at(windowSize).push_back(it);
             cacheBlockSizeSum += it->getSize();
-            if (blockNumThisWindow >= maxBlockThisWindow)
-            {
-                break;
-            }
+            blockNum++;
         }
     }
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "outputBuffersPerWindow size: %ld,blockNum: %d , windowSizes: %ld",
+        outputBuffersPerWindow.size(), blockNum, windowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
     if (outputBuffersPerWindow.size() > 1)
     {
@@ -560,8 +629,10 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 auto const poolIdx = 0;
                 auto const layerIdxInPool = layerIdx;
                 int idx = 0;
-                blockRange.updatePoolIdx(poolIdx);
-                for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+                // blockRange.updatePoolIdx(poolIdx);
+                auto const window = mCacheManager->getBlockManager().getPoolLayerIdx(layerIdx);
+                auto blockRangeForWindow = blockRange.getBlockRangeForWindow(window);
+                for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
                 {
                     if (layerIdxInPool == 0)
                     {
@@ -690,10 +761,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                 }
-                TLLM_CHECK(cacheBufferId.has_value());
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
+                TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+
                 bufferCoverTargetNum = bufferCoverTargetNumtmp;
                 remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 
@@ -707,6 +779,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 // sync to alloc buffer
                 bufferManager.getStream().synchronize();
             }
+            session.setTime(TransferSession::kTimePreprocess);
 
             runtime::ITensor::SharedPtr preAllocRecvBuffer = nullptr;
             if (cacheBufferId.has_value())
@@ -722,7 +795,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
                 TLLM_CHECK(pickUpConnections.size() > processIdx);
                 TLLM_CHECK(recvSplitCaches.size() > processIdx);
-                auto startTime = std::chrono::steady_clock::now();
+                auto startTime = LlmRequest::getSteadyClockNow();
                 size_t size = 0;
 
                 if (processIdx >= remainNoCoverTargetNum)
@@ -763,15 +836,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     }
                 }
 
-                auto endTime = std::chrono::steady_clock::now();
-                double delay = 0.0;
-                if (recordDelay)
-                {
-                    delay = std::chrono::duration<double, std::milli>(startTime - arrivalTime).count();
-                }
-                double cacheTransferTime
-                    = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-                session.appendMeasure(delay, cacheTransferTime, size);
+                auto endTime = LlmRequest::getSteadyClockNow();
+                session.appendMeasure(startTime, endTime, size);
             };
             if (pickUpConnections.size() > 1)
             {
@@ -819,6 +885,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             {
                 recvBufferFun(deviceId, 0);
             }
+            session.setTime(TransferSession::kTimeTransmissions);
 
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
@@ -832,6 +899,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
                 }
             }
+            session.setTime(TransferSession::kTimePostprocess);
         }
     }
 
@@ -905,13 +973,14 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 }
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
-    BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager, bool isMLA)
+    BaseKVCacheManager* cacheManager, std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA)
 {
+    TLLM_CHECK(!cacheTransBufferManagers.empty());
     if (isMLA)
     {
-        return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManager);
+        return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManagers);
     }
-    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManager);
+    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManagers[0]);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

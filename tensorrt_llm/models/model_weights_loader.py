@@ -26,7 +26,7 @@ class ModelWeightsFormat(Enum):
 
 
 class ModelWeightsLoader:
-    """Convert and load external checkpoint into a TensorRT-LLM model.
+    """Convert and load external checkpoint into a TensorRT LLM model.
 
     Attributes:
         model_dir                 : Model directory or in-memory torch model.

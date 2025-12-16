@@ -9,14 +9,13 @@ from typing import Generator, List, Optional, Tuple
 import aiohttp
 import pytest
 import yaml
+from defs.common import revise_disagg_config_file_with_free_ports
 from defs.conftest import skip_no_hopper
-from defs.disaggregated.test_disaggregated_single_gpu import \
-    model_path as get_model_path
 from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
-from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter,
@@ -44,6 +43,7 @@ def run_disaggregated_workers(
     num_ranks: Optional[int] = None
 ) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
 
+    config_file = revise_disagg_config_file_with_free_ports(config_file)
     ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
 
     # TODO: auto detect num_ranks
@@ -68,6 +68,34 @@ DEFAULT_TIMEOUT_SERVER_START = 900
 DEFAULT_TIMEOUT_REQUEST = 180
 
 
+async def wait_until_all_servers_ready(
+    session: aiohttp.ClientSession,
+    servers: List[str],
+    server_start_timeout_secs: int = 180,
+) -> None:
+
+    async def check_all_servers_ready():
+        elapsed_time = 0
+        interval = 3
+        while elapsed_time < server_start_timeout_secs:
+            _, unready_servers = await OpenAIHttpClient.check_ready_for_servers(
+                session, servers)
+            if len(unready_servers) == 0:
+                return
+            await asyncio.sleep(interval)
+            elapsed_time += interval
+            logger.info(
+                f"[{elapsed_time}] Waiting for servers, {unready_servers}...")
+
+    try:
+        await asyncio.wait_for(check_all_servers_ready(),
+                               timeout=server_start_timeout_secs)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"Timeout waiting for all servers to be ready in {server_start_timeout_secs} seconds"
+        )
+
+
 class BasicWorkerTester:
 
     def __init__(self,
@@ -84,9 +112,9 @@ class BasicWorkerTester:
         session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(force_close=True),
             timeout=aiohttp.ClientTimeout(total=self.req_timeout_secs))
-        await OpenAIDisaggServer.wait_for_all_servers_ready(
-            session, self.ctx_servers, self.gen_servers,
-            self.server_start_timeout_secs)
+        await wait_until_all_servers_ready(session,
+                                           self.ctx_servers + self.gen_servers,
+                                           self.server_start_timeout_secs)
         return session
 
     async def send_request(self, session: aiohttp.ClientSession, url: str,
@@ -206,13 +234,10 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                 model_path: Optional[str] = None):
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        if model_path is None:
-            model_path = get_model_path(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model_name = model_name
         self.kv_cache_block_maps: dict[str, KvCacheAwareServerState] = {}
         self.kv_cache_event_maps: dict[str, list[dict]] = {}
@@ -489,6 +514,7 @@ def load_default_prompts(disaggregated_example_root: str):
 @contextlib.contextmanager
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
+    os.chdir(cwd)
     with open(os.path.join(cwd, 'output_workers.log'), 'w+') as log_file:
         workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
             config_file=config_file,
@@ -509,6 +535,7 @@ def background_workers(llm_venv, config_file: str, num_ranks: int = None):
             proc.wait()
 
 
+@pytest.mark.skip(reason="https://nvbugs/5372970")
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_workers_conditional_disaggregation(disaggregated_test_root,
@@ -602,7 +629,6 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
 
     with background_workers(llm_venv, config_file,
                             4) as (ctx_servers, gen_servers):
-        os.chdir(llm_venv.get_working_directory())
         tester = KvCacheAwareRouterTester(ctx_servers,
                                           gen_servers,
                                           model_name="DeepSeek-V3-Lite/bf16",

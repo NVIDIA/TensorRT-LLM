@@ -40,29 +40,31 @@ trtllm-bench \
 #### Basic Performance Configuration (`autodeploy_config.yaml`)
 
 ```yaml
-# Compilation backend
-compile_backend: torch-opt
-
-# Runtime engine
+# runtime engine
 runtime: trtllm
 
-# Model loading
+# model loading
 skip_loading_weights: false
-
-# Fraction of free memory to use for kv-caches
-free_mem_ratio: 0.8
-
-# CUDA Graph optimization
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
-
-# Attention backend
-attn_backend: flashinfer
 
 # Sequence configuration
 max_batch_size: 256
+
+# transform options
+transforms:
+  insert_cached_attention:
+    # attention backend
+    backend: flashinfer
+  resize_kv_cache:
+    # fraction of free memory to use for kv-caches
+    free_mem_ratio: 0.8
+  compile_model:
+    # compilation backend
+    backend: torch-opt
+    # CUDA Graph optimization
+    cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
 ```
 
-Enable multi-GPU execution by specifying `--tp n`, where `n` is the number of GPUs
+Enable multi-GPU execution by specifying `--tp n`, where `n` is the number of GPUs.
 
 ## Configuration Options Reference
 

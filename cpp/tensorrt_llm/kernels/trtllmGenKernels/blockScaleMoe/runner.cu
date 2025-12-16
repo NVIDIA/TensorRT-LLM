@@ -17,14 +17,15 @@
 #include "DevKernel.h"
 #include "RoutingKernel.h"
 #include "runner.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include <iostream>
 #include <tensorrt_llm/common/assert.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -44,7 +45,10 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
     {
         ++out;
     }
-    TLLM_CHECK_WITH_INFO((1 << out) == val, "Expected %s to be a power of 2, got %d", name.c_str(), val);
+    if ((1 << out) != val)
+    {
+        out = -1;
+    }
     return out;
 }
 } // namespace
@@ -60,25 +64,26 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
     int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
-    void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-    int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-    RoutingMethodType routingMethodType, cudaStream_t stream)
+    void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
+    int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
+    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream)
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
-        TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+        TLLM_CHECK_WITH_INFO(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
         // output:
-        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrTopKPacked = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrExpertWeights = expertWeights;
+        routingData.mPtrTopKWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
         routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -86,13 +91,16 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         // input:
         routingData.mPtrRoutingBias = routingBias;
-        routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        routingData.mPtrTopKIds = expertIds;
         routingData.mNumTokens = numTokens;
         routingData.mNumExperts = numExperts;
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -112,12 +120,13 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mUsePdl = true;
 
         // output:
-        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrTopKPacked = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrExpertWeights = expertWeights;
+        routingData.mPtrTopKWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
         routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -127,7 +136,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // input:
         // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
         // routingData.mPtrRoutingBias = routingBias;
-        routingData.mPtrScores = routingLogits;
+
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        routingData.mPtrTopKIds = expertIds;
         // routingData.mPtrIn = args.mInputActs;
         routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
@@ -136,6 +148,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mNumLimitedGroups =topkGroup;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -158,18 +171,19 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
         routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
 
-        routingData.mPtrScores = routingLogits;
-
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
         //
         // Outputs
         //
-        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrTopKPacked = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrExpertWeights = expertWeights;
-
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
         //
         // Grouped Gemm Launch Config Buffers
         //
@@ -184,6 +198,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumExperts = numExperts;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -234,14 +249,24 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     float* ptrClampLimit, void* output, void* outputScale, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
-    void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex)
+    void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
+    int32_t validHiddenSize, int32_t validIntermediateSize)
 {
+    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
+    {
+        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
+        // FIXME: enforce valid hidden dim to be multiple of 512 due to unhandled OOB read in routeAct. Please keep this
+        // in sync with
+        // tensorrt_llm/_torch/modules/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
+        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
+    }
     auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
-        hiddenState, hiddenStateScale, weights, weightsScale, expertWeights, /* perTokensSfB */ nullptr,
-        outputScalesScalar, outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale,
-        permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-        ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex);
+    mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, numTokens, 2 * validIntermediateSize, validHiddenSize, {},
+        numTokens, numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
+        useRoutingScalesOnInput ? expertWeights : nullptr, /* perTokensSfB */ nullptr, outputScalesScalar,
+        outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
+        ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace,
+        stream, device, configIndex);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
@@ -252,21 +277,21 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
         numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, configIndex);
 }
 
-int32_t Runner::getDefaultValidConfigIndex(
-    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const
+int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+    int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    return mRunner.getDefaultValidConfigIndex(
-        numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+    return mRunner.getDefaultValidConfigIndex(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts,
+        maxNumCtasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-    int32_t numExperts, int32_t numTokens) const
+    int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
-    auto const isValid = mRunner.isValidConfigIndex(
-        configIndex, numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+    auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens, 2 * intermediateSize, hiddenSize, {},
+        numTokens, numExperts, maxNumCtasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
 
     return isValid;
 }
@@ -274,6 +299,11 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
 std::vector<int64_t> Runner::getPassingConfigIndices() const
 {
     return mRunner.getPassingConfigIndices();
+}
+
+std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getKernelNameFromConfigIndex(configIndex);
 }
 
 } // namespace PermuteGemm1
@@ -313,11 +343,18 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
     float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
     int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
-    void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex)
+    void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize,
+    int32_t validIntermediateSize)
 {
+    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
+    {
+        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
+        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
+    }
     auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    mRunner.run(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
-        permutedHiddenState, permutedHiddenStateScale, weights, weightsScale, /* perTokensSfA */ nullptr,
+    mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
+        numTokens, numExperts, maxNumCtasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
+        weightsScale, /* perTokensSfA */ nullptr,
         /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr, ptrBias,
         /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
         /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
@@ -332,22 +369,22 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
         numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, configIndex);
 }
 
-int32_t Runner::getDefaultValidConfigIndex(
-    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const
+int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+    int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    return mRunner.getDefaultValidConfigIndex(
-        numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+    return mRunner.getDefaultValidConfigIndex(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts,
+        maxNumCtasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-    int32_t numExperts, int32_t numTokens) const
+    int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
 
     auto const maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
-    auto const isValid = mRunner.isValidConfigIndex(
-        configIndex, numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+    auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {}, numTokens,
+        numExperts, maxNumCtasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
 
     return isValid;
 }
@@ -355,6 +392,11 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
 std::vector<int64_t> Runner::getPassingConfigIndices() const
 {
     return mRunner.getPassingConfigIndices();
+}
+
+std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getKernelNameFromConfigIndex(configIndex);
 }
 
 } // namespace Gemm2
@@ -440,8 +482,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         finalizeData.numExperts = args.num_experts;
         finalizeData.topK = args.top_k;
         // We want to fuse unpadding into the finalize kernel, so we need to use the output hidden size.
-        finalizeData.hiddenDim = args.hidden_size_output.value_or(args.hidden_size);
-        finalizeData.hiddenDimPadded = args.hidden_size;
+        finalizeData.hiddenDim = args.valid_hidden_size.value_or(args.hidden_size);
+        finalizeData.hiddenDimPadded = args.output_hidden_size.value_or(args.hidden_size);
         finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
     }
 }
@@ -457,8 +499,8 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
     return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
-std::vector<int64_t> Runner::getValidConfigIndices(
-    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const
+std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+    int32_t numLocalExperts, int32_t numTokens, int32_t validIntermediateSize, int32_t validHiddenSize) const
 {
     std::vector<int64_t> validIndices;
 
@@ -466,26 +508,33 @@ std::vector<int64_t> Runner::getValidConfigIndices(
     {
         auto const& config = mPassingConfigs[i];
 
-        if (mPermuteGemm1.isValidConfigIndex(
-                config.gemm1Config, topK, hiddenSize, intermediateSize, numLocalExperts, numTokens)
-            && mGemm2.isValidConfigIndex(
-                config.gemm2Config, topK, hiddenSize, intermediateSize, numLocalExperts, numTokens))
+        if (mPermuteGemm1.isValidConfigIndex(config.gemm1Config, topK, hiddenSize, intermediateSize, numLocalExperts,
+                numTokens, validHiddenSize, validIntermediateSize)
+            && mGemm2.isValidConfigIndex(config.gemm2Config, topK, hiddenSize, intermediateSize, numLocalExperts,
+                numTokens, validHiddenSize, validIntermediateSize))
         {
             validIndices.push_back(i);
+            auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_CONFIGS");
+            if (envVarVal && std::atoi(envVarVal) == 1)
+            {
+                auto kernel1 = mPermuteGemm1.getKernelNameFromConfigIndex(config.gemm1Config);
+                auto kernel2 = mGemm2.getKernelNameFromConfigIndex(config.gemm2Config);
+                printf("Valid config index: %d, Gemm1 %s, Gemm2 %s\n", i, kernel1.c_str(), kernel2.c_str());
+            }
         }
     }
 
     return validIndices;
 }
 
-int64_t Runner::getDefaultValidConfigIndex(
-    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const
+int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+    int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
 
-    int32_t indexGemm1
-        = mPermuteGemm1.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
-    int32_t indexGemm2
-        = mGemm2.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+    int32_t indexGemm1 = mPermuteGemm1.getDefaultValidConfigIndex(
+        topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
+    int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(
+        topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, validHiddenSize, validIntermediateSize);
 
     auto it = std::find_if(mPassingConfigs.begin(), mPassingConfigs.end(),
         [indexGemm1, indexGemm2](MoEConfig cfg)
@@ -514,7 +563,9 @@ void Runner::run(
         args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
         workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-        args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config);
+        args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
+        args.valid_hidden_size.value_or(args.hidden_size),
+        args.valid_intermediate_size.value_or(args.intermediate_size));
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
     void* gemm2_input = workspace.gemm1_output;
@@ -530,10 +581,12 @@ void Runner::run(
 
     // Run gemm2
     mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
-        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k, args.hidden_size,
-        args.intermediate_size, args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
-        workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
-        workspace.bmm2_workspace, device, stream, config.gemm2Config);
+        args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
+        args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, args.local_num_experts,
+        args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+        workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
+        config.gemm2Config, args.valid_hidden_size.value_or(args.hidden_size),
+        args.valid_intermediate_size.value_or(args.intermediate_size));
 
     // Run finalize
     if (args.do_finalize)
@@ -547,4 +600,5 @@ void Runner::run(
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

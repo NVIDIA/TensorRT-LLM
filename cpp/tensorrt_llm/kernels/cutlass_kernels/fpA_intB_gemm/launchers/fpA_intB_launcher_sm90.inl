@@ -41,14 +41,15 @@
 #endif          // __GNUC__
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels_oss
@@ -194,7 +195,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
             if (group_size % cta_shape_k != 0)
             {
                 std::string err_msg = "The group size must a multiple of " + std::to_string(cta_shape_k);
-                throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner]" + err_msg);
+                throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner]" + err_msg);
             }
 
             if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY)
@@ -250,7 +251,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
         Gemm gemm;
         if (gemm.get_workspace_size(args) > workspace_bytes)
         {
-            TLLM_LOG_ERROR("[TensorRT-LLm Error][fpA_intB Runner] given workspace size insufficient.");
+            TLLM_LOG_ERROR("[TensorRT LLM Error][fpA_intB Runner] given workspace size insufficient.");
         }
 
         auto can_implement = gemm.can_implement(args);
@@ -259,7 +260,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
             std::string err_msg = "fpA_intB cutlass kernel will fail for params. Error: "
                 + std::string(cutlassGetStatusString(can_implement));
             std::cout << err_msg << std::endl;
-            throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner] " + err_msg);
+            throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner] " + err_msg);
         }
 
         auto init_status = gemm.initialize(args, workspace, stream);
@@ -267,7 +268,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
         {
             std::string err_msg = "Failed to initialize cutlass fpA_intB gemm. Error: "
                 + std::string(cutlassGetStatusString(init_status));
-            throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner] " + err_msg);
+            throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner] " + err_msg);
         }
 
         auto run_status = gemm.run(stream);
@@ -275,13 +276,13 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
         {
             std::string err_msg
                 = "Failed to run cutlass fpA_intB gemm. Error: " + std::string(cutlassGetStatusString(run_status));
-            throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner] " + err_msg);
+            throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner] " + err_msg);
         }
     }
     else
     {
         std::stringstream ss;
-        ss << "[TensorRT-LLm Error][fpA_intB Runner] Config (" << (int64_t) cute::size<0>(CTAShape{}) << ","
+        ss << "[TensorRT LLM Error][fpA_intB Runner] Config (" << (int64_t) cute::size<0>(CTAShape{}) << ","
            << (int64_t) cute::size<1>(CTAShape{}) << "," << (int64_t) cute::size<2>(CTAShape{}) << ") ("
            << (int64_t) cute::size<0>(ClusterShape{}) << "," << (int64_t) cute::size<1>(ClusterShape{}) << ","
            << (int64_t) cute::size<2>(ClusterShape{}) << ") not compiled with FAST_BUILD.";
@@ -291,11 +292,12 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 
 #else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
-        "[TensorRT-LLm Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an arch "
+        "[TensorRT LLM Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an arch "
         "to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }
 
 } // namespace cutlass_kernels_oss
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

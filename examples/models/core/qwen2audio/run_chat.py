@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# isort: off
 import torch
 from run import QWenInfer, parse_arguments
 
 import tensorrt_llm
+# isort: on
 
 if __name__ == '__main__':
     args = parse_arguments()

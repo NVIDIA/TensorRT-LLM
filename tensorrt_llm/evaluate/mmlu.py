@@ -1,40 +1,23 @@
-# MIT License
+# SPDX-FileCopyrightText: Copyright (c) 2020 Dan Hendrycks
+# SPDX-FileCopyrightText: Copyright (c) 2023 Deep Cognition and Language Research (DeCLaRe) Lab
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 and MIT
 #
-# Copyright (c) 2020 Dan Hendrycks
-# Copyright (c) 2023 Deep Cognition and Language Research (DeCLaRe) Lab
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
+# http://www.apache.org/licenses/LICENSE-2.0
 #
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# Not a contribution
-# Changes made by NVIDIA CORPORATION & AFFILIATES or otherwise documented as
-# NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+import json
 import math
-from typing import Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 
 import click
 import numpy as np
@@ -137,10 +120,12 @@ class MMLU(Evaluator):
                  num_fewshot: int = 5,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None):
+                 system_prompt: Optional[str] = None,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
         if dataset_path is None:
             dataset_path = self.dowload_dataset()
         self.dataset_path = dataset_path
@@ -296,6 +281,13 @@ class MMLU(Evaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -314,6 +306,7 @@ class MMLU(Evaluator):
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
                 num_fewshot: int, random_seed: int, apply_chat_template: bool,
+                chat_template_kwargs: Optional[dict[str, Any]],
                 system_prompt: Optional[str], max_input_length: int,
                 max_output_length: int, check_accuracy: bool,
                 accuracy_threshold: float) -> None:
@@ -326,7 +319,8 @@ class MMLU(Evaluator):
                          num_fewshot=num_fewshot,
                          random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
 

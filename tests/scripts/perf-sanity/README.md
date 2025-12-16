@@ -1,138 +1,109 @@
-# TensorRT-LLM Benchmark Test System
+# TensorRT-LLM Perf Sanity Test System
 
-Benchmarking scripts for TensorRT-LLM serving performance tests with configuration-driven test cases and CSV report generation.
+Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
 
 ## Overview
 
-- Run performance benchmarks across multiple model configurations
+- Run performance sanity benchmarks across multiple model configurations
+- Support three deployment architectures: single-node, multi-node aggregated, and multi-node disaggregated
 - Manage test cases through YAML configuration files
-- Generate comprehensive CSV reports with complete test case coverage
-- Support selective execution of specific test cases
+- Automated resource calculation and job submission via SLURM
 
-## Scripts Overview
+## Configuration File Types
 
-### 1. `benchmark_config.yaml` - Test Case Configuration
-**Purpose**: Defines all benchmark test cases in a structured YAML format.
+There are three types of YAML configuration files for different deployment architectures:
+
+### 1. Single-Node Aggregated Test Configuration
+
+**File Example**: `l0_dgx_b200.yaml`
+
+**Use Case**: Single-node performance tests on a single server with multiple GPUs.
 
 **Structure**:
 ```yaml
-test_cases:
-  - id: 1
-    model: "70B-FP8"
-    gpus: 1
-    tp: 1
-    ep: 1
-    attn_backend: "TRTLLM"
-    moe_backend: ""
-    enable_attention_dp: false
-    free_gpu_mem_fraction: 0.9
+server_configs:
+  - name: "r1_fp8_dep8_mtp1_1k1k"
+    model_name: "deepseek_r1_0528_fp8"
+    gpus: 8
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
     max_batch_size: 512
-    isl: 1024
-    osl: 1024
-    max_num_tokens: 16384
-    moe_max_num_tokens: ""
-    concurrency_iterations:
-      - [1, 10]
-      - [8, 10]
-      - [64, 5]
-      - [512, 2]
+    max_num_tokens: 8192
+    attention_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'DEEPGEMM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: 'MTP'
+      num_nextn_predict_layers: 1
+    client_configs:
+      - name: "con4096_iter10_1k1k"
+        concurrency: 4096
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
 ```
 
-**Configuration Fields**:
-- `id`: Unique identifier for the test case
-- `model`: Model name (e.g., "70B-FP8", "Scout-FP4")
-- `gpus`: Number of GPUs to use
-- `tp`: Tensor parallelism size
-- `ep`: Expert parallelism size
-- `attn_backend`: Attention backend ("TRTLLM", "FLASHINFER")
-- `moe_backend`: MoE backend ("DEEPGEMM", "TRTLLM", "CUTLASS", "")
-- `enable_attention_dp`: Enable attention data parallelism
-- `free_gpu_mem_fraction`: GPU memory fraction to reserve
-- `max_batch_size`: Maximum batch size
-- `isl`: Input sequence length
-- `osl`: Output sequence length
-- `max_num_tokens`: Maximum number of tokens
-- `moe_max_num_tokens`: Maximum number of tokens for MoE
-- `concurrency_iterations`: List of [concurrency, iteration] pairs
 
+### 2. Multi-Node Aggregated Test Configuration
 
-### 2. `run_benchmark_serve.py` - Main Benchmark Runner
-**Purpose**: Executes performance benchmarks based on YAML configuration files.
+**File Example**: `l0_gb200_multi_nodes.yaml`
 
-**Usage**:
-```bash
-python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
-```
+**Use Case**: Multi-node aggregated architecture where model runs across multiple nodes with unified execution.
 
-**Arguments**:
-- `--output_folder`: Directory to store benchmark results (required)
-- `--config_file`: Path to YAML configuration file (required)
-- `--skip`: Skip pattern for specific test cases/concurrencies (optional, default: no skipping)
-- `--select`: Select pattern for specific test cases/concurrencies (optional, default: all test cases)
+**Structure**:
+```yaml
+# Hardware Config
+hardware:
+  gpus_per_node: 4
+  gpus_per_server: 8
 
-**Examples**:
-```bash
-# Run all test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --skip default --select default
-
-# Skip specific test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --skip "2-1,4"
-
-# Run specific concurrencies from specific test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --select "1,2-3"
-
-```
-
-**Skip Pattern**:
-Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_case2-concurrency3"`
-- `"2,4"`: Skip test cases 2 and 4 entirely
-- `"2-1,4-2"`: Skip test case 2's 1st concurrency and test case 4's 2nd concurrency
-- `"default"` or empty: No skipping (default)
-
-**Select Pattern**:
-Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_case2-concurrency3"`
-- `"1,3,5"`: Run only test cases 1, 3, and 5 (all concurrencies)
-- `"1-1,2-3"`: Run test case 1's 1st concurrency and test case 2's 3rd concurrency
-- `"default"` or empty: Run all test cases (default)
-
-
-### 3. `parse_benchmark_results.py` - Results Parser
-**Purpose**: Parses benchmark log files and generates comprehensive CSV reports with all test cases from the configuration file.
-
-**Usage**:
-```bash
-python parse_benchmark_results.py --input_folder <input_folder> --output_csv <output_csv> --config_file <config_file>
-```
-
-**Arguments**:
-- `input_folder`: Folder containing benchmark log files (serve.*.log) (required)
-- `output_csv`: Output CSV filename for the results table (required)
-- `config_file`: Path to benchmark_config.yaml file (required)
-
-**Examples**:
-```bash
-python parse_benchmark_results.py --config_file ./benchmark_logs --output_csv results.csv --input_folder ./benchmark_config.yaml
-
-```
-
-### 4. `benchmark-serve.sh` - SLURM Job Script
-**Usage**:
-```bash
-sbatch benchmark-serve.sh [IMAGE] [bench_dir] [output_dir] [select_pattern] [skip_pattern]
-```
-
-**Parameters**:
-- `IMAGE`: Docker image (default: tensorrt-llm-staging/release:main-x86_64)
-- `bench_dir`: Directory containing config file and benchmark scripts (default: current directory)
-- `output_dir`: Directory containing output logs and csv. (default: current directory)
-- `select_pattern`: Select pattern (default: default - all test cases)
-- `skip_pattern`: Skip pattern (default: default - no skipping)
-
-**Examples**:
-```bash
-
-bench_dir="/path/to/benchmark/scripts"
-output_dir="/path/to/store/output/files"
-sbatch --reservation=RES--COM-3970 --qos=reservation -D ${output_dir} ${bench_dir}/benchmark-serve.sh urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64 ${bench_dir} ${output_dir} "1-1" ""
-
+server_configs:
+  - name: "r1_fp4_v2_dep8_mtp1"
+    model_name: "deepseek_r1_0528_fp4_v2"
+    gpus: 8
+    gpus_per_node: 4
+    trust_remote_code: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 2112
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+    client_configs:
+      - name: "con32_iter12_1k1k"
+        concurrency: 32
+        iterations: 12
+        isl: 1024
+        osl: 1024
+        random_range_ratio: 0.8
+        backend: "openai"
 ```

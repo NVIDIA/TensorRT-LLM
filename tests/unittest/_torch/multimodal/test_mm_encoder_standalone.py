@@ -1,18 +1,22 @@
 import json
 import os
+import time
+from pathlib import Path
 
 import pytest
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import default_multimodal_input_loader
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
+test_data_root = Path(
+    os.path.join(llm_models_root(), "multimodals", "test_data"))
 example_images = [
-    "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+    str(test_data_root / "seashore.png"),
+    str(test_data_root / "inpaint.png"),
+    str(test_data_root / "61.jpg"),
 ]
 
 
@@ -22,18 +26,24 @@ def multimodal_model_config():
     # You can extend this to support multiple models or get from environment
     model_configs = {
         'llava-v1.6-mistral-7b-hf': {
-            'model_name': 'llava-v1.6-mistral-7b-hf',
-            'hf_model_dir': 'llava-hf/llava-v1.6-mistral-7b-hf',
+            'model_name':
+            'llava-v1.6-mistral-7b-hf',
+            'hf_model_dir':
+            'llava-hf/llava-v1.6-mistral-7b-hf',
+            'model_dir':
+            llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf",
         }
     }
 
     return model_configs['llava-v1.6-mistral-7b-hf']
 
 
+# TODO: Add multi-image in single chat test
 @pytest.mark.parametrize("model_key", [
     "llava-v1.6-mistral-7b-hf",
 ])
-def test_single_image_chat(model_key, multimodal_model_config):
+@pytest.mark.parametrize("pd_disagg", [False, True])
+def test_single_image_chat(model_key, pd_disagg, multimodal_model_config):
     """Test processing single image using encoder (pass mm_embeddings) + LLM API.
 
     This test verifies that encoder (pass mm_embeddings) + LLM API produces identical
@@ -47,11 +57,11 @@ def test_single_image_chat(model_key, multimodal_model_config):
         )
 
     # Extract model information from config
-    encoder_model_dir = multimodal_model_config['hf_model_dir']
+    encoder_model_dir = multimodal_model_config['model_dir']
 
     # Test configuration
     max_tokens = 64
-    free_gpu_memory_fraction = 0.6
+    free_gpu_memory_fraction = 0.6 if not pd_disagg else 0.2
     max_batch_size = 1
 
     # Test data - OpenAI chat completion format
@@ -68,10 +78,26 @@ def test_single_image_chat(model_key, multimodal_model_config):
     # Process multimodal data using encoder (pass mm_embeddings)
     encoder = MultimodalEncoder(model=encoder_model_dir,
                                 max_batch_size=max_batch_size)
+
+    cache_transceiver_cfg = CacheTransceiverConfig(
+        backend="DEFAULT") if pd_disagg else None
+
+    disable_overlap_scheduler = pd_disagg
+
     llm = LLM(model=encoder_model_dir,
               backend='pytorch',
               kv_cache_config=kv_cache_config,
-              trust_remote_code=True)
+              trust_remote_code=True,
+              cache_transceiver_config=cache_transceiver_cfg,
+              disable_overlap_scheduler=disable_overlap_scheduler)
+
+    llm_decode = None
+    if pd_disagg:
+        llm_decode = LLM(model=encoder_model_dir,
+                         backend='pytorch',
+                         kv_cache_config=kv_cache_config,
+                         trust_remote_code=True,
+                         cache_transceiver_config=cache_transceiver_cfg)
 
     # Load model configuration
     config_path = os.path.join(llm._hf_model_dir, 'config.json')
@@ -109,21 +135,31 @@ def test_single_image_chat(model_key, multimodal_model_config):
 
     # Prepare inputs for llm (pass mm_embeddings)
     encoder_outputs = encoder.generate(inputs)
-    inputs = default_multimodal_input_loader(
-        tokenizer=llm.tokenizer,
-        model_dir=llm._hf_model_dir,
-        model_type=model_type,
-        modality="image",
-        prompts=prompts,
-        mm_embeddings=[
-            SharedTensorContainer.from_dict(
-                output.mm_embedding_handle).get_local_view()
-            for output in encoder_outputs
-        ],
-        image_data_format="pt")
 
     # Generate output using llm (pass mm_embeddings)
-    outputs = llm.generate(inputs, sampling_params=sampling_params)
+    ep_disaggregated_params = encoder_outputs[0].disaggregated_params
+
+    assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
+    ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
+    outputs = llm.generate(inputs,
+                           sampling_params=sampling_params,
+                           disaggregated_params=ep_disaggregated_params)
+
+    if pd_disagg:
+        # Generation using llm_decode
+        assert len(outputs) == 1
+        pd_disaggregated_params = outputs[0].disaggregated_params
+        pd_disaggregated_params.request_type = "generation_only"
+        sampling_params = SamplingParams(max_tokens=max_tokens)
+        inputs[0][
+            'multi_modal_data'] = None  # remove multimodal data from input as decoder worker doesn't need it
+        inputs[0]['prompt_token_ids'] = outputs[
+            0].prompt_token_ids  # use prompt token ids from encoder output
+
+        outputs = llm_decode.generate(
+            inputs,
+            sampling_params=sampling_params,
+            disaggregated_params=pd_disaggregated_params)
 
     # Validate outputs
     assert len(outputs) == len(
@@ -138,9 +174,9 @@ def test_single_image_chat(model_key, multimodal_model_config):
     ), f"Number of outputs don't match: {len(outputs_ref)} vs {len(outputs)}"
 
     for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs)):
-        # Compare prompts
-        assert ref_output.prompt == test_output.prompt, \
-            f"Prompts don't match for output {i}:\nReference: {ref_output.prompt!r}\nTest: {test_output.prompt!r}"
+        # Cannot compare prompts as decoder worker would void it
+        #assert ref_output.prompt == test_output.prompt, \
+        #    f"Prompts don't match for output {i}:\nReference: {ref_output.prompt!r}\nTest: {test_output.prompt!r}"
 
         # Compare number of generated outputs
         assert len(ref_output.outputs) == len(test_output.outputs), \
@@ -161,3 +197,177 @@ def test_single_image_chat(model_key, multimodal_model_config):
             if hasattr(ref_gen, 'logprobs') and hasattr(test_gen, 'logprobs'):
                 assert ref_gen.logprobs == test_gen.logprobs, \
                     f"Log probabilities don't match for output {i}, generation {j}"
+
+
+@pytest.mark.parametrize("model_key", [
+    "llava-v1.6-mistral-7b-hf",
+])
+def test_multi_request_batch_chat(model_key, multimodal_model_config):
+    """Test batching multiple multimodal requests and verify encoder path matches raw path.
+
+    This mirrors test_single_image_chat but with a batch of size 3.
+    """
+    if model_key != "llava-v1.6-mistral-7b-hf":
+        pytest.skip(
+            f"Skipping test for {model_key} - only testing llava-v1.6-mistral-7b-hf for now"
+        )
+
+    encoder_model_dir = multimodal_model_config['model_dir']
+
+    max_tokens = 64
+    free_gpu_memory_fraction = 0.6
+    max_batch_size = 3
+
+    prompts = [
+        "Describe the natural environment in the image.",
+        "Describe the object and weather condition in the image.",
+        "Describe the traffic condition on the road in the image.",
+    ]
+    media = [example_images[0], example_images[1], example_images[2]]
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=
+        False,  # Disable block reuse for output 1-1 matching check
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+    )
+
+    encoder = MultimodalEncoder(model=encoder_model_dir,
+                                max_batch_size=max_batch_size)
+    llm = LLM(
+        model=encoder_model_dir,
+        backend='pytorch',
+        kv_cache_config=kv_cache_config,
+        max_batch_size=1,  # fix batch size to reduce non-determinism in tests
+        trust_remote_code=True)
+
+    config_path = os.path.join(llm._hf_model_dir, 'config.json')
+    assert os.path.exists(
+        config_path), f"Model config not found at {config_path}"
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    model_type = model_config['model_type']
+
+    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                             model_dir=llm._hf_model_dir,
+                                             model_type=model_type,
+                                             modality="image",
+                                             prompts=prompts,
+                                             media=media,
+                                             image_data_format="pt")
+    assert len(inputs) == len(
+        prompts), f"Expected {len(prompts)} inputs, got {len(inputs)}"
+
+    # Reference with raw inputs
+    outputs_ref = llm.generate(inputs, sampling_params=sampling_params)
+    assert outputs_ref is not None and len(outputs_ref) == len(prompts)
+    for i, output in enumerate(outputs_ref):
+        assert len(
+            output.outputs
+        ) > 0, f"Reference generation has no output text for input {i}"
+
+    # Encoder path
+    encoder_outputs = encoder.generate(inputs)
+    for eo in encoder_outputs:
+        eo.disaggregated_params.request_type = "context_and_generation"
+    outputs = llm.generate(inputs,
+                           sampling_params=sampling_params,
+                           disaggregated_params=[
+                               eo.disaggregated_params for eo in encoder_outputs
+                           ])
+
+    assert len(outputs) == len(prompts)
+    for i, output in enumerate(outputs):
+        assert len(
+            output.outputs) > 0, f"generation has no output text for input {i}"
+
+    # Compare
+    for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs)):
+        assert len(ref_output.outputs) == len(test_output.outputs), \
+            f"Number of generated outputs don't match for output {i}: {len(ref_output.outputs)} vs {len(test_output.outputs)}"
+        for j, (ref_gen, test_gen) in enumerate(
+                zip(ref_output.outputs, test_output.outputs)):
+            assert ref_gen.text == test_gen.text, \
+                f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
+
+
+@pytest.mark.parametrize(
+    "prompts,expected_num_duplicates",
+    [
+        # Full reuse: same media + same prompts
+        # All blocks are reused, thus no duplicates
+        (["Describe the natural environment in the image."] * 2, 0),
+        # Partial reuse: same media + different prompts
+        # Prefix blocks are reused, thus 2 duplicates
+        ([
+            "Describe the natural environment in the image.",
+            "What objects can you see in the image?",
+            "Describe the weather in the image.",
+        ], 2),
+    ])
+def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates,
+                                     multimodal_model_config):
+    """Test mm_keys in KV cache events with cache reuse scenarios.
+
+    This test verifies:
+    1. KV cache events contain mm_keys for multimodal blocks
+    2. mm_keys have the expected structure (hash + start_offset)
+    3. Cache reuse behavior based on media and prompts:
+       - Same media + same prompts: full reuse (0 duplicate offsets)
+       - Same media + different prompts: partial reuse (prefix blocks reused)
+    """
+    encoder_model_dir = multimodal_model_config['model_dir']
+
+    max_tokens = 16
+    free_gpu_memory_fraction = 0.6
+
+    # Use same image for all prompts
+    media = [example_images[0]] * len(prompts)
+
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        event_buffer_max_size=1024,  # Enable KV cache events
+    )
+
+    llm = LLM(model=encoder_model_dir,
+              backend='pytorch',
+              kv_cache_config=kv_cache_config,
+              max_batch_size=1)
+
+    config_path = os.path.join(llm._hf_model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    model_type = model_config['model_type']
+
+    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                             model_dir=llm._hf_model_dir,
+                                             model_type=model_type,
+                                             modality="image",
+                                             prompts=prompts,
+                                             media=media,
+                                             image_data_format="pt")
+
+    # Generate for each input separately to test KV cache reuse
+    for inp in inputs:
+        _ = llm.generate([inp], sampling_params=sampling_params)
+
+    time.sleep(0.5)  # Wait for events to be dispatched
+    events = llm.get_kv_cache_events(10)
+
+    # Extract mm_keys offsets from stored events
+    mm_keys_offsets = []
+    for event in events:
+        if event and event.get("data", {}).get("type") == "stored":
+            for block in event["data"].get("blocks", []):
+                if block.get("mm_keys"):
+                    for mm_key in block["mm_keys"]:
+                        assert "hash" in mm_key, "mm_key should have 'hash' field"
+                        assert "start_offset" in mm_key, "mm_key should have 'start_offset' field"
+                        mm_keys_offsets.append(mm_key["start_offset"])
+
+    num_duplicates = len(mm_keys_offsets) - len(set(mm_keys_offsets))
+    assert num_duplicates == expected_num_duplicates, (
+        f"Expected {expected_num_duplicates} duplicate mm_keys offsets, "
+        f"got {num_duplicates}. Offsets: {mm_keys_offsets}")

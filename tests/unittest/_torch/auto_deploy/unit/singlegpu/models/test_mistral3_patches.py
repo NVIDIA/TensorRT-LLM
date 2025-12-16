@@ -4,7 +4,7 @@ from build_and_run_ad import ExperimentConfig
 
 from tensorrt_llm._torch.auto_deploy import LlmArgs
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 
 def test_build_run_mistral3_vlm():
@@ -15,7 +15,7 @@ def test_build_run_mistral3_vlm():
     factory = llm_args.create_factory()
     model = factory.build_model("cuda")
 
-    inputs = factory.get_example_inputs()
+    inputs = factory.get_example_inputs_with_images()
     for key, value in inputs.items():
         if isinstance(value, torch.Tensor):
             dtype = torch.bfloat16 if isinstance(value, torch.FloatTensor) else None
@@ -31,7 +31,10 @@ def test_build_run_mistral3_vlm():
 
     def _run_with_and_without_image(model, use_patch=True):
         with apply_export_patches(
-            patch_list=["hf_mistral3", "hf_pixtral_vit"] if use_patch else []
+            patch_configs={
+                "hf_mistral3": {"enabled": use_patch},
+                "hf_pixtral_vit": {"enabled": use_patch},
+            }
         ):
             with torch.inference_mode():
                 out_no_images = model(
@@ -65,16 +68,16 @@ def test_build_run_mistral3_vlm():
             "pixel_values": pixel_values,
             "image_sizes": image_sizes,
         },
-        patch_list=[
-            "transformers_sdpa_mask",
-            "autocast_noop",
-            "torch_where",
-            "tensor_meta_device",
-            "sdpa_kernel_noop",
-            "sdpa",
-            "hf_mistral3",
-            "hf_pixtral_vit",
-        ],
+        patch_configs={
+            "transformers_sdpa_mask": {},
+            "autocast_noop": {},
+            "torch_where": {},
+            "tensor_meta_device": {},
+            "sdpa_kernel_noop": {},
+            "sdpa": {},
+            "hf_mistral3": {"enabled": True},
+            "hf_pixtral_vit": {"enabled": True},
+        },
     )
     move_to_device(gm, model.device)
 

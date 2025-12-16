@@ -7,20 +7,38 @@ trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAN
 cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
-# generate .coveragerc in workspace
-coverageConfigFile="$jobWorkspace/.coveragerc"
-cat << EOF > "$coverageConfigFile"
-[run]
-branch = True
-data_file = $jobWorkspace/.coverage.$stageName
-[paths]
-source =
-    $llmSrcNode/tensorrt_llm/
-    ---wheel_path---/tensorrt_llm/
-EOF
+set_value_in_command() {
+    # Parameters
+    local key="$1"
+    local value="$2"
+    local command="$3"
 
-resultsPath=$jobWorkspace/results
-mkdir -p $resultsPath
+    # Transform the key
+    local placeholder="__PLACEHOLDER_${key}__"
+
+    # Check if placeholder exists
+    if [[ "$command" != *"$placeholder"* ]]; then
+        echo "Error: placeholder '$placeholder' not found in the command" >&2
+        return 1
+    fi
+
+    # Replace all occurrences
+    local result="${command//${placeholder}/${value}}"
+
+    # Return the result
+    echo "$result"
+}
+
+# Only the first process will save the job ID and set the git config
+if [ $SLURM_PROCID -eq 0 ]; then
+    # Save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
+    echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
+    # Update HOME/.gitconfig
+    if ! git config --global --get-all safe.directory | grep -Fxq "*"; then
+        git config --global --add safe.directory "*"
+    fi
+fi
+
 if [ $SLURM_LOCALID -eq 0 ]; then
     wget -nv $llmTarfile
     tar -zxf $tarName
@@ -28,9 +46,11 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     python3 --version
     apt-get install -y libffi-dev
     nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-    cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
-    cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
-    git config --global --add safe.directory "*"
+    if [[ $pytestCommand == *--run-ray* ]]; then
+        pip3 install --retries 10 ray[default]
+    fi
+    cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt
+    cd $resourcePathNode &&  pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
     hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
     echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
@@ -40,49 +60,24 @@ else
         sleep 5
     done
 fi
-export CPP_TEST_TIMEOUT_OVERRIDDEN=$pytestTestTimeout
-export LLM_ROOT=$llmSrcNode
-export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
-export UCX_TLS=^gdr_copy
 
 llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
-testCmdLines=(
-    "$llmapiLaunchScript"
-    "pytest"
-    "-v"
-    "--timeout-method=thread"
-    "--timeout=$pytestTestTimeout"
-    "--test-list=$testListPathNode"
-    "--waives-file=$waivesListPathNode"
-    "--rootdir $llmSrcNode/tests/integration/defs"
-    "--test-prefix=$stageName"
-    "--splits $splits"
-    "--group $splitId"
-    "--output-dir=$jobWorkspace/"
-    "--csv=$resultsPath/report.csv"
-    "--junit-xml $resultsPath/results.xml"
-    "-o junit_logging=out-err"
-)
-if [ "$perfMode" = "true" ]; then
-    testCmdLines+=(
-        "--perf"
-        "--perf-log-formats csv"
-        "--perf-log-formats yaml"
-    )
-fi
+
+# get trtllm wheel path and add to pytest command
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
-testCmdLines+=(
-    "--cov=$llmSrcNode/examples/"
-    "--cov=$llmSrcNode/tensorrt_llm/"
-    "--cov=$trtllmWhlPath/tensorrt_llm/"
-    "--cov-report="
-    "--cov-config=$coverageConfigFile"
-)
+pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
+
+# Only the first process will save the coverage config file
+if [ $SLURM_PROCID -eq 0 ]; then
+    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+fi
+# Sleep 10 seconds to wait for the coverage config file to be saved
+sleep 10
+
 containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
 containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
 containerLDLibPath=$LD_LIBRARY_PATH
@@ -95,14 +90,39 @@ export LD_LIBRARY_PATH=$containerLDLibPath
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
-fullCmd="${testCmdLines[*]}"
-echo "Full Command: $fullCmd"
 
-# Turn off "exit on error" so the following lines always run
-set +e
-trap - ERR
+echo "Full Command: $pytestCommand"
 
-eval $fullCmd
-exitCode=$?
-echo "Rank${SLURM_LOCALID} Pytest exit code: $exitCode"
-exit $exitCode
+# For single-node test runs, clear all environment variables related to Slurm and MPI.
+# This prevents test processes (e.g., pytest) from incorrectly initializing MPI
+# when running under a single-node srun environment.
+# TODO: check if we can take advantage of --export=None arg when execute srun instead
+# of unset them in the script
+ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
+    for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+        if [ "$v" != "SLURM_PROCID" ]; then
+            unset "$v"
+        fi
+    done
+ fi
+
+eval $pytestCommand
+echo "Rank${SLURM_PROCID} Pytest finished execution"
+
+if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ] && [[ "$stageName" != *Perf-Sanity* ]]; then
+    if [[ "$stageName" == *PyTorch* ]]; then
+        basePerfFilename="base_perf_pytorch.csv"
+    else
+        basePerfFilename="base_perf.csv"
+    fi
+    basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
+    echo "Check Perf Result"
+    python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
+        $stageName/perf_script_test_results.csv \
+        $basePerfPath
+    echo "Check Perf Result"
+    python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
+        --output_path $stageName/report.pdf \
+        --files $stageName/perf_script_test_results.csv \
+        $basePerfPath
+fi

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
@@ -37,8 +38,8 @@
 #include <cuda/std/bit>
 #endif // ENABLE_MULTI_BLOCK_OPTION
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -1363,7 +1364,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps = min(timestep, static_cast<unsigned>(cyclic_kv_cache_len));
+        auto const max_timesteps
+            = min(timestep, min(chunked_attention_size, static_cast<unsigned>(cyclic_kv_cache_len)));
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -2752,4 +2754,5 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 } // namespace mmha
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

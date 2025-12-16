@@ -132,7 +132,9 @@ In addition, older architectures can have limitations for newer software release
   - TensorRT-LLM requires Linux x86_64 or Linux aarch64.
 * - GPU Model Architectures
   -
+    - [NVIDIA GB300 NVL72](https://www.nvidia.com/en-us/data-center/gb300-nvl72/)
     - [NVIDIA GB200 NVL72](https://www.nvidia.com/en-us/data-center/gb200-nvl72/)
+    - [NVIDIA GB300 NVL72](https://www.nvidia.com/en-us/data-center/gb300-nvl72/)
     - [NVIDIA Blackwell Architecture](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/)
     - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
@@ -152,11 +154,12 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [25.06](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [25.10](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.11](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.13](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
+    - Blackwell (SM100/SM103/SM120) - FP32, FP16, BF16, FP8, FP4, INT8, INT4
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]

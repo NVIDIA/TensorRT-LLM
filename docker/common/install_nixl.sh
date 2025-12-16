@@ -4,7 +4,7 @@ set -ex
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="0.5.0"
+NIXL_VERSION="0.8.0"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
@@ -15,9 +15,16 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
   GDS_PATH="$CUDA_PATH/targets/sbsa-linux"
 fi
 
-pip3 install --no-cache-dir meson ninja pybind11
+if [ -n "${GITHUB_MIRROR}" ]; then
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
+pip3 install --no-cache-dir meson ninja pybind11 setuptools
+
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
+
+# Remove POSIX backend compilation from meson.build
+sed -i "/^subdir('posix')/d" src/plugins/meson.build
 
 CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
 
@@ -34,7 +41,8 @@ meson setup builddir \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
-    -Dinstall_headers=true
+    -Dinstall_headers=true \
+    --buildtype=release
 
 cd builddir && ninja install
 cd ../..

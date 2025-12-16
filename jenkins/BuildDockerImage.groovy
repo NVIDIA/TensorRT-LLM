@@ -333,7 +333,7 @@ def buildImage(config, imageKeyToTag)
             }
         }
 
-        args += prepareWheelFromBuildStage(dockerfileStage, arch)
+        def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -346,15 +346,34 @@ def buildImage(config, imageKeyToTag)
             sh "env | sort"
             def randomSleep = (Math.random() * 600 + 600).toInteger()
             trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            trtllm_utils.llmExecStepWithRetry(this, script: """
-            cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-            BASE_IMAGE=${BASE_IMAGE} \
-            TRITON_IMAGE=${TRITON_IMAGE} \
-            TORCH_INSTALL_TYPE=${torchInstallType} \
-            IMAGE_WITH_TAG=${imageWithTag} \
-            STAGE=${dockerfileStage} \
-            BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-            """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+            try {
+                trtllm_utils.llmExecStepWithRetry(this, script: """
+                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
+                TORCH_INSTALL_TYPE=${torchInstallType} \
+                IMAGE_WITH_TAG=${imageWithTag} \
+                STAGE=${dockerfileStage} \
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+            } catch (InterruptedException ex) {
+                throw ex
+            } catch (Exception ex) {
+                if (buildWheelArgs.trim().isEmpty()) {
+                    throw ex
+                }
+                echo "Build failed with wheel arguments, retrying without them"
+                buildWheelArgs = ""
+                trtllm_utils.llmExecStepWithRetry(this, script: """
+                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
+                TORCH_INSTALL_TYPE=${torchInstallType} \
+                IMAGE_WITH_TAG=${imageWithTag} \
+                STAGE=${dockerfileStage} \
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                """, sleepInSecs: randomSleep, numRetries: 2, shortCommondRunTimeMax: 7200)
+            }
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }
@@ -369,7 +388,7 @@ def buildImage(config, imageKeyToTag)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${customImageWithTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
         }
@@ -586,7 +605,7 @@ pipeline {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             // Install wget
-                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget")
 
                             // Poll for build artifacts
                             def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
@@ -683,7 +702,7 @@ pipeline {
                     container("python3") {
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "0e46042381ae25cb7af2f1d45853dfd8e1d54e2d"
+                        def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
                         withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
                             trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                         }
@@ -704,6 +723,7 @@ pipeline {
                             cmd += "--check_launch_api "
                             cmd += "--wait_success ${params.wait_success_seconds} "
                         }
+                        cmd += "--image "
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
                             trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)

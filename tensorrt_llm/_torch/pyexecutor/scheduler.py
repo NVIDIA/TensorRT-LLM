@@ -1,11 +1,14 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-from tensorrt_llm.bindings import executor as tb_executor
+from strenum import StrEnum
+
 from tensorrt_llm.bindings import internal as tb_internal
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
 
@@ -52,6 +55,70 @@ class RequestScheduler(ABC):
         # to be aligned with RequestScheduler::scheduleRequests in cpp/tensorrt_llm/batch_manager/requestScheduler.h
         raise NotImplementedError
 
+    @abstractmethod
+    def can_schedule(self, requests: RequestList) -> bool:
+        """
+        Check if current rank can schedule the requests.
+        :param requests: list of requests to be scheduled
+        :return: True if current rank can schedule the requests, False otherwise
+        """
+        raise NotImplementedError
+
+
+@dataclass
+class SerializableSchedulerOutput:
+    """
+    Serializable version of SchedulerOutput, used for sending schedule result to other ranks. Need this class because LlmRequest is not serializable by pickle.
+    """
+    context_requests: list[int]  # request ids of context requests
+    generation_requests: list[int]  # request ids of generation requests
+    paused_requests: list[int]  # request ids of paused requests
+    fitting_disagg_gen_init_requests: list[
+        int]  # request ids of fitting disaggregated generation initialization requests
+    num_fitting_requests: int  # number of fitting requests
+
+    @classmethod
+    def from_scheduler_result(
+            cls, scheduled_requests: ScheduledRequests,
+            fitting_disagg_gen_init_requests: RequestList,
+            num_fitting_requests: int) -> "SerializableSchedulerOutput":
+        return cls(context_requests=[
+            req.request_id for req in scheduled_requests.context_requests
+        ],
+                   generation_requests=[
+                       req.request_id
+                       for req in scheduled_requests.generation_requests
+                   ],
+                   paused_requests=[
+                       req.request_id
+                       for req in scheduled_requests.paused_requests
+                   ],
+                   fitting_disagg_gen_init_requests=[
+                       req.request_id
+                       for req in fitting_disagg_gen_init_requests
+                   ],
+                   num_fitting_requests=num_fitting_requests)
+
+    def to_scheduler_result(
+        self, active_requests: RequestList
+    ) -> Tuple[ScheduledRequests, RequestList, int]:
+        id_to_request = {req.request_id: req for req in active_requests}
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = [
+            id_to_request[req_id] for req_id in self.context_requests
+        ]
+        scheduled_requests.generation_requests = [
+            id_to_request[req_id] for req_id in self.generation_requests
+        ]
+        scheduled_requests.paused_requests = [
+            id_to_request[req_id] for req_id in self.paused_requests
+        ]
+        fitting_disagg_gen_init_requests = [
+            id_to_request[req_id]
+            for req_id in self.fitting_disagg_gen_init_requests
+        ]
+        return scheduled_requests, fitting_disagg_gen_init_requests, self.num_fitting_requests
+
 
 class CapacityScheduler(ABC):
 
@@ -74,8 +141,8 @@ class BindCapacityScheduler(CapacityScheduler):
         max_num_requests: int,
         kv_cache_manager,
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
-        scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
-        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
+        GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
     ):
         super(BindCapacityScheduler, self).__init__()
@@ -84,7 +151,7 @@ class BindCapacityScheduler(CapacityScheduler):
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
-            capacity_scheduler_policy=scheduler_policy,
+            capacity_scheduler_policy=scheduler_policy._to_pybind(),
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
@@ -172,21 +239,23 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: int = None,
-        ctx_chunk_config: Optional[
-            tb_internal.batch_manager.ContextChunkingConfig] = None,
+        ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+
+        ctx_chunk_config_cpp = None
+        if ctx_chunk_config is not None:
+            ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
+                ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
+
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
-            ctx_chunk_config, max_num_tokens)
+            ctx_chunk_config_cpp, max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
-        for request in active_requests:
-            if get_draft_token_length(request) > 0:
-                request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)
 
@@ -212,3 +281,8 @@ class SimpleScheduler(RequestScheduler):
                                list(generation_requests), list(paused_requests),
                                list(fitting_disagg_gen_init_requests),
                                len(fitting_requests))
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        fitting_requests, _, _ = self.capacity_scheduler.schedule_request(
+            requests)
+        return len(fitting_requests) == len(requests)

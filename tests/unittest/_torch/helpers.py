@@ -3,6 +3,11 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner, CUDAGraphRunnerConfig)
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.mapping import Mapping
+
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -88,9 +93,12 @@ def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
     return atol
 
 
-def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
-                        final_scales: torch.Tensor, num_experts: int,
-                        weights: Dict[str, torch.Tensor]) -> torch.Tensor:
+def reference_moe_torch(x: torch.Tensor,
+                        selected_experts: torch.Tensor,
+                        final_scales: torch.Tensor,
+                        num_experts: int,
+                        weights: Dict[str, torch.Tensor],
+                        apply_routing_on_input: bool = False) -> torch.Tensor:
     # cast back to the input dtype
     results = torch.zeros_like(x)
 
@@ -101,9 +109,63 @@ def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
         w2_weight = weights[f"{expert_id}.w2.weight"]
         w3_weight = weights[f"{expert_id}.w3.weight"]
         expert_inputs = x[batch_idx]
+        if apply_routing_on_input:
+            expert_inputs = expert_inputs * final_scales[batch_idx, nth_expert,
+                                                         None]
         output = (F.silu(expert_inputs @ w1_weight.t()) *
                   (expert_inputs @ w3_weight.t())) @ w2_weight.t()
-        results[batch_idx] += final_scales[batch_idx, nth_expert, None] * output
+        if not apply_routing_on_input:
+            output = output * final_scales[batch_idx, nth_expert, None]
+        results[batch_idx] += output
+
+    return results.view_as(x)
+
+
+def reference_bmm_moe_torch(
+        x: torch.Tensor,
+        selected_experts: torch.Tensor,
+        final_scales: torch.Tensor,
+        w3_w1_stacked_weight: torch.Tensor,
+        w2_stacked_weight: torch.Tensor,
+        apply_routing_on_input: bool = True) -> torch.Tensor:
+    """Reference for stacked MoE in TRT-LLM format.
+
+    Args:
+        x: (seq_len, hidden_size)
+        selected_experts: (seq_len, topk)
+        final_scales: (seq_len, topk)
+        w3_w1_stacked_weight: (num_experts, 2*intermediate_size, hidden_size) - TRT-LLM format
+        w2_stacked_weight: (num_experts, hidden_size, intermediate_size) - TRT-LLM format
+    """
+    num_experts = w3_w1_stacked_weight.shape[0]
+    intermediate_size = w3_w1_stacked_weight.shape[1] // 2
+    results = torch.zeros_like(x)
+
+    # Loop over experts (matches reference_moe_torch pattern)
+    for expert_id in range(num_experts):
+        batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+        if len(batch_idx) == 0:
+            continue
+
+        # Get weights for this expert (TRT-LLM format)
+        gate_up = w3_w1_stacked_weight[expert_id]  # (2*I, H)
+        w3_weight = gate_up[:intermediate_size, :]  # (I, H)
+        w1_weight = gate_up[intermediate_size:, :]  # (I, H)
+        w2_weight = w2_stacked_weight[expert_id]  # (H, I)
+
+        expert_inputs = x[batch_idx]
+        if apply_routing_on_input:
+            expert_inputs = expert_inputs * final_scales[batch_idx, nth_expert,
+                                                         None]
+
+        # Gated MLP computation - TRT-LLM format uses .t()
+        output = (F.silu(expert_inputs @ w1_weight.t()) *
+                  (expert_inputs @ w3_weight.t())) @ w2_weight.t()
+
+        if not apply_routing_on_input:
+            output = output * final_scales[batch_idx, nth_expert, None]
+
+        results[batch_idx] += output
 
     return results.view_as(x)
 
@@ -164,31 +226,23 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-class MockPytorchBackendConfig:
-
-    def __init__(self, use_cuda_graph, cuda_graph_padding_enabled):
-        self.use_cuda_graph = use_cuda_graph
-        self.cuda_graph_padding_enabled = cuda_graph_padding_enabled
-
-
-class MockEngine:
-    """A replacement for SimpleNamespace that supports weak references."""
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-def create_mock_engine(batch_size: int):
-
-    return MockEngine(
-        pytorch_backend_config=MockPytorchBackendConfig(
-            use_cuda_graph=True, cuda_graph_padding_enabled=False),
-        _cuda_graph_batch_sizes=[batch_size],
-        _max_cuda_graph_batch_size=batch_size,
+def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
+    config = CUDAGraphRunnerConfig(
+        use_cuda_graph=True,
+        cuda_graph_padding_enabled=False,
+        cuda_graph_batch_sizes=[batch_size],
+        max_cuda_graph_batch_size=batch_size,
+        batch_size=batch_size,
         max_beam_width=1,
-        max_num_tokens=8192,
-        is_spec_decode=False,
+        max_num_tokens=1,
+        use_mrope=use_mrope,
         spec_config=None,
-        _cuda_graph_mem_pool=None,
-        use_mrope=False,
-    )
+        cuda_graph_mem_pool=None,
+        enable_attention_dp=False,
+        original_max_draft_len=0,
+        original_max_total_draft_tokens=0,
+        is_draft_model=False,
+        mapping=Mapping(),
+        dist=None,
+        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
+    return CUDAGraphRunner(config)

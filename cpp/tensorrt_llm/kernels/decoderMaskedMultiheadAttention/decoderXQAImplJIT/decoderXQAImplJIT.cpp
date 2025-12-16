@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -43,7 +44,9 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const&
 
 } // anonymous namespace
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
@@ -53,6 +56,14 @@ DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
     , mForceXQA(tensorrt_llm::common::forceXQAKernels())
     , mSM(tensorrt_llm::common::getSMVersion())
 {
+}
+
+bool DecoderXQAImplJIT::needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const
+{
+
+    return xqaParams.multi_query_tokens && !jit::supportConfigQGMMA(xqaParams, mSM, forConfigurePlugin)
+        && jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin)
+        && !jit::supportConfigMLA(xqaParams, mSM, forConfigurePlugin);
 }
 
 bool DecoderXQAImplJIT::supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const
@@ -116,6 +127,14 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         bool hasPerfGain = mayHavePerfGain(xqaParams);
         if (!hasPerfGain)
         {
+            if (!xqaParams.is_fp8_output && xqaParams.kv_cache_data_type == DATA_TYPE_E4M3
+                && (xqaParams.data_type == DATA_TYPE_BF16 || xqaParams.data_type == DATA_TYPE_FP16))
+            {
+                TLLM_LOG_DEBUG(
+                    "JIT XQA is selected in the generation phase for fp16/bf16 input and e4m3 kv cache because MMHA "
+                    "does not support this combination.");
+                return true;
+            }
             TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
             return false;
         }
@@ -129,7 +148,7 @@ jit::CubinObjKey DecoderXQAImplJIT::getCubinObjKeyFromXQAParams(XQAParams const&
     loadKey.data_type = xqaParams.data_type;
     loadKey.sm = mSM;
 
-    XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, true);
+    XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, true, mSM);
     return {loadKey, runtimeKey};
 }
 
@@ -150,12 +169,16 @@ void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
 
 void DecoderXQAImplJIT::prepare(XQAParams const& umbrellaXQAParams)
 {
-
     for (int beam_width = 1; beam_width <= umbrellaXQAParams.beam_width; ++beam_width)
     {
         XQAParams actualXQAParams = umbrellaXQAParams;
         actualXQAParams.beam_width = beam_width;
         prepareForActualXQAParams(actualXQAParams);
+        if (needHMMASpecDec(umbrellaXQAParams, true))
+        {
+            actualXQAParams.generation_input_length = 16; // a WAR to generate tileSize=32 JIT cubin
+            prepareForActualXQAParams(actualXQAParams);
+        }
     }
 }
 
@@ -209,10 +232,11 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     jit::CubinObj const* const cubinObj = mResource->getCubinObjRegistry()->getCubin(key);
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
+    bool const isHMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kAMPERE_WARP_SPECIALIZED);
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
     bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
-    TLLM_CHECK_WITH_INFO(
-        !isSpecDec || isGMMAKernel || (isMLAKernel && !xqaParams.spec_decoding_is_generation_length_variable),
+    TLLM_CHECK_WITH_INFO(!isSpecDec || isGMMAKernel || isHMMAKernel
+            || (isMLAKernel && !xqaParams.spec_decoding_is_generation_length_variable),
         "speculative decoding is available for GMMA/MLA kernel only in JIT path for now. For MLA, the input sequence "
         "length must be uniform and draft tokens must be linear.");
     TLLM_CHECK_DEBUG(isGMMAKernel == jit::supportConfigQGMMA(xqaParams, mSM, false));
@@ -354,7 +378,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
     };
 
-    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 15;
+    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 16;
     uint32_t idxNextParam = 0;
     void* kernelParams[kMAX_NB_KERNEL_PARAMS];
     auto appendParam = [&](auto* p) mutable
@@ -389,6 +413,59 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         dim3 const dimGrid{4 * inputSeqLen, multi_block, xqaParams.batch_size};
         dim3 const blockDim(128 * 3, 1, 1);
         cubinObj->launch(dimGrid, blockDim, stream, kernelParams);
+    }
+    else if (isSpecDec && isHMMAKernel)
+    {
+        // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
+        // mask). Input parameters for MultiQueryTokens kernels.
+        unsigned int headGrpSize = num_q_heads_over_kv;
+        // Use mTileSize = 16 kernels when qSeqLen <= 16.
+        unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
+        unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
+        unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
+        unsigned int maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable ? // true for ReDrafter
+            xqaParams.spec_decoding_max_generation_length
+                                                                                        : qSeqLen;
+
+        appendParam(&maxQSeqLen);
+        appendParam(&launchParams.num_k_heads);
+        appendParam(&headGrpSize);
+        appendParam(&launchParams.cu_seq_lens);
+        bool const allowSlidingWindow
+            = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
+                                                          // token, only chained tokens
+        if (allowSlidingWindow)
+        {
+            appendParam(&launchParams.slidingWindowSize);
+        }
+        appendParam(&launchParams.qScale);
+        appendParam(&launchParams.output);
+        if (isFp8Out && !needOutputCvt)
+        {
+            appendParam(&launchParams.rcpOutScale);
+        }
+        appendParam(&kernel_input_tokens);
+        appendParam(&xqaParams.spec_decoding_packed_mask);
+        appendParam(&xqaParams.attention_sinks);
+        appendParam(&launchParams.kvCacheParams);
+        if (xqaParams.beam_width > 1)
+        {
+            appendParam(&launchParams.beamSearchParams.value());
+        }
+        appendParam(&launchParams.batch_size);
+        appendParam(&launchParams.kv_scale_quant_orig);
+        appendParam(&launchParams.semaphores);
+        appendParam(&launchParams.scratch);
+
+        uint32_t multi_block = 1;
+        // if (xqaParams.multi_block_mode)
+        // {
+        //     multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
+        // }
+        auto const gridDim = (dim3{multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp, xqaParams.batch_size});
+        dim3 const blockDim(128, 1, 2);
+
+        cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     }
     else
     {
@@ -471,4 +548,6 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

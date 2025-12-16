@@ -590,7 +590,7 @@ class Tensor(object):
             return id(None)
 
     def __repr__(self):
-        return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+        return f"TensorRT LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
 
     def __xor__(self, b):
         '''
@@ -604,7 +604,7 @@ class Tensor(object):
 
 def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
     '''
-    A helper function to create a TensorRT-LLM Tensor object that encapsulates
+    A helper function to create a TensorRT LLM Tensor object that encapsulates
     the connection between the TensorRT tensor (trt.ITensor) and the layer
     (trt.ILayer) that produces it.
 
@@ -626,7 +626,7 @@ def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
             The producer.
 
     Returns:
-        The TensorRT-LLM tensor (functional.Tensor) that encapsulates the
+        The TensorRT LLM tensor (functional.Tensor) that encapsulates the
         TensorRT tensor and the layer that produces it. The former is
         accessible through the attribute 'trt_tensor' and the latter using the
         attribute 'producer'.
@@ -2051,8 +2051,8 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     return left
 
 
-# If dim is None, return a 1-D TensorRT-LLM tensor of the size
-# If dim is not None, return a 0-D TensorRT-LLM tensor of the dimension size
+# If dim is None, return a 1-D TensorRT LLM tensor of the size
+# If dim is not None, return a 0-D TensorRT LLM tensor of the dimension size
 def shape(input: Tensor,
           dim: Optional[int] = None,
           cast_to_dtype: Optional[Union[str, trt.DataType]] = None,
@@ -3279,8 +3279,6 @@ def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.
 
-    TODO: Document why it can be done using a plugin!!!
-
     Parameters:
         input : Tensor
             The input tensor.
@@ -3471,7 +3469,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
 
     Parameters:
         input : Tensor
-            Input TensorRT-LLM Tensor.
+            Input TensorRT LLM Tensor.
         beta : float
             The parameter for softplus computation.
         threshold : float
@@ -3883,6 +3881,7 @@ class AllReduceStrategy(IntEnum):
     LOWPRECISION = 6
     MNNVL = 7
     NCCL_SYMMETRIC = 8
+    SYMM_MEM = 9  # PyTorch symmetric memory with MULTIMEM
 
 
 class AllReduceFusionOp(IntEnum):
@@ -4022,7 +4021,10 @@ def create_allreduce_plugin(
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+    if all_reduce_params.strategy not in {
+            AllReduceStrategy.NCCL, AllReduceStrategy.UB,
+            AllReduceStrategy.NCCL_SYMMETRIC
+    }:
         plug_inputs.append(workspace)
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
@@ -4094,7 +4096,7 @@ def allreduce(
     workspace = None
     if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         if current_all_reduce_helper().workspace is None:
-            all_reduce_params.strategy = AllReduceStrategy.NCCL
+            all_reduce_params.strategy = AllReduceStrategy.NCCL_SYMMETRIC
         else:
             workspace = current_all_reduce_helper().workspace.trt_tensor
     if all_reduce_params.strategy == AllReduceStrategy.UB:
@@ -5358,7 +5360,7 @@ def gpt_attention(
             An INT32 tensor of shape [1].
             by default, the max_attention_window_size is determined by the shape of cache_indir_table.
             And we support independent max_attention_window_size for each layer.
-            This controls the sliding-window-attention/cyclic-kv-cache features.
+            This controls the sliding-window-attention kv-cache features.
 
         context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape

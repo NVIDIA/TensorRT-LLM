@@ -11,6 +11,7 @@
 
 #include <random>
 #include <tuple>
+#include <unordered_map>
 
 namespace tensorrt_llm::testing
 {
@@ -200,5 +201,89 @@ INSTANTIATE_TEST_SUITE_P(Float, DecoderFloatTest, paramGenerator,
                          << info.param.randomSeed;
         return nameStringStream.str();
     });
+
+// Helper function to test calculateCacheSizePerToken with given parameters.
+std::map<runtime::SizeType32, runtime::SizeType32> calculateCacheSizePerTokenHelper(
+    std::vector<runtime::SizeType32> const& maxAttentionWindowVec, runtime::SizeType32 kvFactor = 2,
+    runtime::SizeType32 vocabSize = 32, runtime::SizeType32 nbLayers = 4, runtime::SizeType32 nbAttentionLayers = 4,
+    runtime::SizeType32 nbRnnLayers = 0, runtime::SizeType32 nbHeads = 8, runtime::SizeType32 hiddenSize = 512,
+    bool isCrossAttention = false)
+{
+    // Create minimal ModelConfig for testing.
+    auto modelConfig = runtime::ModelConfig(
+        vocabSize, nbLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, nvinfer1::DataType::kFLOAT);
+    modelConfig.useGptAttentionPlugin(true);
+    modelConfig.setModelVariant(runtime::ModelConfig::ModelVariant::kGpt);
+    modelConfig.setKVCacheType(runtime::ModelConfig::KVCacheType::kPAGED);
+
+    auto const worldConfig = runtime::WorldConfig();
+
+    return batch_manager::TrtGptModelInflightBatching::calculateCacheSizePerTokenForDisagg(
+        modelConfig, worldConfig, maxAttentionWindowVec, isCrossAttention, kvFactor);
+}
+
+// Test for TrtGptModelInflightBatching::calculateCacheSizePerToken function with different layer types.
+TEST(TrtInflightBatchingTest, CalculateCacheSizePerTokenForDisagg)
+{
+    // Common parameters.
+    constexpr runtime::SizeType32 nbLayers = 5;
+    constexpr runtime::SizeType32 hiddenSize = 512;
+    constexpr runtime::SizeType32 kvFactor = 2;
+    constexpr runtime::SizeType32 vocabSize = 32;
+    constexpr runtime::SizeType32 nbHeads = 8;
+    // Test case 1: Single attention window size - attention layers only.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128};
+        constexpr runtime::SizeType32 nbAttentionLayers = 5;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 0;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 1);
+        EXPECT_EQ(result.at(128), nbAttentionLayers * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+
+    // Test case 2: Multiple attention window sizes - attention layers only.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128, 256};
+        constexpr runtime::SizeType32 nbAttentionLayers = 5;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 0;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 2);
+        auto const nbAttentionLayersIn128Window = 3;
+        auto const nbAttentionLayersIn256Window = 2;
+        EXPECT_EQ(result.at(128), nbAttentionLayersIn128Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+        EXPECT_EQ(result.at(256), nbAttentionLayersIn256Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+
+    // Test case 3: Single attention window size - attention and rnn layers.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128};
+        constexpr runtime::SizeType32 nbAttentionLayers = 3;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 2;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 1);
+        EXPECT_EQ(result.at(128), nbAttentionLayers * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+
+    // Test case 4: Multiple attention window sizes - attention and rnn layers.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128, 256};
+        constexpr runtime::SizeType32 nbAttentionLayers = 3;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 2;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 2);
+        auto const nbAttentionLayersIn128Window = 2;
+        auto const nbAttentionLayersIn256Window = 1;
+        EXPECT_EQ(result.at(128), nbAttentionLayersIn128Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+        EXPECT_EQ(result.at(256), nbAttentionLayersIn256Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+}
 
 } // namespace tensorrt_llm::testing

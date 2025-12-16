@@ -25,6 +25,8 @@
 #include <torch/extension.h>
 #include <vector>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -228,7 +230,7 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStati
 }
 
 void memsetExpertIds(torch::Tensor expertsIds, torch::Tensor recvRankCountCumSum, int64_t maxTokenCountPerRank,
-    int64_t topK, int64_t slotCount, int64_t epSize)
+    int64_t topK, int64_t invalidExpertId, int64_t epSize)
 {
     CHECK_INPUT(expertsIds, torch::kInt32);
     TORCH_CHECK(expertsIds.dim() == 2, "expertsIds must be a 1D tensor");
@@ -243,11 +245,13 @@ void memsetExpertIds(torch::Tensor expertsIds, torch::Tensor recvRankCountCumSum
     auto stream = at::cuda::getCurrentCUDAStream();
 
     tensorrt_llm::kernels::moe_prepare::memsetExpertIds(expertsIds.data_ptr<int>(), recvRankCountCumSum.data_ptr<int>(),
-        static_cast<int>(maxTokenCountPerRank), static_cast<int>(topK), static_cast<int>(slotCount),
+        static_cast<int>(maxTokenCountPerRank), static_cast<int>(topK), static_cast<int>(invalidExpertId),
         static_cast<int>(epSize), stream);
 }
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -259,7 +263,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_comm", &torch_ext::moeCommOp);
+    m.impl("moe_comm", &tensorrt_llm::torch_ext::moeCommOp);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -269,7 +273,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("moe_initialize_workspace", &torch_ext::initializeMoeWorkspace);
+    m.impl("moe_initialize_workspace", &tensorrt_llm::torch_ext::initializeMoeWorkspace);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -279,7 +283,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("get_moe_commworkspace_size_per_rank", &torch_ext::getWorkspaceSizePerRank);
+    m.impl("get_moe_commworkspace_size_per_rank", &tensorrt_llm::torch_ext::getWorkspaceSizePerRank);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -289,7 +293,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("set_moe_max_usable_sm_count", &torch_ext::setMaxUsableSmCount);
+    m.impl("set_moe_max_usable_sm_count", &tensorrt_llm::torch_ext::setMaxUsableSmCount);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -302,7 +306,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("mnnvl_moe_alltoallv_prepare_without_allgather", &torch_ext::moePrepareOp);
+    m.impl("mnnvl_moe_alltoallv_prepare_without_allgather", &tensorrt_llm::torch_ext::moePrepareOp);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -310,12 +314,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "memset_expert_ids(Tensor(a!) experts_ids, Tensor recv_rank_count_cumsum, int max_token_count_per_rank, int "
         "top_k, "
-        "int slot_count, int ep_size) -> ()");
+        "int invalid_expert_id, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("memset_expert_ids", &torch_ext::memsetExpertIds);
+    m.impl("memset_expert_ids", &tensorrt_llm::torch_ext::memsetExpertIds);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -325,5 +329,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("get_moe_prepare_workspace_size_per_rank", &torch_ext::getPrepareWorkspaceSizePerRank);
+    m.impl("get_moe_prepare_workspace_size_per_rank", &tensorrt_llm::torch_ext::getPrepareWorkspaceSizePerRank);
 }

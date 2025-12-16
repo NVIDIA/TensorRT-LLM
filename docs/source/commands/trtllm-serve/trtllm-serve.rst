@@ -34,20 +34,20 @@ For the full syntax and argument descriptions, refer to :ref:`syntax`.
 Inference Endpoints
 -------------------
 
-After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
+After you start the server, you can send inference requests through completions API, Chat API and Responses API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
 
 Chat API
 ~~~~~~~~
 
 You can query Chat API with any http clients, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../examples/serve/openai_chat_client.py
+.. literalinclude:: ../../../../examples/serve/openai_chat_client.py
     :language: python
     :linenos:
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_chat_client.sh
+.. literalinclude:: ../../../../examples/serve/curl_chat_client.sh
     :language: bash
     :linenos:
 
@@ -56,15 +56,33 @@ Completions API
 
 You can query Completions API with any http clients, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../examples/serve/openai_completion_client.py
+.. literalinclude:: ../../../../examples/serve/openai_completion_client.py
     :language: python
     :linenos:
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_completion_client.sh
+.. literalinclude:: ../../../../examples/serve/curl_completion_client.sh
     :language: bash
     :linenos:
+
+Responses API
+~~~~~~~~~~~~~~~
+
+You can query Responses API with any http clients, a typical example is OpenAI Python client:
+
+.. literalinclude:: ../../../../examples/serve/openai_responses_client.py
+    :language: python
+    :linenos:
+
+Another example uses ``curl``:
+
+.. literalinclude:: ../../../../examples/serve/curl_responses_client.sh
+    :language: bash
+    :linenos:
+
+
+More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 
 Multimodal Serving
 ~~~~~~~~~~~~~~~~~~
@@ -97,13 +115,13 @@ Multimodal Chat API
 
 You can query Completions API with any http clients, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../examples/serve/openai_completion_client_for_multimodal.py
+.. literalinclude:: ../../../../examples/serve/openai_completion_client_for_multimodal.py
     :language: python
     :linenos:
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
+.. literalinclude:: ../../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
 
@@ -254,7 +272,23 @@ Example output:
         }
     ]
 
+Configuring with YAML Files
+----------------------------
 
+You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--extra_llm_api_options`` option to the path of a YAML file, the arguments in the file will override the corresponding command line arguments.
+
+The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
+
+.. code-block:: yaml
+
+   max_batch_size: 8
+
+To configure the nested level arguments like ``moe_config.backend``, the yaml file should be like:
+
+.. code-block:: yaml
+
+   moe_config:
+       backend: CUTLASS
 
 Syntax
 ------

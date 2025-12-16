@@ -9,17 +9,21 @@
    Before the pre-built Python wheel can be installed via `pip`, a few
    prerequisites must be put into place:
 
-   Install CUDA Toolkit following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) and
-   make sure `CUDA_HOME` environment variable is properly set.
+   Install CUDA Toolkit 13.0 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+   and make sure `CUDA_HOME` environment variable is properly set.
+
+   The `cuda-compat-13-0` package may be required depending on your system's NVIDIA GPU
+   driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
    ```bash
-   # Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform
-   pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   # By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+   pip3 install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
    sudo apt-get -y install libopenmpi-dev
+   
+   # Optional step: Only required for disagg-serving
+   sudo apt-get -y install libzmq3-dev
    ```
-
-   PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell GPUs and SBSA platform. On prior GPUs or Linux x86_64 platform, this extra installation is not required.
 
    ```{tip}
    Instead of manually installing the preqrequisites as described
@@ -58,3 +62,15 @@ There are some known limitations when you pip install pre-built TensorRT LLM whe
     when OMPI was not configured --with-slurm and we weren't able
     to discover a SLURM installation in the usual places.
     ```
+
+2. Prevent `pip` from replacing existing PyTorch installation
+
+   On certain systems, particularly Ubuntu 22.04, users installing TensorRT LLM would find that their existing, CUDA 13.0 compatible PyTorch installation (e.g., `torch==2.9.0+cu130`) was being uninstalled by `pip`. It was then replaced by a CUDA 12.8 version (`torch==2.9.0`), causing the TensorRT LLM installation to be unusable and leading to runtime errors.
+
+   The solution is to create a `pip` constraints file, locking `torch` to the currently installed version. Here is an example of how this can be done manually:
+
+   ```bash
+   CURRENT_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
+   echo "torch==$CURRENT_TORCH_VERSION" > /tmp/torch-constraint.txt
+   pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
+   ```

@@ -30,8 +30,10 @@ class Eagle3Attention(Attention):
         self,
         model_config: ModelConfig[LlamaConfig],
         layer_idx: Optional[int] = None,
+        next_layer_regular: bool = False,
     ):
         config = model_config.pretrained_config
+        self._next_layer_regular = next_layer_regular
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -48,21 +50,30 @@ class Eagle3Attention(Attention):
         )
 
         tp_size = model_config.mapping.tp_size
+        if model_config.mapping.enable_attention_dp:
+            tp_size = 1
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
-        self.qkv_proj = Linear(
-            2 * self.hidden_size,
-            tp_size * self.q_size + 2 * tp_size * self.kv_size,
-            bias=config.attention_bias,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            weights_loading_config=WeightsLoadingConfig(
-                weight_mode=WeightMode.FUSED_QKV_LINEAR),
-            quant_config=model_config.get_quant_config(),
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
-        )
+        if not self._next_layer_regular:
+            qkv_shard_indices_mapping = {
+                "q": (0, self.q_size),
+                "k": (self.q_size, self.kv_size),
+                "v": (self.q_size + self.kv_size, self.kv_size),
+            }
+            self.qkv_proj = Linear(
+                2 * self.hidden_size,
+                tp_size * self.q_size + 2 * tp_size * self.kv_size,
+                bias=config.attention_bias,
+                dtype=config.torch_dtype,
+                mapping=self.qkv_proj.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_QKV_LINEAR),
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+                fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
+            )
 
 
 class Eagle3DecoderLayer(DecoderLayer):
@@ -71,12 +82,18 @@ class Eagle3DecoderLayer(DecoderLayer):
         self,
         model_config: LlamaConfig,
         layer_idx: int = 0,
+        is_first_layer: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
+        eagle_config = config.eagle_config if hasattr(config,
+                                                      "eagle_config") else {}
         self.layer_idx = layer_idx
-
-        self.self_attn = Eagle3Attention(model_config, layer_idx)
+        self._next_layer_regular = (eagle_config.get("next_layer_regular", True)
+                                    and not is_first_layer) or eagle_config.get(
+                                        "eh_proj_before_attn", False)
+        self.self_attn = Eagle3Attention(model_config, layer_idx,
+                                         self._next_layer_regular)
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
@@ -89,10 +106,13 @@ class Eagle3DecoderLayer(DecoderLayer):
             bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
+            overridden_tp_size=1
+            if model_config.mapping.enable_attention_dp else None,
         )
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype)
+        if not self._next_layer_regular:
+            self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                           eps=config.rms_norm_eps,
+                                           dtype=config.torch_dtype)
 
         self.hidden_norm = RMSNorm(hidden_size=config.hidden_size,
                                    eps=config.rms_norm_eps,
@@ -112,10 +132,10 @@ class Eagle3DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
         residual = hidden_states
 
-        embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
-
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        if not self._next_layer_regular:
+            embeds = self.input_layernorm(embeds)
+            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -146,16 +166,23 @@ class Eagle3DraftModel(DecoderModel):
         super().__init__(model_config)
 
         config = model_config.pretrained_config
+        eagle_config = config.eagle_config if hasattr(config,
+                                                      "eagle_config") else {}
         self.spec_config = model_config.spec_config
         self.dtype = config.torch_dtype
         self.hidden_size = config.hidden_size
         self.mapping = model_config.mapping
         self.num_layers = model_config.pretrained_config.num_hidden_layers
+        self._eh_proj_before_attn = eagle_config.get("eh_proj_before_attn",
+                                                     False)
 
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
         else:
             self.hidden_size_in = config.hidden_size
+
+        self._return_hidden_post_norm = eagle_config.get(
+            "return_hidden_post_norm", False)
 
         if self.spec_config.num_capture_layers > 1:
             self.fc = Linear(self.hidden_size_in *
@@ -166,7 +193,9 @@ class Eagle3DraftModel(DecoderModel):
 
         if self.num_layers > 1:
             self.midlayer = nn.ModuleList([
-                Eagle3DecoderLayer(model_config, start_layer_idx + i)
+                Eagle3DecoderLayer(model_config,
+                                   start_layer_idx + i,
+                                   is_first_layer=(i == 0))
                 for i in range(self.num_layers)
             ])
         else:
@@ -180,16 +209,32 @@ class Eagle3DraftModel(DecoderModel):
             self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
                                                 dtype=torch.int32),
                                     requires_grad=False)
+        if self._eh_proj_before_attn:
+            self.enorm = RMSNorm(hidden_size=config.hidden_size,
+                                 eps=config.rms_norm_eps,
+                                 dtype=config.torch_dtype)
+            self.eh_proj = nn.Linear(config.hidden_size * 2,
+                                     config.hidden_size,
+                                     bias=eagle_config.get(
+                                         "eh_proj_bias", False),
+                                     dtype=config.torch_dtype)
 
         if self.hidden_size_in != config.hidden_size:
-            self.embed_tokens = Embedding(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-            )
+            if model_config.mapping.enable_attention_dp:
+                self.embed_tokens = Embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    dtype=config.torch_dtype,
+                )
+            else:
+                self.embed_tokens = Embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    dtype=config.torch_dtype,
+                    mapping=model_config.mapping,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
+                )
         else:
             # Shared with target model.
             self.embed_tokens = None
@@ -214,11 +259,15 @@ class Eagle3DraftModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
         assert hidden_states is not None
-
         # NOTE: If hidden states from the target model have to be concatenated,
-        # we expect that to happen outside the model definition. This helps us
-        # avoid data-dependent control flow and gives us better CUDA graph
-        # coverage.
+        # ideally, we expect that to happen outside the model definition. This
+        # helps usavoid data-dependent control flow and gives us better CUDA
+        # graph coverage.
+        if self._eh_proj_before_attn:
+            input_embeds = self.enorm(inputs_embeds)
+            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+            hidden_states = self.eh_proj(hidden_states)
+
         residual = None
         if self.num_layers > 1:
             for layer in self.midlayer:
@@ -238,6 +287,8 @@ class Eagle3DraftModel(DecoderModel):
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
+        if self._return_hidden_post_norm:
+            return hidden_states, hidden_states
         return hidden_states, hidden_states_to_save
 
 
@@ -340,7 +391,18 @@ class MTPForCausalLM(nn.Module):
     ):
         super().__init__()
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3MTP
+        model_type = model_config.pretrained_config.model_type
+        mtp_layer = None
+        match model_type:
+            case "glm4_moe":
+                from .modeling_glm import Glm4MTP
+                mtp_layer = Glm4MTP
+            case "deepseek_v3" | "deepseek_v32":
+                from .modeling_deepseekv3 import DeepseekV3MTP
+                mtp_layer = DeepseekV3MTP
+            case _:
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
@@ -351,8 +413,8 @@ class MTPForCausalLM(nn.Module):
             model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
 
         self.mtp_layers = nn.ModuleList([
-            DeepseekV3MTP(model_config, layer_idx + start_layer_idx,
-                          model.aux_stream_dict)
+            mtp_layer(model_config, layer_idx + start_layer_idx,
+                      model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
         self.lm_head = lm_head
@@ -366,12 +428,22 @@ class MTPDraftModel(nn.Module):
                                                        torch.cuda.Stream]):
         super().__init__()
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3MTP
-
-        mtp_layer = DeepseekV3MTP(model_config,
-                                  layer_idx,
-                                  aux_stream_dict,
-                                  is_separate_draft_engine=True)
+        model_type = model_config.pretrained_config.model_type
+        if model_type == "glm4_moe":
+            from .modeling_glm import Glm4MTP
+            mtp_layer = Glm4MTP(model_config,
+                                layer_idx,
+                                aux_stream_dict,
+                                is_separate_draft_engine=True)
+        elif model_type in ["deepseek_v3", "deepseek_v32"]:
+            from .modeling_deepseekv3 import DeepseekV3MTP
+            mtp_layer = DeepseekV3MTP(model_config,
+                                      layer_idx,
+                                      aux_stream_dict,
+                                      is_separate_draft_engine=True)
+        else:
+            raise ValueError(
+                f"MTPDraftModel does not support model_type: {model_type}")
         setattr(self, f"layers.{layer_idx}", mtp_layer)
         self.layers = mtp_layer
         self.layer_idx = layer_idx
@@ -393,6 +465,7 @@ class MTPDraftModel(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.layers(
@@ -402,6 +475,7 @@ class MTPDraftModel(nn.Module):
             embed_tokens=self.embed_tokens,
             attn_metadata=attn_metadata,
             all_rank_num_tokens=all_rank_num_tokens,
+            spec_metadata=spec_metadata,
         )
 
         return hidden_states
@@ -429,8 +503,18 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
 
     def load_weights(self, weights: Dict):
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3WeightLoader
-        weight_loader = DeepseekV3WeightLoader(self, is_draft_model=True)
+        model_type = self.model_config.pretrained_config.model_type
+        match model_type:
+            case "glm4_moe":
+                from .modeling_glm import Glm4WeightLoader
+                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
+            case "deepseek_v3" | "deepseek_v32":
+                from .modeling_deepseekv3 import DeepseekV3WeightLoader
+                weight_loader = DeepseekV3WeightLoader(self,
+                                                       is_draft_model=True)
+            case _:
+                raise ValueError(
+                    f"Model type {model_type} not supported for MTP")
         weight_loader.load_weights(weights)
 
     def load_weights_from_target_model(self,
@@ -456,6 +540,7 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            spec_metadata=spec_metadata,
             **kwargs)
         return self.logits_processor.forward(
             output,
@@ -492,11 +577,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
+        self.draft_config = None
         spec_config = getattr(model_config, 'spec_config', None)
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
-            draft_config = None
             if spec_config.spec_dec_mode.is_eagle3_one_model():
-                draft_config = ModelConfig.from_pretrained(
+                self.draft_config = ModelConfig.from_pretrained(
                     model_config.spec_config.speculative_model_dir,
                     trust_remote_code=True,
                     attn_backend=model_config.attn_backend,
@@ -505,17 +590,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     spec_config=model_config.spec_config,
                     max_num_tokens=model_config.max_num_tokens,
                     moe_max_num_tokens=model_config.moe_max_num_tokens)
-                draft_config.quant_config.kv_cache_quant_algo = \
+                self.draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
 
-            self.draft_model = get_draft_model(model_config, draft_config,
+            self.draft_model = get_draft_model(model_config, self.draft_config,
                                                self.lm_head, self.model)
             self.spec_worker = get_spec_worker(model_config.spec_config,
                                                model_config,
                                                model_config.mapping)
 
-            if draft_config is not None:
-                for key, value in draft_config.extra_attrs.items():
+            if self.draft_config is not None:
+                for key, value in self.draft_config.extra_attrs.items():
                     assert key in ('attn_layers', 'mla_layers')
                     assert key in model_config.extra_attrs
                     model_config.extra_attrs[key].update(value)
@@ -586,10 +671,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
     def load_weights(self,
                      weights: Dict,
-                     weight_mapper: Optional[BaseWeightMapper] = None):
+                     weight_mapper: Optional[BaseWeightMapper] = None,
+                     params_map: Optional[Dict[str, str]] = None,
+                     allow_partial_loading: bool = False):
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
-                             skip_modules=["draft_model"])
+                             skip_modules=["draft_model"],
+                             params_map=params_map,
+                             allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
                            weights: Dict,

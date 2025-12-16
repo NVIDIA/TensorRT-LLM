@@ -1,9 +1,4 @@
-# Disaggregated Serving (Beta)
-
-```{note}
-Note:
-This feature is currently in beta, and the related APIs are subjected to change in future versions.
-```
+# Disaggregated Serving 
 
 - [Motivation](#Motivation)
 - [KV Cache Exchange](#KV-Cache-Exchange)
@@ -11,8 +6,8 @@ This feature is currently in beta, and the related APIs are subjected to change 
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
 - [Usage](#Usage)
-  - [trtllm-serve](#trtllm-serve)
   - [Dynamo](#Dynamo)
+  - [trtllm-serve](#trtllm-serve)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
 
@@ -60,7 +55,7 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 
 ### Overlap Optimization
 
-To optimize the overall performance of disaggregated serving, TensorRT-LLM overlaps the KV cache transmission with computation for multiple independent requests. While one request is sending or receiving its KV cache blocks, other requests can proceed with computation, as illustrated in Figure 4. Furthermore, if context and generation instances are using multiple GPUs per instance, KV cache transmission between different sets of GPUs can occur in parallel.
+To optimize the overall performance of disaggregated serving, TensorRT LLM overlaps the KV cache transmission with computation for multiple independent requests. While one request is sending or receiving its KV cache blocks, other requests can proceed with computation, as illustrated in Figure 4. Furthermore, if context and generation instances are using multiple GPUs per instance, KV cache transmission between different sets of GPUs can occur in parallel.
 
 <div align="center">
 <figure>
@@ -71,7 +66,7 @@ To optimize the overall performance of disaggregated serving, TensorRT-LLM overl
 
 ### Cache Layout Transformation
 
-To minimize KV cache transmission latency, TensorRT-LLM currently uses direct transmission between device memories for cache transfer. The KV cache transmission supports using different parallel strategies for the context and generation phases. In such cases, careful orchestration of KV cache block mapping is required. Figure 5 illustrates this using the example of context phase with TP2 and generation phase with PP2.
+To minimize KV cache transmission latency, TensorRT LLM currently uses direct transmission between device memories for cache transfer. The KV cache transmission supports using different parallel strategies for the context and generation phases. In such cases, careful orchestration of KV cache block mapping is required. Figure 5 illustrates this using the example of context phase with TP2 and generation phase with PP2.
 
 <div align="center">
 <figure>
@@ -80,13 +75,30 @@ To minimize KV cache transmission latency, TensorRT-LLM currently uses direct tr
 </div>
 <p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
 
-The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT-LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
+The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
 
 ## Usage
 
+### Dynamo
+
+The first approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
+
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
+
+In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
+
+Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
+
+For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/backends/trtllm/README.html).
+
 ### trtllm-serve
 
-The first approach to do disaggregated LLM inference with TensorRT-LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
+The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
 
 <div align="center">
 <figure>
@@ -106,7 +118,7 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
+`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is NIXL.
 
 `max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
@@ -171,28 +183,10 @@ curl http://localhost:8000/v1/completions \
 
 Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
 
-### Dynamo
-
-The second approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
-
-<div align="center">
-<figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
-
-In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
-
-Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
-
-For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
-
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
-* `TRTLLM_PARALLEL_CACHE_SEND`: If set to `1`, contextExecutor will attempt to send KV cache for multiple requests in parallel. The default value is `0`.
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
 
@@ -206,7 +200,7 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`: If set to `1`, TRT-LLM will use `cudaMallocAsync` to allocate buffers for KV cache transmission. The default value is `0`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
-* `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `4`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
+* `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
