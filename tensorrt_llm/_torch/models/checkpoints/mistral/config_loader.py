@@ -312,22 +312,19 @@ class MistralConfigLoader(BaseConfigLoader):
                 ]
         elif hf_quant_config.get("quant_method") == "fp8":
             # Used for Eagle3 weight
-            if hf_quant_config.get("weight_block_size"):
+            if hf_quant_config.get("weight_block_size") is not None or hf_quant_config.get("activation_scheme", None) == "static":
+                # hf_quant_config.get("weight_block_size") is for Eagle3 weight
+                # hf_quant_config.get("activation_scheme", None) == "static" is for DeepSeek V3 FP8 per tensor hack
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.exclude_modules = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
                 block_size = hf_quant_config.get("weight_block_size")
-                assert block_size is not None and tuple(block_size) == (128, 128), (
-                    f"FP8_BLOCK_SCALES only supports block_size=(128,128), current block_size: {block_size}"
-                )
-                quant_config.group_size = block_size[0]
-
-            # DeepSeek V3 FP8 per tensor hack
-            elif hf_quant_config.get("activation_scheme", None) == "static":
-                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                quant_config.exclude_modules = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
-
-                block_size = (128, 128)
+                if block_size is not None:
+                    assert tuple(block_size) == (128, 128), (
+                        f"FP8_BLOCK_SCALES only supports block_size=(128,128), current block_size: {block_size}"
+                    )
+                else:
+                    block_size = (128, 128)
                 quant_config.group_size = block_size[0]
 
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
