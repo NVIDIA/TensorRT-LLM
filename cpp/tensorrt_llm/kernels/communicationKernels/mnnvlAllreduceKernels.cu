@@ -462,11 +462,11 @@ using detail::adjustGridConfig;
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
+
+    static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
-
-    static int SM = tensorrt_llm::common::getSMVersion();
 
     auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig(numTokens, tokenDim, eltsPerThread);
     dim3 grid(numTokens, clusterSize, 1);
@@ -479,7 +479,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
     TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
         "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim,
-        1024 * (SM >= 90 ? 8 : 1) * eltsPerThread);
+        1024 * (kSMVersion >= 90 ? 8 : 1) * eltsPerThread);
 
     cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -495,7 +495,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         .dynamicSmemBytes = 0,
         .stream = params.stream,
         .attrs = attrs,
-        .numAttrs = SM >= 90 ? 2 : 1,
+        .numAttrs = kSMVersion >= 90 ? 2 : 1,
     };
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM)                                                                \
@@ -874,6 +874,11 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     }
     constexpr int kELTS_SIZE = sizeof(T_IN);
 
+    // Issue ACQBLK at the end. Assuming preceding kernel will not modify the buffer_flags.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     // Update the buffer pointers
     flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, worldSize) * worldSize * dim * kELTS_SIZE),
         static_cast<uint32_t>(numTokens * dim * kELTS_SIZE), 0, 0});
@@ -881,7 +886,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
-    static int SM = tensorrt_llm::common::getSMVersion();
+    static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const numEltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
@@ -962,9 +967,9 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         rnAttrs[1].val.clusterDim.x = 1;
         rnAttrs[1].val.clusterDim.y = rnClusterSize;
         rnAttrs[1].val.clusterDim.z = 1;
-        rnConfig.numAttrs = SM >= 90 ? 2 : 1;
+        rnConfig.numAttrs = kSMVersion >= 90 ? 2 : 1;
 
-        bool const rnUseCGA = SM >= 90 && rnClusterSize > 1;
+        bool const rnUseCGA = kSMVersion >= 90 && rnClusterSize > 1;
         int const dimPadded = divUp(tokenDim, numEltsPerThread * rnNumThreads) * numEltsPerThread * rnNumThreads;
         int const iters = dimPadded / rnNumThreads;
 
