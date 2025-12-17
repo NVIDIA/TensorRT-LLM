@@ -9,11 +9,13 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..models.modeling_utils import ModelConfig
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
-from ..modules.qk_norm_attention import QKNormRoPEAttention
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.qk_norm_attention import compute_yarn_parameters
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -60,6 +62,17 @@ class MiniMaxM2MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
         )
+        # self.experts = create_moe(
+        #     num_experts=self.num_experts,
+        #     routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
+        #     hidden_size=self.hidden_dim,
+        #     intermediate_size=self.ffn_dim,
+        #     aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
+        #     dtype=config.torch_dtype,
+        #     reduce_results=reduce_results,
+        #     model_config=model_config,
+        #     layer_idx=layer_idx,
+        # )
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -74,7 +87,8 @@ class MiniMaxM2MoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        router_logits = self.gate(hidden_states)
+        hidden_states_f32 = hidden_states.to(torch.float32)
+        router_logits = self.gate(hidden_states_f32)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
@@ -84,7 +98,16 @@ class MiniMaxM2MoE(nn.Module):
         return final_hidden_states
 
 
-class MiniMaxM2Attention(QKNormRoPEAttention):
+# It's a little bit tricky to implement special qk norm
+# because rms dim is hidden_size * num_heads, not hidden_size, after qkv linear,
+# the result size is hidden_size * num_heads / tp_size.
+# Actually, we have two strategies to implement qk norm attention:
+# 1. the first linear layer is not col parallel, then we can use the normal rms layer norm. each attention use full qkv
+# 2. we use col parallel linear layer, then we use allgather to gather qkv from all gpus,
+#    then we use rms norm on q and k. Finally, we split qkv to each gpus and continue.
+# for better performance, we choose the second strategy here.
+# Most adaptions are from QKNormRoPEAttention.
+class MiniMaxM2Attention(Attention):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -104,8 +127,88 @@ class MiniMaxM2Attention(QKNormRoPEAttention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            use_qk_norm=True,
         )
+
+        self.q_norm = RMSNorm(
+            hidden_size=self.q_size * self.tp_size,
+            eps=self.pretrained_config.rms_norm_eps,
+            dtype=self.pretrained_config.torch_dtype,
+        )
+        self.k_norm = RMSNorm(
+            hidden_size=self.kv_size * self.tp_size,
+            eps=self.pretrained_config.rms_norm_eps,
+            dtype=self.pretrained_config.torch_dtype,
+        )
+        self.aux_stream = torch.cuda.Stream()
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def apply_qk_norm(self, q, k):
+        # collect q and k from all gpus
+        from ..distributed import allgather
+
+        temp_q = allgather(q, self.mapping)
+        temp_k = allgather(k, self.mapping)
+
+        temp_q, temp_k = maybe_execute_in_parallel(
+            self.q_norm(temp_q),
+            self.k_norm(temp_k),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        # split q and k to each gpus
+        # Fixme: tp_size may not be equal to the world size of current mapping
+        q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.mapping.tp_rank, :]
+        k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.mapping.tp_rank, :]
+
+        return q, k
+
+    def apply_qk_norm_rope(self, qkv, position_ids):
+        factor, low, high, attention_factor = compute_yarn_parameters(self.pretrained_config)
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv,
+            self.num_heads,
+            self.num_key_value_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.q_norm.variance_epsilon,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox,
+            position_ids.view(-1),
+            factor,
+            low,
+            high,
+            attention_factor,
+            self.is_qk_norm,
+        )
+        return qkv, None, None
+
+    def apply_rope(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+    ):
+        """
+        The apply_rope method is called in the forward method of the Attention class.
+        The apply_rope method is overridden in this class to apply QK norm and RoPE to the input tensor.
+        """
+        # Apply QK norm before RoPE.
+        if not self.fuse_qk_norm_rope:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.apply_qk_norm(q, k)
+            if not self.skip_rope:
+                return super().apply_rope(q, k, v, position_ids)
+            else:
+                return q, k, v
+
+        qkv = q
+        if k is not None and v is not None:
+            qkv = torch.concat([q, k, v], dim=-1)
+        return self.apply_qk_norm_rope(qkv, position_ids)
 
 
 class MiniMaxM2DecoderLayer(DecoderLayer):
