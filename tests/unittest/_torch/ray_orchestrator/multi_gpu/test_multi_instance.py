@@ -32,9 +32,9 @@ class TRTLLMInstance:
         await self.llm.setup_async()
 
 
-@pytest.mark.gpu8
+@pytest.mark.gpu4
 @pytest.mark.parametrize(
-    "tp_size, num_instances", [(2, 4), (1, 8)], ids=["tp2_instances4", "tp1_instances8"]
+    "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_instances2", "tp1_instances4"]
 )
 def test_multi_instance(monkeypatch, tp_size, num_instances):
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
