@@ -169,16 +169,21 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
                     return pattern_fn(x, residual, weight, eps)
                 # Fuse this match
                 return _allreduce_residual_rmsnorm_replacement(x, residual, weight, eps, strategy)
+
             return _conditional_repl
 
-        _conditional_repl_residual_first = _make_conditional_repl(_allreduce_residual_rmsnorm_pattern_trtllm)
-        _conditional_repl_x_first = _make_conditional_repl(_allreduce_residual_rmsnorm_pattern2_trtllm)
+        _conditional_repl_residual_first = _make_conditional_repl(
+            _allreduce_residual_rmsnorm_pattern_trtllm
+        )
+        _conditional_repl_x_first = _make_conditional_repl(
+            _allreduce_residual_rmsnorm_pattern2_trtllm
+        )
 
         # Register TRT-LLM backend patterns only (no torch backend fusion)
         # Pattern 1: residual + allreduce(x)
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern_trtllm,
-            replace_fn=_conditional_repl,
+            replace_fn=_conditional_repl_residual_first,
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,
@@ -188,7 +193,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Pattern 2: allreduce(x) + residual
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern2_trtllm,
-            replace_fn=_conditional_repl,
+            replace_fn=_conditional_repl_x_first,
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,
