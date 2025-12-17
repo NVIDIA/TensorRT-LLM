@@ -420,7 +420,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         self.sf_vec_size = sf_vec_size
         self.acc_dtype: Type[cutlass.Numeric] = cutlass.Float32
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256 and cluster_shape_mn[0] % 2 == 0
+        self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         # K dimension is deferred in _setup_attributes
@@ -1312,7 +1312,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
                     expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
-
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
@@ -1341,7 +1340,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
                     expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
-
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
@@ -2288,17 +2286,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             is_valid = False
 
         # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
+        if (mma_tiler_mn[0] // cluster_shape_mn[0]) != 128:
             is_valid = False
-        # Skip invalid cluster shape
+
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
             or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
             or not is_power_of_2(cluster_shape_mn[0])
             or not is_power_of_2(cluster_shape_mn[1])
         ):
@@ -2317,7 +2311,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         a_major: str,
         b_major: str,
         out_major: str,
-        mma_tiler_mn: Tuple[int, int],
     ) -> bool:
         """
         Check if the tensor alignment is valid
@@ -2357,10 +2350,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
             or not check_contigous_16B_alignment(out_dtype, out_major == "m", (m, n, l))
         ):
-            is_valid = False
-
-        # m should be aligned to tile_m
-        if m % mma_tiler_mn[0] != 0:
             is_valid = False
         return is_valid
 
@@ -2433,7 +2422,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major, mma_tiler_mn
+            m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major
         ):
             can_implement = False
         # Skip unsupported A/B layout
