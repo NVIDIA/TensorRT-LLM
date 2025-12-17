@@ -1124,6 +1124,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
         griddepcontrol_wait()
+        griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule warp
@@ -2258,8 +2259,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
-
-        griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,
