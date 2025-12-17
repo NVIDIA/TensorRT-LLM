@@ -470,19 +470,22 @@ class PyCapacityScheduler:
     ):
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
-        # Use the underlying C++ object via bindings
-        self.kv_cache_manager_cpp = kv_cache_manager.impl
         self.policy = scheduler_policy
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
 
-        # [FIX]: Get this from config/wrapper to ensure C++ API compatibility
-        self.default_window_size = self.kv_cache_manager.max_seq_len
+        if self.kv_cache_manager is not None:
+            self.kv_cache_manager_cpp = kv_cache_manager.impl
+            self.default_window_size = self.kv_cache_manager.max_seq_len
 
     def schedule_request(
         self, active_requests: RequestList
     ) -> Tuple[RequestList, RequestList, RequestList]:
+        # 1. Handle No KV Cache Manager -> MaxRequestsScheduler Logic
+        if self.kv_cache_manager is None:
+            return self._schedule_max_requests(active_requests)
 
+        # 2. Handle Policies with KV Cache Manager
         if self.policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
             return self._schedule_max_utilization(active_requests)
         elif self.policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
@@ -490,6 +493,43 @@ class PyCapacityScheduler:
         else:
             raise NotImplementedError(
                 f"Policy {self.policy} not implemented in PyCapacityScheduler")
+
+    def _schedule_max_requests(self, active_requests: RequestList):
+        """
+        Simple scheduler that only limits the maximum number of requests.
+        Used when no KV Cache Manager is available.
+        """
+        scheduled_requests: RequestList = []
+        paused_requests: RequestList = []
+
+        for req in active_requests:
+            # 1. State Filter
+            if (req.state.value < self.no_schedule_until_state.value
+                    or req.state.value >= self.no_schedule_after_state.value):
+                continue
+
+            # 2. Max Requests Check
+            if len(scheduled_requests) >= self.max_num_requests:
+                break
+
+            # 3. Schedule valid states
+            # Note: LlmRequest properties might vary, using state enum checks for safety
+            if (req.state == LlmRequestState.ENCODER_INIT
+                    or req.state == LlmRequestState.CONTEXT_INIT
+                    or req.state == LlmRequestState.GENERATION_IN_PROGRESS):
+                scheduled_requests.append(req)
+
+        # Output Classification (Standard for all schedulers)
+        fitting_requests = []
+        fitting_disagg_gen_init = []
+
+        for r in scheduled_requests:
+            if r.state == LlmRequestState.DISAGG_GENERATION_INIT:
+                fitting_disagg_gen_init.append(r)
+            else:
+                fitting_requests.append(r)
+
+        return fitting_requests, fitting_disagg_gen_init, paused_requests
 
     def _schedule_max_utilization(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
