@@ -305,7 +305,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             elif req.state == LlmRequestState.CONTEXT_INIT:
                 if not self.ctx_chunk_config:
                     # No Chunking: Greedy allocation
-                    req_num_tokens = req.get_context_remaining_length()
+                    req_num_tokens = req.context_remaining_length
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
                     total_tokens = req_num_tokens + draft_tokens
 
@@ -318,7 +318,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     current_batch_tokens += total_tokens
                 else:
                     # Chunking Enabled: Defer calculation
-                    remaining = req.get_context_remaining_length()
+                    remaining = req.context_remaining_length
                     # Just an estimate for budget check
                     req.context_chunk_size = remaining
 
@@ -385,7 +385,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             made_progress = False
             for req in requests:
                 past_size = req.context_chunk_size
-                remaining = req.get_context_remaining_length()
+                remaining = req.context_remaining_length
 
                 if past_size >= remaining:
                     continue
@@ -409,7 +409,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         current_capacity = capacity if capacity is not None else float('inf')
 
         for req in requests:
-            remaining = req.get_context_remaining_length()
+            remaining = req.context_remaining_length
             actual_size = remaining
 
             if current_capacity < actual_size:
