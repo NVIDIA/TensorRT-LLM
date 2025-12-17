@@ -35,6 +35,7 @@ TESTS_WITH_CONFIGURABLE_MOE = [
     "test_fused_moe_mxfp4_mxfp8",
     "test_fused_moe_w4a8_nvfp4_fp8",
     "test_fused_moe_wfp4a16",
+    "test_fused_moe_fp8_blockwise_deepgemm",
 ]
 
 

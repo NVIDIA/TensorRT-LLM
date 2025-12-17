@@ -74,7 +74,8 @@ class ExecutorMemoryType(StrEnum):
     SPEC_RESOURCES = "spec_resource_manager"
     INIT_KV_CACHE = "_no_capture_init_kv_cache"
     INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
-    MODEL_EXTRA = "_no_capture_model_extra"  # TODO: remove _no_capture after torch fix crash on torch.cuda.empty_cache()
+    # MODEL_EXTRA = "_no_capture_model_extra"  # TODO: remove _no_capture after torch fix crash on torch.cuda.empty_cache()
+    MODEL_EXTRA = "model_extra"
     EXTRA_RESOURCES = "executor_extra"
     KV_CACHE = "kv_cache"
     MODEL_ENGINE_MAIN = "model"

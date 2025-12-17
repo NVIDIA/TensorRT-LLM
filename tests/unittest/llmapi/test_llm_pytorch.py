@@ -1052,8 +1052,9 @@ def test_llm_context_only_timed_out():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-def test_llm_context_only_timed_out_kv_cache_exhausted(
-        sender_future_timeout_ms):
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
+                                                       backend):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1073,7 +1074,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=tp_size,
         cache_transceiver_config=CacheTransceiverConfig(
-            backend="UCX",
+            backend=backend,
             kv_transfer_timeout_ms=1000,
             kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
         **llm_args_extra)

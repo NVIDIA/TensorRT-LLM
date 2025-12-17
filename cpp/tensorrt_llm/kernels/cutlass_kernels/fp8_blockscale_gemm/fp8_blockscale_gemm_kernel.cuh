@@ -31,9 +31,12 @@
 #include "ada_blockwise_gemm/sm89_fp8_gemm_1d1d.cuh"
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/deep_gemm/fp8_gemm.cuh"
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace kernel_utils
 {
@@ -154,7 +157,7 @@ __inline__ __device__ uint32_t elect_one_sync([[maybe_unused]] int lane_id)
 
 } // namespace kernel_utils
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+namespace kernels::fp8_blockscale_gemm
 {
 
 template <typename T>
@@ -1960,4 +1963,6 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     }
 }
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+} // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

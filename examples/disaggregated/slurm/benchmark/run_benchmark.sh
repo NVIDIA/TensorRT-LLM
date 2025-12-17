@@ -62,8 +62,3 @@ for concurrency in ${concurrency_list}; do
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
     echo "Benchmark with concurrency ${concurrency} done"
 done
-
-job_id=${SLURM_JOB_ID}
-if [ -n "${job_id}" ]; then
-    echo "${SLURM_JOB_NODELIST}" > ${log_path}/job_${job_id}.txt
-fi

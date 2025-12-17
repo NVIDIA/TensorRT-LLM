@@ -748,7 +748,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml
 ```
 
 #### trtllm-serve
@@ -779,7 +779,7 @@ For example, you can launch a single context server on port 8001 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/qwen3-disagg-prefill.yaml"
+export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml"
 
 trtllm-serve Qwen3-30B-A3B/ --port 8001 --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_ctx &
 ```
@@ -789,7 +789,7 @@ And you can launch two generation servers on port 8002 and 8003 with:
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/qwen3.yaml"
+export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml"
 
 for port in {8002..8003}; do \
 trtllm-serve Qwen3-30B-A3B/ --port ${port} --extra_llm_api_options ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \

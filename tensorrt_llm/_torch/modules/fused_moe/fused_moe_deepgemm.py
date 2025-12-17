@@ -380,6 +380,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        init_load_balancer: bool = True,
+        without_comm: bool = False,
     ):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
@@ -407,6 +409,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
         )
 
     def get_workspace(self, m_max: int, group_size: int):
@@ -446,6 +450,23 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         }
         return workspace
 
+    def get_workspaces(self, chunk_size_list: list[int]) -> list[dict]:
+        """
+        Get workspaces for multiple chunks.
+
+        Args:
+            chunk_size_list: List of chunk sizes
+
+        Returns:
+            List of workspace dictionaries, one per chunk
+        """
+        workspaces = []
+        for chunk_size in chunk_size_list:
+            m_max = fp8_utils.align(chunk_size, 128)
+            workspace = self.get_workspace(m_max, 128)
+            workspaces.append(workspace)
+        return workspaces
+
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -461,6 +482,208 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         """DeepGEMM backend currently doesn't support alltoall; honor overrides but default to disabled."""
         return AlltoallMethodType.NotEnabled
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
+    ):
+        """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
+
+        Args:
+            x: Input tensor to quantize
+            post_quant_comm:
+                If True, quantize for post-quant communication path.
+                If False, quantize for non-communication path
+
+        Returns: (x, x_sf) where x_sf is None for DeepGemm
+
+        For DeepGemm with has_deepseek_fp8_block_scales:
+        - Quantization is deferred to run_moe (after permutation)
+        - WAR: FP8 block scales doesn't support permutation of quantized inputs
+        - Similar to CuteDslFusedMoE (see fused_moe_cute_dsl.py:242-253)
+        """
+        x_sf = None
+        if self.has_deepseek_fp8_block_scales:
+            # FP8 block scales doesn't support permutation of quantized inputs.
+            # WAR: The quantization is in run_moe.
+            pass
+        else:
+            raise ValueError(
+                f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
+            )
+
+        return x, x_sf
+
+    def run_moe(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: Optional[torch.Tensor] = None,
+        workspace: dict = None,
+    ) -> torch.Tensor:
+        """
+        Run MoE computation with DeepGemm backend.
+
+        This method encapsulates the core MoE computation logic, handling FP8 block scales
+        quantization with DeepGemm backend.
+
+        Args:
+            # Standard MoE interface parameters:
+            x: Input hidden states (unquantized for DeepGemm)
+            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
+                                    this represents expert slots [num_tokens, top_k] instead.
+            token_final_scales: Final scaling factors for each token
+            x_sf: Input scale factors (should be None for DeepGemm)
+            workspace: Workspace dictionary containing buffers for intermediate results
+                      Required keys: 'workspace_0', 'workspace_1', 'workspace_sf'
+
+        Returns:
+            final_hidden_states tensor.
+
+        Note: Similar to CuteDslFusedMoE.run_moe_fp8_block_scales (fused_moe_cute_dsl.py:360-434)
+        """
+        assert self.has_deepseek_fp8_block_scales
+        assert x_sf is None
+        assert workspace is not None, "workspace is required for DeepGemm backend"
+        assert token_selected_experts is not None
+        assert token_final_scales is not None
+
+        # Permutation
+        (
+            permuted_row_to_unpermuted_row_tensor,
+            permuted_token_selected_experts_tensor,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            permuted_token_final_scales_tensor,
+            unpermuted_row_to_permuted_row_tensor,
+        ) = torch.ops.trtllm.moe_permute_op(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            None,  # w3_w1_weight.view(weight_dtype),
+            None,  # w2_weight.view(weight_dtype),
+            None,  # quant_scales,
+            input_sf=x_sf,
+            num_experts_on_rank=self.expert_size_per_partition,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            min_latency_mode=False,
+            use_fp8_block_scaling=True,
+        )
+
+        if permuted_data_tensor.numel() == 0:
+            return torch.zeros_like(x)
+
+        # Preprocess after permute
+        masked_m, token_to_expert_map = preprocess_after_permute(
+            expert_first_token_offset_tensor, permuted_data_tensor)
+
+        expected_m = (token_selected_experts.numel() +
+                      self.expert_size_per_partition -
+                      1) // self.expert_size_per_partition
+
+        # Padding and quantization
+        m_max = fp8_utils.align(x.shape[0], 128)
+        act_input_fp8 = set_strides(workspace["workspace_0"],
+                                    self.expert_size_per_partition, m_max,
+                                    self.hidden_size)
+
+        m_padded = fp8_utils.align(m_max, 4)
+        scale_k = fp8_utils.ceil_div(self.hidden_size, 128)
+        scale_k_padded = fp8_utils.align(scale_k, 4)
+        act_input_sf = set_strides(workspace["workspace_sf"],
+                                   self.expert_size_per_partition,
+                                   scale_k_padded // 4, m_padded)
+
+        act_input_sf = masked_index_copy_group_quant_fp8(
+            act_input_fp8,
+            act_input_sf,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            token_to_expert_map,
+            group_size=128)
+
+        # Grouped gemm 1
+        h1 = set_strides(workspace["workspace_1"],
+                         self.expert_size_per_partition, m_max,
+                         self.intermediate_size_per_partition * 2)
+
+        deepgemm_fp8_group_blockwise_gemm(
+            d=h1,
+            a=act_input_fp8,
+            b=self.w3_w1_weight,
+            sfa=act_input_sf,
+            sfb=self.quant_scales[0],
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
+
+        # Activation and quantization
+        act_input_fp8 = set_strides(workspace["workspace_0"],
+                                    self.expert_size_per_partition, m_max,
+                                    self.intermediate_size_per_partition)
+
+        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition, 128)
+        scale_k_padded = fp8_utils.align(scale_k, 4)
+        act_input_sf = set_strides(workspace["workspace_sf"],
+                                   self.expert_size_per_partition,
+                                   scale_k_padded // 4, m_padded)
+
+        act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
+            output=act_input_fp8,
+            output_scale=act_input_sf,
+            input=h1,
+            quant_group_size=128,
+            masked_m=masked_m,
+            scale_ue8m0=True)
+
+        # Grouped gemm 2
+        h3 = set_strides(workspace["workspace_1"],
+                         self.expert_size_per_partition, m_max,
+                         self.hidden_size)
+
+        deepgemm_fp8_group_blockwise_gemm(
+            d=h3,
+            a=act_input_fp8,
+            b=self.w2_weight,
+            sfa=act_input_sf,
+            sfb=self.quant_scales[1],
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
+
+        # Gather and finalize
+        triton_masked_index_gather(permuted_data_tensor, h3,
+                                   expert_first_token_offset_tensor,
+                                   token_to_expert_map)
+
+        final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
+            permuted_data_tensor,
+            None,  # biases
+            token_final_scales,
+            unpermuted_row_to_permuted_row_tensor,
+            permuted_row_to_unpermuted_row_tensor,
+            token_selected_experts,
+            expert_first_token_offset_tensor,
+            False,  # enable_alltoall
+            x.shape[0],  # num_rows
+            x.shape[1],  # (possibly padded) hidden_size
+            self.unpadded_hidden_size,  # original hidden size
+            self.routing_method.top_k,
+            self.expert_size_per_partition,  # num_experts_per_node
+            self.tp_size,
+            self.tp_rank,
+            self.ep_size,
+            self.ep_rank,
+        )
+
+        return final_hidden_states
 
     @nvtx_range("[DG] forward")
     def forward_chunk(
@@ -495,11 +718,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             token_final_scales = None
 
         # quantize inputs
-        use_deepseek_fp8_block_scale = False
         x_sf = None
         if self.has_any_quant:
             if self.has_deepseek_fp8_block_scales:
-                use_deepseek_fp8_block_scale = True
+                pass
             else:
                 raise ValueError(
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
@@ -513,135 +735,13 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
 
-        (
-            permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
-            permuted_data_tensor,
-            expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
-            unpermuted_row_to_permuted_row_tensor,
-        ) = torch.ops.trtllm.moe_permute_op(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            None,  # w3_w1_weight.view(weight_dtype),
-            None,  # w2_weight.view(weight_dtype),
-            None,  # quant_scales,
-            input_sf=x_sf,
-            num_experts_on_rank=self.expert_size_per_partition,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            cluster_size=self.cluster_size,
-            cluster_rank=self.cluster_rank,
-            min_latency_mode=False,
-            use_fp8_block_scaling=use_deepseek_fp8_block_scale,
-        )
-
-        if permuted_data_tensor.numel() == 0:
-            return torch.zeros_like(x)
-
-        masked_m, token_to_expert_map = preprocess_after_permute(
-            expert_first_token_offset_tensor, permuted_data_tensor)
-
-        expected_m = (token_selected_experts.numel() +
-                      self.expert_size_per_partition -
-                      1) // self.expert_size_per_partition
-
-        # padding and quantization
-        m_max = fp8_utils.align(x.shape[0], 128)
-        act_input_fp8 = set_strides(workspace["workspace_0"],
-                                    self.expert_size_per_partition, m_max,
-                                    self.hidden_size)
-
-        m_padded = fp8_utils.align(m_max, 4)
-        scale_k = fp8_utils.ceil_div(self.hidden_size, 128)
-        scale_k_padded = fp8_utils.align(scale_k, 4)
-        act_input_sf = set_strides(workspace["workspace_sf"],
-                                   self.expert_size_per_partition,
-                                   scale_k_padded // 4, m_padded)
-
-        act_input_sf = masked_index_copy_group_quant_fp8(
-            act_input_fp8,
-            act_input_sf,
-            permuted_data_tensor,
-            expert_first_token_offset_tensor,
-            token_to_expert_map,
-            group_size=128)
-
-        # grouped gemm 1
-        h1 = set_strides(workspace["workspace_1"],
-                         self.expert_size_per_partition, m_max,
-                         self.intermediate_size_per_partition * 2)
-
-        deepgemm_fp8_group_blockwise_gemm(
-            d=h1,
-            a=act_input_fp8,
-            b=self.w3_w1_weight,
-            sfa=act_input_sf,
-            sfb=self.quant_scales[0],
-            masked_m=masked_m,
-            expected_m=expected_m,
-        )
-
-        # activation and quantization
-        act_input_fp8 = set_strides(workspace["workspace_0"],
-                                    self.expert_size_per_partition, m_max,
-                                    self.intermediate_size_per_partition)
-
-        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition, 128)
-        scale_k_padded = fp8_utils.align(scale_k, 4)
-        act_input_sf = set_strides(workspace["workspace_sf"],
-                                   self.expert_size_per_partition,
-                                   scale_k_padded // 4, m_padded)
-
-        act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
-            output=act_input_fp8,
-            output_scale=act_input_sf,
-            input=h1,
-            quant_group_size=128,
-            masked_m=masked_m,
-            scale_ue8m0=True)
-
-        # grouped gemm 2
-        h3 = set_strides(workspace["workspace_1"],
-                         self.expert_size_per_partition, m_max,
-                         self.hidden_size)
-
-        deepgemm_fp8_group_blockwise_gemm(
-            d=h3,
-            a=act_input_fp8,
-            b=self.w2_weight,
-            sfa=act_input_sf,
-            sfb=self.quant_scales[1],
-            masked_m=masked_m,
-            expected_m=expected_m,
-        )
-
-        # gather and finalize
-        triton_masked_index_gather(permuted_data_tensor, h3,
-                                   expert_first_token_offset_tensor,
-                                   token_to_expert_map)
-
-        final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
-            permuted_data_tensor,
-            None,  # biases
-            token_final_scales,
-            unpermuted_row_to_permuted_row_tensor,
-            permuted_row_to_unpermuted_row_tensor,
-            token_selected_experts,
-            expert_first_token_offset_tensor,
-            False,  # enable_alltoall
-            x.shape[0],  # num_rows
-            x.shape[1],  # (possibly padded) hidden_size
-            self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
-            self.expert_size_per_partition,  # num_experts_per_node
-            self.tp_size,
-            self.tp_rank,
-            self.ep_size,
-            self.ep_rank,
+        # Call run_moe to handle the core MoE computation
+        final_hidden_states = self.run_moe(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            x_sf=x_sf,
+            workspace=workspace,
         )
 
         return final_hidden_states
@@ -683,15 +783,14 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             num_rows = x.shape[0]
             if self.use_dp:
                 num_rows = sum(all_rank_num_tokens_padded)
-            m_max = fp8_utils.align(num_rows, 128)
-            workspace = self.get_workspace(m_max, 128)
+            workspaces = self.get_workspaces([num_rows])
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
-                workspace=workspace)
+                workspace=workspaces[0])
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -715,10 +814,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                ) if self.use_dp else chunk_size_list[0]
             chunk_size_1 = sum(all_rank_num_tokens_list[1]
                                ) if self.use_dp else chunk_size_list[1]
-            workspace_0 = self.get_workspace(fp8_utils.align(chunk_size_0, 128),
-                                             128)
-            workspace_1 = self.get_workspace(fp8_utils.align(chunk_size_1, 128),
-                                             128)
+            workspaces = self.get_workspaces([chunk_size_0, chunk_size_1])
+            workspace_0 = workspaces[0]
+            workspace_1 = workspaces[1]
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)

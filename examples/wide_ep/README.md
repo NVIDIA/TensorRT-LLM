@@ -21,13 +21,13 @@ Wide-EP solves these challenges through:
 
 ### Prerequisites
 
-* GPU: GB200 NVL72, H20, or RTX 6000D.
+* GPU: GB200 NVL72, GB300 NVL72, H20, or RTX 6000D.
 * OS: Linux
 * Drivers: CUDA Driver 575 or Later
 * Docker with NVIDIA Container Toolkit installed
 * Python3 and python3-pip (Optional, for accuracy evaluation only)
 
-For GB200 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup, check if the path `/dev/nvidia-caps-imex-channels` exists in the container. If the path doesn't exist, mount it when launching the Docker container.
+For GB200/GB300 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup, check if the path `/dev/nvidia-caps-imex-channels` exists in the container. If the path doesn't exist, mount it when launching the Docker container.
 
 For more information on NVIDIA IMEX service for NVLink networks, refer to https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html.
 
@@ -108,16 +108,16 @@ If `never` is highlighted, enable Transparent HugePages by the following command
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
-### GB200 NUMA binding
+### GB200/GB300 NVL72 NUMA binding
 
-GPU memory is also on NUMA nodes on GB200 and the system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
+GPU memory is also on NUMA nodes on GB200/GB300 NVL72 and the system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
 ```bash
 numactl -m 0,1 <command>
 ```
 
 ### Shared Memory on EPLB
 
-To achieve online load balancing, all expert weights are stored in shared host memory. Four ranks on the same GB200 node share the same expert weights to save memory.
+To achieve online load balancing, all expert weights are stored in shared host memory. Four ranks on the same GB200/GB300 NVL72 node share the same expert weights to save memory.
 
 There is one environment variable `TRTLLM_EPLB_SHM_NAME` to specify the base name of the shared memory. This environment variable may need to be specified if there are multiple instances on one node. If not, you can ignore it.
 

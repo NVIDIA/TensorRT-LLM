@@ -10,6 +10,24 @@ This step-by-step tutorial covers the following topics for running online servin
  * Using `extra_llm_api_options`
  * Multimodal Serving and Benchmarking
 
+## Table of Contents
+- [Run benchmarking with `trtllm-serve`](#run-benchmarking-with-trtllm-serve)
+  - [Table of Contents](#table-of-contents)
+  - [Methodology Introduction](#methodology-introduction)
+  - [Preparation](#preparation)
+    - [Launch the NGC container](#launch-the-ngc-container)
+    - [Start the trtllm-serve service](#start-the-trtllm-serve-service)
+  - [Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`](#benchmark-using-tensorrt_llmservescriptsbenchmark_serving)
+    - [Key Metrics](#key-metrics)
+  - [About `extra_llm_api_options`](#about-extra_llm_api_options)
+      - [`kv_cache_config`](#kv_cache_config)
+      - [`cuda_graph_config`](#cuda_graph_config)
+      - [`moe_config`](#moe_config)
+      - [`attention_backend`](#attention_backend)
+  - [Multimodal Serving and Benchmarking](#multimodal-serving-and-benchmarking)
+    - [Setting up Multimodal Serving](#setting-up-multimodal-serving)
+    - [Multimodal Benchmarking](#multimodal-benchmarking)
+
 
 ## Methodology Introduction
 
@@ -17,8 +35,9 @@ The overall performance benchmarking involves:
    1. Launch the OpenAI-compatible service with `trtllm-serve`
    2. Run the benchmark with [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
+## Preparation
 
-## Launch the NGC container
+### Launch the NGC container
 
 TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags).
 
@@ -29,7 +48,7 @@ docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --uli
 ```
 
 
-## Start the trtllm-serve service
+### Start the trtllm-serve service
 > [!WARNING]
 > The commands and configurations presented in this document are for illustrative purposes only.
 > They serve as examples and may not deliver the optimal performance for your specific use case.
@@ -79,9 +98,9 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 ```
 
-## Run the benchmark
+## Benchmark using `tensorrt_llm.serve.scripts.benchmark_serving`
 
-Similar to starting trtllm-serve, create a script to execute the benchmark using the following code and name it bench.sh.
+Similar to starting `trtllm-serve`, create a script to execute the benchmark using the following code and name it bench.sh.
 
 ```bash
 concurrency_list="1 2 4 8 16 32 64 128 256"

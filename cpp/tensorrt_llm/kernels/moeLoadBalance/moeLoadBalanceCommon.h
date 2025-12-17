@@ -16,8 +16,9 @@
  */
 #pragma once
 
-namespace tensorrt_llm
-{
+#include "tensorrt_llm/common/config.h"
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -89,4 +90,5 @@ struct MoePlacementInfo
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

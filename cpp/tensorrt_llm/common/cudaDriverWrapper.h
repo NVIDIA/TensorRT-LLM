@@ -17,6 +17,7 @@
 #ifndef CUDA_DRIVER_WRAPPER_H
 #define CUDA_DRIVER_WRAPPER_H
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 
@@ -25,7 +26,9 @@
 #include <cstdio>
 #include <memory>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 class CUDADriverWrapper
@@ -165,8 +168,9 @@ void checkDriverExitSafe(T result, char const* const func, char const* const fil
     }
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
 
+TRTLLM_NAMESPACE_END
 /*
  * Macros compliant with TensorRT coding conventions
  */
