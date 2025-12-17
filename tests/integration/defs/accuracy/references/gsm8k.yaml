@@ -285,3 +285,5 @@ bigcode/starcoder2-15b:
   - accuracy: 54.5
 mistral/Mistral-Large-3-675B:
   - accuracy: 90.83
+nvidia/Nemotron-Super-V3:
+  - accuracy: 84.38
