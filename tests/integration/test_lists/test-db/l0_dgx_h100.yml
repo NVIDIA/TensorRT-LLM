@@ -303,4 +303,5 @@ l0_dgx_h100:
   tests:
     - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu4"
     - unittest/llmapi/test_async_llm.py -m "gpu4"
-    - ray_orchestrator/RL/test_rl_perf_reproduce.py
+    - ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp2_instances2]
+    - ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp1_instances4]
