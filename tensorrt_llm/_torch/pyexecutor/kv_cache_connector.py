@@ -581,5 +581,5 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
 
     def wait_for_initialization(self):
-        if self.scheduler is None:
+        if self.scheduler is not None:
             self.scheduler.wait_for_initialization()
