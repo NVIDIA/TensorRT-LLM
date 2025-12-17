@@ -32,7 +32,7 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (
     DecoderModel,
     DecoderModelForCausalLM,
@@ -56,7 +56,7 @@ AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
 # fmt: on
 
 
-PRINT_DEBUG = True
+PRINT_DEBUG = False
 
 
 def debug_print(tag: str, x: torch.Tensor, layer_idx: Optional[int] = None):
@@ -120,8 +120,8 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
 
         fuse_qk_norm_rope = self.is_sliding and fuse_qk_norm_rope
 
-        # TODO: Fusing qk norm with rope has an issue that slightly hurts accuracy.
-        assert fuse_qk_norm_rope is False, "Fusing qk norm and rope is having issue now"
+        # NOTE: Fusing qk norm with rope has an issue that slightly hurts accuracy.
+        assert not fuse_qk_norm_rope, "Fusing qk norm and rope is having issue now"
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -147,9 +147,6 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # TODO LoRA has not been tested yet but there is no need to prevent it.
-        assert lora_params is None, "LORA is not supported for ExaoneMoeAttention"
-
         return super().forward(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -252,11 +249,13 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 layer_idx=layer_idx,
             )
         else:
-            block_size = 1 if quant_config.quant_algo is None else quant_config.group_size
+            block_size = 1
+            if quant_config.quant_algo is None and quant_config.group_size is not None:
+                block_size = quant_config.group_size
             self.mlp_tp_size = self._compute_mlp_tp_size(config.intermediate_size, block_size)
             has_mlp_tp = self.mlp_tp_size > 1
             # TODO(jaedeokk): Enable when FP4 is available.
-            # self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
+            self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
             self.mlp = GatedMLP(
@@ -265,6 +264,9 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 bias=False,
                 dtype=config.torch_dtype,
                 config=model_config,
+                # Keep sharding consistent with computed mlp_tp_size.
+                # In attention-DP, mlp_tp_size==1 -> disable TP sharding here.
+                overridden_tp_size=self.mlp_tp_size,
                 layer_idx=layer_idx,
                 disable_deep_gemm=self.disable_deep_gemm,
                 reduce_output=has_mlp_tp,
@@ -470,18 +472,17 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fusion_config.PRE_MLP_FUSION:
-            raise NotImplementedError("FP4 has not supported yet.")
-            # act_fp4, act_sf, residual = self.allreduce(
-            #     hidden_states,
-            #     all_reduce_params=AllReduceParams(
-            #         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-            #         residual=residual,
-            #         norm_weight=self.post_attention_layernorm.weight,
-            #         scale=self.mlp.gate_up_proj.input_scale,
-            #         eps=self.post_attention_layernorm.variance_epsilon,
-            #     ),
-            # )
-            # hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            act_fp4, act_sf, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    scale=self.mlp.gate_up_proj.input_scale,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ),
+            )
+            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
         else:
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
