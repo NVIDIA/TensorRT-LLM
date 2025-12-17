@@ -362,6 +362,7 @@ unittest/_torch/auto_deploy/unit/multigpu/test_ad_build_small_multi.py::test_bui
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5683039)
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
 unittest/_torch/speculative/test_draft_len_schedule.py::test_correctness_across_batch_sizes[model_drafter-schedule1] SKIP (https://nvbugs/5680911)
+unittest/_torch/speculative/test_eagle3.py::test_qwen3_eagle3[True-True-True-True] SKIP (https://nvbugspro.nvidia.com/bug/5749988)
 test_e2e.py::test_openai_responses SKIP (https://nvbugs/5635153)
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype SKIP (https://nvbugs/5612438)
 accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[True] SKIP (https://nvbugs/5688721)
