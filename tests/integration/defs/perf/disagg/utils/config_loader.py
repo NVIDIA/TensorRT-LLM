@@ -85,7 +85,7 @@ _COMMON_ACCURACY_METRICS = MetricsConfig(
 DEFAULT_METRICS_CONFIG = {
     # Performance test default configuration
     ("disagg", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Median\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
             (?:.*\n)*?
@@ -96,7 +96,7 @@ DEFAULT_METRICS_CONFIG = {
         metric_names=["SERVER_MEDIAN_TTFT", "SERVER_MEDIAN_E2EL"],
     ),
     ("wideep", "perf"): MetricsConfig(
-        log_file="bench.log",
+        log_file="6_bench.log",
         extractor_pattern=r"""
             ^.*?Mean\ TTFT\ \(ms\):\s+([0-9.]+).*?$\n
             (?:.*\n)*?
