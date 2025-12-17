@@ -11,7 +11,6 @@ from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 from .llm_request import LlmRequest, LlmRequestState
-from .resource_manager import KVCacheManager
 
 RequestList = list[LlmRequest]
 
@@ -463,7 +462,7 @@ class PyCapacityScheduler:
     def __init__(
         self,
         max_num_requests: int,
-        kv_cache_manager: KVCacheManager,
+        kv_cache_manager,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
         MAX_UTILIZATION,
         no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
