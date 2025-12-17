@@ -69,9 +69,7 @@ class LongBenchV2(Evaluator):
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None,
-                 dump_path: Optional[str] = None,
-                 dump_as_text: bool = False):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         """Initialize LongBench v2 evaluator.
 
         Args:
@@ -93,15 +91,12 @@ class LongBenchV2(Evaluator):
             apply_chat_template: Whether to apply model's chat template
             system_prompt: System prompt to prepend
             chat_template_kwargs: Chat template kwargs as JSON string
-            dump_path: Path to dump data to ids for trtllm-bench usage.
-            dump_as_text: Whether to dump data to text.
         """
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
                          chat_template_kwargs=chat_template_kwargs,
-                         dump_path=dump_path,
-                         dump_as_text=dump_as_text)
+                         output_dir=output_dir)
 
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -769,14 +764,6 @@ class LongBenchV2(Evaluator):
                   type=float,
                   default=0.95,
                   help="Top p for sampling.")
-    @click.option("--dump_path",
-                  type=str,
-                  default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
@@ -787,8 +774,7 @@ class LongBenchV2(Evaluator):
                 apply_chat_template: bool, system_prompt: Optional[str],
                 max_len: int, max_input_length: int, max_output_length: int,
                 chat_template_kwargs: Optional[dict[str, Any]],
-                temperature: float, top_p: float,
-                dump_path: Optional[str], dump_as_text: bool) -> None:
+                temperature: float, top_p: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
         sampling_params = SamplingParams(max_tokens=max_output_length,
@@ -812,9 +798,7 @@ class LongBenchV2(Evaluator):
                                 random_seed=random_seed,
                                 apply_chat_template=apply_chat_template,
                                 system_prompt=system_prompt,
-                                chat_template_kwargs=chat_template_kwargs,
-                                dump_path=dump_path,
-                                dump_as_text=dump_as_text)
+                                chat_template_kwargs=chat_template_kwargs)
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

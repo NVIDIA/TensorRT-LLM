@@ -37,16 +37,14 @@ class JsonModeEval(Evaluator):
                  random_seed: int = 0,
                  apply_chat_template: bool = True,
                  system_prompt: Optional[str] = None,
-                 dump_path: Optional[str] = None,
-                 dump_as_text: bool = False):
+                 output_dir: Optional[str] = None):
         if not apply_chat_template:
             raise ValueError(
                 f"{self.__class__.__name__} requires apply_chat_template=True.")
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
-                         dump_path=dump_path,
-                         dump_as_text=dump_as_text)
+                         output_dir=output_dir)
         if dataset_path is None:
             dataset_path = "NousResearch/json-mode-eval"
         self.data = datasets.load_dataset(dataset_path,
@@ -124,20 +122,16 @@ class JsonModeEval(Evaluator):
                   type=int,
                   default=512,
                   help="Maximum generation length.")
-    @click.option("--dump_path",
+    @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
+                  help="Directory to save results.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
                 random_seed: int, system_prompt: Optional[str],
                 max_input_length: int, max_output_length: int,
-                dump_path: Optional[str], dump_as_text: bool) -> None:
+                output_dir: Optional[str]) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -147,7 +141,6 @@ class JsonModeEval(Evaluator):
                                  random_seed=random_seed,
                                  apply_chat_template=True,
                                  system_prompt=system_prompt,
-                                 dump_path=dump_path,
-                                 dump_as_text=dump_as_text)
+                                 output_dir=output_dir)
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

@@ -38,8 +38,7 @@ class Evaluator(ABC):
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
-                 dump_path: Optional[str] = None,
-                 dump_as_text: bool = False):
+                 output_dir: Optional[str] = None):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -47,8 +46,8 @@ class Evaluator(ABC):
         self.fewshot_as_multiturn = fewshot_as_multiturn
         self.system_prompt = system_prompt
         self.chat_template_kwargs = chat_template_kwargs
-        self.dump_path = dump_path
-        self.dump_as_text = dump_as_text
+        self.output_dir = output_dir
+        self.inference_results = []
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -110,16 +109,16 @@ class Evaluator(ABC):
             auxiliaries.append(aux)
         results = []
         task_id = 0
-        if self.dump_path:
-            self.dump_path = prepare_dump_path(self.dump_path)
-            logger.info(f"Dumping data to {self.dump_path}")
+        self.inference_results = []
         for output in tqdm(outputs, desc="Fetching responses"):
             res = output.result()
             results.append(res)
-            dump_inference_result(self.dump_path, res, task_id,
-                                  self.dump_as_text,
-                                  getattr(llm, 'tokenizer', None))
+            collect_inference_result(self.inference_results, res, task_id)
             task_id += 1
+
+        if self.output_dir:
+            dump_inference_results(self.output_dir, self.inference_results,
+                                   getattr(llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -134,52 +133,59 @@ class Evaluator(ABC):
         raise NotImplementedError()
 
 
-def prepare_dump_path(dump_path: str) -> str:
-    if dump_path:
-        if os.path.isdir(dump_path) or dump_path.endswith(os.sep):
-            dump_path = os.path.join(dump_path, "dumped_data.json")
-        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-        if os.path.exists(dump_path):
-            os.remove(dump_path)
-    return dump_path
+def collect_inference_result(results_list: List[dict], result: RequestOutput,
+                             task_id: int):
+    input_ids = result.prompt_token_ids
+    output_ids = result.outputs[0].token_ids
+    results_list.append({
+        "task_id": task_id,
+        "input_ids": input_ids,
+        "output_ids": output_ids
+    })
 
 
-def dump_inference_result(dump_path: str, result: RequestOutput, task_id: int,
-                          dump_as_text: bool, tokenizer: Any):
-    if not dump_path:
+def dump_inference_results(output_dir: str, results_list: List[dict],
+                           tokenizer: Any):
+    if not output_dir:
         return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Dump token ids
+    ids_path = os.path.join(output_dir, "dumped_ids.json")
     try:
-        with open(dump_path, "a") as f:
-            input_ids = result.prompt_token_ids
-            output_ids = result.outputs[0].token_ids
-
-            if tokenizer is None:
-                logger.warning("Tokenizer not found, dumping raw token ids")
-                dump_as_text = False
-
-            if dump_as_text:
-                input_content = tokenizer.decode(input_ids)
-                output_content = tokenizer.decode(output_ids)
-            else:
-                input_content = input_ids
-                output_content = output_ids
-
-            if dump_as_text:
+        with open(ids_path, "w") as f:
+            for item in results_list:
                 data = {
-                    "task_id": task_id,
-                    "input_text": input_content,
-                    "output_text": output_content,
-                    "input_lens": len(input_content),
-                    "output_lens": len(output_content)
+                    "task_id": item["task_id"],
+                    "input_ids": item["input_ids"],
+                    "output_ids": item["output_ids"],
+                    "input_tokens": len(item["input_ids"]),
+                    "output_tokens": len(item["output_ids"])
                 }
-            else:
-                data = {
-                    "task_id": task_id,
-                    "input_ids": input_ids,
-                    "output_ids": output_ids,
-                    "input_tokens": len(input_content),
-                    "output_tokens": len(output_content)
-                }
-            f.write(json.dumps(data) + "\n")
+                f.write(json.dumps(data) + "\n")
+        logger.info(f"Dumped IDs to {ids_path}")
     except Exception as e:
-        logger.warning(f"Failed to dump data to {dump_path}: {e}")
+        logger.warning(f"Failed to dump IDs to {ids_path}: {e}")
+
+    # Dump text if tokenizer available
+    if tokenizer is not None:
+        text_path = os.path.join(output_dir, "dumped_text.json")
+        try:
+            with open(text_path, "w") as f:
+                for item in results_list:
+                    input_text = tokenizer.decode(item["input_ids"])
+                    output_text = tokenizer.decode(item["output_ids"])
+                    data = {
+                        "task_id": item["task_id"],
+                        "input_text": input_text,
+                        "output_text": output_text,
+                        "input_len": len(input_text),
+                        "output_len": len(output_text)
+                    }
+                    f.write(json.dumps(data) + "\n")
+            logger.info(f"Dumped text to {text_path}")
+        except Exception as e:
+            logger.warning(f"Failed to dump text to {text_path}: {e}")
+    else:
+        logger.warning("Tokenizer not found, skipping text dump")

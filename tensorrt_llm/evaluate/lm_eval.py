@@ -39,7 +39,8 @@ from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .interface import Evaluator, dump_inference_result, prepare_dump_path
+from .interface import (Evaluator, collect_inference_result,
+                        dump_inference_results)
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -55,15 +56,14 @@ class LmEvalWrapper(TemplateLM):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
-                 dump_path: Optional[str] = None,
-                 dump_as_text: bool = False):
+                 output_dir: Optional[str] = None):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
-        self.dump_path = dump_path
-        self.dump_as_text = dump_as_text
+        self.output_dir = output_dir
+        self.inference_results = []
 
     @property
     def eot_token_id(self) -> int:
@@ -144,15 +144,18 @@ class LmEvalWrapper(TemplateLM):
 
         outputs = []
         task_id = 0
+        self.inference_results = []
         for output in tqdm(results,
                            desc="Fetching responses",
                            disable=disable_tqdm):
             res = output.result()
             outputs.append(res)
-            dump_inference_result(self.dump_path, res, task_id,
-                                  self.dump_as_text,
-                                  getattr(self.llm, 'tokenizer', None))
+            collect_inference_result(self.inference_results, res, task_id)
             task_id += 1
+
+        if self.output_dir:
+            dump_inference_results(self.output_dir, self.inference_results,
+                                   getattr(self.llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -178,8 +181,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
-                 dump_path: Optional[str] = None,
-                 dump_as_text: bool = False):
+                 output_dir: Optional[str] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -189,14 +191,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             streaming: Whether to use streaming generation
             max_images: Maximum number of images per prompt (currently unlimited in TRT-LLM), set to 999 from lm_eval's default value.
             chat_template_kwargs: Chat template kwargs as JSON string
-            dump_path: Path to dump data to ids for trtllm-bench usage
-            dump_as_text: Whether to dump data to text
+            output_dir: Directory to save results
         """
-        super().__init__(llm,
-                         sampling_params,
-                         streaming,
-                         dump_path=dump_path,
-                         dump_as_text=dump_as_text)
+        super().__init__(llm, sampling_params, streaming, output_dir=output_dir)
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
@@ -329,14 +326,19 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             results.append(output)
 
         outputs = []
+        self.inference_results = []
+        task_id = 0
         for output in tqdm(results,
                            desc="Fetching responses",
                            disable=disable_tqdm):
             res = output.result()
             outputs.append(res)
-            dump_inference_result(self.dump_path, res, task_id,
-                                  self.dump_as_text,
-                                  getattr(self.llm, 'tokenizer', None))
+            collect_inference_result(self.inference_results, res, task_id)
+            task_id += 1
+
+        if self.output_dir:
+            dump_inference_results(self.output_dir, self.inference_results,
+                                   getattr(self.llm, 'tokenizer', None))
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
@@ -358,8 +360,7 @@ class LmEvalEvaluator(Evaluator):
                  system_prompt: Optional[str] = None,
                  is_multimodal: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
-                 dump_path: Optional[str] = None,
-                 dump_as_text: bool = False):
+                 output_dir: Optional[str] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -379,8 +380,7 @@ class LmEvalEvaluator(Evaluator):
                          fewshot_as_multiturn=fewshot_as_multiturn,
                          system_prompt=system_prompt,
                          chat_template_kwargs=chat_template_kwargs,
-                         dump_path=dump_path,
-                         dump_as_text=dump_as_text)
+                         output_dir=output_dir)
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -473,10 +473,6 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
 
-        if self.dump_path:
-            self.dump_path = prepare_dump_path(self.dump_path)
-            logger.info(f"Dumping data to {self.dump_path}")
-
         results = lm_eval.evaluate(
             lm=lm_cls(llm,
                       sampling_params=sampling_params,
@@ -484,8 +480,7 @@ class LmEvalEvaluator(Evaluator):
                       chat_template_kwargs=self.chat_template_kwargs,
                       model_type=model_type,
                       is_force_single_image=is_force_single_image,
-                      dump_path=self.dump_path,
-                      dump_as_text=self.dump_as_text),
+                      output_dir=self.output_dir),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -526,8 +521,7 @@ class LmEvalEvaluator(Evaluator):
                         is_multimodal=kwargs.pop("is_multimodal", False),
                         chat_template_kwargs=kwargs.pop("chat_template_kwargs",
                                                         None),
-                        dump_path=kwargs.pop("dump_path", None),
-                        dump_as_text=kwargs.pop("dump_as_text", False))
+                        output_dir=kwargs.pop("output_dir", None))
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
             truncate_prompt_tokens=kwargs.pop("max_input_length"),
@@ -584,14 +578,10 @@ class GSM8K(LmEvalEvaluator):
                   type=int,
                   default=256,
                   help="Maximum generation length.")
-    @click.option("--dump_path",
+    @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
+                  help="Directory to save the results.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -646,14 +636,10 @@ class GPQADiamond(LmEvalEvaluator):
                   type=int,
                   default=32768,
                   help="Maximum generation length.")
-    @click.option("--dump_path",
+    @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
+                  help="Directory to save the results.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -704,14 +690,10 @@ class GPQAMain(LmEvalEvaluator):
                   type=int,
                   default=32768,
                   help="Maximum generation length.")
-    @click.option("--dump_path",
+    @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
+                  help="Directory to save the results.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -762,14 +744,10 @@ class GPQAExtended(LmEvalEvaluator):
                   type=int,
                   default=32768,
                   help="Maximum generation length.")
-    @click.option("--dump_path",
+    @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
+                  help="Directory to save the results.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -821,14 +799,10 @@ class MMMU(LmEvalEvaluator):
         default=
         512,  # NOTE: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/mmmu/_template_yaml#L13
         help="Maximum generation length.")
-    @click.option("--dump_path",
+    @click.option("--output_dir",
                   type=str,
                   default=None,
-                  help="Path to dump data to ids for trtllm-bench usage.")
-    @click.option("--dump_as_text",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to dump data to text.")
+                  help="Directory to save the results.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
