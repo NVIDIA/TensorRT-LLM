@@ -1534,7 +1534,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
-                    server: 10.117.145.14
+                    server: 10.120.131.95
                     path: /vol/scratch19/scratch.trt_llm_data
     """
     if (type.contains("6000d") || type.contains("gh200")) {
