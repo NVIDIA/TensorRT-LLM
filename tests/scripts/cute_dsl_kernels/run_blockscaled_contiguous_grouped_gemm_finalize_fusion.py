@@ -72,8 +72,8 @@ except ImportError:
 def create_mask(group_m_list, cta_tile_mn, permuted_m=None):
     """Create mask and group mapping for contiguous grouped GEMM.
 
-    :param group_m_list: List of M values for each group (will be aligned to cta_tile_mn[0])
-    :param cta_tile_m: CTA tile size in M dimension (from mma_tiler_mn[0])
+    :param group_m_list: List of M values for each group (will be aligned to cta_tile_mn[0] dimension)
+    :param cta_tile_mn: CTA tile size tuple (M, N) - M dimension used for alignment
     :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
                      tile_idx_to_expert_idx will be padded to this size.
                      When tile_idx >= num_non_exiting_tiles, the kernel exits.
@@ -84,9 +84,13 @@ def create_mask(group_m_list, cta_tile_mn, permuted_m=None):
           Only the actual valid rows (aligned_groupm[0]+aligned_groupm[1]+...) contain
           valid data. The kernel will exit when tile_idx >= num_non_exiting_tiles.
 
-    :return: Tuple of (valid_m, aligned_group_m_list, tile_idx_to_expert_idx, num_non_exiting_tiles)
-             - tile_idx_to_expert_idx: shape (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
+    :return: Tuple of (valid_m, aligned_group_m_list, tile_idx_to_expert_idx,
+                num_non_exiting_tiles, tile_idx_to_mn_limit)
+         - valid_m: total valid M dimension
+         - aligned_group_m_list: aligned group M dimension list
+         - tile_idx_to_expert_idx: shape (permuted_m/cta_tile_m,) if permuted_m provided, else (valid_m/cta_tile_m,)
              - num_non_exiting_tiles: scalar value = valid_m/cta_tile_m
+             - tile_idx_to_mn_limit: M limit for each tile index
     """
     m_aligned = cta_tile_mn[0]
     valid_m = 0
@@ -299,7 +303,7 @@ def create_tensors(
     :param permuted_m: Optional padded M dimension for cuda_graph support. If provided,
                      A matrix, C matrix, and scale factor A will be padded to this size.
                      The kernel exits when tile_idx >= num_non_exiting_tiles.
-    :param topK: Number of experts per token (for MoE with fused finalize)
+    :param seq_len: Sequence length (number of output tokens for C tensor)
     :return: Tuple of (a_tensor, b_tensor, out_tensor, sfa_tensor, sfb_tensor,
                       tile_idx_to_expert_idx, num_non_exiting_tiles, alpha,
                       a_torch_cpu, b_torch_cpu, out_torch_cpu, sfa_torch_cpu, sfb_torch_cpu,
@@ -318,7 +322,7 @@ def create_tensors(
             out_dtype=cutlass.BFloat16,
             sf_dtype=cutlass.Float8E4M3FN,
             sf_vec_size=16,
-            cta_tile_m=128,  # CTA tile size in M dimension
+            mma_tiler_mn=(128, 128),  # MMA tile shape
             permuted_m=34808,  # Enable padding for cuda_graph
         )
         # Returns tensors with A, C, and SFA padded to permuted_m rows,
@@ -434,7 +438,7 @@ def verify_reference_result(
 ) -> torch.Tensor:
     gemm_output = torch.empty((1, valid_m, n), dtype=torch.float32)
     valid_mask = torch.zeros((valid_m,), dtype=torch.bool, device="cuda")
-    #########  gemm caculcation #########
+    #########  gemm calculation #########
     start = 0
     for i, group_m in enumerate(aligned_group_m_list):
         end = start + group_m
@@ -448,7 +452,7 @@ def verify_reference_result(
         valid_mask[start : start + group_m_list[i]] = 1
         start = end
 
-    #########  finalize caculcation#########
+    #########  finalize calculation #########
     # Considering BF16 accumulator gpu accuracy error, we used gpu to verify the result
     gemm_output = gemm_output.permute((1, 2, 0)).cuda()
 
@@ -523,7 +527,7 @@ def run(
     :param topK: Number of experts per token (for MoE with fused finalize)
     :param seq_len: Sequence length for MoE, used by fused finalize,
             need to know the sequence length to do finalize correctly.
-    :param raster_along_m: If True, raster along M dimensionfor tile scheduler.
+    :param raster_along_m: If True, raster along M dimension for tile scheduler.
     :param use_cupti (bool, optional): If True, uses CUPTI to measure execution time.
             Defaults to False.
     """
@@ -1032,7 +1036,7 @@ if __name__ == "__main__":
         action="store_true",
         dest="raster_along_m",
         default=False,
-        help="Enable raster along M (default: True)",
+        help="Enable raster along M (default: False)",
     )
 
     parser.add_argument(
