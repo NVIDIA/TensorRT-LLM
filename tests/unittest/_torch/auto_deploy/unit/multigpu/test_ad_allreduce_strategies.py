@@ -187,8 +187,15 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
         "SYMM_MEM",
     ],
 )
-def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # noqa: F811
-    """Test different allreduce strategies with multi-GPU configuration making sure that there are no crashes or hangs.
+@pytest.mark.parametrize(
+    "compile_backend",
+    [
+        "torch-cudagraph",
+        "torch-opt",
+    ],
+)
+def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy, compile_backend):  # noqa: F811
+    """Test different allreduce strategies and compile backends with multi-GPU configuration.
 
     Configuration:
         The allreduce_strategy is set in the transforms config:
@@ -196,6 +203,8 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
         transforms:
           detect_sharding:
             allreduce_strategy: "ONESHOT"  # or AUTO, NCCL, TWOSHOT, etc.
+          compile_model:
+            backend: "torch-cudagraph"  # or torch-opt
         ```
 
     Test configuration:
@@ -208,6 +217,7 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
         llm_root: Root directory fixture
         shared_dataset: Shared dataset fixture (prepared once for all test runs)
         allreduce_strategy: Strategy to test (AUTO, ONESHOT, TWOSHOT, MIN_LATENCY, NCCL)
+        compile_backend: Compile backend to test (torch-cudagraph, torch-opt)
     """
     # Fixed timeout for all strategies (5 minutes should be enough)
     TEST_TIMEOUT_SECONDS = 300
@@ -229,6 +239,29 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
 
         # Create configuration with specified allreduce strategy in transforms
         extra_llm_api_options_path = f"{temp_dir}/extra_llm_api_options.yaml"
+
+        # Build transforms config
+        transforms_config = {
+            "detect_sharding": {
+                "stage": "sharding",
+                "allreduce_strategy": allreduce_strategy,
+            },
+            "compile_model": {
+                "stage": "compile",
+                "backend": compile_backend,
+                "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+            },
+        }
+
+        # For torch-opt backend, enable skip_first_match workaround to prevent hang
+        # when torch.compile + NCCL triggers lazy initialization during JIT compilation
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/9847
+        if compile_backend == "torch-opt":
+            transforms_config["fuse_allreduce_residual_rmsnorm"] = {
+                "enabled": True,
+                "skip_first_match": True,
+            }
+
         with open(extra_llm_api_options_path, "w") as f:
             yaml.dump(
                 {
@@ -236,17 +269,7 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
                     "max_batch_size": max_batch_size,
                     "max_num_tokens": max_num_tokens,
                     "max_seq_len": 256,
-                    "transforms": {
-                        "detect_sharding": {
-                            "stage": "sharding",
-                            "allreduce_strategy": allreduce_strategy,
-                        },
-                        "compile_model": {
-                            "stage": "compile",
-                            "backend": "torch-cudagraph",
-                            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256],
-                        },
-                    },
+                    "transforms": transforms_config,
                 },
                 f,
             )
@@ -288,7 +311,8 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
                 assert result.exit_code == 0, f"Benchmark failed with output: {result.output}"
         except TimeoutError as e:
             pytest.fail(
-                f"Test timed out after {TEST_TIMEOUT_SECONDS}s for strategy {allreduce_strategy}. "
+                f"Test timed out after {TEST_TIMEOUT_SECONDS}s for strategy {allreduce_strategy} "
+                f"with backend {compile_backend}. "
                 f"This might indicate a hang (e.g., TWOSHOT without C++ fix). Error: {e}"
             )
 
