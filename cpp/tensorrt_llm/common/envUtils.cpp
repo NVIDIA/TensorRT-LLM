@@ -246,7 +246,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
     return useTileSizeKv64;
 }
 
-bool getEnvEnablePDL_()
+bool getEnvEnablePDL()
 {
     static std::once_flag flag;
     static bool enablePDL = false;

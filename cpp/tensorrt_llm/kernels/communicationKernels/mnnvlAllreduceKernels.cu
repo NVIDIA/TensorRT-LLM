@@ -482,7 +482,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
     cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     attrs[1].id = cudaLaunchAttributeClusterDimension;
     attrs[1].val.clusterDim.x = 1;
@@ -896,7 +896,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
     cudaLaunchAttribute arAttrs[1];
     arAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    arAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0;
+    arAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
     cudaLaunchConfig_t arConfig{
         .gridDim = arGrid,
@@ -958,7 +958,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         rnConfig.blockDim = rnBlockSize;
         rnConfig.attrs = rnAttrs;
         rnAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        rnAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0;
+        rnAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 #ifndef DISABLE_CGA
         rnAttrs[1].id = cudaLaunchAttributeClusterDimension;
         rnAttrs[1].val.clusterDim.x = 1;

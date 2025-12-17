@@ -454,7 +454,7 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
     if (cta_size * details::kBytesPerAccess / sizeof(T) < params.fusion_params.hidden_size)
     {
         smem_size = params.fusion_params.hidden_size * sizeof(T);
-        if (tensorrt_llm::common::getEnvEnablePDL_())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
             TLLM_LOG_DEBUG("Enable PDL in rms_norm_kernel");
             cudaLaunchConfig_t kernelConfig = {0};
@@ -494,7 +494,7 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
     }
     else
     {
-        if (tensorrt_llm::common::getEnvEnablePDL_())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
             TLLM_LOG_DEBUG("Enable PDL in rms_norm_kernel");
             cudaLaunchConfig_t kernelConfig = {0};
@@ -908,7 +908,7 @@ void lamport_style_one_shot_all_reduce_norm_kernel_launcher(AllReduceParams para
     attribute[0].val.clusterDim.z = 1;
     kernel_config.attrs = attribute;
     kernel_config.numAttrs = 1;
-    if (tensorrt_llm::common::getEnvEnablePDL_())
+    if (tensorrt_llm::common::getEnvEnablePDL())
     {
         attribute[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attribute[1].val.programmaticStreamSerializationAllowed = 1;
@@ -1236,7 +1236,7 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStrea
         if (cta_size * kPackedSize < params.fusion_params.hidden_size)
         {
             smem_size = params.fusion_params.hidden_size * sizeof(T);
-            if (tensorrt_llm::common::getEnvEnablePDL_())
+            if (tensorrt_llm::common::getEnvEnablePDL())
             {
                 TLLM_LOG_DEBUG("Enable PDL in one_shot_all_reduce_norm_kernel");
 
@@ -1278,7 +1278,7 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStrea
         }
         else
         {
-            if (tensorrt_llm::common::getEnvEnablePDL_())
+            if (tensorrt_llm::common::getEnvEnablePDL())
             {
                 cudaLaunchConfig_t kernelConfig = {0};
                 kernelConfig.gridDim = cta_num;
@@ -1737,7 +1737,7 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
         auto output_ptr = params.local_output_buffer_ptr;
         params.local_output_buffer_ptr = params.fusion_params.intermediate_buffer;
 
-        if (tensorrt_llm::common::getEnvEnablePDL_())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
             TLLM_LOG_DEBUG("Enable PDL in twoShotAllReduceKernel");
             cudaLaunchConfig_t kernelConfig = {0};
@@ -1804,7 +1804,7 @@ void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig confi
         config.stream = stream;
         cudaLaunchAttribute attribute[1];
         attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_();
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
         config.attrs = attribute;
         config.numAttrs = 1;
         cudaLaunchKernelEx(&config, kernel_instance, params);
@@ -1819,7 +1819,7 @@ void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig confi
         config.stream = stream;
         cudaLaunchAttribute attribute[1];
         attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_();
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
         config.attrs = attribute;
         config.numAttrs = 1;
         cudaLaunchKernelEx(&config, kernel_instance, params);

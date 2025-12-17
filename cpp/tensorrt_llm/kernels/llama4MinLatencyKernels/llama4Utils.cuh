@@ -83,7 +83,7 @@ inline void launch_kernel_pdl(
     config.numAttrs = 0;
     attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed
-        = (tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0);
+        = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
 
     cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
 }

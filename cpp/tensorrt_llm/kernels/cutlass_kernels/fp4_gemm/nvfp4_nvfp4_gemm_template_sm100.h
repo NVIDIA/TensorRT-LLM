@@ -315,7 +315,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                 = "Failed to initialize cutlass FP4 gemm. Error: " + std::string(cutlassGetStatusString(initStatus));  \
             throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);                               \
         }                                                                                                              \
-        auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL_());         \
+        auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());          \
         if (runStatus != cutlass::Status::kSuccess)                                                                    \
         {                                                                                                              \
             std::string errMsg                                                                                         \

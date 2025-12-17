@@ -249,7 +249,7 @@ public:
                 = clusterDimX > 1 ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
             launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
             launch_attribute[2].value.programmaticStreamSerializationAllowed
-                = tensorrt_llm::common::getEnvEnablePDL_() && !tensorrt_llm::common::getEnvDisableMhaPDL();
+                = tensorrt_llm::common::getEnvEnablePDL() && !tensorrt_llm::common::getEnvDisableMhaPDL();
 
             launch_config.attrs = launch_attribute;
             launch_config.numAttrs = 3;

@@ -452,7 +452,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL_() && !tensorrt_llm::common::getEnvDisableBmmPDL(),
+        tensorrt_llm::common::getEnvEnablePDL() && !tensorrt_llm::common::getEnvDisableBmmPDL(),
         globalTrtllmGenBatchedGemmModuleCache);
 
     CUresult cuErr = static_cast<CUresult>(err);

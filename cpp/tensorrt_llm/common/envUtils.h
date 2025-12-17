@@ -58,7 +58,7 @@ int getEnvMmhaBlocksPerSequence();
 int getEnvMmhaKernelBlockSize();
 
 // Whether PDL is enabled.
-bool getEnvEnablePDL_();
+bool getEnvEnablePDL();
 
 bool getEnvDisableQuantizePDL();
 bool getEnvDisableBmmPDL();
@@ -80,7 +80,7 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL_();
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     kernelConfig.attrs = attrs;
     kernelConfig.numAttrs = 1;
 
