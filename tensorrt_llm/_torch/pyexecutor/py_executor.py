@@ -330,7 +330,6 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
-
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
@@ -359,8 +358,7 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
             
-            if self.dist.rank == 0: 
-                self.kv_connector_manager.wait_for_ready()
+            self.kv_connector_manager.wait_for_initialization()
 
     def _event_loop_wrapper(self):
         try:
@@ -1345,6 +1343,7 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
+
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
@@ -1583,6 +1582,7 @@ class PyExecutor:
                             can_forward = True
 
                 self._pause_requests(scheduled_batch.paused_requests)
+
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
