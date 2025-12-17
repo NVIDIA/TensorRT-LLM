@@ -5377,6 +5377,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  **pytorch_config,
                  enable_attention_dp=attention_dp) as llm:
-
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

@@ -14,7 +14,6 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.qk_norm_attention import compute_yarn_parameters
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
@@ -45,7 +44,7 @@ class MiniMaxM2MoE(nn.Module):
             torch.empty((self.num_experts), dtype=torch.float32), requires_grad=False
         )
 
-        reduce_results = False
+        reduce_results = True
         # TODO: use_routing_bias parameter, torch_dtype is None for now, we also need quant config
         self.experts = create_moe(
             num_experts=self.num_experts,
@@ -107,13 +106,39 @@ class MiniMaxM2MoE(nn.Module):
 #    then we use rms norm on q and k. Finally, we split qkv to each gpus and continue.
 # for better performance, we choose the second strategy here.
 # Most adaptions are from QKNormRoPEAttention.
+
+
 class MiniMaxM2Attention(Attention):
     def __init__(
         self,
+        *,
         model_config: ModelConfig[PretrainedConfig],
+        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+        skip_rope: bool = False,
+        fuse_qk_norm_rope: bool = False,
         layer_idx: Optional[int] = None,
+        dtype: torch.dtype = None,
+        use_gemma_rms_norm: bool = False,
+        is_qk_norm: bool = True,
     ):
         config = model_config.pretrained_config
+        self.pretrained_config = config
+
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope
+        self.skip_rope = skip_rope
+        if use_gemma_rms_norm:
+            assert fuse_qk_norm_rope is False, (
+                "fused_qk_norm_rope is not supported for gemma rms norm."
+            )
+
+        # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
+        # will be skipped in the overridden apply_rope.
+        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope and not use_gemma_rms_norm
+        self.is_qk_norm = is_qk_norm
+        assert not (fuse_qk_norm_rope and skip_rope), (
+            "Fusing qk norm and skipping rope is not supported"
+        )
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -124,6 +149,7 @@ class MiniMaxM2Attention(Attention):
                 type=PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
             ),
+            rope_fusion=rope_fusion,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -131,13 +157,13 @@ class MiniMaxM2Attention(Attention):
 
         self.q_norm = RMSNorm(
             hidden_size=self.q_size * self.tp_size,
-            eps=self.pretrained_config.rms_norm_eps,
-            dtype=self.pretrained_config.torch_dtype,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
         )
         self.k_norm = RMSNorm(
             hidden_size=self.kv_size * self.tp_size,
-            eps=self.pretrained_config.rms_norm_eps,
-            dtype=self.pretrained_config.torch_dtype,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
         )
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
@@ -146,20 +172,25 @@ class MiniMaxM2Attention(Attention):
         # collect q and k from all gpus
         from ..distributed import allgather
 
-        temp_q = allgather(q, self.mapping)
-        temp_k = allgather(k, self.mapping)
-
-        temp_q, temp_k = maybe_execute_in_parallel(
-            self.q_norm(temp_q),
-            self.k_norm(temp_k),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        temp_q = allgather(q, self.qkv_proj.mapping)
+        temp_k = allgather(k, self.qkv_proj.mapping)
+        temp_q = self.q_norm(temp_q)
+        temp_k = self.k_norm(temp_k)
+        # temp_q, temp_k = maybe_execute_in_parallel(
+        #     self.q_norm(temp_q),
+        #     self.k_norm(temp_k),
+        #     self.ln_events[0],
+        #     self.ln_events[1],
+        #     self.aux_stream,
+        # )
         # split q and k to each gpus
         # Fixme: tp_size may not be equal to the world size of current mapping
-        q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.mapping.tp_rank, :]
-        k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.mapping.tp_rank, :]
+        q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
+            -1, self.q_size
+        )
+        k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
+            -1, self.kv_size
+        )
 
         return q, k
 
@@ -222,9 +253,11 @@ class MiniMaxM2DecoderLayer(DecoderLayer):
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MiniMaxM2Attention(model_config, layer_idx=layer_idx)
+        self.self_attn = MiniMaxM2Attention(model_config=model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MiniMaxM2MoE(model_config, aux_stream, layer_idx=layer_idx)
+        self.block_sparse_moe = MiniMaxM2MoE(
+            model_config=model_config, aux_stream=aux_stream, layer_idx=layer_idx
+        )
 
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype

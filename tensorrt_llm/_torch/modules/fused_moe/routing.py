@@ -415,9 +415,12 @@ class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
               router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scores, scores_with_bias = self.get_scores(router_logits,
                                                    self.e_score_correction_bias)
-        _, topk_idx = torch.topk(scores_with_bias, k=self.top_k, dim=-1)
-        scores.gather(-1, topk_idx)
-        top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+        _, topk_idx = torch.topk(scores_with_bias,
+                                 k=self.top_k,
+                                 dim=-1,
+                                 sorted=False)
+        top_k_weights = scores.gather(1, topk_idx)
+        top_k_weights /= (top_k_weights.sum(dim=-1, keepdim=True) + 1e-20)
         return topk_idx.to(torch.int32), top_k_weights.to(self.output_dtype)
 
     @property
