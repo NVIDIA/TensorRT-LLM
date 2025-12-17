@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import json
+import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Iterable, List, Optional, Union
@@ -35,7 +37,9 @@ class Evaluator(ABC):
                  apply_chat_template: bool = False,
                  fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 dump_path: Optional[str] = None,
+                 dump_as_text: bool = False):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -43,6 +47,8 @@ class Evaluator(ABC):
         self.fewshot_as_multiturn = fewshot_as_multiturn
         self.system_prompt = system_prompt
         self.chat_template_kwargs = chat_template_kwargs
+        self.dump_path = dump_path
+        self.dump_as_text = dump_as_text
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -103,8 +109,18 @@ class Evaluator(ABC):
             references.append(reference)
             auxiliaries.append(aux)
         results = []
+        task_id = 0
+        if self.dump_path:
+            self.dump_path = prepare_dump_path(self.dump_path)
+            logger.info(f"Dumping data to {self.dump_path}")
         for output in tqdm(outputs, desc="Fetching responses"):
-            results.append(output.result())
+            res = output.result()
+            results.append(res)
+            dump_inference_result(self.dump_path, res, task_id,
+                                  self.dump_as_text,
+                                  getattr(llm, 'tokenizer', None))
+            task_id += 1
+
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
@@ -116,3 +132,54 @@ class Evaluator(ABC):
     @staticmethod
     def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()
+
+
+def prepare_dump_path(dump_path: str) -> str:
+    if dump_path:
+        if os.path.isdir(dump_path) or dump_path.endswith(os.sep):
+            dump_path = os.path.join(dump_path, "dumped_data.json")
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+        if os.path.exists(dump_path):
+            os.remove(dump_path)
+    return dump_path
+
+
+def dump_inference_result(dump_path: str, result: RequestOutput, task_id: int,
+                          dump_as_text: bool, tokenizer: Any):
+    if not dump_path:
+        return
+    try:
+        with open(dump_path, "a") as f:
+            input_ids = result.prompt_token_ids
+            output_ids = result.outputs[0].token_ids
+
+            if tokenizer is None:
+                logger.warning("Tokenizer not found, dumping raw token ids")
+                dump_as_text = False
+
+            if dump_as_text:
+                input_content = tokenizer.decode(input_ids)
+                output_content = tokenizer.decode(output_ids)
+            else:
+                input_content = input_ids
+                output_content = output_ids
+
+            if dump_as_text:
+                data = {
+                    "task_id": task_id,
+                    "input_text": input_content,
+                    "output_text": output_content,
+                    "input_lens": len(input_content),
+                    "output_lens": len(output_content)
+                }
+            else:
+                data = {
+                    "task_id": task_id,
+                    "input_ids": input_ids,
+                    "output_ids": output_ids,
+                    "input_tokens": len(input_content),
+                    "output_tokens": len(output_content)
+                }
+            f.write(json.dumps(data) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to dump data to {dump_path}: {e}")

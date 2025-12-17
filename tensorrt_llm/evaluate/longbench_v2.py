@@ -62,12 +62,16 @@ class LongBenchV2(Evaluator):
                  cot: bool = False,
                  no_context: bool = False,
                  rag: int = 0,
+                 max_len: int = 128000,
                  max_input_length: int = 128000,
+                 max_output_length: int = 32000,
                  output_dir: Optional[str] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 dump_path: Optional[str] = None,
+                 dump_as_text: bool = False):
         """Initialize LongBench v2 evaluator.
 
         Args:
@@ -81,17 +85,23 @@ class LongBenchV2(Evaluator):
             cot: Enable Chain-of-Thought reasoning
             no_context: Test without context (memorization test)
             rag: Number of top retrieved contexts to use (0 to disable)
-            max_input_length: Maximum prompt length in tokens for truncation
+            max_len: Maximum length (input + output) in tokens
+            max_input_length: Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle.
+            max_output_length: Maximum output length in tokens for truncation
             output_dir: Directory to save evaluation results
             random_seed: Random seed for reproducibility
             apply_chat_template: Whether to apply model's chat template
             system_prompt: System prompt to prepend
             chat_template_kwargs: Chat template kwargs as JSON string
+            dump_path: Path to dump data to ids for trtllm-bench usage.
+            dump_as_text: Whether to dump data to text.
         """
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
-                         chat_template_kwargs=chat_template_kwargs)
+                         chat_template_kwargs=chat_template_kwargs,
+                         dump_path=dump_path,
+                         dump_as_text=dump_as_text)
 
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -103,7 +113,8 @@ class LongBenchV2(Evaluator):
         self.no_context = no_context
         self.rag = rag
         self.output_dir = output_dir
-        self.max_input_length = max_input_length
+        # We need to minus max_output_length from max_len to reserve budget for output tokens.
+        self.max_input_length = min(max_input_length, max_len - max_output_length)
 
         # Will be set during evaluation
         self.tokenizer = None
@@ -305,7 +316,6 @@ class LongBenchV2(Evaluator):
 
         If the prompt exceeds max_input_length, it takes the first half and last half
         to preserve both context beginning and end.
-        We need to minus max_output_length from max_len to reserve budget for output tokens.
 
         Args:
             prompt: The prompt string to truncate
@@ -728,12 +738,16 @@ class LongBenchV2(Evaluator):
                   default=None,
                   help="System prompt.")
     @click.option(
-        "--max_input_length",
+        "--max_len",
         type=int,
-        default=128000,
+        default=1024000,
         help=
-        "Maximum prompt length before apply chat template. If exceeds, the prompt will be truncated in the middle."
+        "Maximum length (input + output) in tokens which can be supported by the model."
     )
+    @click.option("--max_input_length",
+                  type=int,
+                  default=128000,
+                  help="Maximum context length in tokens. If exceeds, the prompt will be truncated in the middle.")
     @click.option("--max_output_length",
                   type=int,
                   default=32000,
@@ -755,6 +769,14 @@ class LongBenchV2(Evaluator):
                   type=float,
                   default=0.95,
                   help="Top p for sampling.")
+    @click.option("--dump_path",
+                  type=str,
+                  default=None,
+                  help="Path to dump data to ids for trtllm-bench usage.")
+    @click.option("--dump_as_text",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to dump data to text.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, prompts_dir: Optional[str],
@@ -763,9 +785,10 @@ class LongBenchV2(Evaluator):
                 cot: bool, no_context: bool, rag: int,
                 output_dir: Optional[str], random_seed: int,
                 apply_chat_template: bool, system_prompt: Optional[str],
-                max_input_length: int, max_output_length: int,
+                max_len: int, max_input_length: int, max_output_length: int,
                 chat_template_kwargs: Optional[dict[str, Any]],
-                temperature: float, top_p: float) -> None:
+                temperature: float, top_p: float,
+                dump_path: Optional[str], dump_as_text: bool) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
         sampling_params = SamplingParams(max_tokens=max_output_length,
@@ -782,12 +805,16 @@ class LongBenchV2(Evaluator):
                                 cot=cot,
                                 no_context=no_context,
                                 rag=rag,
+                                max_len=max_len,
                                 max_input_length=max_input_length,
+                                max_output_length=max_output_length,
                                 output_dir=output_dir,
                                 random_seed=random_seed,
                                 apply_chat_template=apply_chat_template,
                                 system_prompt=system_prompt,
-                                chat_template_kwargs=chat_template_kwargs)
+                                chat_template_kwargs=chat_template_kwargs,
+                                dump_path=dump_path,
+                                dump_as_text=dump_as_text)
 
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

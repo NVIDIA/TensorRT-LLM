@@ -121,11 +121,15 @@ class MMLU(Evaluator):
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 chat_template_kwargs: Optional[dict[str, Any]] = None,
+                 dump_path: Optional[str] = None,
+                 dump_as_text: bool = False):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
-                         chat_template_kwargs=chat_template_kwargs)
+                         chat_template_kwargs=chat_template_kwargs,
+                         dump_path=dump_path,
+                         dump_as_text=dump_as_text)
         if dataset_path is None:
             dataset_path = self.dowload_dataset()
         self.dataset_path = dataset_path
@@ -302,6 +306,14 @@ class MMLU(Evaluator):
                   help="Maximum generation length.")
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=30)
+    @click.option("--dump_path",
+                  type=str,
+                  default=None,
+                  help="Path to dump data to ids for trtllm-bench usage.")
+    @click.option("--dump_as_text",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to dump data to text.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
@@ -309,7 +321,8 @@ class MMLU(Evaluator):
                 chat_template_kwargs: Optional[dict[str, Any]],
                 system_prompt: Optional[str], max_input_length: int,
                 max_output_length: int, check_accuracy: bool,
-                accuracy_threshold: float) -> None:
+                accuracy_threshold: float, dump_path: Optional[str],
+                dump_as_text: bool) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -320,7 +333,9 @@ class MMLU(Evaluator):
                          random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
-                         chat_template_kwargs=chat_template_kwargs)
+                         chat_template_kwargs=chat_template_kwargs,
+                         dump_path=dump_path,
+                         dump_as_text=dump_as_text)
         accuracy = evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
 
