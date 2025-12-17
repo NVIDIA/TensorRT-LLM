@@ -41,6 +41,10 @@ class PlanParams:
 
     causal: bool = True
     has_custom_mask: bool = False  # Affects cache key when using VLM custom masks
+    # Sliding window attention: FlashInfer uses inclusive `window_left` (<=0 disables, use -1).
+    window_left: int = -1
+    # Logits softcapping: FlashInfer uses `logits_soft_cap` (<=0 disables, use 0.0).
+    logits_soft_cap: float = 0.0
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -110,6 +114,8 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
+                logits_soft_cap=plan_params.logits_soft_cap,
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
@@ -137,6 +143,9 @@ class _FlashInferPlanner:
                 _plan_decode(self.decode_wrapper)
             else:
                 # plan prefill with optional custom_mask for VLM support
+                # NOTE: when using a custom mask, set window_left=-1 to avoid FlashInfer applying
+                # sliding-window attention on top of the custom mask.
+                window_left = -1 if custom_mask is not None else plan_params.window_left
                 self.prefill_wrapper.plan(
                     qo_indptr,
                     kv_page_indptr,
@@ -150,6 +159,8 @@ class _FlashInferPlanner:
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
+                    window_left=window_left,
+                    logits_soft_cap=plan_params.logits_soft_cap,
                     custom_mask=custom_mask,  # VLM custom mask (None for standard causal)
                 )
             self.plan_params = plan_params
@@ -235,6 +246,8 @@ def flashinfer_mha_with_cache(
     k_scale: float,
     v_scale: float,
     mask_kind: str,  # "full", "sliding", or "none"
+    window_left: int,  # FlashInfer inclusive sliding window (use -1 to disable)
+    logits_soft_cap: float,  # FlashInfer logits softcap (use 0.0 to disable)
     # VLM CUSTOM MASKS (optional, for Gemma3 etc.)
     custom_mask_full: Optional[torch.Tensor],
     custom_mask_sliding: Optional[torch.Tensor],
@@ -264,7 +277,6 @@ def flashinfer_mha_with_cache(
     n_kv_heads = k.shape[1]
 
     is_generate = s == 1
-
     # Determine which custom mask to use (if any)
     # Custom masks only apply during prefill, not generation
     if mask_kind == "none" or is_generate:
@@ -275,6 +287,10 @@ def flashinfer_mha_with_cache(
         custom_mask = custom_mask_sliding
     else:
         custom_mask = None
+
+    # If a custom mask is provided, force-disable sliding window at the FlashInfer level.
+    # Custom masks only apply during prefill; decode should always have custom_mask=None.
+    effective_window_left = -1 if custom_mask is not None else window_left
 
     pp = PlanParams(
         n_heads=n_heads,
@@ -287,6 +303,8 @@ def flashinfer_mha_with_cache(
         kv_dtype=k_cache.dtype,
         sm_scale=scale,
         has_custom_mask=(custom_mask is not None),
+        window_left=effective_window_left,
+        logits_soft_cap=float(logits_soft_cap or 0.0),
     )
 
     # Assuming k_scale = v_scale = 1.0
@@ -349,6 +367,8 @@ def flashinfer_mha_with_cache_fake(
     k_scale: float,
     v_scale: float,
     mask_kind: str,
+    window_left: int,
+    logits_soft_cap: float,
     # VLM CUSTOM MASKS
     custom_mask_full: Optional[torch.Tensor],
     custom_mask_sliding: Optional[torch.Tensor],
@@ -465,15 +485,54 @@ class FlashInferAttention(AttentionDescriptor):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
+        # Get sliding_window and logit_cap from args or kwargs and convert to FlashInfer conventions.
+        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+        if sliding_window is None:
+            window_left = -1
+        elif isinstance(sliding_window, int):
+            # HF sliding_window is an exclusive window size; FlashInfer is inclusive window_left.
+            window_left = sliding_window - 1 if sliding_window > 0 else -1
+        else:
+            ad_logger.warning(
+                f"Provided sliding_window={sliding_window!r} is not an int. Disabling sliding window."
+            )
+            window_left = -1
+
+        logit_cap = extract_op_args(source_attn_node, "logit_cap")[0]
+        if logit_cap is None:
+            logits_soft_cap = 0.0
+        elif isinstance(logit_cap, (float, int)):
+            logits_soft_cap = float(logit_cap) if float(logit_cap) > 0.0 else 0.0
+        else:
+            ad_logger.warning(
+                f"Provided logit_cap={logit_cap!r} is not a number. Disabling logits softcapping."
+            )
+            logits_soft_cap = 0.0
+
         # Determine mask_kind based on layer's attention type.
-        # Prefer FX node metadata (set during transforms); fall back to kwargs (legacy/profiling path).
-        mask_kind = source_attn_node.meta.get(
-            "mask_kind", source_attn_node.kwargs.get("mask_kind", "none")
-        )
+        # Priority:
+        #   1. FX node metadata (set during transforms)
+        #   2. FX node kwargs (legacy/profiling path)
+        #   3. Infer from sliding_window: None -> "full", int -> "sliding"
+        # NOTE: For Gemma3 VLM, all layers need VLM masks (either "full" or "sliding").
+        # The sliding_window parameter tells us which type of attention this layer uses.
+        mask_kind = source_attn_node.meta.get("mask_kind", None)
+        if mask_kind is None:
+            mask_kind = source_attn_node.kwargs.get("mask_kind", None)
+        if mask_kind is None:
+            # Infer from sliding_window for Gemma3-style VLM models
+            if sliding_window is None:
+                mask_kind = "full"  # Global attention layer
+            elif isinstance(sliding_window, int) and sliding_window > 0:
+                mask_kind = "sliding"  # Sliding window attention layer
+            else:
+                mask_kind = "none"  # Fall back to no VLM mask
 
         return [
             scale,  # softmax scale
             1.0,  # k_scale
             1.0,  # v_scale
             mask_kind,  # VLM mask selection: "full", "sliding", or "none"
+            window_left,  # FlashInfer inclusive sliding window size (-1 disables)
+            logits_soft_cap,  # FlashInfer logits softcap (0 disables)
         ]

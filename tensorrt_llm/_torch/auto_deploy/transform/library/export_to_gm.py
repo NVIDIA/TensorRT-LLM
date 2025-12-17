@@ -169,7 +169,6 @@ class ExportToGM(BaseTransform):
             root_is_vlm = root_is_vlm or ("ImageTextToText" in type(factory).__name__)
         except Exception:
             pass
-
         export_infos = factory.get_export_infos(mod)
 
         # check if any submodules to be exported are children of other submodules that need to be

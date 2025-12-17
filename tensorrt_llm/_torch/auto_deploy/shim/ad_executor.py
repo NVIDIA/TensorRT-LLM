@@ -718,55 +718,72 @@ class ADEngine(ModelEngine):
         - Strip VLM-only kwargs (e.g., token_type_ids) before calling the exported GraphModule to
           avoid torch.export strict in_spec mismatches.
         """
-        # Ensure custom mask inputs exist if the graph expects them; default to None.
-        # (Graph-mode kvcache insertion adds these placeholders for FlashInfer.)
+        # Only provide VLM custom mask kwargs if the optimized model actually expects them.
+        # For torch.export GraphModules, passing unexpected kwargs can fail strict in_spec checks.
         if getattr(self, "_expects_vlm_custom_masks", False):
-            kwargs["custom_mask_full"] = None
-            kwargs["custom_mask_sliding"] = None
+            # The optimized graph expects custom mask tensors. Always generate and supply them.
+            # (Even if there are no image tokens, the generated masks reduce to causal/sliding masks.)
+            # NOTE:
+            # - token_type_ids/mm_token_type_ids may be absent for text-only prompts; default to all-text.
+            # - seq_len is always maintained by SequenceInfo but may be omitted from `named_args`
+            #   before cached attention is activated. Pull it from the underlying interface if needed.
+            position_ids = kwargs.get("position_ids", None)
+            if position_ids is None:
+                raise RuntimeError(
+                    "Graph expects VLM custom masks (custom_mask_full/custom_mask_sliding) but "
+                    "position_ids is missing from kwargs."
+                )
 
-            # Only compute masks if we have token type ids available and the batch contains images.
             token_type_ids = kwargs.get("token_type_ids", None)
             if token_type_ids is None:
                 token_type_ids = kwargs.get("mm_token_type_ids", None)
+            if token_type_ids is None:
+                # Default: no image tokens present (all text tokens).
+                token_type_ids = torch.zeros_like(position_ids, dtype=torch.long)
 
-            position_ids = kwargs.get("position_ids", None)
-            seq_len = kwargs.get("seq_len", None)
-            if token_type_ids is not None and position_ids is not None and seq_len is not None:
-                # Flatten token types to align with the flattened token stream used by cached attention.
-                total_tokens = position_ids.numel()
-                token_type_ids_flat = token_type_ids.reshape(-1)[:total_tokens]
-                image_token_mask = token_type_ids_flat == 1
+            # Always source seq_len from SequenceInfo.
+            # Rationale: `SequenceInfo.named_args` may omit `seq_len` before cached attention is
+            # activated, but SequenceInfo always maintains the authoritative seq_len buffer.
+            seq_info = getattr(getattr(self, "cache_seq_interface", None), "info", None)
+            seq_len = (
+                getattr(seq_info, "_args_device", {}).get("seq_len", None) if seq_info else None
+            )
+            if seq_len is None:
+                raise RuntimeError(
+                    "Graph expects VLM custom masks (custom_mask_full/custom_mask_sliding) but "
+                    "SequenceInfo is unavailable; cannot read seq_len."
+                )
 
-                if image_token_mask.any():
-                    # Ensure custom op is registered.
-                    from ..custom_ops import flashinfer_gemma3_mask  # noqa: F401
+            # Ensure custom op is registered.
+            from ..custom_ops import flashinfer_gemma3_mask  # noqa: F401
 
-                    # Match FlashInfer metadata conventions: sanitize seq_len like the metadata op does.
-                    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-                    qo_indptr = torch.zeros(
-                        len(seq_len_sanitized) + 1,
-                        dtype=torch.int,
-                        device=seq_len_sanitized.device,
-                    )
-                    qo_indptr[1:] = torch.cumsum(seq_len_sanitized, 0)
+            # Flatten token types to align with the flattened token stream used by cached attention.
+            total_tokens = position_ids.numel()
+            token_type_ids_flat = token_type_ids.reshape(-1)[:total_tokens]
+            image_token_mask = token_type_ids_flat == 1
 
-                    # Sliding window is model-dependent; default to 0 (i.e., no extra constraint).
-                    sliding_window = 0
-                    if hasattr(self, "_vlm_mask_config") and isinstance(
-                        self._vlm_mask_config, dict
-                    ):
-                        sliding_window = int(self._vlm_mask_config.get("sliding_window") or 0)
+            # Match FlashInfer metadata conventions: sanitize seq_len like the metadata op does.
+            seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
+            qo_indptr = torch.zeros(
+                len(seq_len_sanitized) + 1,
+                dtype=torch.int,
+                device=seq_len_sanitized.device,
+            )
+            qo_indptr[1:] = torch.cumsum(seq_len_sanitized, 0)
 
-                    custom_mask_full, custom_mask_sliding = (
-                        torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
-                            image_token_mask,
-                            qo_indptr,
-                            seq_len_sanitized,
-                            sliding_window,
-                        )
-                    )
-                    kwargs["custom_mask_full"] = custom_mask_full
-                    kwargs["custom_mask_sliding"] = custom_mask_sliding
+            # Sliding window is model-dependent; default to 0 (i.e., no extra constraint).
+            sliding_window = int(getattr(self, "_vlm_sliding_window", 0) or 0)
+
+            custom_mask_full, custom_mask_sliding = (
+                torch.ops.auto_deploy.flashinfer_gemma3_mask_gen(
+                    image_token_mask,
+                    qo_indptr,
+                    seq_len_sanitized,
+                    sliding_window,
+                )
+            )
+            kwargs["custom_mask_full"] = custom_mask_full
+            kwargs["custom_mask_sliding"] = custom_mask_sliding
 
         # Strip kwargs that we intentionally keep outside the exported HF GraphModule.
         kwargs.pop("token_type_ids", None)
@@ -810,24 +827,53 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
     """Configure VLM custom mask settings on the engine.
 
     This is used to:
-    - enable/disable external VLM custom mask generation based on attention backend
-    - best-effort extract VLM mask parameters (e.g., sliding_window) from HF config
+    - enable/disable external VLM custom mask generation based on (graph input contract, backend)
+    - best-effort extract VLM mask parameters (e.g., sliding_window) from HF config when needed
     """
-    # Graph-mode KV-cache insertion adds optional custom mask inputs for FlashInfer.
-    engine._expects_vlm_custom_masks = ad_config.attn_backend == "flashinfer"
+    engine._ad_config = ad_config  # so _prepare_inputs() constraint checks actually run
 
-    # Best-effort extraction of VLM mask configuration (sliding_window) from HF config so we can
-    # generate FlashInfer custom masks outside the exported graph when needed.
+    def _model_expects_custom_masks(mod: torch.nn.Module) -> bool:
+        """Return True if any nested GraphModule takes custom mask placeholders as inputs."""
+        try:
+            import torch.fx  # local import to keep module import surface small
+
+            for m in mod.modules():
+                if isinstance(m, torch.fx.GraphModule):
+                    try:
+                        placeholders = {
+                            n.target
+                            for n in m.graph.nodes
+                            if n.op == "placeholder" and isinstance(n.target, str)
+                        }
+                        if (
+                            "custom_mask_full" in placeholders
+                            and "custom_mask_sliding" in placeholders
+                        ):
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return False
+
+    # Only pass VLM mask kwargs if:
+    # - runtime backend is FlashInfer, AND
+    # - the optimized model graph actually expects these extra inputs
+    engine._expects_vlm_custom_masks = (
+        ad_config.attn_backend == "flashinfer" and _model_expects_custom_masks(engine.model)
+    )
+    # Best-effort extract `sliding_window` for FlashInfer Gemma3 mask generation.
+    # Only needed if we will actually be passing/producing custom masks.
+    engine._vlm_sliding_window = 0
+    if not engine._expects_vlm_custom_masks:
+        return
+
     try:
         from transformers import AutoConfig
 
         cfg, _ = AutoConfig.from_pretrained(
             ad_config.model, return_unused_kwargs=True, trust_remote_code=True
         )
-        model_type = getattr(cfg, "model_type", None)
-        if model_type is None and hasattr(cfg, "text_config"):
-            model_type = getattr(cfg.text_config, "model_type", None)
-
         sliding_window = getattr(cfg, "sliding_window", None)
         if sliding_window is None:
             for sub_config_key in getattr(cfg, "sub_configs", []):
@@ -835,11 +881,10 @@ def _configure_vlm_mask_settings(engine: ADEngine, ad_config: LlmArgs) -> None:
                 if sub_cfg is not None and getattr(sub_cfg, "sliding_window", None) is not None:
                     sliding_window = getattr(sub_cfg, "sliding_window", None)
                     break
-
-        engine._vlm_mask_config = {"model_type": model_type, "sliding_window": sliding_window}
+        engine._vlm_sliding_window = int(sliding_window or 0)
     except Exception:
         # Not all environments/models have an HF config with these fields; ignore.
-        engine._vlm_mask_config = {"model_type": None, "sliding_window": None}
+        engine._vlm_sliding_window = 0
 
 
 def create_draft_model_engine_maybe(
