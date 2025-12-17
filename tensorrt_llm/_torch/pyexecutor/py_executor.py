@@ -3011,7 +3011,7 @@ class PyExecutor:
                     if not request.is_disagg_context_transmission_state:
                         requests_to_terminate.append(request)
                 
-                if os.environ.get('TENSORRT_LLM_USE_FLEXKV') == '1':
+                if self.kv_connector_manager is not None:
                     self.resource_manager.free_slot_only(request)
             else:
                 new_active_requests.append(request)
