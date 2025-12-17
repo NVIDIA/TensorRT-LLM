@@ -125,6 +125,23 @@ class AsyncTransferManager:
     TODO(jthomson04): This only handles async send/saving, not loading. Loading kv cache is handled through a separate codepath. Eventually, we'll want to merge these two paths.
     """
 
+    class RequestTransferMetadata:
+
+        def __init__(self, block_id: Optional[int]):
+            self.block_id = block_id
+            self.counter = 1
+
+        def start_transfer(self):
+            self.counter += 1
+
+        def end_transfer(self) -> bool:
+            """
+            Returns:
+                bool: True if there are no more transfers for this request
+            """
+            self.counter -= 1
+            return self.counter == 0
+
     def __init__(self,
                  resource_manager: "ResourceManager",
                  should_store_blocks: bool = True):
@@ -134,14 +151,15 @@ class AsyncTransferManager:
 
         self.should_store_blocks = should_store_blocks
 
-        # Mapping of request id to the tuple:
-        # 1. llm_request
-        # 2. The value returned from store_blocks_for_reuse
-        # 3. The amount of currently pending transfers
-        self._requests: Dict[int, (LlmRequest, Optional[int], int)] = dict()
+        # Mapping of request id to the LlmRequest
+        self._requests: Dict[int, LlmRequest] = dict()
 
-    def requests_in_transfer(self) -> dict[int, LlmRequest]:
-        return {k: v[0] for k, v in self._requests.items()}
+        # Mapping of request id to the the request metadata
+        self._request_transfer_metadata: Dict[
+            int, self.RequestTransferMetadata] = dict()
+
+    def requests_in_transfer(self) -> Dict[int, LlmRequest]:
+        return self._requests
 
     def start_transfer(self, request: LlmRequest):
         """
@@ -151,7 +169,9 @@ class AsyncTransferManager:
         3. Store KV cache blocks for reuse.
         """
 
-        if request.py_request_id not in self._requests:
+        req_id = request.py_request_id
+
+        if req_id not in self._requests:
             for resource_mgr_type in (
                     ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER):
@@ -168,34 +188,36 @@ class AsyncTransferManager:
             else:
                 block_id = None
 
-            self._requests[request.py_request_id] = (request, block_id, 1)
+            self._requests[req_id] = request
+            self._request_transfer_metadata[
+                req_id] = self.RequestTransferMetadata(block_id)
         else:
-            _, block_id, counter = self._requests[request.py_request_id]
-            self._requests[request.py_request_id] = (request, block_id,
-                                                     counter + 1)
+            self._request_transfer_metadata[req_id].start_transfer()
 
-    def end_transfer(self, request: LlmRequest):
+    def end_transfer(self, request: LlmRequest) -> bool:
         """
         Called after a send of KV cache is complete.
         1. Decrements counter for request.
         2. If there are no more inflight transfers for this request, unpin the blocks and mark the request as complete.
+
+        Returns:
+            bool: True if the request should be terminated after call to end_transfer
         """
-        request, block_id, counter = self._requests.pop(request.py_request_id)
+        transfer_metadata = self._request_transfer_metadata.pop(
+            request.py_request_id)
 
         should_terminate = False
 
-        if counter == 1:
+        if transfer_metadata.end_transfer():
             if self.should_store_blocks:
-                self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                self.kv_cache_manager.unpin_blocks_by_id(
+                    transfer_metadata.block_id)
             else:
                 should_terminate = True
 
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-        else:
-            self._requests[request.py_request_id] = (request, block_id,
-                                                     counter - 1)
 
         return should_terminate
 
@@ -1255,7 +1277,7 @@ class PyExecutor:
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
 
-                if self.kv_cache_transceiver and self.async_transfer_manager.requests_in_transfer(
+                if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
 
@@ -1499,7 +1521,7 @@ class PyExecutor:
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
-                if self.kv_cache_transceiver and self.async_transfer_manager.requests_in_transfer(
+                if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
 
@@ -1759,7 +1781,7 @@ class PyExecutor:
                         iter_stats=iter_stats,
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
-                if self.kv_cache_transceiver and self.async_transfer_manager.requests_in_transfer(
+                if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
 
@@ -2273,9 +2295,9 @@ class PyExecutor:
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
-        finished_error_ids = set(finished_requests + error_requests)
+        completed_req_ids = set(finished_requests + error_requests)
 
-        for request_id in finished_requests + error_requests:
+        for request_id in completed_req_ids:
 
             request = self.async_transfer_manager.requests_in_transfer(
             )[request_id]
@@ -2285,7 +2307,7 @@ class PyExecutor:
 
         for request in list(
                 self.async_transfer_manager.requests_in_transfer().values()):
-            if request.py_kv_transfer_timed_out and request.py_request_id not in finished_error_ids:
+            if request.py_kv_transfer_timed_out and request.py_request_id not in completed_req_ids:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration

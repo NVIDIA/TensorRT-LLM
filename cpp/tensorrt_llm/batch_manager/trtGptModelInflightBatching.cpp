@@ -503,7 +503,7 @@ TrtGptModelInflightBatching::~TrtGptModelInflightBatching()
 {
     if (mCacheTransceiver)
     {
-        mCacheTransceiver->checkContextTransferStatus(true);
+        mCacheTransceiver->checkContextTransferStatus(1, true);
         TLLM_CHECK_WITH_INFO(mCacheTransceiver->checkGenTransferComplete(), "Generation transfer not complete");
     }
     if (mAsyncSendWaitThread)
@@ -932,7 +932,7 @@ void TrtGptModelInflightBatching::forwardSync()
     }
     if (mCacheTransceiver)
     {
-        checkContextTransferStatus(currRequests.contextRequests, 0);
+        mCacheTransceiver->checkContextTransferStatus(0, true);
     }
     ++mIterCounter;
 
@@ -989,20 +989,6 @@ void TrtGptModelInflightBatching::resetIterationStats()
     mLastIterationStatsIFB = IterationStatsIFB{mMicroBatchId};
 }
 
-void TrtGptModelInflightBatching::checkContextTransferStatus(
-    RequestVector const& activeRequests, std::optional<int> const& atLeastRequestNum)
-{
-    RequestStatuses requestStatuses = mCacheTransceiver->checkContextTransferStatus(atLeastRequestNum);
-
-    for (auto& request : activeRequests)
-    {
-        if (requestStatuses.completedRequestIds.find(request->mRequestId) != requestStatuses.completedRequestIds.end())
-        {
-            request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
-        }
-    }
-}
-
 void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -1039,7 +1025,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 mIterCounter);
             if (mCacheTransceiver)
             {
-                checkContextTransferStatus(currRequests.contextRequests, 1);
+                mCacheTransceiver->checkContextTransferStatus(1, true);
                 // will free kvCache in next iteration.
             }
         }

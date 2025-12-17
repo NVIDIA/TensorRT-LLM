@@ -58,10 +58,11 @@ public:
 
     using RequestStatuses = tb::RequestStatuses;
 
-    RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    RequestStatuses checkContextTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override
     {
         PYBIND11_OVERLOAD_PURE(
-            RequestStatuses, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum);
+            RequestStatuses, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum, markComplete);
     }
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
@@ -89,12 +90,12 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def(
             "check_context_transfer_status",
-            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum)
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
             {
                 RequestStatuses result;
                 {
                     py::gil_scoped_release release;
-                    result = self.checkContextTransferStatus(atLeastRequestNum);
+                    result = self.checkContextTransferStatus(atLeastRequestNum, markComplete);
                 }
 
                 auto completedRequestIds
@@ -103,7 +104,7 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
                     = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
                 return py::make_tuple(completedRequestIds, errorRequestIds);
             },
-            py::arg("at_least_request_num") = std::nullopt)
+            py::arg("at_least_request_num") = std::nullopt, py::arg("mark_complete") = false)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             py::call_guard<py::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)

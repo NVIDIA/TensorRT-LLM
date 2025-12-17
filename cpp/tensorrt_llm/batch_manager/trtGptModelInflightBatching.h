@@ -235,9 +235,6 @@ public:
         return mModelConfig.getSpeculativeDecodingMode();
     }
 
-    void checkContextTransferStatus(
-        RequestVector const& activeRequests, std::optional<int> const& atLeastRequestNum = std::nullopt);
-
 private:
     [[nodiscard]] SizeType32 getContextBufferId() const
     {

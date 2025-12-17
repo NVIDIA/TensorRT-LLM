@@ -60,9 +60,10 @@ public:
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
 
-    tb::RequestStatuses checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
+    tb::RequestStatuses checkContextTransferStatus(
+        std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override
     {
-        NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum);
+        NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum, markComplete);
     }
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
@@ -90,12 +91,12 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def(
             "check_context_transfer_status",
-            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum)
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
             {
                 RequestStatuses result;
                 {
                     nb::gil_scoped_release release;
-                    result = self.checkContextTransferStatus(atLeastRequestNum);
+                    result = self.checkContextTransferStatus(atLeastRequestNum, markComplete);
                 }
 
                 auto completedRequestIds
@@ -104,7 +105,7 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
                     = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
                 return nb::make_tuple(completedRequestIds, errorRequestIds);
             },
-            nb::arg("at_least_request_num") = std::nullopt)
+            nb::arg("at_least_request_num") = std::nullopt, nb::arg("mark_complete") = false)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
