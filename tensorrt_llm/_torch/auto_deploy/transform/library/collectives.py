@@ -155,19 +155,24 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             add_order="x_first", strategy=strategy
         )
 
-        # Create replacement function, optionally skipping the first match
+        # Create replacement functions, optionally skipping the first match
         skip_first = self.config.skip_first_match
         match_counter = [0]  # Use list to allow mutation in nested function
 
-        def _conditional_repl(
-            x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
-        ):
-            match_counter[0] += 1
-            if skip_first and match_counter[0] == 1:
-                # Skip first match - return unfused pattern
-                return _allreduce_residual_rmsnorm_pattern_trtllm(x, residual, weight, eps)
-            # Fuse this match
-            return _allreduce_residual_rmsnorm_replacement(x, residual, weight, eps, strategy)
+        def _make_conditional_repl(pattern_fn):
+            def _conditional_repl(
+                x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+            ):
+                match_counter[0] += 1
+                if skip_first and match_counter[0] == 1:
+                    # Skip first match - return unfused pattern
+                    return pattern_fn(x, residual, weight, eps)
+                # Fuse this match
+                return _allreduce_residual_rmsnorm_replacement(x, residual, weight, eps, strategy)
+            return _conditional_repl
+
+        _conditional_repl_residual_first = _make_conditional_repl(_allreduce_residual_rmsnorm_pattern_trtllm)
+        _conditional_repl_x_first = _make_conditional_repl(_allreduce_residual_rmsnorm_pattern2_trtllm)
 
         # Register TRT-LLM backend patterns only (no torch backend fusion)
         # Pattern 1: residual + allreduce(x)
