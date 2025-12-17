@@ -38,7 +38,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6 \
+nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
 /bin/bash
 ```
 

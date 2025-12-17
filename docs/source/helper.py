@@ -358,15 +358,23 @@ def update_version():
     docs_source_dir = Path(__file__).parent.resolve()
     md_files = list(docs_source_dir.rglob("*.md"))
 
+    # NOTE: We intentionally do NOT mutate docs sources during normal Sphinx builds.
+    # This helper is kept for workflows that explicitly opt-in (e.g., release docs),
+    # because rewriting files in-place is surprising for local dev and can cause
+    # unintended diffs (e.g., x.y.z placeholders becoming a specific tag).
+    if os.environ.get("TRTLLM_DOCS_REPLACE_CONTAINER_TAG", "0") != "1":
+        return
+
     for file_path in md_files:
         with open(file_path, "r") as f:
             content = f.read()
-        content = content.replace(
+        updated = content.replace(
             "nvcr.io/nvidia/tensorrt-llm/release:x.y.z",
             f"nvcr.io/nvidia/tensorrt-llm/release:{version}",
         )
-        with open(file_path, "w") as f:
-            f.write(content)
+        if updated != content:
+            with open(file_path, "w") as f:
+                f.write(updated)
 
 
 if __name__ == "__main__":
