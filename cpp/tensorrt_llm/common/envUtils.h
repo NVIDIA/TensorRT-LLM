@@ -65,6 +65,7 @@ bool getEnvDisableBmmPDL();
 bool getEnvDisableMhaPDL();
 bool getEnvDisableBiaRopePDL();
 bool getEnvDisableMOEFinalizePDL();
+bool getEnvDisableTRTLLMGenGemmPDL();
 
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
