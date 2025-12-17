@@ -139,7 +139,7 @@ void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kern
     TLLM_CHECK(mInitialized);
     CUlaunchAttribute pdlAttr;
     pdlAttr.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-    pdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
+    pdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0);
     CUlaunchConfig const cfg{
         gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, &pdlAttr, 1};
 

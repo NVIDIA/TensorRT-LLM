@@ -178,7 +178,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         config.stream = stream;
         cudaLaunchAttribute attrs[1];
         attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        attrs[0].val.programmaticStreamSerializationAllowed
+            = tensorrt_llm::common::getEnvEnablePDL_() && !tensorrt_llm::common::getEnvDisableQuantizePDL();
         config.numAttrs = 1;
         config.attrs = attrs;
         cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
@@ -213,7 +214,8 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed
+        = tensorrt_llm::common::getEnvEnablePDL_() && !tensorrt_llm::common::getEnvDisableQuantizePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
     cudaLaunchKernelEx(&config,
@@ -388,7 +390,8 @@ void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* 
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed
+        = tensorrt_llm::common::getEnvEnablePDL_() && !tensorrt_llm::common::getEnvDisableQuantizePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(

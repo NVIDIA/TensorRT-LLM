@@ -137,7 +137,7 @@ int create_communicator_grouped2(communicator** comm, ::tensorrt_llm::runtime::W
     (*comm)->nranks = nranks;
     (*comm)->myrank = myrank;
     (*comm)->free_region = 0;
-    (*comm)->pdl_launch = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    (*comm)->pdl_launch = tensorrt_llm::common::getEnvEnablePDL_() ? 1 : 0;
 
     cudaDeviceProp device_prop{};
     TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));

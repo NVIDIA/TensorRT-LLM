@@ -182,7 +182,7 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
     dim3 block(BLOCK_SIZE);
     dim3 grid(params.m / TILE_M, params.n / TILE_N);
 
-    if (tensorrt_llm::common::getEnvEnablePDL())
+    if (tensorrt_llm::common::getEnvEnablePDL_())
     {
         TLLM_LOG_DEBUG("Enable PDL in fp8_gemm_plugin");
         cudaLaunchConfig_t kernelConfig = {0};

@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include <iostream>
 #include <tensorrt_llm/common/assert.h>
+#include <tensorrt_llm/common/envUtils.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -463,7 +464,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         // Setup finalize data
         finalizeData.mDtypeElt = args.mDtypeOut;
         finalizeData.mDtypeExpW = args.mDtypeExpW;
-        finalizeData.mUsePdl = true;
+        finalizeData.mUsePdl = !tensorrt_llm::common::getEnvDisableMOEFinalizePDL();
         finalizeData.mUseDeepSeekFp8 = false;
         finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;

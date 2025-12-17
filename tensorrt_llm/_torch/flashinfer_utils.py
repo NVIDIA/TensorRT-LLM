@@ -15,6 +15,10 @@ def get_env_enable_pdl():
     return enabled
 
 
+def gen_env_disable_fused_add_rmsnorm_pdl():
+    return os.environ.get("TRTLLM_DISABLE_FUSED_ADD_RMSNORM_PDL", "0") == "1"
+
+
 if platform.system() != "Windows":
     try:
         import flashinfer

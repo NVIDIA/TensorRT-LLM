@@ -12,7 +12,7 @@
 import flashinfer
 import torch
 
-from ...flashinfer_utils import get_env_enable_pdl
+from ...flashinfer_utils import gen_env_disable_fused_add_rmsnorm_pdl, get_env_enable_pdl
 
 
 @torch.library.custom_op(
@@ -36,7 +36,11 @@ def flashinfer_fused_add_rms_norm_inplace(
     residual_flat = residual.view(-1, residual.shape[-1])
 
     flashinfer.norm.fused_add_rmsnorm(
-        x_flat, residual_flat, weight, eps, enable_pdl=get_env_enable_pdl()
+        x_flat,
+        residual_flat,
+        weight,
+        eps,
+        enable_pdl=get_env_enable_pdl() and not gen_env_disable_fused_add_rmsnorm_pdl(),
     )
     x_flat.view(x_shape)
     residual_flat.view(residual_shape)

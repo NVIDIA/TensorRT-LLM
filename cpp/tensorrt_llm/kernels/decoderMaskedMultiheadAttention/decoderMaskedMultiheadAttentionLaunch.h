@@ -186,7 +186,7 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     const auto mmhaFunc = mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer,    \
         Dh, DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, ENABLE_MULTI_BLOCK, POS_SHIFT,    \
         BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, ATTN_LOGIT_SOFTCAPPING>;                                            \
-    if (tensorrt_llm::common::getEnvEnablePDL())                                                                       \
+    if (tensorrt_llm::common::getEnvEnablePDL_())                                                                      \
     {                                                                                                                  \
         TLLM_LOG_DEBUG("Enable PDL in MMHA");                                                                          \
         cudaLaunchConfig_t kernelConfig = {0};                                                                         \

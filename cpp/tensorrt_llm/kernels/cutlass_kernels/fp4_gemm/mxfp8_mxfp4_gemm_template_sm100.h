@@ -278,7 +278,7 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
             + std::string(cutlassGetStatusString(initStatus));
         throw std::runtime_error("[TensorRT LLM Error][MXFP8xMXFP4 gemm Runner] " + errMsg);
     }
-    auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());
+    auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL_());
     if (runStatus != cutlass::Status::kSuccess)
     {
         std::string errMsg
