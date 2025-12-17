@@ -72,13 +72,13 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --balance-method ImbalancedExperts
 ### Run with Slurm
 
 > Tips:
-> 1. If you have a running Slurm job, please skip step 1 and go straight to step 2 and 3.
-> 2. Further, if you have installed `tensorrt_llm` in the Slurm job, you can also skip step 2 and run step 3 with `export CONTAINER_NAME=aaa` specified. If you don't know the container name, run `export CONTAINER_NAME=$(SLURM_JOB_ID=$SLURM_JOB_ID ./slurm_query_container_name.sh)` to get it.
+> 1. If you have a running Slurm job, you can set environment variable `export SLURM_JOB_ID=aaa` and skip step 1.
+> 2. Further, if you have installed `tensorrt_llm` in the Slurm job, you can also skip step 2. Just run step 3 with `export CONTAINER_NAME=aaa` specified. If you don't know the container name, run `export CONTAINER_NAME=$(./slurm_query_container_name.sh)` to get it.
 
-**Step 1:** On the controller node, allocate one or multiple nodes, and record the `SLURM_JOB_ID`:
+**Step 1:** On the controller node, allocate one or multiple nodes, and export the `SLURM_JOB_ID`:
 
 ```bash
-SLURM_JOB_ID=$(NODES=4 TIME=02:00:00 ./slurm_alloc.sh)
+export SLURM_JOB_ID=$(NODES=4 TIME=02:00:00 ./slurm_alloc.sh)
 ```
 
 Please fill the variables in `./slurm_alloc.sh`.
@@ -86,7 +86,7 @@ Please fill the variables in `./slurm_alloc.sh`.
 **Step 2:** Start a container and install `tensorrt_llm`. Run the following command on the controller node:
 
 ```bash
-SLURM_JOB_ID=$SLURM_JOB_ID ./slurm_init_containers.sh
+./slurm_init_containers.sh
 ```
 
 It uses the image recorded in `../../jenkins/current_image_tags.properties`. The image will be downloaded to `../../enroot/` for once.
@@ -96,7 +96,7 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 **(Optional) Get an interactive shell**
 
 ```bash
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=1 ./slurm_launch.sh --overlap --pty middleware/exclude_slurm_envs bash
+NODES=1 NP=1 ./slurm_launch.sh --overlap --pty middleware/exclude_slurm_envs bash
 ```
 
 The `--overlap` option allows this shell to share the node with other jobs. The middleware enables nested MPI process spawning from within Slurm jobs.
@@ -116,17 +116,17 @@ python3 scripts/build_wheel.py --cuda_architectures "100-real" --no-venv --skip_
 export TLLM_AUTOTUNER_CACHE_PATH=autotuner_cache/cache
 
 # Run DeepSeek-R1 NVFP4 with wide ep: uses MNNVL A2A if applicable
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
 # Run with TRTLLMGen
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
+NODES=4 NP=16 TRTLLM_ENABLE_PDL=1 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
 
 # Run with DeepEPLowLatency
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
 
 # You can run 4-GPU and 8-GPU tasks without reallocate the slurm job
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
-SLURM_JOB_ID=$SLURM_JOB_ID NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gen.yaml
+NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
+NODES=2 NP=8 ./slurm_launch.sh ./run.sh config_gen.yaml
 ```
 
 ### Batched run

@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "Please set SLURM_JOB_ID"
+    exit 1
+fi
+
 prefix="pyxis_${SLURM_JOB_ID}_"
 matches=$(printf "%s\n" "$(srun -N 1 enroot list)" | grep "^${prefix}" || true)
 count=$(printf "%s\n" "$matches" | wc -l)
