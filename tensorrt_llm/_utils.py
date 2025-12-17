@@ -473,10 +473,20 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
-def get_free_port():
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
+def get_free_port() -> int:
+    return get_free_ports(1)[0]
+
+
+def get_free_ports(num=1) -> List[int]:
+    sockets = [
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(num)
+    ]
+    for s in sockets:
+        s.bind(('', 0))
+    ports = [s.getsockname()[1] for s in sockets]
+    for s in sockets:
+        s.close()
+    return ports
 
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
@@ -1117,7 +1127,9 @@ class KVCacheEventSerializer:
             "cache_level":
             data.cache_level,
             "priority":
-            data.priority
+            data.priority,
+            "mm_keys":
+            KVCacheEventSerializer._mm_keys_to_json(data)
         }
 
     @staticmethod
@@ -1152,6 +1164,30 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+    @staticmethod
+    def _mm_key_to_json(data):
+        # MmKey is a pair of (array<uint8_t, 32>, SizeType32)
+        hash_array, start_offset = data
+
+        # Convert array to hex string
+        hash_hex = ''.join(f'{b:02x}' for b in hash_array)
+        return {
+            "type": "mm_key",
+            "hash": hash_hex,
+            "start_offset": start_offset
+        }
+
+    @staticmethod
+    def _mm_keys_to_json(data):
+        # MmKeys is a list of MmKey
+        if hasattr(data, 'mm_keys') and data.mm_keys:
+            return [
+                KVCacheEventSerializer._mm_key_to_json(mm_key)
+                for mm_key in data.mm_keys
+            ]
+        else:
+            return []
 
 
 def set_prometheus_multiproc_dir() -> object:

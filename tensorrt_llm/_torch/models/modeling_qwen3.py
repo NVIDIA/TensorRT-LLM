@@ -48,7 +48,11 @@ class Qwen3Attention(QKNormRoPEAttention):
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.from_string(pos_type),
                 rope=RopeParams.from_config(config),
-            )
+                mrope_section=config.rope_scaling.get("mrope_section", None),
+                mrope_interleaved=config.rope_scaling.get(
+                    "mrope_interleaved", False))
+            if config.rope_scaling.get("mrope_interleaved", False):
+                fuse_qk_norm_rope = False
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
@@ -64,6 +68,7 @@ class Qwen3Attention(QKNormRoPEAttention):
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=fuse_qk_norm_rope,
             layer_idx=layer_idx,
+            rope_fusion=not getattr(config, 'disable_fuse_rope', False),
             dtype=config.torch_dtype,
             dense_bias=getattr(config, "attention_bias", None),
             config=model_config,

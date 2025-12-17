@@ -17,14 +17,15 @@
 #include "DevKernel.h"
 #include "RoutingKernel.h"
 #include "runner.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 #include <iostream>
 #include <tensorrt_llm/common/assert.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace trtllmGenFp8BlockScaleMoe
@@ -69,7 +70,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
-        TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+        TLLM_CHECK_WITH_INFO(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
@@ -599,4 +600,5 @@ void Runner::run(
 
 } // namespace trtllmGenFp8BlockScaleMoe
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

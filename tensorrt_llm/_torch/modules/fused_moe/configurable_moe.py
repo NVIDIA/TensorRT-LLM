@@ -28,7 +28,7 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -456,6 +456,32 @@ class ConfigurableMoE(MoE):
 
         return outputs
 
+    def _prepare_workspace_deepgemm(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        all_rank_num_tokens: List[int],
+    ) -> Optional[torch.Tensor]:
+        """
+        Prepare workspace for DeepGemmFusedMoE backend.
+
+        Args:
+            x: Input tensor
+            all_rank_num_tokens: List of token counts for all ranks (used when use_dp is True)
+
+        Returns:
+            Workspace tensor or None if not using DeepGemmFusedMoE
+        """
+        if not isinstance(self.backend, DeepGemmFusedMoE):
+            return None
+
+        # Calculate the number of rows
+        num_rows = x.shape[0]
+        if self.use_dp:
+            num_rows = sum(all_rank_num_tokens)
+
+        workspaces = self.backend.get_workspaces([num_rows])
+        return workspaces[0]
+
     def _forward_single_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -473,6 +499,9 @@ class ConfigurableMoE(MoE):
         is_first_call = self.repeat_idx == 0
         is_last_call = self.repeat_idx == self.repeat_count - 1
 
+        # ========== Create workspace for DeepGemmFusedMoE ==========
+        workspace = self._prepare_workspace_deepgemm(x, all_rank_num_tokens)
+
         # Execute unified flow (handles both separated and fused routing)
         outputs = self._forward_chunk_impl(
             x,
@@ -483,6 +512,7 @@ class ConfigurableMoE(MoE):
             is_first_call,
             is_last_call,
             do_finalize,
+            workspace=workspace,
         )
 
         return outputs
@@ -497,6 +527,7 @@ class ConfigurableMoE(MoE):
         is_first_call: bool,
         is_last_call: bool,
         do_finalize: bool = True,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Unified execution flow for all backends
@@ -667,7 +698,7 @@ class ConfigurableMoE(MoE):
             token_final_scales=token_final_scales,
             x_sf=x_sf,
             **self._get_backend_kwargs(
-                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x
+                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
             ),
         )
 
@@ -687,6 +718,54 @@ class ConfigurableMoE(MoE):
         self._load_balancer_done_set_cpu_stage(is_last_call)
 
         return final_hidden_states
+
+    def _prepare_workspaces_for_chunk(
+        self,
+        all_rank_num_tokens_list: List[Optional[List[int]]],
+        chunk_size_list: List[int],
+        use_multi_stream: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Prepare workspaces for chunked execution with DeepGemmFusedMoE backend.
+        This will also be used for alltoall communication in the future.
+
+        Args:
+            all_rank_num_tokens_list: List of token counts per rank for each chunk (None if not using DP)
+            chunk_size_list: List of chunk sizes
+            use_multi_stream: Whether to use multi-stream execution (requires workspace_1)
+
+        Returns:
+            Tuple of (workspace_0, workspace_1), where workspace_1 is None if not using multi-stream
+        """
+        workspace_0 = None
+        workspace_1 = None
+
+        if not isinstance(self.backend, DeepGemmFusedMoE):
+            return workspace_0, workspace_1
+
+        # Always need at least workspace_0
+        chunk_size_0 = (
+            sum(all_rank_num_tokens_list[0])
+            if self.use_dp and all_rank_num_tokens_list[0] is not None
+            else chunk_size_list[0]
+        )
+        workspace_chunk_sizes = [chunk_size_0]
+
+        # Add workspace_1 if using multi-stream for alternating between streams
+        if use_multi_stream:
+            chunk_size_1 = (
+                sum(all_rank_num_tokens_list[1])
+                if self.use_dp and all_rank_num_tokens_list[1] is not None
+                else chunk_size_list[1]
+            )
+            workspace_chunk_sizes.append(chunk_size_1)
+
+        workspaces = self.backend.get_workspaces(workspace_chunk_sizes)
+        workspace_0 = workspaces[0]
+        if use_multi_stream:
+            workspace_1 = workspaces[1]
+
+        return workspace_0, workspace_1
 
     def _forward_multiple_chunks(
         self,
@@ -734,11 +813,19 @@ class ConfigurableMoE(MoE):
         x_list = x.split(chunk_size_list)
         router_logits_list = router_logits.split(chunk_size_list)
 
+        # Determine if we need multiple streams for overlapped execution
+        use_multi_stream = not use_all_to_all and self.aux_stream is not None
+
         # ========== Setup auxiliary stream ==========
-        if not use_all_to_all and self.aux_stream is not None:
+        if use_multi_stream:
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
+
+        # ========== Create workspace for DeepGemmFusedMoE ==========
+        workspace_0, workspace_1 = self._prepare_workspaces_for_chunk(
+            all_rank_num_tokens_list, chunk_size_list, use_multi_stream
+        )
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
@@ -747,7 +834,7 @@ class ConfigurableMoE(MoE):
             is_first_call = idx_chunk == 0 and self.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
 
-            if not use_all_to_all and self.aux_stream is not None:
+            if use_multi_stream:
                 # Alternate between main stream and auxiliary stream
                 # Each stream processes complete chunks (forward + reducescatter)
                 if idx_chunk % 2 == 0:
@@ -762,6 +849,7 @@ class ConfigurableMoE(MoE):
                             is_first_call,
                             is_last_call,
                             do_finalize,
+                            workspace=workspace_0,
                         )
                 else:
                     # Odd chunk: execute on main stream
@@ -774,6 +862,7 @@ class ConfigurableMoE(MoE):
                         is_first_call,
                         is_last_call,
                         do_finalize,
+                        workspace=workspace_1,
                     )
             else:
                 # No overlap
@@ -786,12 +875,13 @@ class ConfigurableMoE(MoE):
                     is_first_call,
                     is_last_call,
                     do_finalize,
+                    workspace=workspace_0,
                 )
 
             outputs_list.append(outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
-        if not use_all_to_all and self.aux_stream is not None:
+        if use_multi_stream:
             # Wait for auxiliary stream to complete all its chunks
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.MoeChunkingOverlap].record()
@@ -942,6 +1032,7 @@ class ConfigurableMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         output_dtype: Optional[torch.dtype] = None,
         x: Optional[torch.Tensor] = None,
+        workspace: Optional[dict] = None,
     ) -> Dict:
         """
         Get backend-specific keyword arguments for run_moe
@@ -1014,7 +1105,8 @@ class ConfigurableMoE(MoE):
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:
-            pass
+            if workspace is not None:
+                kwargs["workspace"] = workspace
 
         # TRTLLMGen-specific parameters
         elif self.backend.__class__ == TRTLLMGenFusedMoE:
