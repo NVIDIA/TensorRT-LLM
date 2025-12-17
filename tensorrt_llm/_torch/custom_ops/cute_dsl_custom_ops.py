@@ -371,7 +371,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self,
                      output_dtype: torch.dtype,
                      to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = True):
+                     use_tvm_ffi: bool = False):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -775,7 +775,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = True,
+        use_tvm_ffi: bool = False,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -825,7 +825,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = True,
+        use_tvm_ffi: bool = False,
     ):
         # [m, k]
         shape = list(mat_a.shape)
