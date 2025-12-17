@@ -215,10 +215,12 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /tests/integration/defs/llmapi @NVIDIA/trt-llm-qa-function
 /tests/integration/defs/stress_test @NVIDIA/trt-llm-qa-function
 /tests/integration/defs/triton_server @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/test_e2e.py @NVIDIA/trt-llm-qa-function
 /tests/integration/defs/perf/disagg @NVIDIA/trt-llm-qa-serving
 /tests/integration/defs/disaggregated @NVIDIA/trt-llm-qa-serving
 /tests/integration/defs/perf @NVIDIA/trt-llm-qa-perf
 /tests/integration/defs/sysinfo @NVIDIA/trt-llm-qa-perf
+
 ### CODEOWNERS file itself
 /.github/CODEOWNERS @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
