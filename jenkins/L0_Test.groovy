@@ -1078,6 +1078,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Kill tail -f process
                     kill \$tailPid
                     # Check if the job failed or not
+                    sleep 5
                     STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
                     EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
