@@ -6,14 +6,14 @@ set -euo pipefail
 CONTAINER_NAME=${CONTAINER_NAME:-layer_wise_benchmarks}
 CONTAINER_MOUNTS=$(realpath "$(pwd)/../.."):$(realpath "$(pwd)/../..")
 
-if [ "${SLURM_JOB_ID:-}" == "" ]; then
+if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "Please set SLURM_JOB_ID"
     exit 1
 fi
 
 NODES=$(squeue -j $SLURM_JOB_ID -h -o "%D")
 
-if [ "${CONTAINER_IMAGE:-}" == "" ]; then
+if [ -z "${CONTAINER_IMAGE:-}" ]; then
     # Read Docker image from current_image_tags.properties
     source ../../jenkins/current_image_tags.properties
     MACHINE="$(uname -m)"
