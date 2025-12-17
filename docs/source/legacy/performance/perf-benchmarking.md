@@ -415,6 +415,12 @@ Total Latency (ms):             13525.6862
 
 ### Running with the PyTorch Workflow
 
+```{eval-rst}
+.. include:: ../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following command with [dataset](#preparing-a-dataset) generated from previous steps. With the PyTorch flow, you will not need to
 run `trtllm-bench build`; the `throughput` benchmark initializes the backend by tuning against the
 dataset provided via `--dataset` (or the other build mode settings described [above](#other-build-modes)).

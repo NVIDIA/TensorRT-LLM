@@ -157,6 +157,12 @@ llm = LLM(
 
 ### YAML Configuration
 
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 Create a `config.yaml` file:
 
 ```yaml
@@ -195,6 +201,12 @@ response = client.completions.create(
 ## TRTLLM bench with LORA
 
 ### YAML Configuration
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
 
 Create a `config.yaml` file:
 

@@ -26,6 +26,12 @@ As in the PyTorch workflow, AutoDeploy does not require a separate `trtllm-bench
 
 For more granular control over AutoDeploy's behavior during benchmarking, use the `--config` flag with a YAML configuration file:
 
+```{eval-rst}
+.. include:: ../../../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 ```bash
 trtllm-bench \
   --model meta-llama/Llama-3.1-8B \

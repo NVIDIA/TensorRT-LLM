@@ -33,6 +33,12 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 To enable torch.compile and Piecewise CUDA Graph, add the following configuration to `config.yml`. Typically, the `config.yml` can be used by adding launching args `--config config.yml` to `trtllm-serve` or `trtllm-bench`.
 
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 ```yaml
 ... # Other extra config
 torch_compile_config:
