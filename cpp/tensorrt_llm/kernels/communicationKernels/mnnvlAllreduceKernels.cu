@@ -423,9 +423,9 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
         }
         float blockSum = blockReduceSum<float, true>(threadSum);
 
-        __shared__ float sharedVal[8]; // Temporary variable to share the sum within block
         float fullSum = blockSum;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        __shared__ float sharedVal[8]; // Temporary variable to share the sum within block
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         int const numBlocks = cluster.num_blocks();
@@ -495,7 +495,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         .dynamicSmemBytes = 0,
         .stream = params.stream,
         .attrs = attrs,
-        .numAttrs = kSMVersion >= 90 ? 2 : 1,
+        .numAttrs = kSMVersion >= 90 ? 2U : 1U,
     };
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM)                                                                \
@@ -829,9 +829,9 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     float blockSum = blockReduceSum<float, true>(threadSum);
 
     float fullSum = blockSum;
-    __shared__ float sharedVal[8];
     // Use CGA Reduction if supported
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    __shared__ float sharedVal[8];
     int const numBlocks = cluster.num_blocks();
     if (numBlocks > 1)
     {
@@ -967,7 +967,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         rnAttrs[1].val.clusterDim.x = 1;
         rnAttrs[1].val.clusterDim.y = rnClusterSize;
         rnAttrs[1].val.clusterDim.z = 1;
-        rnConfig.numAttrs = kSMVersion >= 90 ? 2 : 1;
+        rnConfig.numAttrs = (kSMVersion >= 90) ? 2U : 1U;
 
         bool const rnUseCGA = kSMVersion >= 90 && rnClusterSize > 1;
         int const dimPadded = divUp(tokenDim, numEltsPerThread * rnNumThreads) * numEltsPerThread * rnNumThreads;
