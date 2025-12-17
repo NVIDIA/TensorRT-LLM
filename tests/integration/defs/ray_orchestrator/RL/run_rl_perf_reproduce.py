@@ -1,25 +1,3 @@
-##############################################################################
-# OVERVIEW:
-# This script is to emulate the performance of running TensorRT-LLM with Ray
-# orchestrator for Reinforcement Learning (RL) workloads. It creates multiple
-# AsyncLLM instances distributed across GPUs using Ray placement groups,
-# enabling parallel generation for RL training scenarios.
-#
-# EXAMPLE USAGE:
-#   python rl_perf_repro.py \
-#       --model_dir /path/to/model_dir \
-#       --data_path /path/to/prompts.json \
-#       --num_instances 2 \
-#       --tp_size 4 \
-#       --max_batch_size 1024 \
-#       --enable_cuda_graph_padding \
-#       --enable_block_reuse \
-#       --logprobs 1
-#
-# NOTE:
-# - This script supports single-node execution only (max 8 GPUs)
-##############################################################################
-
 import argparse
 import asyncio
 import json
