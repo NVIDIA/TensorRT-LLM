@@ -140,6 +140,7 @@ class ShardingTransformConfig(TransformConfig):
     sharding_dims: List[ShardingDim] = Field(
         default_factory=lambda: [ShardingDim.TP, ShardingDim.EP, ShardingDim.BMM]
     )
+    shard_all_unprocessed: bool = Field(default=False)
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
@@ -2608,7 +2609,8 @@ def detect_column_row_shard(
                 num_attention_shards += 1
 
     # simple shard remaining linear nodes
-    num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
+    if config.shard_all_unprocessed:
+        num_simple_shards += _process_simple_shard(unprocessed_linear_nodes, transform_container)
     num_column_row_shards += num_ssm_shards
     num_shards = num_simple_shards + num_column_row_shards
     ad_logger.info(
