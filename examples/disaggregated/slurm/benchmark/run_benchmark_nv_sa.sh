@@ -89,8 +89,3 @@ for concurrency in ${concurrency_list}; do
 
     echo "Benchmark with concurrency ${concurrency} done"
 done
-
-# Save job information
-if [ -n "${SLURM_JOB_ID:-}" ]; then
-    echo "${SLURM_JOB_NODELIST}" > "${log_path}/job_${SLURM_JOB_ID}.txt"
-fi
