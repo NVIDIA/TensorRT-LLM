@@ -21,104 +21,16 @@
 As Large Language Models (LLMs) are applied to increasingly complex tasks such as long-document summarization, code generation, and autonomous agents, the demand for processing long contexts and extended generation has surged. In Transformer-based models, the attention mechanism's computational complexity and memory usage grow quadratically and linearly with sequence length, respectively. This creates significant bottlenecks in both the **Context (Prefill)** and **Generation (Decode)** phases:
 
 *   **Context Phase**: Processing long prompts requires substantial memory bandwidth and computation, affecting time-to-first-token (TTFT). Since the context phase is typically compute-bound, reducing the computational load here is critical.
-*   **Generation Phase**: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.
+*   **Generation Phase**: The Key-Value (KV) cache grows with every generated token, consuming vast amounts of GPU memory and bandwidth. Since the generation phase is usually memory-bound, reducing the memory footprint directly alleviates memory pressure, improves token-to-token latency (TPOT), and allows for larger batch sizes.
 
-Consequently, using sparse attention to reduce overhead in both context and generation phases has attracted significant research interest. Several state-of-the-art models and techniques are evolving to minimize these overheads. Based on our research, we categorize sparse attention methods as follows:
+Fortunately, key observations indicate that attention scores naturally exhibit sparsity, meaning not all K/V tokens are necessary for attention computation. To enhance the efficiency of long-sequence LLMs, numerous methods have been proposed to optimize performance by leveraging approximate sparse attention. Among those methods, sparsity can be applied to different dimensions of the attention: head dimension, hidden dimension, and sequence dimension. When applying sparsity to the sequence dimension, those methods selectively compute only the most important query-key pairs. This approach can be referred to as token sparsity. Token sparsity has been widely explored in lots of recent academic works, and it is also a kind of structured sparse method that is friendly for GPU. TensorRT LLM will focus on the sparse attention methods that leverages token sparsity.
 
-<div align="center">
-<table>
-    <thead>
-        <tr>
-            <th colspan="2" align="center">Context</th>
-            <th colspan="2" align="center">Generation</th>
-            <th rowspan="2" align="center">Training-Free</th>
-            <th rowspan="2" align="center">Methods</th>
-        </tr>
-        <tr>
-            <th align="center">Sparse Computation</th>
-            <th align="center">KV Cache Compression</th>
-            <th align="center">Sparse Computation</th>
-            <th align="center">KV Cache Compression</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">StreamingLLM</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">DuoAttention</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">H2O</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Minference</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Quest</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">XAttention</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">NSA,DSA</td>
-        </tr>
-        <tr>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">No</td>
-            <td align="center">MoBA</td>
-        </tr>
-        <tr>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">Yes</td>
-            <td align="center">No</td>
-            <td align="center">Yes</td>
-            <td align="center">RocketKV</td>
-        </tr>
-    </tbody>
-</table>
-</div>
+Token sparsity can be applied to two distinct aspects of LLM inference:
+*   **Sparse Computation**: If a query token does not require the entire history, just skip the computation for irrelevant tokens, thereby reducing attention computational costs.
+*   **Sparse KV cache**: Evicts KV tokens from the cache that are not required for future generation steps. This reduces GPU memory usage and lowers computation overhead for subsequent steps.
+Both methods can be enabled simultaneously to achieve better performance.
 
-The table above summarizes several representative sparse attention algorithms. DuoAttention, NSA and MoBA perform sparse computation in the context phase, but they require structural changes to the model and are therefore architecture-specific methods. For the other methods, we observe that most follow a pattern of performing KV cache compression in the context phase and sparse computation in the generation phase. Approaches such as StreamingLLM and H2O also dynamically compress (or evict) the KV cache during generation in addition to sparse computation, typically following a fixed pattern. Based on these observations, TensorRT LLM first focuses on supporting KV cache compression in the context phase and sparse computation in the generation phase, with RocketKV as the primary reference implementation. With the release of the DeepSeek V3.2 model that adopts sparse attention, we have also added support for this model. In the future, we plan to further explore and support sparse computation in the context phase and KV cache compression in the generation phase.
+To support these emerging techniques, TensorRT LLM has designed a general, extensible Sparse Attention framework (which is continuously being optimized) to compatibly integrate advanced sparse algorithms. Currently we can support [RocketKV](https://arxiv.org/pdf/2502.14051) and [DSA](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf).
 
 ## Quick Start
 
