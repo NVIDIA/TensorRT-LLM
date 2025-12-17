@@ -1583,6 +1583,9 @@ class PyExecutor:
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+                    
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
