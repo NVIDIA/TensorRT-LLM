@@ -258,6 +258,11 @@ class CachedResidualAdd(AttentionDescriptor):
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         return []
 
+    @classmethod
+    def get_standard_metadata_args(cls) -> List[str]:
+        # unused, I think?
+        return []
+
 
 @TransformRegistry.register("insert_cached_residual_add")
 class InsertCachedResidualAdd(InsertCachedAttention):
