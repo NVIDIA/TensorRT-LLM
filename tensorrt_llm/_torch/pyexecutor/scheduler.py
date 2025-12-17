@@ -457,10 +457,6 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 class PyCapacityScheduler:
     """
     Python implementation of the C++ CapacityScheduler.
-
-    It delegates the heavy lifting of block counting and tracking to the C++
-    KVCacheManager via bindings, but controls the decision-making loop (policy)
-    in Python.
     """
 
     def __init__(
@@ -478,13 +474,12 @@ class PyCapacityScheduler:
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
 
+        # [FIX]: Get this from config!
+        self.default_window_size = self.kv_cache_manager.max_sequence_length
+
     def schedule_request(
         self, active_requests: RequestList
     ) -> Tuple[RequestList, RequestList, RequestList]:
-        """
-        Main entry point.
-        Returns: (fitting_requests, fitting_disagg_gen_init, paused_requests)
-        """
 
         if self.policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
             return self._schedule_max_utilization(active_requests)
@@ -498,18 +493,10 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        # Binding: Resets internal transactional state (e.g. mSchedulingNumFreeBlocks)
-        if hasattr(self.kv_cache_manager, "start_scheduling"):
-            self.kv_cache_manager.start_scheduling()
-
-        # We track "scheduling" free blocks in Python to mimic C++ logic if binding missing
-        # C++ Manager tracks this internally via mSchedulingNumFreeBlocks.
-        # IF the C++ binding `try_scheduling_request` exists (custom added), use it.
-        # IF NOT, we must rely on `get_needed_blocks_one_step` and internal tracking.
-
-        # Assuming for Phase 1 you WILL add `try_scheduling_request` to binding
-        # (It's the safest way to ensure parity).
-        # If you cannot add binding, let me know, I can write the manual accounting version.
+        # [FIX] Track free blocks manually in Python because C++ internal transactional state
+        # is not exposed/updated via bindings for tentative scheduling.
+        # get_num_free_blocks() returns the physical free blocks.
+        current_free_blocks = self.kv_cache_manager.get_num_free_blocks()
 
         cached_active_list = list(active_requests)
         idx = 0
@@ -532,33 +519,29 @@ class PyCapacityScheduler:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            # 3. Try Allocation
-            # Using the binding name you likely need to add: `try_schedule`
-            # or `check_and_update_allocation`.
-            # Since it's missing in your provided nanobind, I assume you will add it.
-            can_allocate = False
-            if hasattr(self.kv_cache_manager, "try_scheduling_request"):
-                can_allocate = self.kv_cache_manager.try_scheduling_request(req)
-            else:
-                # Fallback: Manual check (simplified parity)
-                # Note: This requires get_needed_blocks_one_step binding
-                needed = self.kv_cache_manager.get_needed_blocks_one_step(
-                    req, False, 0)  # window_size arg?
-                free_blocks = self.kv_cache_manager.get_num_free_blocks(
-                )  # This gets Physical free, not Transactional...
-                # RISK: Without C++ support for transactional state (mSchedulingNumFreeBlocks),
-                # Python side cannot accurately backtrack.
-                # STRONG RECOMMENDATION: Add `try_scheduling_request` to C++ binding.
-                if free_blocks >= needed:
-                    # We can't easily "commit" this without C++ support
-                    can_allocate = True
+            # 3. Try Allocation (Python Manual Check)
+            # [FIX] Use get_needed_blocks_one_step instead of missing try_scheduling_request
+            needed_blocks = 0
+            if is_disagg_init:
+                # Disagg Init needs special calculation usually same as Context
+                needed_blocks = self.kv_cache_manager.get_needed_blocks_one_step(
+                    req, False, self.default_window_size)
+            elif req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                # Generation usually needs 0 or 1 block depending on boundary
+                needed_blocks = self.kv_cache_manager.get_needed_blocks_one_step(
+                    req, False, self.default_window_size)
+            elif req.state == LlmRequestState.CONTEXT_INIT:
+                needed_blocks = self.kv_cache_manager.get_needed_blocks_one_step(
+                    req, False, self.default_window_size)
 
-            if can_allocate:
+            if current_free_blocks >= needed_blocks:
+                # Commit locally
+                current_free_blocks -= needed_blocks
                 scheduled_requests.append(req)
                 idx += 1
                 continue
 
-            # 4. Backtracking
+            # 4. Backtracking / Eviction Logic
             victim_idx = -1
             for i in range(len(scheduled_requests) - 1, -1, -1):
                 r = scheduled_requests[i]
@@ -567,22 +550,25 @@ class PyCapacityScheduler:
                     break
 
             if victim_idx != -1:
+                # Found a victim. Evict it.
                 victim_req = scheduled_requests.pop(victim_idx)
                 paused_requests.append(victim_req)
 
-                if hasattr(self.kv_cache_manager, "scheduling_remove_sequence"):
-                    self.kv_cache_manager.scheduling_remove_sequence(
-                        victim_req.request_id)
+                # [FIX] Reclaim victim's blocks manually
+                victim_needed = self.kv_cache_manager.get_needed_blocks_one_step(
+                    victim_req, False, self.default_window_size)
+                current_free_blocks += victim_needed
 
+                # Retry current req without incrementing idx
                 continue
             else:
+                # No victim found, and current request doesn't fit.
                 break
 
-        # 5. Output Classification
-        # Any active request not in `scheduled_requests` is effectively paused/waiting.
-        # But `paused_requests` list contains specifically those we *actively* evicted.
+        # 5. Output Classification (Same as before)
+        fitting_requests = []
+        fitting_disagg_gen_init = []
 
-        # We also need to capture requests that were active but we stopped loop before reaching them.
         scheduled_ids = set(r.request_id for r in scheduled_requests)
         evicted_ids = set(r.request_id for r in paused_requests)
 
@@ -590,12 +576,7 @@ class PyCapacityScheduler:
             if (req.state == LlmRequestState.GENERATION_IN_PROGRESS
                     and req.request_id not in scheduled_ids
                     and req.request_id not in evicted_ids):
-                # Request was running, but we ran out of slots/memory before processing it
-                # or we stopped scheduling.
                 paused_requests.append(req)
-
-        fitting_requests = []
-        fitting_disagg_gen_init = []
 
         for r in scheduled_requests:
             if r.state == LlmRequestState.DISAGG_GENERATION_INIT:
@@ -609,17 +590,18 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         pending_requests: RequestList = []
 
-        # FIX: available = Total - Used
         max_blocks = self.kv_cache_manager.max_num_blocks
-        used_blocks = self.kv_cache_manager.get_used_num_blocks(
-        )  # Binding `used_num_blocks`
+
+        # [FIX] Must subtract used blocks to get available for *new* allocations
+        used_blocks = self.kv_cache_manager.get_used_num_blocks()
+
+        # We track 'reserved' as blocks we PLAN to add on top of 'used'
         available_blocks = max_blocks - used_blocks
 
         # --- Pass 1: Running Requests ---
         for request in active_requests:
             req_state = request.state
 
-            # State Filter (Disagg Init is NOT a running request, handled in Pass 2)
             if (req_state.value < self.no_schedule_until_state.value
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
@@ -631,21 +613,20 @@ class PyCapacityScheduler:
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
-                # This returns needed ADDITIONAL blocks
+                # [FIX] Added window_size argument
                 needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
-                    request)
+                    request, self.default_window_size)
 
                 if needed > available_blocks:
-                    # Resource Exhaustion
                     pending_requests.append(request)
                     continue
 
                 scheduled_requests.append(request)
-                available_blocks -= needed  # Reserve space
+                available_blocks -= needed
             else:
                 pending_requests.append(request)
 
-        # --- Pass 2: New Requests ---
+        # --- Pass 2: New / Context Requests ---
         for request in pending_requests:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
@@ -653,23 +634,23 @@ class PyCapacityScheduler:
             if (request.state == LlmRequestState.CONTEXT_INIT
                     or request.state == LlmRequestState.DISAGG_GENERATION_INIT):
 
-                needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
-                    request)
+                # [FIX] Added window_size argument
+                needed_blocks = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                    request, self.default_window_size)
 
-                if needed <= available_blocks:
+                if needed_blocks <= available_blocks:
                     scheduled_requests.append(request)
-                    available_blocks -= needed
+                    available_blocks -= needed_blocks
                 else:
                     break
 
-        # --- Output Classification ---
+        # --- Output Classification (Same as before) ---
         fitting_requests = []
         fitting_disagg_gen_init = []
         paused_requests = []
 
         scheduled_ids = set(r.request_id for r in scheduled_requests)
 
-        # Identify running requests that were implicitly paused
         for req in active_requests:
             if (req.request_id not in scheduled_ids
                     and req.state == LlmRequestState.GENERATION_IN_PROGRESS):
