@@ -93,6 +93,22 @@ It uses the image recorded in `../../jenkins/current_image_tags.properties`. The
 
 > Tips: If you want to change the image, no need to reallocate Slurm jobs. Just start another container by running step 2 with `export CONTAINER_NAME=aaa`, and step 3 will run in the container specified by the `CONTAINER_NAME` env.
 
+**(Optional) Get an interactive shell**
+
+```bash
+SLURM_JOB_ID=$SLURM_JOB_ID NODES=1 NP=1 ./slurm_launch.sh --overlap --pty middleware/exclude_slurm_envs bash
+```
+
+The `--overlap` option allows this shell to share the node with other jobs. The middleware enables nested MPI process spawning from within Slurm jobs.
+
+You may compile C++ extensions in the interactive shell:
+
+```bash
+cd ../..
+export CCACHE_DIR=$(realpath cpp/.ccache)
+python3 scripts/build_wheel.py --cuda_architectures "100-real" --no-venv --skip_building_wheel --use_ccache --clean
+```
+
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
