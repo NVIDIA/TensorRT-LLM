@@ -1,5 +1,19 @@
 # This file defines code ownership rules for the repository.
 
+## TensorRT-LLM QA
+### Integration Tests
+/tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
+/tests/integration/defs/examples/test_ray.py @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/examples/test_redrafter.py @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/accuracy @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/stress_test @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/triton_server @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/test_e2e.py @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/disaggregated @NVIDIA/trt-llm-qa-serving
+/tests/integration/defs/perf @NVIDIA/trt-llm-qa-perf
+/tests/integration/defs/perf/disagg @NVIDIA/trt-llm-qa-serving
+/tests/integration/defs/sysinfo @NVIDIA/trt-llm-qa-perf
+
 
 ## TensorRT-LLM Infra
 ### CI
@@ -206,20 +220,6 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
 ### TAVA Architecture Diagram
 /.github/tava_architecture_diagram.md @NVIDIA/trt-llm-TAVA-design-change
-
-### Test Case & Test List
-/tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
-/tests/integration/defs @NVIDIA/trt-llm-qa
-/tests/integration/defs/examples @NVIDIA/trt-llm-qa-function
-/tests/integration/defs/accuracy @NVIDIA/trt-llm-qa-function
-/tests/integration/defs/llmapi @NVIDIA/trt-llm-qa-function
-/tests/integration/defs/stress_test @NVIDIA/trt-llm-qa-function
-/tests/integration/defs/triton_server @NVIDIA/trt-llm-qa-function
-/tests/integration/defs/test_e2e.py @NVIDIA/trt-llm-qa-function
-/tests/integration/defs/perf/disagg @NVIDIA/trt-llm-qa-serving
-/tests/integration/defs/disaggregated @NVIDIA/trt-llm-qa-serving
-/tests/integration/defs/perf @NVIDIA/trt-llm-qa-perf
-/tests/integration/defs/sysinfo @NVIDIA/trt-llm-qa-perf
 
 ### CODEOWNERS file itself
 /.github/CODEOWNERS @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
