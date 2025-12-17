@@ -41,7 +41,7 @@ class TRTLLMInstance:
 
     async def init_llm(self):
         """Initialize the AsyncLLM instance with configured parameters."""
-        self.llm = AsyncLLM(
+        self.llm = await AsyncLLM(
             model=self.async_llm_kwargs["model"],
             backend="pytorch",
             orchestrator_type=self.async_llm_kwargs["orchestrator_type"],
@@ -61,7 +61,6 @@ class TRTLLMInstance:
             batch_wait_timeout_iters=32,
             batch_wait_max_tokens_ratio=0.5,
         )
-        await self.llm.setup_async()
         self.sampling_params = SamplingParams(
             temperature=self.sampling_kwargs["temperature"],
             top_p=self.sampling_kwargs["top_p"],
