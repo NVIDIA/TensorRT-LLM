@@ -1,3 +1,25 @@
+##############################################################################
+# OVERVIEW:
+# This script is to emulate the performance of running TensorRT-LLM with Ray
+# orchestrator for Reinforcement Learning (RL) workloads. It creates multiple
+# AsyncLLM instances distributed across GPUs using Ray placement groups,
+# enabling parallel generation for RL training scenarios.
+#
+# EXAMPLE USAGE:
+#   python rl_perf_repro.py \
+#       --model_dir /path/to/model_dir \
+#       --data_path /path/to/prompts.json \
+#       --num_instances 2 \
+#       --tp_size 4 \
+#       --max_batch_size 1024 \
+#       --enable_cuda_graph_padding \
+#       --enable_block_reuse \
+#       --logprobs 1
+#
+# NOTE:
+# - This script supports single-node execution only (max 8 GPUs)
+##############################################################################
+
 import argparse
 import asyncio
 import json
@@ -20,6 +42,19 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 
 @ray.remote
 class TRTLLMInstance:
+    """Ray actor wrapping an AsyncLLM instance for distributed RL workloads.
+
+    This actor manages a single TensorRT-LLM instance that can be scheduled
+    on specific GPUs using Ray placement groups. Multiple instances can run
+    in parallel for high-throughput RL generation.
+
+    Attributes:
+        async_llm_kwargs: Configuration dict for AsyncLLM initialization
+        sampling_kwargs: Configuration dict for SamplingParams
+        llm: The underlying AsyncLLM instance (initialized via init_llm)
+        sampling_params: SamplingParams object for generation
+    """
+
     def __init__(self, async_llm_kwargs: dict, sampling_kwargs: dict):
         self.async_llm_kwargs = async_llm_kwargs
         self.sampling_kwargs = sampling_kwargs
@@ -27,6 +62,7 @@ class TRTLLMInstance:
         self.sampling_params = None
 
     async def init_llm(self):
+        """Initialize the AsyncLLM instance with configured parameters."""
         self.llm = AsyncLLM(
             model=self.async_llm_kwargs["model"],
             backend="pytorch",
@@ -62,7 +98,16 @@ class TRTLLMInstance:
         )
 
     async def generate(self, prompt: list[int]):
-        """Generate for a single prompt."""
+        """Generate output tokens for a single prompt.
+
+        Args:
+            prompt: List of input token IDs
+
+        Returns:
+            Tuple of (token_ids, log_probs):
+                - token_ids: List of generated token IDs
+                - log_probs: List of log probabilities (if logprobs enabled, else None)
+        """
         outputs = await self.llm.generate_async(inputs=prompt, sampling_params=self.sampling_params)
         token_ids = outputs.outputs[0].token_ids
         log_probs = None
@@ -72,6 +117,19 @@ class TRTLLMInstance:
 
 
 async def setup_rl_llm(args):
+    """Main setup and execution function for RL LLM workloads.
+
+    This function:
+    1. Loads prompts from the input JSON file
+    2. Initializes Ray with placement groups for GPU allocation
+    3. Creates multiple TRTLLMInstance actors distributed across GPUs
+    4. Distributes prompts round-robin across instances
+    5. Runs async generation and reports throughput metrics
+
+    Args:
+        args: Parsed command-line arguments
+    """
+    # Load prompts from JSON file (expected format: list of token ID lists)
     data_path = Path(args.data_path)
     with open(data_path, "r") as f:
         prompts = json.load(f)
@@ -90,24 +148,36 @@ async def setup_rl_llm(args):
             f"Number of GPUs ({available_gpus}) is less than number of GPUs required ({num_gpus})."
         )
 
+    # Prevent Ray from setting CUDA_VISIBLE_DEVICES automatically
+    # This allows TensorRT-LLM to manage GPU visibility internally
     os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     runtime_env = {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}}
     pg = None
 
     try:
         ray.init()
+
+        # Create placement group with one bundle per GPU
+        # STRICT_PACK ensures all bundles are on the same node
         pg = placement_group(
             [{"GPU": 1, "CPU": 2} for _ in range(num_gpus)], strategy="STRICT_PACK"
         )
 
+        # Wait for placement group to be ready
         ray.get(pg.ready())
 
+        # Configure placement groups for each instance
+        # Each instance gets a contiguous range of GPU bundles for tensor parallelism
+        # Example with num_instances=2, tp_size=2:
+        #   Instance 0: bundles [0, 1] -> GPUs 0, 1
+        #   Instance 1: bundles [2, 3] -> GPUs 2, 3
         tp_size = args.tp_size
         placement_group_list = [[pg] for _ in range(num_instances)]
         placement_bundle_indices_list = [
             [list(range(i * tp_size, (i + 1) * tp_size))] for i in range(num_instances)
         ]
 
+        # Create TRTLLMInstance actors for each parallel instance
         llm_instances = []
         for i in range(num_instances):
             llm_instances.append(
@@ -159,6 +229,7 @@ async def setup_rl_llm(args):
                     },
                 )
             )
+        # Wait for all Ray actors to be ready, then initialize LLM instances
         ray.get([llm.__ray_ready__.remote() for llm in llm_instances])
         ray.get([llm.init_llm.remote() for llm in llm_instances])
 
@@ -195,10 +266,17 @@ async def setup_rl_llm(args):
 
 
 def add_rl_llm_args(parser):
+    """Add command-line arguments for RL LLM configuration."""
+    # Required arguments
     parser.add_argument("--model_dir", type=str, required=True, help="Model checkpoint directory.")
-    parser.add_argument("--data_path", type=str, required=True, help="Input data file path.")
     parser.add_argument(
-        "--num_instances", type=int, required=True, help="Number of trtllm instances."
+        "--data_path",
+        type=str,
+        required=True,
+        help="Input data file path, expected format: list of token ID lists.",
+    )
+    parser.add_argument(
+        "--num_instances", type=int, required=True, help="Number of TRTLLM instances."
     )
 
     # AsyncLLM parameters

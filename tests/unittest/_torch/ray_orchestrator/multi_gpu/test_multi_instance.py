@@ -37,6 +37,12 @@ class TRTLLMInstance:
     "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_instances2", "tp1_instances4"]
 )
 def test_multi_instance(monkeypatch, tp_size, num_instances):
+    """Test that multiple TRTLLMInstance actors can be started without port conflicts.
+
+    This test guards against port conflict failures when launching multiple
+    TensorRT-LLM instances concurrently. It runs multiple iterations to ensure
+    reliable instance creation and teardown.
+    """
     monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
 
     num_gpus = tp_size * num_instances
@@ -50,6 +56,7 @@ def test_multi_instance(monkeypatch, tp_size, num_instances):
             f"Number of GPUs ({available_gpus}) is less than number of GPUs required ({num_gpus})."
         )
 
+    # Run multiple iterations to catch intermittent port conflict issues
     excution_times = 5
     for i in range(excution_times):
         pg = None
