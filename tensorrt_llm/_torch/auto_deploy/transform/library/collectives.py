@@ -5,16 +5,22 @@ when TRT-LLM is available (MPI mode) since it provides optimized fused kernels.
 The torch backend (demollm mode) does not benefit from fusion.
 """
 
-from functools import partial
-from typing import Tuple
+from typing import Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 # TODO: This is an overly simplified model that works well for vanilla Llama models.
 # However, we eventually want to consider more sophisticated patterns such as
@@ -87,6 +93,19 @@ def _allreduce_residual_rmsnorm_replacement(
 # ============================================================================
 
 
+class FuseAllreduceResidualRMSNormConfig(TransformConfig):
+    """Configuration for the allreduce + residual + RMSNorm fusion transform."""
+
+    skip_first_match: bool = Field(
+        default=False,
+        description=(
+            "Skip fusing the first allreduce+rmsnorm match. This is a workaround for a hang "
+            "that occurs with torch.compile + NCCL when the first collective triggers lazy "
+            "initialization while ranks are desynchronized during JIT compilation."
+        ),
+    )
+
+
 @TransformRegistry.register("fuse_allreduce_residual_rmsnorm")
 class FuseAllreduceResidualRMSNorm(BaseTransform):
     """Fuse (allreduce + residual add + RMSNorm) into one fused op with tuple output.
@@ -95,6 +114,10 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
     optimized fused kernels. The torch backend (demollm mode) does not benefit from
     this fusion and uses unfused operations.
     """
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseAllreduceResidualRMSNormConfig
 
     def _apply(
         self,
@@ -132,11 +155,25 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             add_order="x_first", strategy=strategy
         )
 
+        # Create replacement function, optionally skipping the first match
+        skip_first = self.config.skip_first_match
+        match_counter = [0]  # Use list to allow mutation in nested function
+
+        def _conditional_repl(
+            x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+        ):
+            match_counter[0] += 1
+            if skip_first and match_counter[0] == 1:
+                # Skip first match - return unfused pattern
+                return _allreduce_residual_rmsnorm_pattern_trtllm(x, residual, weight, eps)
+            # Fuse this match
+            return _allreduce_residual_rmsnorm_replacement(x, residual, weight, eps, strategy)
+
         # Register TRT-LLM backend patterns only (no torch backend fusion)
         # Pattern 1: residual + allreduce(x)
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern_trtllm,
-            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
+            replace_fn=_conditional_repl,
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,
@@ -146,7 +183,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Pattern 2: allreduce(x) + residual
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern2_trtllm,
-            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
+            replace_fn=_conditional_repl,
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,

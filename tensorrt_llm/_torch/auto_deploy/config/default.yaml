@@ -125,6 +125,7 @@ transforms:
     backend: trtllm
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
+    skip_first_match: false
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
   fuse_rmsnorm:
     stage: post_load_fusion
