@@ -1081,7 +1081,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
                     EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
-                        echo "Pytest succeed, Slurm job \$jobId"
+                        echo "Pytest succeed in Slurm job \$jobId"
                         echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
                         exit 0
                     else
