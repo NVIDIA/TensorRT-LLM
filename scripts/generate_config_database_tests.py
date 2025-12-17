@@ -77,6 +77,11 @@ def recipe_to_server_config(recipe: Recipe, llm_api_config: dict) -> dict:
     for key, value in llm_api_config.items():
         server_config[key] = value
 
+    # Disable KV cache reuse to ensure consistency
+    if "kv_cache_config" not in server_config:
+        server_config["kv_cache_config"] = {}
+    server_config["kv_cache_config"]["enable_block_reuse"] = False
+
     # Add client configs
     server_config["client_configs"] = [
         {
