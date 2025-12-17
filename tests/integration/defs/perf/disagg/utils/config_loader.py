@@ -77,7 +77,7 @@ class AccuracyConfig:
 # Note: Only log_file is used by AccuracyParser (accuracy_parser.py)
 # The regex pattern is hardcoded in AccuracyParser._extract_accuracy_values()
 _COMMON_ACCURACY_METRICS = MetricsConfig(
-    log_file="accuracy_eval.log",
+    log_file="7_accuracy_eval.log",
     extractor_pattern=r"\|([a-zA-Z0-9_-]+)\|.*?\|([\w-]+)\|.*?\|exact_match\|.*?\|([0-9.]+)\|",
     metric_names=["flexible-extract", "strict-match"],
 )
