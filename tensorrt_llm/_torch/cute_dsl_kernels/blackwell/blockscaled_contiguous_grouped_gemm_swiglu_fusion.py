@@ -348,6 +348,11 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        self.cta_tile_shape_mnk_sfb = (
+            self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler_sfb[1],
+            self.mma_tiler_sfb[2],
+        )
 
         self.mma_tiler_c = (
             self.mma_inst_shape_mn[0],
@@ -441,6 +446,24 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
             self.epi_tile,
             self.num_c_stage,
         )
+
+        # Overlap and double buffer accumulator when num_acc_stage == 1 for cta_tile_n = 256 case
+        self.overlapping_accum = self.num_acc_stage == 1
+
+        # Compute number of TMEM columns for SFA/SFB/Accumulator
+        sf_atom_mn = 32
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        self.num_accumulator_tmem_cols = (
+            self.cta_tile_shape_mnk[1] * self.num_acc_stage
+            if not self.overlapping_accum
+            else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
+        )
+
+        self.epi_tile_n_required = 2 * cute.size(self.epi_tile[1])
+        # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
+        self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n_required
 
     @cute.jit
     def __call__(
@@ -1052,7 +1075,27 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        if cutlass.const_expr(self.overlapping_accum):
+            num_acc_stage_overlapped = 2
+            tCtAcc_fake = tiled_mma.make_fragment_C(
+                cute.append(acc_shape, num_acc_stage_overlapped)
+            )
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = cute.make_tensor(
+                tCtAcc_fake.iterator,
+                cute.make_layout(
+                    tCtAcc_fake.shape,
+                    stride=(
+                        tCtAcc_fake.stride[0],
+                        tCtAcc_fake.stride[1],
+                        tCtAcc_fake.stride[2],
+                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1],
+                    ),
+                ),
+            )
+        else:
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
         #
         # Cluster wait before tensor memory alloc
@@ -1068,7 +1111,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         # Specialized Schedule warp
         #
         if warp_idx == self.sched_warp_id:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1084,10 +1126,11 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                if cur_tile_coord[0] < num_non_exiting_tiles[0]:
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                if mma_tile_coord_m < num_non_exiting_tiles[0]:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
                     cur_tile_coord = work_tile.tile_idx
-                    expert_idx = tile_idx_to_expert_idx[cur_tile_coord[0]]
+                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
                         sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
@@ -1127,7 +1170,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1278,7 +1320,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
 
             # Make SFA tmem tensor
             sfa_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
+                acc_tmem_ptr + self.num_accumulator_tmem_cols,
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_M, MMA_K)
@@ -1292,9 +1334,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
 
             # Make SFB tmem tensor
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr
-                + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+                acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_N, MMA_K)
@@ -1370,7 +1410,13 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     tile_info[2],
                 )
 
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                # Get accumulator stage index
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_producer_state.phase ^ 1
+                else:
+                    acc_stage_index = acc_producer_state.index
+
+                tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
@@ -1381,8 +1427,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     )
                     shifted_ptr = cute.recast_ptr(
                         acc_tmem_ptr
-                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + self.num_accumulator_tmem_cols
+                        + self.num_sfa_tmem_cols
                         + offset,
                         dtype=self.sf_dtype,
                     )
@@ -1392,8 +1438,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
                         acc_tmem_ptr
-                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + self.num_accumulator_tmem_cols
+                        + self.num_sfa_tmem_cols
                         + offset,
                         dtype=self.sf_dtype,
                     )
@@ -1620,6 +1666,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 mma_tile_coord_mnl = (
                     tile_info[0] // cute.size(tiled_mma.thr_id.shape),
@@ -1649,9 +1696,18 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     )
                 ]
 
+                # Get accumulator stage index
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_consumer_state.phase
+                    reverse_subtile = (
+                        cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
+                    )
+                else:
+                    acc_stage_index = acc_consumer_state.index
+
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
 
                 if cutlass.const_expr(self.generate_sfc):
                     # (T2R, T2R_M, T2R_N, RestM, RestN)
@@ -1678,17 +1734,35 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 # Store accumulator to global memory in sub-tiles
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
                 for subtile_idx in cutlass.range(0, subtile_cnt, 2):
+                    real_subtile_idx = subtile_idx // 2
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if reverse_subtile:
+                            real_subtile_idx = (
+                                self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
+                                - 1
+                                - subtile_idx // 2
+                            )
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, subtile_idx)]
-                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, subtile_idx + 1)]
+                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
+                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
 
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+
+                    #
+                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
+                    #
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if subtile_idx // 2 == self.iter_acc_early_release_in_epilogue:
+                            # Fence for TMEM load
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
                     acc_vec_gate = tTR_rAcc_gate.load()
@@ -1749,7 +1823,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                         # Assume subtile partitioned always happens on n dimension
                         sfc_subtile_idx_mn = (
                             tile_info[0] * self.epi_tile_cnt[0],
-                            tile_info[1] * self.epi_tile_cnt[1] + subtile_idx // 2,
+                            tile_info[1] * self.epi_tile_cnt[1] + real_subtile_idx,
                         )
                         tCgSFD = tCgSFD_mn[
                             (
@@ -1868,7 +1942,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     #
                     # Store C to shared memory
                     #
-                    c_buffer = (num_prev_subtiles + subtile_idx // 2) % self.num_c_stage
+                    num_prev_subtiles = num_prev_subtiles + 1
+                    c_buffer = num_prev_subtiles % self.num_c_stage
 
                     cute.copy(
                         tiled_copy_r2s,
@@ -1888,7 +1963,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx // 2)],
+                            bSG_gC[(None, real_subtile_idx)],
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
@@ -1898,9 +1973,10 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
+                if cutlass.const_expr(not self.overlapping_accum):
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
@@ -2435,7 +2511,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         # The contiguous layout means the aligned data is stored in a contiguous manner.
         # It can't handle runtime oob when alignment is not align with the tile_M,
         # since the problem shape of TMA store can't be changed at runtime.
-        if cluster_tiler_m not in [64, 128, 256]:
+        if cluster_tiler_m not in [128, 256]:
             is_valid = False
 
         # Check if m_aligned is a multiple of cluster_tiler_m

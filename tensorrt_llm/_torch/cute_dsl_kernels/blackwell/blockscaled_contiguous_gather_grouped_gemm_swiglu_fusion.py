@@ -308,6 +308,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.mma_warp_id = 8
         self.tma_b_warp_id = 9
         self.sched_warp_id = 10
+        self.sync_transform_warp_id = 11
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -316,16 +317,30 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 self.tma_b_warp_id,
                 *self.epilog_warp_id,
                 self.sched_warp_id,
+                self.sync_transform_warp_id,
             )
         )
-        self.threads_wo_sched = self.threads_per_warp * len(
-            (
-                *self.epilog_warp_id,
-                self.mma_warp_id,
-                self.tma_b_warp_id,
-                *self.ldgsts_a_warp_id,
+        self.warps_wo_sched = (
+            len(
+                (
+                    *self.epilog_warp_id,
+                    self.mma_warp_id,
+                    self.tma_b_warp_id,
+                    self.sync_transform_warp_id,
+                    *self.ldgsts_a_warp_id,
+                )
+            )
+            if self.use_2cta_instrs
+            else len(
+                (
+                    *self.epilog_warp_id,
+                    self.mma_warp_id,
+                    self.tma_b_warp_id,
+                    *self.ldgsts_a_warp_id,
+                )
             )
         )
+        self.threads_wo_sched = self.threads_per_warp * self.warps_wo_sched
 
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -428,6 +443,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.mma_tiler_sfa[2],
         )
 
+        self.cta_tile_shape_mnk_sfb = (
+            self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler_sfb[1],
+            self.mma_tiler_sfb[2],
+        )
+
         self.mma_tiler_c = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1] // 2,
@@ -515,8 +536,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.num_c_stage,
         )
 
-        # Compute the number of tensor memory allocation columns
-        self.num_tmem_alloc_cols = 512
+        # Overlap and double buffer accumulator when num_acc_stage == 1 for cta_tile_n = 256 case
+        self.overlapping_accum = self.num_acc_stage == 1
+
+        # Compute number of TMEM columns for SFA/SFB/Accumulator
+        sf_atom_mn = 32
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        self.num_accumulator_tmem_cols = (
+            self.cta_tile_shape_mnk[1] * self.num_acc_stage
+            if not self.overlapping_accum
+            else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
+        )
+
+        self.epi_tile_n_required = 2 * cute.size(self.epi_tile[1])
+        # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
+        self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n_required
 
     @cute.jit
     def __call__(
@@ -713,7 +749,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # Define shared storage for kernel
         @cute.struct
-        class SharedStorage:
+        class SharedStorage1cta:
             # (bidx, bidy, bidz, valid, mn_limit)
             sInfo: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
@@ -755,7 +791,53 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 self.buffer_align_bytes,
             ]
 
-        self.shared_storage = SharedStorage
+        @cute.struct
+        class SharedStorage2cta:
+            # (bidx, bidy, bidz, valid, mn_limit)
+            sInfo: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                # 1 byte alignment
+                1,
+            ]
+            a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            a_sync_transform_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+            # (EPI_TILE_M, EPI_TILE_N, STAGE)
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.c_dtype,
+                    cute.cosize(self.c_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            # (MMA, MMA_M, MMA_K, STAGE)
+            sA: cute.struct.Align[
+                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+                self.buffer_align_bytes,
+            ]
+            # (MMA, MMA_N, MMA_K, STAGE)
+            sB: cute.struct.Align[
+                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                self.buffer_align_bytes,
+            ]
+            # (granularity_m, repeat_m), (granularity_k, repeat_k), num_scale_stage)
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ]
+            # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ]
+
+        self.shared_storage = (
+            SharedStorage2cta if cutlass.const_expr(self.use_2cta_instrs) else SharedStorage1cta
+        )
 
         # Launch the kernel synchronously
         self.kernel(
@@ -917,10 +999,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Consumer: MMA warp for consuming A/SFA data
         a_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            128
-            * cute.size(
-                cluster_layout_vmnk, mode=[0]
-            ),  # 4 warps * 32 threads per warp = 128 threads
+            self.threads_per_warp * 4,
         )
 
         a_pipeline = PipelineCpAsyncUmma.create(
@@ -930,8 +1009,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
-            enable_cp_async=(not self.use_2cta_instrs),
         )
+        if cutlass.const_expr(self.use_2cta_instrs):
+            a_sync_transform_pipeline_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                32 * cute.size(cluster_layout_vmnk, mode=[0]),
+            )
+            a_sync_transform_pipeline = pipeline.PipelineAsyncUmma.create(
+                barrier_storage=storage.a_sync_transform_mbar_ptr.data_ptr(),
+                num_stages=self.num_ab_stage,
+                producer_group=a_sync_transform_pipeline_producer_group,
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
 
         # Pipeline Init: Initialize B pipeline for TMA operations
         # Using PipelineTmaUmma for B/SFB since they use TMA load with multicast support
@@ -1007,16 +1098,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
-        # (bidx, bidy, bidz, valid)
+        # (bidx, bidy, bidz, valid, mn_limit)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
 
         #
         # Compute multicast mask for A/B buffer full
         #
-        # a_full_mcast_mask = None
         b_full_mcast_mask = None
-        # sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
         if cutlass.const_expr(self.is_b_mcast or use_2cta_instrs):
             b_full_mcast_mask = cpasync.create_tma_multicast_mask(
@@ -1113,7 +1202,27 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        if cutlass.const_expr(self.overlapping_accum):
+            num_acc_stage_overlapped = 2
+            tCtAcc_fake = tiled_mma.make_fragment_C(
+                cute.append(acc_shape, num_acc_stage_overlapped)
+            )
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = cute.make_tensor(
+                tCtAcc_fake.iterator,
+                cute.make_layout(
+                    tCtAcc_fake.shape,
+                    stride=(
+                        tCtAcc_fake.stride[0],
+                        tCtAcc_fake.stride[1],
+                        tCtAcc_fake.stride[2],
+                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1],
+                    ),
+                ),
+            )
+        else:
+            # (MMA, MMA_M, MMA_N, STAGE)
+            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
         #
         # Cluster wait before tensor memory alloc
@@ -1280,9 +1389,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
-                # Get tile coord from tile scheduler
-                # cur_tile_coord = work_tile.tile_idx
-
                 # Load token IDs for gather operation
                 # For A matrix: each thread loads 8 token offsets (for 8 LDGSTS.128 operations)
                 # For SFA matrix: each thread loads 1 token offset (for 4 LDGSTS.32 operations)
@@ -1415,10 +1521,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             sfa_atom_copy, tAgSFA_slice, tAsSFA_slice, pred=sfa_predicate_tensor
                         )
 
-                    # Signal the completion of async
-                    if cutlass.const_expr(self.use_2cta_instrs):
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(0)
                     a_pipeline.producer_commit(a_producer_state)
 
                     # Peek (try_wait) A buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
@@ -1446,6 +1548,78 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             a_pipeline.producer_tail(a_producer_state)
 
+        if warp_idx == self.sync_transform_warp_id:
+            if cutlass.const_expr(self.use_2cta_instrs):
+                #
+                # Persistent tile scheduling loop
+                #
+                tile_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                # First tile
+                work_tile = tile_sched.initial_work_tile_info()
+
+                a_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                )
+                a_sync_transform_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_ab_stage
+                )
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_stage
+                )
+
+                # Get the first tile info
+                valid_tile_info = cute.make_rmem_tensor((1,), cutlass.Int32)
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                valid_tile_info[0] = sInfo[(3, tile_info_consumer_state.index)]
+                is_valid_tile = valid_tile_info[0] == 1
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+
+                while is_valid_tile:
+                    # Peek (try_wait) A buffer full for k_tile = 0
+                    a_consumer_state.reset_count()
+                    peek_a_full_status = cutlass.Boolean(1)
+                    if a_consumer_state.count < k_tile_cnt:
+                        peek_a_full_status = a_pipeline.consumer_try_wait(a_consumer_state)
+                    # Peek (try_wait) a sync transform buffer empty
+                    a_sync_transform_producer_state.reset_count()
+
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        # Conditionally wait for A buffer full
+                        a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
+
+                        a_sync_transform_pipeline.producer_commit(a_sync_transform_producer_state)
+                        a_sync_transform_producer_state.advance()
+
+                        # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
+                        a_consumer_state.advance()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        if a_consumer_state.count < k_tile_cnt:
+                            peek_a_full_status = a_pipeline.consumer_try_wait(a_consumer_state)
+
+                    #
+                    # Advance to next tile
+                    #
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    valid_tile_info[0] = sInfo[(3, tile_info_consumer_state.index)]
+                    is_valid_tile = valid_tile_info[0] == 1
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+
+                #
+                # Wait A/B buffer empty
+                #
+                a_sync_transform_pipeline.producer_tail(a_sync_transform_producer_state)
         #
         # Specialized TMA B/SFB load warp (warp 9)
         # This warp uses TMA instructions to load B and SFB from global to shared memory
@@ -1584,7 +1758,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             # Make SFA tmem tensor
             sfa_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
+                acc_tmem_ptr + self.num_accumulator_tmem_cols,
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_M, MMA_K)
@@ -1598,9 +1772,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             # Make SFB tmem tensor
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr
-                + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+                acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
             )
             # (MMA, MMA_N, MMA_K)
@@ -1633,9 +1805,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
             work_tile = tile_sched.initial_work_tile_info()
 
+            if cutlass.const_expr(self.use_2cta_instrs):
+                a_sync_transform_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                )
             a_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
+
             b_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
@@ -1662,12 +1839,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             while is_valid_tile:
                 # Peek (try_wait) AB buffer full for k_tile = 0
-                a_consumer_state.reset_count()
+                if cutlass.const_expr(self.use_2cta_instrs):
+                    a_sync_transform_consumer_state.reset_count()
+                    peek_a_sync_transform_full_status = cutlass.Boolean(1)
+                    if a_sync_transform_consumer_state.count < k_tile_cnt and is_leader_cta:
+                        peek_a_sync_transform_full_status = (
+                            a_sync_transform_pipeline.consumer_try_wait(
+                                a_sync_transform_consumer_state
+                            )
+                        )
+                    a_consumer_state.reset_count()
+                else:
+                    a_consumer_state.reset_count()
+                    peek_a_full_status = cutlass.Boolean(1)
+                    if a_consumer_state.count < k_tile_cnt:
+                        peek_a_full_status = a_pipeline.consumer_try_wait(a_consumer_state)
+
                 b_consumer_state.reset_count()
-                peek_a_full_status = cutlass.Boolean(1)
                 peek_b_full_status = cutlass.Boolean(1)
-                if a_consumer_state.count < k_tile_cnt and is_leader_cta:
-                    peek_a_full_status = a_pipeline.consumer_try_wait(a_consumer_state)
                 if b_consumer_state.count < k_tile_cnt and is_leader_cta:
                     peek_b_full_status = b_pipeline.consumer_try_wait(b_consumer_state)
 
@@ -1677,7 +1866,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     tile_info[2],
                 )
 
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                # Get accumulator stage index
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_producer_state.phase ^ 1
+                else:
+                    acc_stage_index = acc_producer_state.index
+
+                tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
                 # Apply TMEM pointer offset hack when cta_tile_shape_n=192 or
                 # cta_tile_shape_n=64
@@ -1692,8 +1887,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     )
                     shifted_ptr = cute.recast_ptr(
                         acc_tmem_ptr
-                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + self.num_accumulator_tmem_cols
+                        + self.num_sfa_tmem_cols
                         + offset,
                         dtype=self.sf_dtype,
                     )
@@ -1703,8 +1898,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
                         acc_tmem_ptr
-                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + self.num_accumulator_tmem_cols
+                        + self.num_sfa_tmem_cols
                         + offset,
                         dtype=self.sf_dtype,
                     )
@@ -1729,7 +1924,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
-                        a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
+                        if cutlass.const_expr(self.use_2cta_instrs):
+                            a_sync_transform_pipeline.consumer_wait(
+                                a_sync_transform_consumer_state, peek_a_sync_transform_full_status
+                            )
+                        else:
+                            a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
                         b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
 
                         #  Copy SFA/SFB from smem to tmem
@@ -1787,16 +1987,31 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                         # Async arrive AB buffer empty
                         a_pipeline.consumer_release(a_consumer_state)
+                        if cutlass.const_expr(self.use_2cta_instrs):
+                            a_sync_transform_pipeline.consumer_release(
+                                a_sync_transform_consumer_state
+                            )
                         b_pipeline.consumer_release(b_consumer_state)
 
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
-                    a_consumer_state.advance()
-                    b_consumer_state.advance()
-                    peek_a_full_status = cutlass.Boolean(1)
-                    if a_consumer_state.count < k_tile_cnt:
-                        if is_leader_cta:
+                    if cutlass.const_expr(self.use_2cta_instrs):
+                        a_sync_transform_consumer_state.advance()
+                        peek_a_sync_transform_full_status = cutlass.Boolean(1)
+                        if a_sync_transform_consumer_state.count < k_tile_cnt:
+                            if is_leader_cta:
+                                peek_a_sync_transform_full_status = (
+                                    a_sync_transform_pipeline.consumer_try_wait(
+                                        a_sync_transform_consumer_state
+                                    )
+                                )
+                        a_consumer_state.advance()
+                    else:
+                        a_consumer_state.advance()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        if a_consumer_state.count < k_tile_cnt:
                             peek_a_full_status = a_pipeline.consumer_try_wait(a_consumer_state)
 
+                    b_consumer_state.advance()
                     peek_b_full_status = cutlass.Boolean(1)
                     if b_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
@@ -1965,9 +2180,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     )
                 ]
 
+                # Get accumulator stage index
+                if cutlass.const_expr(self.overlapping_accum):
+                    acc_stage_index = acc_consumer_state.phase
+                    reverse_subtile = (
+                        cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
+                    )
+                else:
+                    acc_stage_index = acc_consumer_state.index
+
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
 
                 if cutlass.const_expr(self.generate_sfc):
                     # (T2R, T2R_M, T2R_N, RestM, RestN)
@@ -1996,17 +2220,35 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # up * silu(gate)
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
                 for subtile_idx in cutlass.range(0, subtile_cnt, 2):
+                    real_subtile_idx = subtile_idx // 2
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if reverse_subtile:
+                            real_subtile_idx = (
+                                self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
+                                - 1
+                                - subtile_idx // 2
+                            )
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, subtile_idx)]
-                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, subtile_idx + 1)]
+                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
+                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
 
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+
+                    #
+                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
+                    #
+                    if cutlass.const_expr(self.overlapping_accum):
+                        if subtile_idx // 2 == self.iter_acc_early_release_in_epilogue:
+                            # Fence for TMEM load
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
                     acc_vec_gate = tTR_rAcc_gate.load()
@@ -2081,7 +2323,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         # Assume subtile partitioned always happens on n dimension
                         sfc_subtile_idx_mn = (
                             tile_info[0] * self.epi_tile_cnt[0],
-                            tile_info[1] * self.epi_tile_cnt[1] + subtile_idx // 2,
+                            tile_info[1] * self.epi_tile_cnt[1] + real_subtile_idx,
                         )
                         tCgSFC = tCgSFC_mn[
                             (
@@ -2201,7 +2443,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Store C to shared memory
                     #
                     num_prev_subtiles = num_prev_subtiles + 1
-                    c_buffer = (num_prev_subtiles + subtile_idx // 2) % self.num_c_stage
+                    c_buffer = num_prev_subtiles % self.num_c_stage
 
                     cute.copy(
                         tiled_copy_r2s,
@@ -2221,7 +2463,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx // 2)],
+                            bSG_gC[(None, real_subtile_idx)],
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
@@ -2231,9 +2473,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
+                if cutlass.const_expr(not self.overlapping_accum):
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
@@ -2515,10 +2758,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Start with total smem per CTA (capacity / occupancy)
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B stage
-        # cute.printf("num_smem_capacity: {}, occupancy: {}, "
-        #             "mbar_helpers_bytes: {}, c_bytes: {}",
-        #             num_smem_capacity, occupancy, mbar_helpers_bytes, c_bytes)
-        # cute.printf("ab_bytes_per_stage: {}", ab_bytes_per_stage)
         num_ab_stage = (
             num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
         ) // ab_bytes_per_stage
@@ -2706,15 +2945,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
-        # TODO: Currently we don't support m major output for Float4E2M1FN,
-        # Need to support it in the future.
         if c_dtype is cutlass.Float4E2M1FN and c_major == "m":
             is_valid = False
         return is_valid
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(
-        use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         m_aligned: cutlass.Int64,
@@ -2736,6 +2972,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         is_valid = True
 
+        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape
         if not (
             (not use_2cta_instrs and mma_tiler_mn[0] in [64, 128])
@@ -2768,7 +3005,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # The contiguous layout means the aligned data is stored in a contiguous manner.
         # It can't handle runtime oob when alignment is not align with the tile_M,
         # since the problem shape of TMA store can't be changed at runtime.
-        if cluster_tiler_m not in [64, 128, 256]:
+        if cluster_tiler_m not in [128, 256]:
             is_valid = False
 
         # Check if m_aligned is a multiple of cluster_tiler_m
@@ -2864,8 +3101,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
-        :param use_2cta_instrs: Whether to use 2 CTA groups
-        :type use_2cta_instrs: bool
         :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
@@ -2903,10 +3138,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             can_implement = False
 
-        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape and cluster shape
         if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m_aligned
+            mma_tiler_mn, cluster_shape_mn, m_aligned
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment

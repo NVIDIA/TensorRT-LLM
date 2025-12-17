@@ -443,7 +443,6 @@ class PipelineCpAsyncUmma(PipelineAsync):
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         defer_sync: bool = False,
-        enable_cp_async: bool = False,
     ):
         """Creates and initializes a new PipelineCpAsyncUmma instance.
 
@@ -459,8 +458,6 @@ class PipelineCpAsyncUmma(PipelineAsync):
         :type cta_layout_vmnk: cute.Layout, optional
         :param defer_sync: Whether to defer the sync
         :type defer_sync: bool, optional
-        :param enable_cp_async: Whether to enable cp.async instructions
-        :type enable_cp_async: bool, optional
         :raises ValueError: If barrier_storage is not a cute.Pointer instance
         :return: A new PipelineCpAsyncUmma instance configured with the provided parameters
         :rtype: PipelineCpAsyncUmma
@@ -470,7 +467,7 @@ class PipelineCpAsyncUmma(PipelineAsync):
                 f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
             )
 
-        producer_type = PipelineOp.AsyncLoad if enable_cp_async else PipelineOp.AsyncThread
+        producer_type = PipelineOp.AsyncLoad
         consumer_type = PipelineOp.TCGen05Mma
 
         producer = (producer_type, producer_group)
