@@ -602,12 +602,11 @@ def _remove_dead_inplace_nodes_in_region(
     def target(n: torch.fx.Node) -> bool:
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
-    try:
-        node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+    node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+    if node_to_remove:
         graph.erase_node(node_to_remove)
         return True
-    except RuntimeError:
-        return False
+    return False
 
 
 class MatchMoePattern(BaseTransform):
@@ -920,12 +919,12 @@ class MatchBmmMoePattern(BaseTransform):
         input_hidden_states = repeat_node.args[0]
 
         # Trace back from routing_weight to find topk
-        try:
-            topk_node, _ = bfs(
-                routing_weight_node,
-                lambda n: is_op(n, torch.ops.aten.topk),
-                attr_next="all_input_nodes",
-            )
+        topk_node, _ = bfs(
+            routing_weight_node,
+            lambda n: is_op(n, torch.ops.aten.topk),
+            attr_next="all_input_nodes",
+        )
+        if topk_node:
             router_logits = topk_node.args[0] if topk_node.args else None
             if not router_logits:
                 return None
@@ -936,8 +935,7 @@ class MatchBmmMoePattern(BaseTransform):
             k_value = topk_node.args[1]
             if k_value != 1:
                 return None
-
-        except RuntimeError:
+        else:
             return None
 
         return (input_hidden_states, topk_node)
