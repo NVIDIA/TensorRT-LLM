@@ -165,12 +165,6 @@ class ShardingTransformConfig(TransformConfig):
                     config.clear()
                     continue
 
-            if "head_dim" not in config:
-                ad_logger.debug("Sharding config does not contain head_dim. Skipping.")
-                # invalidate the config
-                config.clear()
-                continue
-
             if "tp_plan" not in config or config["tp_plan"] is None or len(config["tp_plan"]) == 0:
                 ad_logger.debug("Sharding config does not contain tp_plan. Skipping.")
                 # invalidate the config
@@ -2445,8 +2439,11 @@ def detect_sharding_from_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
-                cur_node_index = linear_nodes.index(lin_node)
-                layer_subgraph = get_layer_after_linear_node(linear_nodes, cur_node_index)
+                if config in ["colwise", "mamba"]:
+                    cur_node_index = linear_nodes.index(lin_node)
+                    layer_subgraph = get_layer_after_linear_node(
+                        linear_nodes, [cur_node_index - 1], enforce_strict_linear_history=False
+                    )
                 if config == "colwise":
                     _process_column_sharding(
                         layer_subgraph=layer_subgraph,

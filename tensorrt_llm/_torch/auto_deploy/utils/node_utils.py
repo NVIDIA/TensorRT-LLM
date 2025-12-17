@@ -749,6 +749,7 @@ def get_layer_after_linear_node(
     linear_nodes: List[Node],
     terminating_indices: List[int],
     match_on_shapes: bool = True,
+    enforce_strict_linear_history: bool = True,
 ) -> LayerSubgraph:
     """
     Get the next model layer.
@@ -844,11 +845,13 @@ def get_layer_after_linear_node(
     )
     # get all opening linear nodes
     opening_linear_nodes = list(filtered_nodes(backward_subgraph, filter_condition))
-    # opening nodes must succeed last terminating node
-    last_terminating_index = terminating_indices[-1]
-    opening_linear_nodes = [
-        n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
-    ]
+
+    if enforce_strict_linear_history:
+        # opening nodes must succeed last terminating node
+        last_terminating_index = terminating_indices[-1]
+        opening_linear_nodes = [
+            n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
+        ]
 
     # subgraph_nodes should not include opening nodes.
     # the entire layer =  opening_nodes + subgraph_nodes + terminating_node,
@@ -899,11 +902,13 @@ def get_layer_after_linear_node(
         terminating_index = (
             start_lin_index + len(opening_linear_nodes) + len(intermediate_lin_nodes)
         )
-    if terminating_index < len(linear_nodes):
-        assert linear_nodes[terminating_index] == terminating_linear_node, (
-            "ill-formed layer subgraph"
-        )
-    terminating_indices.append(terminating_index)
+
+    if enforce_strict_linear_history:
+        if terminating_index < len(linear_nodes):
+            assert linear_nodes[terminating_index] == terminating_linear_node, (
+                "ill-formed layer subgraph"
+            )
+        terminating_indices.append(terminating_index)
     # otherwise, we are done. We processed the last linear node.
     return layer_subgraph
 
