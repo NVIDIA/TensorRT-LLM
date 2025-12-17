@@ -257,7 +257,7 @@ class RequestGroupKey(Generic[GenericStrategyKeyType]):
 class RequestGroupValue:
     indices: torch.Tensor
     strategies: list[Strategy]
-    speculation_needs_probs: torch.Tensor
+    speculation_needs_probs_indices: torch.Tensor
     need_processed_logprobs: torch.Tensor
     need_raw_logprobs: torch.Tensor
 
@@ -266,7 +266,7 @@ class RequestGroupValue:
             (
                 self.indices,
                 self.strategies,
-                self.speculation_needs_probs,
+                self.speculation_needs_probs_indices,
                 self.need_processed_logprobs,
                 self.need_raw_logprobs,
             )
@@ -286,7 +286,7 @@ class RequestGroupValueWithMetadata(RequestGroupValue):
             (
                 self.indices,
                 self.strategies,
-                self.speculation_needs_probs,
+                self.speculation_needs_probs_indices,
                 self.need_processed_logprobs,
                 self.need_raw_logprobs,
                 self.metadata,
@@ -422,7 +422,7 @@ def _group_requests_by_strategy_key(
     # NB: Client code relies on request indices in returned torch.Tensor being sorted.
     group_dict: dict[
         tuple[GenericStrategyKeyType, bool],
-        tuple[list[int], list[Strategy], list[bool], list[bool], list[bool]],
+        tuple[list[int], list[Strategy], list[int], list[bool], list[bool]],
     ] = defaultdict(lambda: ([], [], [], [], []))
 
     for req_index, req in enumerate(requests):
@@ -441,7 +441,8 @@ def _group_requests_by_strategy_key(
         group_dict_entry = group_dict[(strategy_key, needs_probs)]
         group_dict_entry[0].append(req_index)
         group_dict_entry[1].append(strategy)
-        group_dict_entry[2].append(speculation_needs_probs)
+        if speculation_needs_probs:
+            group_dict_entry[2].append(req_index)
         group_dict_entry[3].append(need_processed_logprobs)
         group_dict_entry[4].append(need_raw_logprobs)
     return {
@@ -451,8 +452,8 @@ def _group_requests_by_strategy_key(
         ): RequestGroupValue(
             indices=torch.tensor(indices, pin_memory=pin_memory, dtype=torch.int32),
             strategies=strategies,
-            speculation_needs_probs=torch.tensor(
-                speculation_needs_probs_list, pin_memory=pin_memory, dtype=torch.bool
+            speculation_needs_probs_indices=torch.tensor(
+                speculation_needs_probs_list, pin_memory=pin_memory, dtype=torch.int32
             ),
             need_processed_logprobs=torch.tensor(
                 need_processed_logprobs_list, pin_memory=pin_memory, dtype=torch.bool
@@ -1899,7 +1900,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             grouped_requests_with_metadata[key] = RequestGroupValueWithMetadata(
                 indices=value.indices,
                 strategies=value.strategies,
-                speculation_needs_probs=value.speculation_needs_probs,
+                speculation_needs_probs_indices=value.speculation_needs_probs_indices,
                 need_processed_logprobs=value.need_processed_logprobs,
                 need_raw_logprobs=value.need_raw_logprobs,
                 metadata=metadata,
@@ -2338,7 +2339,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         for (strategy_key, needs_probs), (
             group_req_indices,
             group_strategies,
-            group_speculation_needs_probs,
+            group_speculation_needs_probs_indices,
             group_need_processed_logprobs,
             group_need_raw_logprobs,
             group_metadata,
@@ -2483,17 +2484,13 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 )
 
             # Set LlmRequest.py_target_probs
-            if needs_probs:
+            if group_speculation_needs_probs_indices.size(0) > 0:
                 assert group_softmax_cuda is not None
                 current_offset = 0
-                requests_with_speculation_need_probs = [
-                    (req_idx, steps)
-                    for local_req_idx, (req_idx, steps) in enumerate(
-                        zip(group_req_indices, req_num_generated_tokens[group_req_indices].tolist())
-                    )
-                    if group_speculation_needs_probs[local_req_idx]
-                ]
-                for req_idx, steps in requests_with_speculation_need_probs:
+                for req_idx, steps in zip(
+                    group_speculation_needs_probs_indices.tolist(),
+                    req_num_steps[group_speculation_needs_probs_indices].tolist(),
+                ):
                     next_offset = current_offset + steps
                     # using view avoids copy
                     requests[req_idx].py_target_probs = group_softmax_cuda[
