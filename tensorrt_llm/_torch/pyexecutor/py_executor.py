@@ -1503,17 +1503,8 @@ class PyExecutor:
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
-            self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
-
-    def _kv_connector_refresh_unfinished_tasks(self, scheduled_batch):
-        if self.kv_connector_manager and \
-            scheduled_batch.batch_size == 0 and \
-            os.environ.get('TENSORRT_LLM_USE_FLEXKV') == '1':
-
-            self.kv_connector_manager.handle_metadata()
-            time.sleep(0.01)
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
@@ -1546,12 +1537,13 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                self._kv_connector_refresh_unfinished_tasks(scheduled_batch)
                 self._terminate_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
                 can_queue, _ = self._can_queue(scheduled_batch)
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1767,7 +1759,6 @@ class PyExecutor:
                             can_forward = True
 
                 self._terminate_requests(scheduled_batch.paused_requests)
-                self._kv_connector_refresh_unfinished_tasks(scheduled_batch)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
