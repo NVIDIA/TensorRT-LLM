@@ -620,8 +620,7 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         pending_requests: RequestList = []
 
-        # REQUIRED BINDING: `get_max_resource_count()` -> int
-        max_blocks = self.kv_cache_manager.get_max_resource_count()
+        max_blocks = self.kv_cache_manager.max_num_blocks
         reserved_blocks = 0
 
         # --- Pass 1: Running Requests (Priority) ---
@@ -642,9 +641,7 @@ class PyCapacityScheduler:
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
-                # REQUIRED BINDING: `get_needed_resource_to_completion(req)` -> int
-                # This calculates blocks needed for full generation length, not just next step.
-                needed = self.kv_cache_manager.get_needed_resource_to_completion(
+                needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
                     request)
 
                 if reserved_blocks + needed > max_blocks:
@@ -670,7 +667,7 @@ class PyCapacityScheduler:
             if (request.state == LlmRequestState.CONTEXT_INIT
                     or request.state == LlmRequestState.DISAGG_GENERATION_INIT):
 
-                needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(
+                needed_blocks = self.kv_cache_manager.get_remaining_blocks_to_completion(
                     request)
 
                 if needed_blocks <= available_blocks:
