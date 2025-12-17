@@ -684,9 +684,16 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # 2. Initialize Python MicroBatch Scheduler
         py_chunk_config = None
         if ctx_chunk_config:
-            # Convert StrEnum to our Python Enum
-            policy_enum = ChunkingPolicy.EQUAL_PROGRESS if ctx_chunk_config[
-                0] == tb_internal.batch_manager.ChunkingPolicy.EQUAL_PROGRESS else ChunkingPolicy.FIRST_COME_FIRST_SERVED
+            # Fix: Use string comparison to identify the policy.
+            # This works regardless of whether the input is a Python Enum, C++ Binding Enum, or String.
+            input_policy = ctx_chunk_config[0]
+
+            if "EQUAL_PROGRESS" in str(input_policy):
+                policy_enum = ChunkingPolicy.EQUAL_PROGRESS
+            else:
+                # Default to FCFS for FIRST_COME_FIRST_SERVED or others
+                policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
+
             py_chunk_config = ContextChunkingConfig(policy_enum,
                                                     ctx_chunk_config[1])
 
