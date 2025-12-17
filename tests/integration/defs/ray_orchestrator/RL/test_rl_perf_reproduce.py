@@ -16,7 +16,6 @@ def test_rl_perf_reproduce(llm_venv, tp_size, num_instances):
     script_path = (
         integration_path() / "defs" / "ray_orchestrator" / "RL" / "run_rl_perf_reproduce.py"
     )
-    math_txt_path = integration_path() / "test_input_files" / "math.txt"
     model_dir = f"{llm_models_root()}/Qwen2-7B-Instruct"
 
     if tp_size == 2:
