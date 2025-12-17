@@ -8,3 +8,7 @@ deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 77.00
   - spec_dec_algo: MTP
     accuracy: 77.00
+google/gemma-3-1b-it:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 63.00
