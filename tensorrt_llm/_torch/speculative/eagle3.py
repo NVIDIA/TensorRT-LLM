@@ -401,7 +401,7 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Predict draft tokens
         next_draft_tokens = []
-        for i in range(self.max_draft_len):
+        for i in range(self.max_draft_len - len(draft_model.parallel_draft_heads)):
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_len + 1)).long()
@@ -422,7 +422,7 @@ class Eagle3OneModelWorker(nn.Module):
                                                     draft_step=i)
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
-
+            final_hidden_states = hidden_states
             # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
             # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
             # then the following step can use regular decoding mode to generate 1 tokens per step.
@@ -471,6 +471,13 @@ class Eagle3OneModelWorker(nn.Module):
                 "attn_metadata": attn_metadata,
                 "spec_metadata": spec_metadata,
             }
+        for layer in draft_model.parallel_draft_heads:
+            med_out = layer.model(hidden_states=final_hidden_states)
+            logits = layer.logits_processor(med_out, layer.lm_head,
+                                            attn_metadata, True)
+            new_draft_token = self.draft_decoder(logits, layer)
+            next_draft_tokens.append(new_draft_token)
+
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
