@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.scaffolding import Controller, ScaffoldingLlm, TRTOpenaiWorker, Worker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.load_generation_strategy import ConcurrentStrategy
-from tensorrt_llm.scaffolding.task import GenerationTask, TaskStatus
+from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, TaskStatus, UserMessage
 
 # =============================================================================
 # Type Aliases
@@ -709,56 +709,28 @@ class MultiroundChatWorker(Worker):
         conv_id = self.conv_ids[request_index % len(self.conv_ids)]
         return conv_id, self.conversations[conv_id]
 
-    def _build_chat_prompt(self, messages: List[Dict[str, str]]) -> str:
-        """Build a chat prompt from message history."""
-        try:
-            if hasattr(self.tokenizer, "apply_chat_template"):
-                return self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-        except Exception:
-            pass
-
-        prompt_parts = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "user":
-                prompt_parts.append(f"User: {content}")
-            elif role == "assistant":
-                prompt_parts.append(f"Assistant: {content}")
-            elif role == "system":
-                prompt_parts.append(f"System: {content}")
-
-        return "\n\n".join(prompt_parts) + "\n\nAssistant:"
-
-    async def multiround_handler(self, task: GenerationTask) -> TaskStatus:
-        """Process a turn in a multi-round conversation."""
-        if task.customized_result_fields is None:
-            task.customized_result_fields = {}
-
+    async def multiround_handler(self, task: ChatTask) -> TaskStatus:
+        """Fill the task with the conversation data for the next turn."""
+        # Initialize the conversation state if it is not set
         conv_state = task.customized_result_fields.get("conversation_state")
-
         if conv_state is None:
             request_index = task.customized_result_fields.get("request_index", 0)
             conv_id, messages = self._get_conversation_for_request(request_index)
-
             conv_state = {
                 "conv_id": conv_id,
                 "messages": [m.copy() for m in messages],
                 "current_turn_index": 0,
-                "history": [],
             }
             task.customized_result_fields["conversation_state"] = conv_state
 
         current_turn = conv_state["current_turn_index"]
         messages = conv_state["messages"]
-        history = conv_state["history"]
 
         if current_turn >= len(messages):
             task.customized_result_fields["is_conversation_end"] = True
             return TaskStatus.SUCCESS
 
+        # Skip the assistant messages
         while current_turn < len(messages):
             msg = messages[current_turn]
             if msg["role"] == "user":
@@ -775,41 +747,16 @@ class MultiroundChatWorker(Worker):
             if delay > 0:
                 await asyncio.sleep(delay)
 
-        user_msg = messages[current_turn]
-        history.append(user_msg)
-
-        task.input_str = self._build_chat_prompt(history)
+        task.add_message(UserMessage(messages[current_turn]["content"]))
         task.max_tokens = self.max_output_tokens
-        task.output_str = None
-        task.output_tokens = None
 
         conv_state["current_turn_index"] = current_turn + 1
         task.customized_result_fields["is_conversation_end"] = False
 
         return TaskStatus.SUCCESS
 
-    async def post_generation_handler(self, task: GenerationTask) -> TaskStatus:
-        """Update conversation history after generation."""
-        if task.customized_result_fields is None:
-            return TaskStatus.SUCCESS
-
-        conv_state = task.customized_result_fields.get("conversation_state")
-        if conv_state is None:
-            return TaskStatus.SUCCESS
-
-        if task.output_str:
-            conv_state["history"].append({"role": "assistant", "content": task.output_str})
-
-        current_turn = conv_state["current_turn_index"]
-        messages = conv_state["messages"]
-
-        if current_turn < len(messages) and messages[current_turn]["role"] == "assistant":
-            conv_state["current_turn_index"] = current_turn + 1
-
-        return TaskStatus.SUCCESS
-
     task_handlers = {
-        GenerationTask: multiround_handler,
+        ChatTask: multiround_handler,
     }
 
 
@@ -825,7 +772,11 @@ class MultiroundChatController(Controller):
         self.max_rounds = max_rounds
 
     def generate(self, prompt: str):
-        task = GenerationTask.create_from_prompt(prompt)
+        task = ChatTask.create_from_prompt(
+            None,  # Pseudo user prompt
+            [SystemMessage(content="You are a helpful assistant.")],
+            None,  # No tools
+        )
         yield from self.process([task])
         return task.create_scaffolding_output()
 
