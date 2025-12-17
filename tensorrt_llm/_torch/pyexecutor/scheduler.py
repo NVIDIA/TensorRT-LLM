@@ -470,12 +470,13 @@ class PyCapacityScheduler:
     ):
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
+        self.kv_cache_manager_cpp = kv_cache_manager.impl
         self.policy = scheduler_policy
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
 
         # [FIX]: Get this from config!
-        self.default_window_size = self.kv_cache_manager.max_sequence_length
+        self.default_window_size = self.kv_cache_manager.max_seq_len
 
     def schedule_request(
         self, active_requests: RequestList
@@ -496,7 +497,7 @@ class PyCapacityScheduler:
         # [FIX] Track free blocks manually in Python because C++ internal transactional state
         # is not exposed/updated via bindings for tentative scheduling.
         # get_num_free_blocks() returns the physical free blocks.
-        current_free_blocks = self.kv_cache_manager.get_num_free_blocks()
+        current_free_blocks = self.kv_cache_manager_cpp.get_num_free_blocks()
 
         cached_active_list = list(active_requests)
         idx = 0
@@ -524,14 +525,14 @@ class PyCapacityScheduler:
             needed_blocks = 0
             if is_disagg_init:
                 # Disagg Init needs special calculation usually same as Context
-                needed_blocks = self.kv_cache_manager.get_needed_blocks_one_step(
+                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     req, False, self.default_window_size)
             elif req.state == LlmRequestState.GENERATION_IN_PROGRESS:
                 # Generation usually needs 0 or 1 block depending on boundary
-                needed_blocks = self.kv_cache_manager.get_needed_blocks_one_step(
+                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     req, False, self.default_window_size)
             elif req.state == LlmRequestState.CONTEXT_INIT:
-                needed_blocks = self.kv_cache_manager.get_needed_blocks_one_step(
+                needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     req, False, self.default_window_size)
 
             if current_free_blocks >= needed_blocks:
@@ -555,7 +556,7 @@ class PyCapacityScheduler:
                 paused_requests.append(victim_req)
 
                 # [FIX] Reclaim victim's blocks manually
-                victim_needed = self.kv_cache_manager.get_needed_blocks_one_step(
+                victim_needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     victim_req, False, self.default_window_size)
                 current_free_blocks += victim_needed
 
@@ -590,10 +591,10 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         pending_requests: RequestList = []
 
-        max_blocks = self.kv_cache_manager.max_num_blocks
+        max_blocks = self.kv_cache_manager_cpp.max_num_blocks
 
         # [FIX] Must subtract used blocks to get available for *new* allocations
-        used_blocks = self.kv_cache_manager.get_used_num_blocks()
+        used_blocks = self.kv_cache_manager_cpp.get_used_num_blocks()
 
         # We track 'reserved' as blocks we PLAN to add on top of 'used'
         available_blocks = max_blocks - used_blocks
@@ -614,7 +615,7 @@ class PyCapacityScheduler:
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
                 # [FIX] Added window_size argument
-                needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
                     request, self.default_window_size)
 
                 if needed > available_blocks:
@@ -635,7 +636,7 @@ class PyCapacityScheduler:
                     or request.state == LlmRequestState.DISAGG_GENERATION_INIT):
 
                 # [FIX] Added window_size argument
-                needed_blocks = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
                     request, self.default_window_size)
 
                 if needed_blocks <= available_blocks:

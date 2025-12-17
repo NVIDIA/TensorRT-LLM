@@ -816,8 +816,7 @@ def create_py_executor_instance(
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            kv_cache_manager=kv_cache_manager.impl
-            if kv_cache_manager is not None else None,
+            kv_cache_manager=kv_cache_manager,
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config)
     else:
