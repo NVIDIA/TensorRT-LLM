@@ -1535,7 +1535,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 - name: scratch-trt-llm-data
                   nfs:
                     server: 10.117.145.14
-                    path: /vol/scratch1/scratch.michaeln_blossom
+                    path: /vol/scratch19/scratch.trt_llm_data
     """
     if (type.contains("6000d") || type.contains("gh200")) {
         // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
