@@ -730,7 +730,7 @@ def create_py_executor(
     _adjust_torch_mem_fraction()
 
     if mapping.rank == 0:
-        logger.info(f"LLM Args:\n{llm_args}")
+        logger.info(f"LLM Args:\n{llm_args} ")
 
     logger.info(f"{llm_args}")
 
