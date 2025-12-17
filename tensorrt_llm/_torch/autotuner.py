@@ -1444,9 +1444,6 @@ class AutoTuner:
                                custom_op: str):
         """Synchronize cache data across all ranks."""
         if not self._is_distributed():
-            logger.warning(
-                f"[AutoTuner] Not in distributed environment, skipping synchronization"
-            )
             return
 
         if strategy == DistributedTuningStrategy.BROADCAST:
