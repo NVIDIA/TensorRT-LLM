@@ -99,6 +99,9 @@ class ModelDrafter(Drafter):
 
         # Create accumulator for draft tokens in non-CDL mode
         self.draft_tokens_accumulator: Dict[int, List[int]] = {}
+
+        # Initialize draft latency tracking for specDecodingStats
+        self.last_draft_latency_ms = 0.0
         # Track previous draft batch for overlap scheduling
         self.previous_draft_batch: Optional[ScheduledRequests] = None
         self.previous_draft_outputs: Optional[Any] = None
@@ -809,6 +812,8 @@ class ModelDrafter(Drafter):
                 - Updated target inputs or None
                 - Draft sample state or None
         """
+        import time
+        draft_start_time = time.time()
 
         self.disable_overlap_scheduler = False
         if target_inputs is None:
@@ -896,6 +901,10 @@ class ModelDrafter(Drafter):
         self.previous_draft_outputs = previous_draft_state
         self.previous_scheduled_batch = scheduled_batch
 
+        # Record draft latency for stats
+        draft_end_time = time.time()
+        self.last_draft_latency_ms = (draft_end_time - draft_start_time) * 1e3
+
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
         self,
@@ -909,6 +918,9 @@ class ModelDrafter(Drafter):
             scheduled_requests: The scheduled requests for this iteration
             resource_manager: The resource manager for this iteration
         """
+        import time
+        draft_start_time = time.time()
+
         self.disable_overlap_scheduler = True
         if not self.draft_model_engine:
             raise ValueError("Draft model engine is not set")
@@ -936,6 +948,10 @@ class ModelDrafter(Drafter):
                 # Clean up draft_seq_slot_manager resources
                 for req in draft_batch.all_requests():
                     self.draft_seq_slot_manager.free_resources(req)
+                # Record draft latency before returning
+                draft_end_time = time.time()
+                self.last_draft_latency_ms = (draft_end_time -
+                                              draft_start_time) * 1e3
                 return
 
             if self.guided_decoder is not None:
@@ -958,6 +974,11 @@ class ModelDrafter(Drafter):
             for req_id, tokens in self.draft_tokens_accumulator.items():
                 target_model_req = self.req_id_to_old_request[req_id]
                 target_model_req.py_draft_tokens = tokens
+
+            # Record draft latency for stats
+            draft_end_time = time.time()
+            self.last_draft_latency_ms = (draft_end_time -
+                                          draft_start_time) * 1e3
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
