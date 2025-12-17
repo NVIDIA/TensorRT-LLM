@@ -1690,7 +1690,7 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
-// Test for race condition during destructor with DP enabled (2 context ranks, 4 generation ranks)
+// Test for race condition during destructor (2 context ranks, 4 generation ranks, DP disabled)
 INSTANTIATE_TEST_CASE_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest,
     testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(16),
