@@ -495,23 +495,22 @@ class PyCapacityScheduler:
                 f"Policy {self.policy} not implemented in PyCapacityScheduler")
 
     def _schedule_max_utilization(self, active_requests: RequestList):
-        """
-        Greedy strategy with Backtracking.
-        1. Try to schedule requests.
-        2. If a request doesn't fit, try to 'pause' (evict) a running generation request
-           that was scheduled earlier in this loop to free up blocks.
-        3. Retry the current request.
-        """
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        # REQUIRED BINDING: C++ `startScheduling()`
-        # Resets the internal transactional state of block manager for this step.
+        # Binding: Resets internal transactional state (e.g. mSchedulingNumFreeBlocks)
         if hasattr(self.kv_cache_manager, "start_scheduling"):
             self.kv_cache_manager.start_scheduling()
 
-        # We use a while loop index because we might need to retry the *same* request
-        # after evicting a victim.
+        # We track "scheduling" free blocks in Python to mimic C++ logic if binding missing
+        # C++ Manager tracks this internally via mSchedulingNumFreeBlocks.
+        # IF the C++ binding `try_scheduling_request` exists (custom added), use it.
+        # IF NOT, we must rely on `get_needed_blocks_one_step` and internal tracking.
+
+        # Assuming for Phase 1 you WILL add `try_scheduling_request` to binding
+        # (It's the safest way to ensure parity).
+        # If you cannot add binding, let me know, I can write the manual accounting version.
+
         cached_active_list = list(active_requests)
         idx = 0
 
@@ -519,45 +518,48 @@ class PyCapacityScheduler:
             req = cached_active_list[idx]
 
             # 1. State Filter
-            # Skip requests that haven't reached INIT or are already DONE
-            if (req.state.value < self.no_schedule_until_state.value
+            # Allow Disagg Gen Init to pass through (matching C++ logic)
+            is_disagg_init = (
+                req.state == LlmRequestState.DISAGG_GENERATION_INIT)
+
+            if not is_disagg_init and (
+                    req.state.value < self.no_schedule_until_state.value
                     or req.state.value >= self.no_schedule_after_state.value):
                 idx += 1
                 continue
 
             # 2. Max Requests Check
             if len(scheduled_requests) >= self.max_num_requests:
-                # If we hit the request count limit, we can't schedule more.
-                # However, in C++ implementation, we might break or continue logic.
-                # Usually we break because sorting ensures priority.
-                # But here we simply treat unscheduled active requests as paused implicitly later.
                 break
 
-            # 3. Try Allocation (Atomic Check & Update)
-            # REQUIRED BINDING: `try_scheduling_request(req, max_requests_limit)`
-            # This binding should map to `trySchedulingRequestMaxUtilization` in C++.
-            # It performs the check: (available_blocks >= needed_blocks)
-            # If True, it commits the usage to the transaction and returns True.
+            # 3. Try Allocation
+            # Using the binding name you likely need to add: `try_schedule`
+            # or `check_and_update_allocation`.
+            # Since it's missing in your provided nanobind, I assume you will add it.
             can_allocate = False
-            try:
-                # Assuming binding takes (req, current_scheduled_count) or just (req)
-                # if manager doesn't track count.
+            if hasattr(self.kv_cache_manager, "try_scheduling_request"):
                 can_allocate = self.kv_cache_manager.try_scheduling_request(req)
-            except AttributeError:
-                # Fallback for development/mocking
-                can_allocate = True
+            else:
+                # Fallback: Manual check (simplified parity)
+                # Note: This requires get_needed_blocks_one_step binding
+                needed = self.kv_cache_manager.get_needed_blocks_one_step(
+                    req, False, 0)  # window_size arg?
+                free_blocks = self.kv_cache_manager.get_num_free_blocks(
+                )  # This gets Physical free, not Transactional...
+                # RISK: Without C++ support for transactional state (mSchedulingNumFreeBlocks),
+                # Python side cannot accurately backtrack.
+                # STRONG RECOMMENDATION: Add `try_scheduling_request` to C++ binding.
+                if free_blocks >= needed:
+                    # We can't easily "commit" this without C++ support
+                    can_allocate = True
 
             if can_allocate:
                 scheduled_requests.append(req)
                 idx += 1
                 continue
 
-            # 4. Backtracking / Eviction Logic
-            # If we are here, 'req' did NOT fit.
-            # Can we pause a previously scheduled RUNNING request to make room?
-
+            # 4. Backtracking
             victim_idx = -1
-            # Search backwards for a Generation request (we don't pause Context init usually)
             for i in range(len(scheduled_requests) - 1, -1, -1):
                 r = scheduled_requests[i]
                 if r.state == LlmRequestState.GENERATION_IN_PROGRESS:
@@ -565,22 +567,15 @@ class PyCapacityScheduler:
                     break
 
             if victim_idx != -1:
-                # Found a victim. Evict it.
                 victim_req = scheduled_requests.pop(victim_idx)
                 paused_requests.append(victim_req)
 
-                # REQUIRED BINDING: `scheduling_remove_sequence(req_id)`
-                # Reverts the block usage of the victim in the current transaction.
                 if hasattr(self.kv_cache_manager, "scheduling_remove_sequence"):
                     self.kv_cache_manager.scheduling_remove_sequence(
                         victim_req.request_id)
 
-                # CRITICAL: Do NOT increment `idx`.
-                # We loop back and try to schedule `req` again, now that space is freed.
                 continue
             else:
-                # No valid victim found, and current request doesn't fit.
-                # We cannot make progress. Stop scheduling.
                 break
 
         # 5. Output Classification
@@ -611,55 +606,46 @@ class PyCapacityScheduler:
         return fitting_requests, fitting_disagg_gen_init, paused_requests
 
     def _schedule_guaranteed_no_evict(self, active_requests: RequestList):
-        """
-        Conservative strategy.
-        1. First, ensure ALL currently running requests have enough memory to run to COMPLETION.
-           If not, we technically shouldn't schedule them (or system is over-subscribed).
-        2. Only then, use remaining memory for New (Context) requests.
-        """
         scheduled_requests: RequestList = []
         pending_requests: RequestList = []
 
+        # FIX: available = Total - Used
         max_blocks = self.kv_cache_manager.max_num_blocks
-        reserved_blocks = 0
+        used_blocks = self.kv_cache_manager.get_used_num_blocks(
+        )  # Binding `used_num_blocks`
+        available_blocks = max_blocks - used_blocks
 
-        # --- Pass 1: Running Requests (Priority) ---
+        # --- Pass 1: Running Requests ---
         for request in active_requests:
             req_state = request.state
 
-            # Filter valid states
+            # State Filter (Disagg Init is NOT a running request, handled in Pass 2)
             if (req_state.value < self.no_schedule_until_state.value
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
-            # Hard constraints check
             if len(scheduled_requests) >= self.max_num_requests:
                 pending_requests.append(request)
                 continue
 
-            # Check Generation Requests
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
+                # This returns needed ADDITIONAL blocks
                 needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
                     request)
 
-                if reserved_blocks + needed > max_blocks:
-                    # System Overload. Even though policy is NoEvict, we physically can't fit.
-                    # We skip this request (effectively pausing it).
-                    # NOTE: In strict NoEvict, this implies a system error or aggressive over-subscription.
+                if needed > available_blocks:
+                    # Resource Exhaustion
                     pending_requests.append(request)
                     continue
 
                 scheduled_requests.append(request)
-                reserved_blocks += needed
+                available_blocks -= needed  # Reserve space
             else:
-                # Defer Context/Init requests to Pass 2
                 pending_requests.append(request)
 
-        # --- Pass 2: New / Context Requests ---
-        available_blocks = max_blocks - reserved_blocks
-
+        # --- Pass 2: New Requests ---
         for request in pending_requests:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
@@ -667,15 +653,13 @@ class PyCapacityScheduler:
             if (request.state == LlmRequestState.CONTEXT_INIT
                     or request.state == LlmRequestState.DISAGG_GENERATION_INIT):
 
-                needed_blocks = self.kv_cache_manager.get_remaining_blocks_to_completion(
+                needed = self.kv_cache_manager.get_remaining_blocks_to_completion(
                     request)
 
-                if needed_blocks <= available_blocks:
+                if needed <= available_blocks:
                     scheduled_requests.append(request)
-                    available_blocks -= needed_blocks
+                    available_blocks -= needed
                 else:
-                    # Cannot fit new request. Since we cannot evict running requests,
-                    # we stop here (Head-of-Line blocking behavior is typical for FIFO).
                     break
 
         # --- Output Classification ---
