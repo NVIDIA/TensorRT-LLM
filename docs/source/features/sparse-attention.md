@@ -1,6 +1,6 @@
 # Sparse Attention
 
-- [Motivation](#motivation)
+- [Background and Motivation](#background-and-motivation)
 - [Quick Start](#quick-start)
   - [Python API](#python-api)
   - [Usage with trtllm-bench or trtllm-serve](#usage-with-trtllm-bench-or-trtllm-serve)
