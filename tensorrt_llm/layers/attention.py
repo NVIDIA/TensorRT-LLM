@@ -702,7 +702,9 @@ class Attention(Module):
                           is_buffer=True))
         else:
 
-            def register_rope_params(rotary_base, names_to_register, is_local=False):
+            def register_rope_params(rotary_base,
+                                     names_to_register,
+                                     is_local=False):
                 # Rotary const weights.
                 embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
                     max_position_embeddings,
@@ -1146,10 +1148,12 @@ class Attention(Module):
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 rotary_embedding_base=self.rotary_embedding_base
                 if not self.is_local else self.rotary_embedding_base_local,
-                rotary_embedding_scale_type=self.rotary_embedding_scale_type if not self.is_local else RotaryScalingType.none,
+                rotary_embedding_scale_type=self.rotary_embedding_scale_type
+                if not self.is_local else RotaryScalingType.none,
                 rotary_embedding_short_m_scale=attention_params.short_mscale,
                 rotary_embedding_long_m_scale=attention_params.long_mscale,
-                rotary_embedding_scale=self.rotary_embedding_scale if not self.is_local else 1.0,
+                rotary_embedding_scale=self.rotary_embedding_scale
+                if not self.is_local else 1.0,
                 rotary_embedding_max_positions=self.max_position_embeddings,
                 rotary_embedding_original_max_positions=self.
                 original_max_position_embeddings,

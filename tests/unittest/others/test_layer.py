@@ -2115,7 +2115,6 @@ class TestLayer(unittest.TestCase):
                                    atol=atol,
                                    rtol=rtol)
 
-
     def test_gemma3_local_attention_rope_scaling(self):
         """
         Test that local attention layers in Gemma3 do NOT apply rope scaling,
@@ -2126,8 +2125,7 @@ class TestLayer(unittest.TestCase):
         ensures that local attention layers get scale=1.0 and scale_type=none,
         while global layers get the configured scaling.
         """
-        from tensorrt_llm.functional import (PositionEmbeddingType,
-                                             RotaryScalingType)
+        from tensorrt_llm.functional import PositionEmbeddingType
         from tensorrt_llm.layers.attention import Attention
 
         # Create a mock config similar to Gemma3 27B with rope_scaling
@@ -2138,10 +2136,7 @@ class TestLayer(unittest.TestCase):
             max_position_embeddings = 32768
             position_embedding_type = PositionEmbeddingType.rope_gpt_neox
             rotary_base = 1000000.0
-            rotary_scaling = {
-                "factor": 8.0,
-                "rope_type": "linear"
-            }
+            rotary_scaling = {"factor": 8.0, "rope_type": "linear"}
             rotary_pct = 1.0
             # Local attention uses a different base frequency
             rope_local_base_freq = 10000.0
@@ -2202,8 +2197,8 @@ class TestLayer(unittest.TestCase):
         # For local attention with scale=1.0 and base=10000:
         # inv_freq = 1.0 / (10000 ** (arange(0, dim, 2) / dim))
         dim = config.head_size  # rotary_embedding_dim = head_size * rotary_pct = 128
-        expected_local_inv_freq = 1.0 / (config.rope_local_base_freq**(
-            np.arange(0, dim, 2) / dim))
+        expected_local_inv_freq = 1.0 / (config.rope_local_base_freq
+                                         **(np.arange(0, dim, 2) / dim))
 
         np.testing.assert_allclose(
             local_inv_freq,
@@ -2214,14 +2209,15 @@ class TestLayer(unittest.TestCase):
         # For global attention with linear scaling (factor=8.0):
         # scale = 1.0 / 8.0 = 0.125
         # inv_freq = 0.125 / (1000000 ** (arange(0, dim, 2) / dim))
-        expected_global_inv_freq = (1.0 / 8.0) / (config.rotary_base**(
-            np.arange(0, dim, 2) / dim))
+        expected_global_inv_freq = (1.0 / 8.0) / (config.rotary_base**
+                                                  (np.arange(0, dim, 2) / dim))
 
         np.testing.assert_allclose(
             global_inv_freq,
             expected_global_inv_freq,
             rtol=1e-5,
-            err_msg="Global rotary_inv_freq should be computed WITH linear scaling")
+            err_msg=
+            "Global rotary_inv_freq should be computed WITH linear scaling")
 
 
 if __name__ == '__main__':
