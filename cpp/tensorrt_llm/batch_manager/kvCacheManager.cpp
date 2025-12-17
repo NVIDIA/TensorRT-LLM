@@ -1429,7 +1429,6 @@ void WindowBlockManager::addSequence(
     if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
     {
         numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
-        llmRequest.setNumConnectorMatchedTokens(numConnectorMatchedTokens);
     }
 
     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numConnectorMatchedTokens, getTokensPerBlock());
