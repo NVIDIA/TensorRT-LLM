@@ -2666,14 +2666,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                            tokens_per_block=64)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                            tokens_per_block=64)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2743,8 +2741,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                        tokens_per_block=64)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
@@ -2807,8 +2804,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
-                                        tokens_per_block=64)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None

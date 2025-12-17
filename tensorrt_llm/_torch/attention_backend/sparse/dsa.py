@@ -768,7 +768,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         if self.num_generations > 0:
-            tokens_per_block = self.kv_cache_manager.indexer_k_cache_tokens_per_block
             torch.cumsum(
                 self.kv_lens_cuda[self.num_contexts:self.
                                   num_seqs],  # num_contexts should be 0
@@ -783,14 +782,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 out=self.gen_cached_token_indptr[1:self.num_generations + 1])
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                tokens_per_block, self.num_sms)
+                self.kv_cache_manager.tokens_per_block, self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                  non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
         super().update_for_spec_dec()
-        self.kv_cache_manager.indexer_k_cache_tokens_per_block
         # host
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
@@ -993,7 +991,7 @@ class Indexer(nn.Module):
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
         head_dim = metadata.kv_cache_manager.index_head_dim
-        tokens_per_block = metadata.kv_cache_manager.indexer_k_cache_tokens_per_block
+        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         total_tokens = seq_lens.sum().item()
@@ -1704,9 +1702,6 @@ class DSACacheManager(KVCacheManager):
     ) -> None:
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
-        # Use a fixed tokens_per_block for indexer k cache due to DG kernel constraints
-        self.indexer_k_cache_tokens_per_block = 64
-        assert self.indexer_k_cache_tokens_per_block == tokens_per_block, "tokens_per_block must be set to 64 for DeepSeek v3.2"
 
         super().__init__(
             kv_cache_config,
@@ -1732,7 +1727,7 @@ class DSACacheManager(KVCacheManager):
         self.num_blocks = self.blocks_in_primary_pool
 
         # Indexer K cache pool for DSA attention
-        # Shape: [num_blocks, self.indexer_k_cache_tokens_per_block * (index_head_dim + scale_size)]
+        # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
         # Store FP8-quantized k values from the indexer
         self.indexer_k_cache_pool_per_layer = [
@@ -1759,9 +1754,7 @@ class DSACacheManager(KVCacheManager):
         config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
         index_head_dim = sparse_attn_config.index_head_dim
-        tokens_per_block = kwargs['tokens_per_block']
         quant_block_size = 128
-        indexer_k_cache_tokens_per_block = 64
 
         # get kv cache dtype bytes
         mem_per_token = 2
@@ -1781,8 +1774,7 @@ class DSACacheManager(KVCacheManager):
         # 1 for K, others for indexer K cache
         head_dim_factor = (index_head_dim +
                            index_head_dim // quant_block_size * 4) / head_dim
-        tokens_per_block_factor = indexer_k_cache_tokens_per_block / tokens_per_block
-        kv_factor = 1 + head_dim_factor * tokens_per_block_factor
+        kv_factor = 1 + head_dim_factor
         mem_per_token *= kv_factor
         return mem_per_token
 
@@ -1790,8 +1782,7 @@ class DSACacheManager(KVCacheManager):
         # self.kv_factor for K, others for indexer K cache
         head_dim_factor = (self.index_head_dim + self.index_head_dim //
                            self.quant_block_size * 4) / self.head_dim
-        tokens_per_block_factor = self.indexer_k_cache_tokens_per_block / self.tokens_per_block
-        kv_factor = self.kv_factor + head_dim_factor * tokens_per_block_factor
+        kv_factor = self.kv_factor + head_dim_factor
         cache_size_per_token = math.ceil(
             kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
