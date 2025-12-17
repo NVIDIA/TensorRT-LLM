@@ -495,10 +495,14 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
+        # [FIX] Use get_kv_cache_stats() to get block counts safely
+        if hasattr(self.kv_cache_manager, "start_scheduling"):
+            self.kv_cache_manager.start_scheduling()
+
+        # Get snapshot of current state
+        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
         # Track free blocks manually in Python to simulate transactional state.
-        # get_num_free_blocks() returns the current physical free blocks.
-        # We subtract from this as we tentatively schedule requests.
-        current_free_blocks = self.kv_cache_manager_cpp.get_num_free_blocks()
+        current_free_blocks = stats.free_num_blocks
 
         cached_active_list = list(active_requests)
         idx = 0
@@ -507,7 +511,6 @@ class PyCapacityScheduler:
             req = cached_active_list[idx]
 
             # 1. State Filter
-            # Allow Disagg Gen Init to pass through (matching C++ logic)
             is_disagg_init = (
                 req.state == LlmRequestState.DISAGG_GENERATION_INIT)
 
@@ -522,14 +525,11 @@ class PyCapacityScheduler:
                 break
 
             # 3. Try Allocation (Python Manual Check)
-            # Use get_needed_blocks_one_step to calculate incremental need
             needed_blocks = 0
             if is_disagg_init:
-                # Disagg Init needs special calculation usually same as Context
                 needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     req, False, self.default_window_size)
             elif req.state == LlmRequestState.GENERATION_IN_PROGRESS:
-                # Generation usually needs 0 or 1 block depending on boundary
                 needed_blocks = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     req, False, self.default_window_size)
             elif req.state == LlmRequestState.CONTEXT_INIT:
@@ -537,15 +537,13 @@ class PyCapacityScheduler:
                     req, False, self.default_window_size)
 
             if current_free_blocks >= needed_blocks:
-                # Commit locally (transactional update)
+                # Commit locally
                 current_free_blocks -= needed_blocks
                 scheduled_requests.append(req)
                 idx += 1
                 continue
 
             # 4. Backtracking / Eviction Logic
-            # If current request doesn't fit, try to evict a previously scheduled
-            # GENERATION request to make room.
             victim_idx = -1
             for i in range(len(scheduled_requests) - 1, -1, -1):
                 r = scheduled_requests[i]
@@ -559,15 +557,14 @@ class PyCapacityScheduler:
                 paused_requests.append(victim_req)
 
                 # Reclaim victim's blocks manually
-                # We simply give back what we subtracted earlier for this victim.
                 victim_needed = self.kv_cache_manager_cpp.get_needed_blocks_one_step(
                     victim_req, False, self.default_window_size)
                 current_free_blocks += victim_needed
 
-                # Retry current req (do NOT increment idx)
+                # Retry current req without incrementing idx
                 continue
             else:
-                # No victim found, and current request doesn't fit. Stop.
+                # No victim found, and current request doesn't fit.
                 break
 
         # 5. Output Classification
@@ -581,7 +578,6 @@ class PyCapacityScheduler:
             if (req.state == LlmRequestState.GENERATION_IN_PROGRESS
                     and req.request_id not in scheduled_ids
                     and req.request_id not in evicted_ids):
-                # Request was running but dropped due to capacity/limit
                 paused_requests.append(req)
 
         for r in scheduled_requests:
@@ -596,10 +592,10 @@ class PyCapacityScheduler:
         scheduled_requests: RequestList = []
         pending_requests: RequestList = []
 
-        max_blocks = self.kv_cache_manager_cpp.max_num_blocks
-
-        # [FIX] Must subtract used blocks to get available for *new* allocations
-        used_blocks = self.kv_cache_manager_cpp.get_used_num_blocks()
+        # [FIX] Use get_kv_cache_stats() to fetch state atomically and robustly
+        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
+        max_blocks = stats.max_num_blocks
+        used_blocks = stats.used_num_blocks
 
         # We track 'reserved' as blocks we PLAN to add on top of 'used'
         available_blocks = max_blocks - used_blocks
@@ -619,19 +615,16 @@ class PyCapacityScheduler:
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
-                # [FIX] Added window_size argument
                 needed = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
                     request, self.default_window_size)
 
                 if needed > available_blocks:
-                    # System Overload (should ideally not happen in NoEvict)
                     pending_requests.append(request)
                     continue
 
                 scheduled_requests.append(request)
                 available_blocks -= needed
             else:
-                # Defer Context/Init requests to Pass 2
                 pending_requests.append(request)
 
         # --- Pass 2: New / Context Requests ---
@@ -642,7 +635,6 @@ class PyCapacityScheduler:
             if (request.state == LlmRequestState.CONTEXT_INIT
                     or request.state == LlmRequestState.DISAGG_GENERATION_INIT):
 
-                # [FIX] Added window_size argument
                 needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
                     request, self.default_window_size)
 
@@ -650,7 +642,6 @@ class PyCapacityScheduler:
                     scheduled_requests.append(request)
                     available_blocks -= needed_blocks
                 else:
-                    # Cannot fit new request. Stop.
                     break
 
         # --- Output Classification ---
@@ -660,7 +651,6 @@ class PyCapacityScheduler:
 
         scheduled_ids = set(r.request_id for r in scheduled_requests)
 
-        # Identify running requests that were implicitly paused
         for req in active_requests:
             if (req.request_id not in scheduled_ids
                     and req.state == LlmRequestState.GENERATION_IN_PROGRESS):
