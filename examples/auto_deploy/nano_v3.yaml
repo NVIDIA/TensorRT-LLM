@@ -45,6 +45,9 @@ transforms:
       cache_config:
         # mamba_dtype: float32
         mamba_dtype: null
+  gather_logits_before_lm_head:
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: true
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
