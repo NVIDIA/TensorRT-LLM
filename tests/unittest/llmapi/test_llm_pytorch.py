@@ -568,6 +568,7 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
     assert similar(output.outputs[0].text, reference)
 
 
+@skip_ray  # https://nvbugs/5682551
 @skip_gpu_memory_less_than_80gb
 def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
     skip_fp8_pre_ada(use_fp8=True)
