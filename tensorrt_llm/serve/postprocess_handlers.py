@@ -31,14 +31,76 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
-                              PromptTokensDetails, ResponsesRequest,
-                              ResponsesResponse, StreamOptions, ToolCall,
-                              UsageInfo, to_disaggregated_params)
+                              KvCacheMetrics, PerfMetrics, PromptTokensDetails,
+                              SpeculativeDecodingMetrics, ResponsesRequest,
+                              ResponsesResponse, StreamOptions,
+                              TimingMetrics, ToolCall, UsageInfo,
+                              to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
 from .tool_parser.core_types import ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
 
 # yapf: enable
+
+
+def build_perf_metrics(request_perf_metrics) -> Optional[PerfMetrics]:
+    """Build PerfMetrics from request_perf_metrics object.
+
+    Args:
+        request_perf_metrics: The request performance metrics from the executor.
+
+    Returns:
+        PerfMetrics object or None if request_perf_metrics is None.
+    """
+    if request_perf_metrics is None:
+        return None
+
+    timing_metrics = None
+    if request_perf_metrics.timing_metrics:
+        tm = request_perf_metrics.timing_metrics
+        timing_metrics = TimingMetrics(
+            arrival_time=tm.arrival_time.total_seconds()
+            if tm.arrival_time else None,
+            first_scheduled_time=tm.first_scheduled_time.total_seconds()
+            if tm.first_scheduled_time else None,
+            first_token_time=tm.first_token_time.total_seconds()
+            if tm.first_token_time else None,
+            last_token_time=tm.last_token_time.total_seconds()
+            if tm.last_token_time else None,
+            kv_cache_transfer_start=tm.kv_cache_transfer_start.total_seconds()
+            if tm.kv_cache_transfer_start else None,
+            kv_cache_transfer_end=tm.kv_cache_transfer_end.total_seconds()
+            if tm.kv_cache_transfer_end else None,
+            kv_cache_size=tm.kv_cache_size if tm.kv_cache_size else None,
+        )
+
+    kv_cache_metrics = None
+    if request_perf_metrics.kv_cache_metrics:
+        kv = request_perf_metrics.kv_cache_metrics
+        kv_cache_metrics = KvCacheMetrics(
+            num_total_allocated_blocks=kv.num_total_allocated_blocks,
+            num_new_allocated_blocks=kv.num_new_allocated_blocks,
+            num_reused_blocks=kv.num_reused_blocks,
+            num_missed_blocks=kv.num_missed_blocks,
+        )
+
+    speculative_decoding = None
+    if (request_perf_metrics.speculative_decoding and
+            request_perf_metrics.speculative_decoding.total_draft_tokens > 0):
+        sd = request_perf_metrics.speculative_decoding
+        speculative_decoding = SpeculativeDecodingMetrics(
+            acceptance_rate=sd.acceptance_rate,
+            total_accepted_draft_tokens=sd.total_accepted_draft_tokens,
+            total_draft_tokens=sd.total_draft_tokens,
+        )
+
+    return PerfMetrics(
+        first_iter=request_perf_metrics.first_iter,
+        last_iter=request_perf_metrics.last_iter,
+        timing_metrics=timing_metrics,
+        kv_cache_metrics=kv_cache_metrics,
+        speculative_decoding=speculative_decoding,
+    )
 
 
 @dataclass(kw_only=True)
@@ -378,10 +440,17 @@ def chat_response_post_processor(
         prompt_tokens_details=PromptTokensDetails(
             cached_tokens=rsp.cached_tokens),
     )
+
+    # Extract perf_metrics from the first output (all outputs share the same request metrics)
+    perf_metrics = None
+    if rsp.outputs and rsp.outputs[0].request_perf_metrics:
+        perf_metrics = build_perf_metrics(rsp.outputs[0].request_perf_metrics)
+
     response = ChatCompletionResponse(
         model=args.model,
         choices=choices,
         usage=usage,
+        perf_metrics=perf_metrics,
     )
     return response
 
@@ -543,9 +612,16 @@ def completion_response_post_processor(
                       total_tokens=completion_tokens + prompt_tokens,
                       prompt_tokens_details=PromptTokensDetails(
                           cached_tokens=rsp.cached_tokens))
+
+    # Extract perf_metrics from the first output (all outputs share the same request metrics)
+    perf_metrics = None
+    if rsp.outputs and rsp.outputs[0].request_perf_metrics:
+        perf_metrics = build_perf_metrics(rsp.outputs[0].request_perf_metrics)
+
     response = CompletionResponse(choices=choices,
                                   model=args.model,
-                                  usage=usage)
+                                  usage=usage,
+                                  perf_metrics=perf_metrics)
     return response
 
 
@@ -580,6 +656,12 @@ def chat_harmony_post_processor(
         num_prompt_tokens=args.num_prompt_tokens,
         tokenizer=args.tokenizer,
     )
+
+    # Add perf_metrics from the first output (all outputs share the same request metrics)
+    if rsp.outputs and rsp.outputs[0].request_perf_metrics:
+        response.perf_metrics = build_perf_metrics(
+            rsp.outputs[0].request_perf_metrics)
+
     return response
 
 
