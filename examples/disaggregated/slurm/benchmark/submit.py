@@ -8,9 +8,9 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from datetime import datetime
 from typing import Any, Dict, List
-import traceback
 
 import yaml
 
@@ -99,7 +99,7 @@ def allocate_gpus(
                 "nodes": {},
             }
             assign_server(server_allocation, world_size, gpus_per_node)
-            server_allocations[server_type][i]=server_allocation
+            server_allocations[server_type][i] = server_allocation
 
     assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
@@ -108,29 +108,25 @@ def allocate_gpus(
 
     return allocations
 
+
 def convert_allocations_to_server_config(allocations, server_port=8333):
-    generation_servers={}
-    context_servers={}
-    server_hostname=None
+    generation_servers = {}
+    context_servers = {}
+    server_hostname = None
     for server_type in allocations.keys():
-        num_servers=len(allocations[server_type])
-        urls=[]
+        num_servers = len(allocations[server_type])
+        urls = []
         for server_id in allocations[server_type].keys():
-            instance=allocations[server_type][server_id]
-            urls.append(f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
+            instance = allocations[server_type][server_id]
+            urls.append(
+                f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
         if server_type == "GEN":
-            generation_servers={
-                'num_instances': num_servers,
-                'urls': urls
-            }
-            server_hostname=urls[0].split(':')[0]
-            if allocations[server_type][server_id]['port']==server_port:
-                server_port+=1 # Avoid port conflict
+            generation_servers = {'num_instances': num_servers, 'urls': urls}
+            server_hostname = urls[0].split(':')[0]
+            if allocations[server_type][server_id]['port'] == server_port:
+                server_port += 1  # Avoid port conflict
         elif server_type == "CTX":
-            context_servers={
-                'num_instances': num_servers,
-                'urls': urls
-            }
+            context_servers = {'num_instances': num_servers, 'urls': urls}
 
     server_config = {
         'backend': 'pytorch',
@@ -140,6 +136,7 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
         'generation_servers': generation_servers
     }
     return server_config
+
 
 def submit_job(config, log_dir, dry_run):
     # Extract configurations
@@ -192,15 +189,13 @@ def submit_job(config, log_dir, dry_run):
     # Calculate nodes based on world sizes
     ctx_tp_size = worker_config['ctx'].get('tensor_parallel_size', 1)
     ctx_cp_size = worker_config['ctx'].get('context_parallel_size', 1)
-    ctx_pp_size = worker_config['ctx'].get('pipeline_parallel_size',
-                                                     1)
+    ctx_pp_size = worker_config['ctx'].get('pipeline_parallel_size', 1)
     ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
 
     gen_tp_size = worker_config['gen'].get('tensor_parallel_size', 1)
     gen_cp_size = worker_config['gen'].get('context_parallel_size', 1)
-    gen_pp_size = worker_config['gen'].get('pipeline_parallel_size',
-                                                     1)
+    gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
 
@@ -211,8 +206,7 @@ def submit_job(config, log_dir, dry_run):
     isl = benchmark_config['input_length']
     osl = benchmark_config['output_length']
     gen_batch_size = worker_config['gen']['max_batch_size']
-    gen_enable_attention_dp = worker_config['gen'][
-        'enable_attention_dp']
+    gen_enable_attention_dp = worker_config['gen']['enable_attention_dp']
 
     if log_dir is None:
         # Create base log directory path
@@ -221,8 +215,8 @@ def submit_job(config, log_dir, dry_run):
                                 f"{date_prefix}/{isl}-{osl}")
 
         # Get eplb num_slots for gen worker
-        load_balancer_config = worker_config['gen'].get(
-            'moe_config', {}).get('load_balancer', {})
+        load_balancer_config = worker_config['gen'].get('moe_config', {}).get(
+            'load_balancer', {})
         if isinstance(load_balancer_config, str):
             with open(load_balancer_config, 'r') as f:
                 load_balancer_config = yaml.safe_load(f)
@@ -230,7 +224,8 @@ def submit_job(config, log_dir, dry_run):
 
         # Get mtp_size from gen config's speculative_config
         mtp_size = worker_config['gen'].get('speculative_config',
-                                {}).get('num_nextn_predict_layers', 0)
+                                            {}).get('num_nextn_predict_layers',
+                                                    0)
 
         # Determine directory suffix based on attention_dp
         if gen_enable_attention_dp:
@@ -279,8 +274,9 @@ def submit_job(config, log_dir, dry_run):
     for server_type in allocations.keys():
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
-            cuda_devices = ",".join(
-                [str(device) for device in list(allocation["nodes"].values())[0]])
+            cuda_devices = ",".join([
+                str(device) for device in list(allocation["nodes"].values())[0]
+            ])
             cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
             cmd = [
                 "srun -l",
@@ -302,8 +298,8 @@ def submit_job(config, log_dir, dry_run):
                 str(slurm_config['numa_bind']).lower(),
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
-                profiling_config['gen_profile_range']
-                if server_type == "GEN" else profiling_config['ctx_profile_range'],
+                profiling_config['gen_profile_range'] if server_type == "GEN"
+                else profiling_config['ctx_profile_range'],
                 gen_config_path if server_type == "GEN" else ctx_config_path,
                 f'"{cur_worker_env_var}"',
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
