@@ -40,8 +40,8 @@ num_gen_servers=$6
 concurrency_list=$7
 streaming=$8
 log_path=$9
-hostname=$10
-port=$11
+hostname=${10}
+port=${11}
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
