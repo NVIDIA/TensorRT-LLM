@@ -630,26 +630,33 @@ class PyCapacityScheduler:
 
     def _schedule_guaranteed_no_evict(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
+        # Separate pending lists to match C++ priority logic
         pending_requests: RequestList = []
+        pending_disagg_requests: RequestList = []
 
-        # [FIX] Use get_kv_cache_stats() to fetch state atomically and robustly
         stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
         max_blocks = stats.max_num_blocks
         used_blocks = stats.used_num_blocks
-
-        # We track 'reserved' as blocks we PLAN to add on top of 'used'
         available_blocks = max_blocks - used_blocks
 
         # --- Pass 1: Running Requests ---
         for request in active_requests:
             req_state = request.state
 
-            if (req_state.value < self.no_schedule_until_state.value
+            is_disagg_init = (
+                req_state == LlmRequestState.DISAGG_GENERATION_INIT)
+
+            if not is_disagg_init and (
+                    req_state.value < self.no_schedule_until_state.value
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
             if len(scheduled_requests) >= self.max_num_requests:
-                pending_requests.append(request)
+                # Still check state to sort into correct pending list
+                if is_disagg_init:
+                    pending_disagg_requests.append(request)
+                else:
+                    pending_requests.append(request)
                 continue
 
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
@@ -665,10 +672,19 @@ class PyCapacityScheduler:
                 scheduled_requests.append(request)
                 available_blocks -= needed
             else:
-                pending_requests.append(request)
+                # Add to pending lists based on type
+                if is_disagg_init:
+                    pending_disagg_requests.append(request)
+                else:
+                    pending_requests.append(request)
 
         # --- Pass 2: New / Context Requests ---
-        for request in pending_requests:
+        # C++ logic prioritizes Disagg Generation Init requests over standard Context Init
+        # So we iterate pending_disagg_requests FIRST, then pending_requests
+
+        all_pending = pending_disagg_requests + pending_requests
+
+        for request in all_pending:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
@@ -682,6 +698,7 @@ class PyCapacityScheduler:
                     scheduled_requests.append(request)
                     available_blocks -= needed_blocks
                 else:
+                    # Head-of-line blocking logic (standard in NoEvict)
                     break
 
         # --- Output Classification ---
