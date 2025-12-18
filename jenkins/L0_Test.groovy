@@ -1120,10 +1120,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Kill tail -f process
                     kill \$tailPid
                     # Check if the job failed or not
+                    sleep 5
+                    STATUS=\$(sacct -j \$jobId --format=State --noheader | head -n 1 | awk '{print \$1}')
                     EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
-                    if [ "\$EXIT_CODE" -ne 0 ]; then
-                        echo "Pytest failed in Slurm job \$jobId with exit code \$EXIT_CODE"
-                        exit \$EXIT_CODE
+                    if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
+                        echo "Pytest succeed in Slurm job \$jobId"
+                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
+                        exit 0
+                    else
+                        echo "Pytest failed in Slurm job \$jobId"
+                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
+                        exit 1
                     fi
                 """.replaceAll("(?m)^\\s*", "").trim()
                 pipeline.writeFile(file: scriptExecPathLocal, text: scriptExec)
