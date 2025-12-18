@@ -177,7 +177,8 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 
 
 def setup(app):
-    from helper import generate_examples, generate_llmapi, update_version
+    from helper import (generate_examples, generate_llmapi,
+                        generate_supported_models, update_version)
 
     try:
         from tensorrt_llm.llmapi.utils import tag_llm_params
@@ -189,6 +190,7 @@ def setup(app):
 
     generate_examples()
     generate_llmapi()
+    generate_supported_models()
     update_version()
 
 
