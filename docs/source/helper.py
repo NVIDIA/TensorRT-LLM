@@ -358,11 +358,12 @@ def update_version():
     docs_source_dir = Path(__file__).parent.resolve()
     md_files = list(docs_source_dir.rglob("*.md"))
 
-    # NOTE: We intentionally do NOT mutate docs sources during normal Sphinx builds.
-    # This helper is kept for workflows that explicitly opt-in (e.g., release docs),
-    # because rewriting files in-place is surprising for local dev and can cause
-    # unintended diffs (e.g., x.y.z placeholders becoming a specific tag).
-    if os.environ.get("TRTLLM_DOCS_REPLACE_CONTAINER_TAG", "0") != "1":
+    # NOTE: This helper mutates docs sources in-place (replacing the container tag
+    # placeholder) so that CI/pipeline builds don't publish docs with `x.y.z`.
+    #
+    # Local devs who prefer a no-diff Sphinx build can opt out:
+    #   TRTLLM_DOCS_REPLACE_CONTAINER_TAG=0 make -C docs html
+    if os.environ.get("TRTLLM_DOCS_REPLACE_CONTAINER_TAG", "1") != "1":
         return
 
     for file_path in md_files:
