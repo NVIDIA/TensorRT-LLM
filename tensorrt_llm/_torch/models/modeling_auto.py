@@ -14,6 +14,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         config: ModelConfig[TConfig],
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
         model_arch = config.pretrained_config.architectures[0]
+        has_eagle3_suffix = "Eagle3" in model_arch
         if config.mm_encoder_only:
             vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
                 model_arch)
@@ -29,7 +30,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         # avoid nasty stuff like this.
         model_arch = model_arch.replace("Eagle3",
                                         "")  # Strip the appended EAGLE3
-        if hasattr(config.pretrained_config, "draft_vocab_size"):
+        if hasattr(config.pretrained_config,
+                   "draft_vocab_size") or has_eagle3_suffix:
             model_arch = "EAGLE3" + model_arch
         if model_arch in (
                 "DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"
