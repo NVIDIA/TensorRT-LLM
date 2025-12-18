@@ -481,6 +481,7 @@ class PyCapacityScheduler:
     def schedule_request(
         self, active_requests: RequestList
     ) -> Tuple[RequestList, RequestList, RequestList]:
+
         # 1. Handle No KV Cache Manager -> MaxRequestsScheduler Logic
         if self.kv_cache_manager is None:
             return self._schedule_max_requests(active_requests)
@@ -495,16 +496,17 @@ class PyCapacityScheduler:
                 f"Policy {self.policy} not implemented in PyCapacityScheduler")
 
     def _schedule_max_requests(self, active_requests: RequestList):
-        """
-        Simple scheduler that only limits the maximum number of requests.
-        Used when no KV Cache Manager is available.
-        """
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
         for req in active_requests:
             # 1. State Filter
-            if (req.state.value < self.no_schedule_until_state.value
+            # Allow Disagg Gen Init to pass through
+            is_disagg_init = (
+                req.state == LlmRequestState.DISAGG_GENERATION_INIT)
+
+            if not is_disagg_init and (
+                    req.state.value < self.no_schedule_until_state.value
                     or req.state.value >= self.no_schedule_after_state.value):
                 continue
 
@@ -513,35 +515,24 @@ class PyCapacityScheduler:
                 break
 
             # 3. Schedule valid states
-            # Note: LlmRequest properties might vary, using state enum checks for safety
             if (req.state == LlmRequestState.ENCODER_INIT
                     or req.state == LlmRequestState.CONTEXT_INIT
-                    or req.state == LlmRequestState.GENERATION_IN_PROGRESS):
+                    or req.state == LlmRequestState.GENERATION_IN_PROGRESS
+                    or is_disagg_init):
                 scheduled_requests.append(req)
 
-        # Output Classification (Standard for all schedulers)
-        fitting_requests = []
-        fitting_disagg_gen_init = []
-
-        for r in scheduled_requests:
-            if r.state == LlmRequestState.DISAGG_GENERATION_INIT:
-                fitting_disagg_gen_init.append(r)
-            else:
-                fitting_requests.append(r)
-
-        return fitting_requests, fitting_disagg_gen_init, paused_requests
+        return self._classify_output(active_requests, scheduled_requests,
+                                     paused_requests)
 
     def _schedule_max_utilization(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        # [FIX] Use get_kv_cache_stats() to get block counts safely
         if hasattr(self.kv_cache_manager, "start_scheduling"):
             self.kv_cache_manager.start_scheduling()
 
-        # Get snapshot of current state
-        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
         # Track free blocks manually in Python to simulate transactional state.
+        stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
         current_free_blocks = stats.free_num_blocks
 
         cached_active_list = list(active_requests)
@@ -551,6 +542,7 @@ class PyCapacityScheduler:
             req = cached_active_list[idx]
 
             # 1. State Filter
+            # Allow Disagg Gen Init to pass through (matching C++ logic)
             is_disagg_init = (
                 req.state == LlmRequestState.DISAGG_GENERATION_INIT)
 
@@ -577,7 +569,6 @@ class PyCapacityScheduler:
                     req, False, self.default_window_size)
 
             if current_free_blocks >= needed_blocks:
-                # Commit locally
                 current_free_blocks -= needed_blocks
                 scheduled_requests.append(req)
                 idx += 1
@@ -604,35 +595,18 @@ class PyCapacityScheduler:
                 # Retry current req without incrementing idx
                 continue
             else:
-                # No victim found, and current request doesn't fit.
+                # No victim found, and current request doesn't fit. Stop.
                 break
 
-        # 5. Output Classification
-        fitting_requests = []
-        fitting_disagg_gen_init = []
-
-        scheduled_ids = set(r.request_id for r in scheduled_requests)
-        evicted_ids = set(r.request_id for r in paused_requests)
-
-        for req in active_requests:
-            if (req.state == LlmRequestState.GENERATION_IN_PROGRESS
-                    and req.request_id not in scheduled_ids
-                    and req.request_id not in evicted_ids):
-                paused_requests.append(req)
-
-        for r in scheduled_requests:
-            if r.state == LlmRequestState.DISAGG_GENERATION_INIT:
-                fitting_disagg_gen_init.append(r)
-            else:
-                fitting_requests.append(r)
-
-        return fitting_requests, fitting_disagg_gen_init, paused_requests
+        return self._classify_output(active_requests, scheduled_requests,
+                                     paused_requests)
 
     def _schedule_guaranteed_no_evict(self, active_requests: RequestList):
         scheduled_requests: RequestList = []
-        # Separate pending lists to match C++ priority logic
-        pending_requests: RequestList = []
+
+        # Pending lists separated to enforce priority: Disagg Init > Context Init
         pending_disagg_requests: RequestList = []
+        pending_context_requests: RequestList = []
 
         stats = self.kv_cache_manager_cpp.get_kv_cache_stats()
         max_blocks = stats.max_num_blocks
@@ -642,23 +616,24 @@ class PyCapacityScheduler:
         # --- Pass 1: Running Requests ---
         for request in active_requests:
             req_state = request.state
-
             is_disagg_init = (
                 req_state == LlmRequestState.DISAGG_GENERATION_INIT)
 
+            # Filter valid states (Allow Disagg Init)
             if not is_disagg_init and (
                     req_state.value < self.no_schedule_until_state.value
                     or req_state.value >= self.no_schedule_after_state.value):
                 continue
 
+            # Capacity Check
             if len(scheduled_requests) >= self.max_num_requests:
-                # Still check state to sort into correct pending list
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
-                    pending_requests.append(request)
+                    pending_context_requests.append(request)
                 continue
 
+            # Prioritize Running Requests (Generation)
             if (req_state == LlmRequestState.GENERATION_IN_PROGRESS
                     or req_state == LlmRequestState.GENERATION_TO_COMPLETE):
 
@@ -666,50 +641,54 @@ class PyCapacityScheduler:
                     request, self.default_window_size)
 
                 if needed > available_blocks:
-                    pending_requests.append(request)
+                    # If running req doesn't fit, skip it (effectively pause)
+                    pending_context_requests.append(request)
                     continue
 
                 scheduled_requests.append(request)
                 available_blocks -= needed
             else:
-                # Add to pending lists based on type
+                # Non-running requests go to pending
                 if is_disagg_init:
                     pending_disagg_requests.append(request)
                 else:
-                    pending_requests.append(request)
+                    pending_context_requests.append(request)
 
         # --- Pass 2: New / Context Requests ---
-        # C++ logic prioritizes Disagg Generation Init requests over standard Context Init
-        # So we iterate pending_disagg_requests FIRST, then pending_requests
-
-        all_pending = pending_disagg_requests + pending_requests
+        # Critical: Process Disagg Init requests BEFORE standard Context Init
+        all_pending = pending_disagg_requests + pending_context_requests
 
         for request in all_pending:
             if len(scheduled_requests) >= self.max_num_requests:
                 break
 
-            if (request.state == LlmRequestState.CONTEXT_INIT
-                    or request.state == LlmRequestState.DISAGG_GENERATION_INIT):
+            # Note: For Disagg Init, get_remaining_blocks_to_completion calculates
+            # full prompt + generation needs, which is what we want.
+            needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
+                request, self.default_window_size)
 
-                needed_blocks = self.kv_cache_manager_cpp.get_remaining_blocks_to_completion(
-                    request, self.default_window_size)
+            if needed_blocks <= available_blocks:
+                scheduled_requests.append(request)
+                available_blocks -= needed_blocks
+            else:
+                # Head-of-line blocking (Standard NoEvict behavior)
+                break
 
-                if needed_blocks <= available_blocks:
-                    scheduled_requests.append(request)
-                    available_blocks -= needed_blocks
-                else:
-                    # Head-of-line blocking logic (standard in NoEvict)
-                    break
+        return self._classify_output(active_requests, scheduled_requests, [])
 
-        # --- Output Classification ---
+    def _classify_output(self, active_requests, scheduled_requests,
+                         explicit_paused_requests):
         fitting_requests = []
         fitting_disagg_gen_init = []
-        paused_requests = []
+        paused_requests = list(explicit_paused_requests)
 
         scheduled_ids = set(r.request_id for r in scheduled_requests)
+        paused_ids = set(r.request_id for r in paused_requests)
 
+        # Identify running requests that were implicitly paused (dropped)
         for req in active_requests:
             if (req.request_id not in scheduled_ids
+                    and req.request_id not in paused_ids
                     and req.state == LlmRequestState.GENERATION_IN_PROGRESS):
                 paused_requests.append(req)
 
