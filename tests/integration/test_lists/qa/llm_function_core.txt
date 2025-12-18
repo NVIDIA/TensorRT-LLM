@@ -629,6 +629,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_tr
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_trtllm_eagle3]
 accuracy/test_llm_api_pytorch.py::TestKanana_Instruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency]
+accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[4gpus]
+accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[8gpus]
 accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
