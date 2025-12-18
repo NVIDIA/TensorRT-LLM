@@ -308,12 +308,6 @@ def parse_arguments():
         default=1000,
         help="Average for lognormal prefix distribution (default: 1000)",
     )
-    parser.add_argument(
-        "--multiround_common_prefix_tokens",
-        type=int,
-        default=0,
-        help="Common prefix tokens shared across all conversations (default: 0)",
-    )
 
     # -------------------------------------------------------------------------
     # User delay distribution (simulates user thinking/typing time)
