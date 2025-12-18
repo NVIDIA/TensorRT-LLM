@@ -53,6 +53,20 @@ cleanup_on_failure() {
     exit 1
 }
 
+replace_placeholder() {
+    file_path="$1"
+    all_nodes_str="$2"
+    IFS=',' read -r -a node_array <<< "$all_nodes_str"
+    for i in "${!node_array[@]}"; do
+        current_val="${node_array[$i]}"
+        placeholder="<node${i}_placeholder>"
+
+        # Use sed to replace the placeholder with the value in-place
+        sed -i "s|$placeholder|$current_val|g" "${file_path}"
+        echo "Replaced $placeholder with $current_val in ${file_path}"
+    done
+}
+
 env > ${full_logdir}/environment.txt
 
 # Start container
@@ -122,15 +136,9 @@ all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
 start_server_cmds_file=${full_logdir}/start_server_cmds.sh
-IFS=',' read -r -a node_array <<< "$all_nodes_str"
-for i in "${!node_array[@]}"; do
-    current_val="${node_array[$i]}"
-    placeholder="<node${i}_placeholder>"
-
-    # Use sed to replace the placeholder with the value in-place
-    sed -i "s|$placeholder|$current_val|g" "${start_server_cmds_file}"
-    echo "Replaced $placeholder with $current_val"
-done
+replace_placeholder ${start_server_cmds_file} ${all_nodes_str}
+server_config_file=${full_logdir}/server_config.yaml
+replace_placeholder ${server_config_file} ${all_nodes_str}
 
 # start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_server_cmds_file}..."
