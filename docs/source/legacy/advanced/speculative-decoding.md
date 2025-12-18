@@ -171,7 +171,7 @@ The EAGLE approach enhances the single-model Medusa method by predicting and ver
 
 Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine(EAGLE-1 and EAGLE-2 are both supported). Please, visit the [EAGLE README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md) for information about building and running the model.
 
-> **EAGLE3 compatibility note.** TensorRT-LLM implements the EAGLE3 draft head, which expects the pretrained config to expose a `draft_vocab_size` attribute. Draft heads built for other runtimes (for example, community EAGLE heads that work in vLLM) may omit this field and will raise an error such as `AttributeError: 'LlamaConfig' object has no attribute 'draft_vocab_size'`. Use an EAGLE3-compatible draft head or add the `draft_vocab_size` entry to the config before exporting to TensorRT-LLM. When the field is missing, TensorRT-LLM now assumes the draft vocabulary matches the target vocabulary (the value of `vocab_size`) and emits a warning; this mirrors the implicit behavior in runtimes like vLLM that reuse the target vocabulary for the draft head. If your draft head was trained with a different vocabulary, set `draft_vocab_size` explicitly so the converter can build the correct tokenizer table.
+> **EAGLE3 note.** If the EAGLE3 draft head config omits `draft_vocab_size`, TensorRT-LLM assumes it matches `vocab_size` and emits a warning. Set `draft_vocab_size` explicitly if the draft head uses a different vocabulary.
 
 ### Disaggregated Serving
 
