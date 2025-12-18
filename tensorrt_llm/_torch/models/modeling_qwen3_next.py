@@ -1017,9 +1017,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             ssm_states[state_indices_p] = torch.zeros((),
                                                       dtype=ssm_states.dtype,
                                                       device=ssm_states.device)
-            # conv_states[state_indices_p] = torch.zeros(
-            #     (), dtype=conv_states.dtype,
-            #     device=conv_states.device)  # not necessary
 
         def _compute_projected_states_qkvz():
             return self.in_proj_qkvz(hidden_states)
