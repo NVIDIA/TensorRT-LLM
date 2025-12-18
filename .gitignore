@@ -40,7 +40,7 @@ tensorrt_llm/libs
 tensorrt_llm/bindings.*.so
 tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/**/*.pyi
-tensorrt_llm/tensorrt_llm_transfer_agent_binding*.so
+tensorrt_llm/tensorrt_llm_transfer_agent_binding.*.so
 tensorrt_llm/tensorrt_llm_transfer_agent_binding.pyi
 tensorrt_llm/tensorrt_llm_transfer_agent_binding/**/*.pyi
 tensorrt_llm/tensorrt_llm_agent_binding.pyi
