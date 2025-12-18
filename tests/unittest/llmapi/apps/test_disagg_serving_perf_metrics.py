@@ -39,8 +39,7 @@ def gen_port(test_ports: list[int]):
 
 @pytest.fixture
 def model_name():
-    model_path = os.path.join(llm_models_root(),
-                              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     assert os.path.exists(model_path), f"Model path {model_path} does not exist"
     return model_path
 
