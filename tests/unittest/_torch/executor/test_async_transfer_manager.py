@@ -66,10 +66,11 @@ def test_start_transfer_single_request():
 
     # Check request is tracked
     assert 42 in manager._requests
-    req, block_id, counter = manager._requests[42]
-    assert req is request
-    assert block_id == 100
-    assert counter == 1
+
+    transfer_metadata = manager._request_transfer_metadata[42]
+
+    assert transfer_metadata.block_id == 100
+    assert transfer_metadata.counter == 1
 
     # Check state was updated
     assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -97,8 +98,8 @@ def test_start_transfer_multiple_transfers_same_request():
     manager.start_transfer(request)
 
     # Counter should be incremented
-    _, block_id, counter = manager._requests[42]
-    assert counter == 3
+    transfer_metadata = manager._request_transfer_metadata[42]
+    assert transfer_metadata.counter == 3
 
     # store_blocks_for_reuse should only be called once
     kv_cache_manager.store_blocks_for_reuse.assert_called_once()
@@ -126,9 +127,9 @@ def test_transfer_without_storing_blocks():
 
     # Check request is tracked
     assert 42 in manager._requests
-    req, block_id, counter = manager._requests[42]
-    assert block_id is None  # No block stored
-    assert counter == 1
+    transfer_metadata = manager._request_transfer_metadata[42]
+    assert transfer_metadata.block_id is None  # No block stored
+    assert transfer_metadata.counter == 1
 
     # Check KV cache manager was NOT called
     kv_cache_manager.store_blocks_for_reuse.assert_not_called()

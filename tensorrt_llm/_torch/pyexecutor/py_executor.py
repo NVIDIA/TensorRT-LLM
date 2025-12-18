@@ -203,12 +203,21 @@ class AsyncTransferManager:
         Returns:
             bool: True if the request should be terminated after call to end_transfer
         """
-        transfer_metadata = self._request_transfer_metadata.pop(
-            request.py_request_id)
+        try:
+            transfer_metadata = self._request_transfer_metadata[
+                request.py_request_id]
+        except KeyError:
+            logger.warning(
+                f"Request {request.py_request_id} not found in transfer manager"
+            )
+            return
 
         should_terminate = False
 
         if transfer_metadata.end_transfer():
+            self._requests.pop(request.py_request_id)
+            self._request_transfer_metadata.pop(request.py_request_id)
+
             if self.should_store_blocks:
                 self.kv_cache_manager.unpin_blocks_by_id(
                     transfer_metadata.block_id)
