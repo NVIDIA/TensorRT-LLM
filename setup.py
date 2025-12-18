@@ -114,6 +114,8 @@ else:
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so', 'libs/nixl/**/*',
+        'tensorrt_llm_transfer_agent_binding*.so',
+        'tensorrt_llm_transfer_agent_binding.pyi',
         'libs/libtensorrt_llm_mooncake_wrapper.so', 'libs/ucx/**/*',
         'libs/libpg_utils.so', 'libs/libdecoder_attention_1.so',
         'libs/nvshmem/License.txt', 'libs/nvshmem/nvshmem_bootstrap_uid.so.3',

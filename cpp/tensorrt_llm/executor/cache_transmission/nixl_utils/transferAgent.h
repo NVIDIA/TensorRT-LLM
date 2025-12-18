@@ -45,7 +45,7 @@ public:
 
     [[nodiscard]] bool isCompleted() const override;
 
-    void wait() const override;
+    [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
 private:
     nixlAgent* mRawAgent{};

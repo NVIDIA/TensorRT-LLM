@@ -30,11 +30,53 @@ if(NIXL_ROOT)
 
   # Add include directories
   target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_include_directories(${NIXL_WRAPPER_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
   # Link against CUDA
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
+  # ============================================================================
+  # TensorRT-LLM Transfer Agent Binding Python Module (standalone, independent
+  # of main trtllm bindings) Uses BINDING_TYPE to choose between pybind11 and
+  # nanobind
+  # ============================================================================
+  set(AGENT_BINDING_TARGET "tensorrt_llm_transfer_agent_binding")
+
+  if(BINDING_TYPE STREQUAL "pybind")
+    # Use pybind11 (already fetched via FetchContent)
+    pybind11_add_module(${AGENT_BINDING_TARGET} agentBindingsPybind.cpp)
+    message(STATUS "Building tensorrt_llm_transfer_agent_binding with pybind11")
+  else()
+    # Default to nanobind (already fetched via FetchContent)
+    nanobind_add_module(${AGENT_BINDING_TARGET} agentBindingsNanobind.cpp)
+    message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
+  endif()
+
+  target_compile_options(${AGENT_BINDING_TARGET} PRIVATE -Wno-error)
+
+  # Add include directories
+  target_include_directories(${AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
+  target_include_directories(${AGENT_BINDING_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+  # Link against NIXL wrapper and NIXL libraries
+  target_link_libraries(${AGENT_BINDING_TARGET} PRIVATE ${NIXL_WRAPPER_TARGET})
+  target_link_libraries(${AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
+  target_link_libraries(${AGENT_BINDING_TARGET} PRIVATE CUDA::cudart)
+
+  # Set RPATH for the module to find libtensorrt_llm_nixl_wrapper.so
+  set_target_properties(
+    ${AGENT_BINDING_TARGET} PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/libs"
+                                       INSTALL_RPATH "$ORIGIN;$ORIGIN/libs")
+
+  # Export the agent binding target name to parent scope so it can be added as
+  # dependency to tensorrt_llm main library
+  set(AGENT_BINDING_TARGET
+      ${AGENT_BINDING_TARGET}
+      PARENT_SCOPE)
 
 endif()

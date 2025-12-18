@@ -141,7 +141,8 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    status->wait();
+    TransferState transferState = status->wait();
+    TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
@@ -246,8 +247,8 @@ AgentConnectionManager::AgentConnectionManager(
 
     mAgentName = genUniqueAgentName();
     // Create Agent
-    BaseAgentConfig config{mAgentName, true};
-    m_Agent = makeTransferAgent(backendType, &config);
+    BaseAgentConfig config{mAgentName, true, false, true, 1};
+    m_Agent = makeTransferAgent("nixl", &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     std::vector<MemoryDesc> memDescs;
     for (auto* cacheTransBufferManager : mCacheTransBufferManagers)
