@@ -571,7 +571,27 @@ class PyTorchModelEngine(ModelEngine):
         finally:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
+    @staticmethod
+    def warmup_with_kv_cache_cleanup(method):
+
+        @functools.wraps(method)
+        def wrapper(self, resource_manager: ResourceManager, *args, **kwargs):
+            kv_cache_manager = resource_manager.get_resource_manager(
+                self.kv_cache_manager_key)
+            if kv_cache_manager is not None:
+                kv_cache_manager.check_nan_in_buffers(fill_with_zero=True)
+            result = method(self, resource_manager, *args, **kwargs)
+            if kv_cache_manager is not None:
+                has_nan = kv_cache_manager.check_nan_in_buffers(
+                    fill_with_zero=True)
+                if has_nan:
+                    raise ValueError("NaN introduced to KVCache during warmup")
+            return result
+
+        return wrapper
+
     @with_warmup_flag
+    @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
