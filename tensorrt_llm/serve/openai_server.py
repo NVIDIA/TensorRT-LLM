@@ -1189,9 +1189,6 @@ class OpenAIServer:
                     yield pp_res
 
         try:
-            if request.background:
-                logger.warning("Request.background is not supported yet, will fallback to foreground processing.")
-
             # Get prev response
             prev_response = None
             if self.enable_store:
