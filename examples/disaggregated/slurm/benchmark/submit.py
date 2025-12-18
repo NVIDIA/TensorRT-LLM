@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import datetime
 from typing import Any, Dict, List
+import traceback
 
 import yaml
 
@@ -41,11 +42,8 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-def save_worker_config(config, output_path, worker_type):
+def save_worker_config(worker_config, output_path):
     """Save worker config to a separate YAML file."""
-    # Get just the worker configuration without the wrapper
-    worker_config = config['worker_config'][worker_type]
-
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         yaml.dump(worker_config, f, default_flow_style=False)
@@ -65,7 +63,7 @@ def allocate_gpus(
     ctx_world_size: int,
     base_port: int = 8000,
 ) -> List[Dict[str, Any]]:
-    allocations = []
+    allocations = {}
     hostnames = [f"<node{i}_placeholder>" for i in range(total_nodes)]
 
     global_gpu_cursor = 0
@@ -87,21 +85,21 @@ def allocate_gpus(
             global_gpu_cursor += 1
 
     def assign_servers(
-        server_allocations: List[Dict[str, Any]],
+        server_allocations: Dict[str, Any],
         server_type: str,
         num_servers: int,
         world_size: int,
         gpus_per_node: int,
     ):
+        if server_type not in server_allocations:
+            server_allocations[server_type] = {}
         for i in range(num_servers):
             server_allocation = {
-                "server_type": server_type,
-                "server_id": i,
                 "port": base_port + i,
                 "nodes": {},
             }
             assign_server(server_allocation, world_size, gpus_per_node)
-            server_allocations.append(server_allocation)
+            server_allocations[server_type][i]=server_allocation
 
     assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
@@ -110,6 +108,21 @@ def allocate_gpus(
 
     return allocations
 
+def convert_allocations_to_server_config(allocations):
+    server_config = {
+        'backend': 'pytorch',
+        'hostname': hostname,
+        'port': port,
+        'context_servers': {
+            'num_instances': 0 if gen_only else args.num_ctx_servers,
+            'urls': [] if gen_only else ctx_urls
+        },
+        'generation_servers': {
+            'num_instances': args.num_gen_servers,
+            'urls': gen_urls
+        }
+    }
+    return server_config
 
 def submit_job(config, log_dir, dry_run):
     # Extract configurations
@@ -119,6 +132,7 @@ def submit_job(config, log_dir, dry_run):
 
     hw_config = config['hardware']
     env_config = config['environment']
+    worker_config = config['worker_config']
     benchmark_config = config['benchmark']
 
     # Set default accuracy configuration for backward compatibility
@@ -158,22 +172,17 @@ def submit_job(config, log_dir, dry_run):
     gen_num = hw_config['num_gen_servers']
     gpus_per_node = hw_config['gpus_per_node']
 
-    # Get mtp_size from gen config's speculative_config
-    gen_config = config['worker_config']['gen']
-    mtp_size = gen_config.get('speculative_config',
-                              {}).get('num_nextn_predict_layers', 0)
-
     # Calculate nodes based on world sizes
-    ctx_tp_size = config['worker_config']['ctx'].get('tensor_parallel_size', 1)
-    ctx_cp_size = config['worker_config']['ctx'].get('context_parallel_size', 1)
-    ctx_pp_size = config['worker_config']['ctx'].get('pipeline_parallel_size',
+    ctx_tp_size = worker_config['ctx'].get('tensor_parallel_size', 1)
+    ctx_cp_size = worker_config['ctx'].get('context_parallel_size', 1)
+    ctx_pp_size = worker_config['ctx'].get('pipeline_parallel_size',
                                                      1)
     ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
     ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
 
-    gen_tp_size = config['worker_config']['gen'].get('tensor_parallel_size', 1)
-    gen_cp_size = config['worker_config']['gen'].get('context_parallel_size', 1)
-    gen_pp_size = config['worker_config']['gen'].get('pipeline_parallel_size',
+    gen_tp_size = worker_config['gen'].get('tensor_parallel_size', 1)
+    gen_cp_size = worker_config['gen'].get('context_parallel_size', 1)
+    gen_pp_size = worker_config['gen'].get('pipeline_parallel_size',
                                                      1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
@@ -184,8 +193,8 @@ def submit_job(config, log_dir, dry_run):
     # Generate log directory path based on configuration
     isl = benchmark_config['input_length']
     osl = benchmark_config['output_length']
-    gen_batch_size = config['worker_config']['gen']['max_batch_size']
-    gen_enable_attention_dp = config['worker_config']['gen'][
+    gen_batch_size = worker_config['gen']['max_batch_size']
+    gen_enable_attention_dp = worker_config['gen'][
         'enable_attention_dp']
 
     if log_dir is None:
@@ -195,18 +204,22 @@ def submit_job(config, log_dir, dry_run):
                                 f"{date_prefix}/{isl}-{osl}")
 
         # Get eplb num_slots for gen worker
-        load_balancer_config = config['worker_config']['gen'].get(
+        load_balancer_config = worker_config['gen'].get(
             'moe_config', {}).get('load_balancer', {})
         if isinstance(load_balancer_config, str):
             with open(load_balancer_config, 'r') as f:
                 load_balancer_config = yaml.safe_load(f)
         eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
+        # Get mtp_size from gen config's speculative_config
+        mtp_size = worker_config['gen'].get('speculative_config',
+                                {}).get('num_nextn_predict_layers', 0)
+
         # Determine directory suffix based on attention_dp
         if gen_enable_attention_dp:
-            dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
         else:
-            dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
 
         # Create full log directory path
         log_dir = os.path.join(log_base, dir_suffix)
@@ -221,8 +234,8 @@ def submit_job(config, log_dir, dry_run):
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
-    save_worker_config(config, ctx_config_path, 'ctx')
-    save_worker_config(config, gen_config_path, 'gen')
+    save_worker_config(worker_config['ctx'], ctx_config_path)
+    save_worker_config(worker_config['gen'], gen_config_path)
 
     # Prepare allocation template
     allocations = allocate_gpus(
@@ -239,38 +252,39 @@ def submit_job(config, log_dir, dry_run):
     container_name = "disaggr-test"
     start_server_cmds = []
     # Generate start worker commands with placeholder hostnames
-    for allocation in allocations:
-        server_type = allocation["server_type"]
-        cuda_devices = ",".join(
-            [str(device) for device in list(allocation["nodes"].values())[0]])
-        cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
-        cmd = [
-            "srun -l",
-            f"--nodelist {','.join(allocation['nodes'].keys())}",
-            f"-N {len(allocation['nodes'])}",
-            f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
-            f"--ntasks-per-node {gpus_per_node}",
-            f"--container-image {env_config['container_image']}",
-            f"--container-name {container_name}",
-            f"--container-mounts {env_config['container_mount']}",
-            "--mpi=pmix --overlap",
-            f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
-            server_type,
-            str(allocation['server_id']),
-            env_config['model_path'],
-            str(allocation["port"]),
-            benchmark_config['mode'],
-            f"'{benchmark_config['concurrency_list']}'",
-            str(slurm_config['numa_bind']).lower(),
-            log_dir,
-            str(profiling_config['nsys_on']).lower(),
-            f"'{profiling_config['gen_profile_range']}'"
-            if server_type == "GEN" else f"'{profiling_config['ctx_profile_range']}'",
-            gen_config_path if server_type == "GEN" else ctx_config_path,
-            f"'{cur_worker_env_var}'",
-            f"&> {log_dir}/3_output_{server_type}_{allocation['server_id']}.log &",
-        ]
-        start_server_cmds.append(" ".join(cmd))
+    for server_type in allocations.keys():
+        for server_id in allocations[server_type].keys():
+            allocation = allocations[server_type][server_id]
+            cuda_devices = ",".join(
+                [str(device) for device in list(allocation["nodes"].values())[0]])
+            cur_worker_env_var = worker_env_var + f" CUDA_VISIBLE_DEVICES={cuda_devices}"
+            cmd = [
+                "srun -l",
+                f"--nodelist {','.join(allocation['nodes'].keys())}",
+                f"-N {len(allocation['nodes'])}",
+                f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
+                f"--ntasks-per-node {gpus_per_node}",
+                f"--container-image {env_config['container_image']}",
+                f"--container-name {container_name}",
+                f"--container-mounts {env_config['container_mount']}",
+                "--mpi=pmix --overlap",
+                f"bash {os.path.join(env_config['work_dir'], 'start_worker.sh')}",
+                server_type,
+                str(server_id),
+                env_config['model_path'],
+                str(allocation["port"]),
+                benchmark_config['mode'],
+                benchmark_config['concurrency_list'],
+                str(slurm_config['numa_bind']).lower(),
+                log_dir,
+                str(profiling_config['nsys_on']).lower(),
+                profiling_config['gen_profile_range']
+                if server_type == "GEN" else profiling_config['ctx_profile_range'],
+                gen_config_path if server_type == "GEN" else ctx_config_path,
+                f'"{cur_worker_env_var}"',
+                f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
+            ]
+            start_server_cmds.append(" ".join(cmd))
 
     # Generate start server commands
     cmd = [
@@ -392,6 +406,7 @@ def main():
             submit_job(config, args.log_dir, args.dry_run)
             print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
+            traceback.print_exc()
             print(f"Error processing {config_file}: {e}", file=sys.stderr)
             # Continue processing other files even if one fails
             continue
